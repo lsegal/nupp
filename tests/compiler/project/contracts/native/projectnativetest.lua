@@ -40,7 +40,7 @@ function M.nativeFacilitiesSharingAProviderBuildAsOneUnion()
     assert(ok, outputs)
     assert(outputs, problem)
     testAssert.eq(#calls, 1, "one provider union is built once")
-    testAssert.eq(#copies, 2, "the shared library and path runtime are staged")
+    testAssert.eq(#copies, 3, "the shared library and the path and URI runtimes are staged")
     local command = "\n" .. table.concat(calls[1], "\n") .. "\n"
     assert(command:find("\nnative%-rust\nfilesystem,uri\n"), "path and URI select one sorted Rust feature union")
     testAssert.eq(copies[1][1], "/built/libnupp_native.dylib", "the Rust provider union has one source artifact")
