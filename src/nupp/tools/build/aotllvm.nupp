@@ -99,7 +99,8 @@ function aotllvm.emit(
     tier: string,
     triple: string,
     logical: boolean?,
-    sourceFile: string?
+    sourceFile: string?,
+    exports: boolean?
 ): (string?, string?)
     local selected, profileErr = llvmProfile.of(triple)
     if selected == nil then
@@ -126,7 +127,8 @@ function aotllvm.emit(
         sourceFile,
         logical,
         bridges,
-        aotllvm.wasmOracle()
+        aotllvm.wasmOracle(),
+        exports
     )
     if not ok then
         if llvmProgram.isUnsupported(module) then

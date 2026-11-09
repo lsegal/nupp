@@ -460,6 +460,15 @@ export function install(c: state.Checker): state.StatHandlers
                 if requested ~= nil then
                     targetBody.aotTarget = requested
                 end
+                local exported = values and values.export
+                local exportName = exported and stringValue(exported.expr) or nil
+                if exported and (exportName == nil or not exportName:match("^[%a_][%w_]*$")) then
+                    c.diag("NUPP2902", annotationName, "@aot export must be a literal C identifier")
+                elseif exportName ~= nil and requested == "gpu" then
+                    c.diag("NUPP2902", annotationName, "@aot export publishes a CPU function; a GPU kernel has no C symbol")
+                elseif exportName ~= nil then
+                    targetBody.aotExport = exportName
+                end
             end
             if stat.stat then
                 c.checkStat(stat.stat)

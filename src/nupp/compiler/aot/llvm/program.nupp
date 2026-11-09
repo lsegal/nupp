@@ -85,6 +85,10 @@ record llvmProgram.Unit
 
     --- Functions already defined or declared, by LLVM name.
     defined: {[string]: boolean}
+
+    --- Whether this unit publishes each entry's `@aot(export = ...)` C name.
+    --- Only one tier's unit may, since a name defined twice does not link.
+    exports: boolean?
 end
 
 --- @raises string always
@@ -488,6 +492,9 @@ local function kernel(unit: llvmProgram.Unit, program: scalarIR.Program, oracle:
     local roots = countRules.roots(program)
     local aliases = countRules.equal(program, roots)
     local parameters: {string} = {}
+    -- The same parameters as types alone, which is what a C export's alias
+    -- states the function as.
+    local signature: {string} = {}
     local narrowCounts = selected.sizeType ~= "i64"
     local countSuffix = narrowCounts and ".arg" or ""
     -- A span's length is a Lua number, so at most 2^53, which only the
@@ -499,10 +506,12 @@ local function kernel(unit: llvmProgram.Unit, program: scalarIR.Program, oracle:
     for _, param in ipairs(program.params) do
         if scalarIR.isSpan(param) then
             parameters[#parameters + 1] = spanParameter(unit, program, param)
+            signature[#signature + 1] = "ptr"
         elseif param.kind == "uniform" then
             parameters[
                 #parameters + 1
             ] = entryValueType(module, program, tostring(param.type), types.parameter) .. " %p_" .. param.name
+            signature[#signature + 1] = entryValueType(module, program, tostring(param.type), types.require)
         else
             expressions.unsupported("scalar parameters of kind " .. param.kind)
         end
@@ -511,19 +520,37 @@ local function kernel(unit: llvmProgram.Unit, program: scalarIR.Program, oracle:
         for _, param in ipairs(program.params) do
             if scalarIR.isSpan(param) and (param.soa == nil or param.soa.ordinal == 1) then
                 parameters[#parameters + 1] = countType .. " %count_" .. param.name .. countSuffix
+                signature[#signature + 1] = selected.sizeType
             end
         end
     else
         parameters[#parameters + 1] = countType .. " %count" .. countSuffix
+        signature[#signature + 1] = selected.sizeType
     end
     local resultStruct: string? = nil
     if #results > 1 then
         resultStruct = types.resultStruct(results)
         parameters[#parameters + 1] = unit.facts.access and "ptr noalias captures(none) writeonly %ks_result"
             or "ptr %ks_result"
+        signature[#signature + 1] = "ptr"
     end
     local result = #results ~= 1 and "void" or entryValueType(module, program, tostring(results[1]), types.result)
     local symbol = physical(program.symbol .. (oracle and "_forced_scalar" or ""), unit.tier)
+    -- A C export is the kernel under a second name: an alias, so C callers
+    -- reach the same code the Lua wrapper does, with nothing in between.
+    if program.exportName ~= nil and unit.exports == true and not oracle then
+        local returned = #results ~= 1 and "void" or entryValueType(module, program, tostring(results[1]), types.require)
+        builder.once(
+            module,
+            "@" .. tostring(program.exportName),
+            ("@%s = alias %s (%s), ptr @%s"):format(
+                tostring(program.exportName),
+                returned,
+                table.concat(signature, ", "),
+                symbol
+            )
+        )
+    end
     -- A kernel frees nothing and synchronizes with nothing; what it reads and
     -- writes is settled once the unit is complete (`llvmProgram.module`). The
     -- oracle is the same body left as written.
@@ -689,7 +716,8 @@ function llvmProgram.module(
     sourceFile: string?,
     logical: boolean?,
     bridges: {[string]: integer}?,
-    oracleBridges: boolean?
+    oracleBridges: boolean?,
+    exports: boolean?
 ): string
     local module = builder.module()
     local unit = llvmProgram.Unit(
@@ -701,7 +729,8 @@ function llvmProgram.module(
         facts = stated or facts.all(),
         lines = sourceFile ~= nil and dwarf.unit(module, sourceFile as string, selected.format == "macho" and 4 or 5)
         or nil,
-        defined = {}
+        defined = {},
+        exports = exports
     )
     local kernels: {[integer]: boolean} = {}
     local registered: {luaEntry.Registered} = {}
