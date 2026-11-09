@@ -27,7 +27,7 @@ const FUSED: {[string]: boolean} = {fmadd = true, fmsub = true, fnmadd = true, f
 const FUSED_PREFIXES: {string} = {"vfmadd", "vfmsub", "vfnmadd", "vfnmsub", "f64x2.relaxed_madd"}
 
 --- Functions (by IR name) carrying each licence, read from attribute groups.
-type Licences = {contract: {[string]: boolean}, algebraic: {[string]: boolean}}
+local type Licences = {contract: {[string]: boolean}, algebraic: {[string]: boolean}}
 
 --- The lines of `text`, each without its line ending.
 local function lines(text: string): {string}

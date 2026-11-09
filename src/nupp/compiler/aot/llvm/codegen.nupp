@@ -224,6 +224,7 @@ end
 --- form: triple, cpu, features, opt, then whether to return the assembly and
 --- the optimized IR. Verifying needs the optimized IR, and the assembly when it
 --- is asked for; outputs nobody keeps are produced only to verify.
+--- @raises string when the options are refused
 local function nativeOptions(options: {[string]: string}, kept: boolean): (codegen.Options, string)
     local parsed, err = codegen.parseOptions(optionText(options))
     if parsed == nil then

@@ -1035,10 +1035,8 @@ name = "nupp-native-codegen"
 version = "0.1.0"
 dependencies = [
  "cc",
- "flate2",
  "llvm-sys",
  "reqwest",
- "ring",
  "rustls",
 ]
 
