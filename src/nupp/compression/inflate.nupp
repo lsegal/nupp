@@ -622,6 +622,10 @@ export function finishinput(self: Decoder, room: number): (number?, number?, str
         return nil, nil, problem
     end
     local written = self.at
+    if self.phase == "between" and self.position > #self.data then
+        -- The last member ended and nothing follows it.
+        self.finished = true
+    end
     if self.finished then
         return written, FINISHED, nil
     end
