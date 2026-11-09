@@ -30,24 +30,24 @@ export const FINISHED = 3
 local WINDOW = 32768
 local WINDOW_MASK = WINDOW - 1
 
-local LENGTH_BASE: {integer} = {
+local LENGTH_BASE: any = {
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
 }
-local LENGTH_EXTRA: {integer} = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
-local DISTANCE_BASE: {integer} = {
+local LENGTH_EXTRA: any = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
+local DISTANCE_BASE: any = {
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
     8193, 12289, 16385, 24577
 }
-local DISTANCE_EXTRA: {integer} = {
+local DISTANCE_EXTRA: any = {
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
 }
-local CODE_LENGTH_ORDER: {integer} = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
+local CODE_LENGTH_ORDER: any = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
 
 --- A canonical Huffman code: how many codes each length has, and the symbols
 --- in code order.
 local record Code
-    counts: {integer}
-    symbols: {integer}
+    counts: any
+    symbols: any
 end
 
 --- Raised inside an item when the input runs out; the item is retried later.
@@ -63,8 +63,8 @@ end
 
 --- Builds a code from symbol lengths, refusing an over-subscribed set and, unless
 --- `incompleteAllowed`, an incomplete one with more than a single code.
-local function build(lengths: {integer}, count: integer, incompleteAllowed: boolean, label: string): Code
-    local counts: {integer} = {}
+local function build(lengths: any, count: number, incompleteAllowed: boolean, label: string): Code
+    local counts: any = {}
     for length = 0, 15 do
         counts[length] = 0
     end
@@ -84,12 +84,12 @@ local function build(lengths: {integer}, count: integer, incompleteAllowed: bool
     if left > 0 and not incompleteAllowed and codes ~= 1 then
         fail("invalid " .. label .. " code lengths")
     end
-    local offsets: {integer} = {}
+    local offsets: any = {}
     offsets[1] = 0
     for length = 1, 14 do
         offsets[length + 1] = offsets[length] + counts[length]
     end
-    local symbols: {integer} = {}
+    local symbols: any = {}
     for symbol = 0, count - 1 do
         local length = lengths[symbol] or 0
         if length ~= 0 then
@@ -106,12 +106,12 @@ local fixedDistances: Code? = nil
 
 local function fixedCodes(): (Code, Code)
     if fixedLiterals == nil then
-        local lengths: {integer} = {}
+        local lengths: any = {}
         for symbol = 0, 287 do
             lengths[symbol] = symbol < 144 and 8 or symbol < 256 and 9 or symbol < 280 and 7 or 8
         end
         fixedLiterals = build(lengths, 288, true, "fixed literal")
-        local distances: {integer} = {}
+        local distances: any = {}
         for symbol = 0, 29 do
             distances[symbol] = 5
         end
@@ -129,36 +129,37 @@ export record Decoder
     -- bits pulled from them but not yet used.
     data: string
     position: integer
-    bits: integer
-    count: integer
+    bits: number
+    count: number
     -- Where the current item began, to roll back to on underflow.
     markPosition: integer
-    markBits: integer
-    markCount: integer
+    markBits: number
+    markCount: number
     -- The block being decoded.
     last: boolean
     literals: Code?
     distances: Code?
-    storedLeft: integer
-    copyLength: integer
-    copyDistance: integer
+    storedLeft: number
+    copyLength: number
+    copyDistance: number
     -- History for back-references, and how much of it is filled.
     window: any
-    windowAt: integer
-    produced: integer
+    windowAt: number
+    produced: number
     -- Integrity: the running checksum of the member's output.
     checksum: uint64
-    adlerLow: integer
-    adlerHigh: integer
-    memberSize: integer
+    adlerLow: number
+    adlerHigh: number
+    memberSize: number
     completedMember: boolean
     finished: boolean
     failed: string?
     -- The step in progress: its output, how far into it this step has written,
     -- and how much of that the checksum has seen.
     output: any
-    at: integer
-    accounted: integer
+    capacity: number
+    at: number
+    accounted: number
 end
 
 local crc32 = crc.lookup(1) as crc.Algorithm
@@ -209,7 +210,8 @@ export function create(format: integer, concatenated: boolean): Decoder
         completedMember = false,
         finished = false,
         failed = nil,
-        output = nil,
+        output = ffi.new("uint8_t[?]", 1),
+        capacity = 1,
         at = 0,
         accounted = 0
     )
@@ -229,7 +231,7 @@ local function rewind(self: Decoder): nil
     self.count = self.markCount
 end
 
-local function need(self: Decoder, wanted: integer): nil
+local function need(self: Decoder, wanted: number): nil
     while self.count < wanted do
         local byte = self.data:byte(self.position)
         if byte == nil then
@@ -241,7 +243,7 @@ local function need(self: Decoder, wanted: integer): nil
     end
 end
 
-local function take(self: Decoder, wanted: integer): integer
+local function take(self: Decoder, wanted: number): number
     if wanted == 0 then
         return 0
     end
@@ -260,11 +262,11 @@ local function align(self: Decoder): nil
     self.count = self.count - spare
 end
 
-local function byteAligned(self: Decoder): integer
+local function byteAligned(self: Decoder): number
     return take(self, 8)
 end
 
-local function decode(self: Decoder, code: Code): integer
+local function decode(self: Decoder, code: Code): number
     local value = 0
     local first = 0
     local index = 0
@@ -283,7 +285,7 @@ local function decode(self: Decoder, code: Code): integer
     return 0
 end
 
-local function emit(self: Decoder, byte: integer): nil
+local function emit(self: Decoder, byte: number): nil
     self.output[self.at] = byte
     self.at = self.at + 1
     self.window[self.windowAt] = byte
@@ -298,7 +300,7 @@ local function dynamicTables(self: Decoder): nil
     if literalCount > 286 or distanceCount > 30 then
         fail("invalid dynamic block code counts")
     end
-    local lengths: {integer} = {}
+    local lengths: any = {}
     for index = 0, 18 do
         lengths[index] = 0
     end
@@ -306,7 +308,7 @@ local function dynamicTables(self: Decoder): nil
         lengths[CODE_LENGTH_ORDER[index]] = take(self, 3)
     end
     local lengthCode = build(lengths, 19, false, "code length")
-    local all: {integer} = {}
+    local all: any = {}
     local index = 0
     local total = literalCount + distanceCount
     while index < total do
@@ -316,7 +318,7 @@ local function dynamicTables(self: Decoder): nil
             index = index + 1
         else
             local repeated = 0
-            local times: integer
+            local times: number
             if symbol == 16 then
                 if index == 0 then
                     fail("code length repeat with no previous length")
@@ -340,11 +342,11 @@ local function dynamicTables(self: Decoder): nil
     if (all[256] or 0) == 0 then
         fail("dynamic block has no end-of-block code")
     end
-    local literalLengths: {integer} = {}
+    local literalLengths: any = {}
     for symbol = 0, literalCount - 1 do
         literalLengths[symbol] = all[symbol]
     end
-    local distanceLengths: {integer} = {}
+    local distanceLengths: any = {}
     for symbol = 0, distanceCount - 1 do
         distanceLengths[symbol] = all[literalCount + symbol]
     end
@@ -456,7 +458,8 @@ local function trailer(self: Decoder): nil
 end
 
 --- Advances as far as the input and `room` output bytes allow.
-local function run(self: Decoder, room: integer): nil
+--- @raises UNDERFLOW when the input ends mid-item, or a Failure on a malformed stream
+local function run(self: Decoder, room: number): nil
     while not self.finished do
         mark(self)
         local phase = self.phase
@@ -556,8 +559,11 @@ end
 
 --- Runs one step, converting an underflow into a rollback to the interrupted
 --- item. Answers false and a reason when the stream is malformed.
-local function step(self: Decoder, output: any, room: integer): (boolean, string?)
-    self.output = output
+local function step(self: Decoder, room: number): (boolean, string?)
+    if room > self.capacity then
+        self.output = ffi.new("uint8_t[?]", room)
+        self.capacity = room
+    end
     self.at = 0
     self.accounted = 0
     local ok, problem = pcall(run, self, room)
@@ -570,13 +576,13 @@ local function step(self: Decoder, output: any, room: integer): (boolean, string
         rewind(self)
     end
     account(self)
-    self.output = nil
     return true, nil
 end
 
---- One decoding step over `input`, writing into `room` bytes at `output`.
---- Answers bytes consumed, bytes written and a status, or nil and a reason.
-export function read(self: Decoder, input: string, output: any, room: integer): (integer?, integer?, integer?, string?)
+--- One decoding step over `input`, producing at most `room` bytes into
+--- `self.output`. Answers bytes consumed, bytes written and a status, or nil
+--- and a reason.
+export function read(self: Decoder, input: string, room: number): (number?, number?, number?, string?)
     if self.failed ~= nil then
         return nil, nil, nil, self.failed
     end
@@ -585,7 +591,7 @@ export function read(self: Decoder, input: string, output: any, room: integer): 
     end
     self.data = self.data:sub(self.position) .. input
     self.position = 1
-    local ok, problem = step(self, output, room)
+    local ok, problem = step(self, room)
     if not ok then
         return nil, nil, nil, problem
     end
@@ -603,7 +609,7 @@ end
 
 --- Reports the end of the input. A stream that has not ended is truncated or,
 --- after a complete gzip member, followed by bytes that are not one.
-export function finishinput(self: Decoder, output: any, room: integer): (integer?, integer?, string?)
+export function finishinput(self: Decoder, room: number): (number?, number?, string?)
     if self.failed ~= nil then
         return nil, nil, self.failed
     end
@@ -611,7 +617,7 @@ export function finishinput(self: Decoder, output: any, room: integer): (integer
         self.finished = true
         return 0, FINISHED, nil
     end
-    local ok, problem = step(self, output, room)
+    local ok, problem = step(self, room)
     if not ok then
         return nil, nil, problem
     end

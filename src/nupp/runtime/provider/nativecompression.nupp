@@ -14,12 +14,26 @@ const inflate = require("nupp.compression.inflate")
 const span = require("bytes.span")
 const ffi = require("ffi")
 
+-- The two copies across the span boundary, typed so a borrowed range is all
+-- that crosses: one call each way, and nothing retained.
+local ffiString: function(borrows source: const uint8[?], count: integer): string = ffi.string as any
+local copyInto: function(borrows destination: uint8[?], source: any, count: integer): nil = ffi.copy as any
+
 local function text(borrows input: span.Span<uint8>): string
     local count = #input
     if count == 0 then
         return ""
     end
-    return ffi.string(input:ref() as any, count)
+    return ffiString(input:ref(), count)
+end
+
+--- Copies `chunk` to the start of `output`, answering how many bytes that was.
+local function publish(chunk: string, exclusive output: span.ByteWriteSpan): integer
+    local count = #chunk
+    if count > 0 then
+        copyInto(output:ref(), chunk, count)
+    end
+    return count
 end
 
 local record Encoder is contract.Encoder
@@ -33,18 +47,18 @@ local record Encoder is contract.Encoder
         borrows input: span.Span<uint8>,
         exclusive output: span.ByteWriteSpan
     ): (integer?, integer?, integer?, string?)
-        local consumed, written, status = deflate.write(self.state, text(input), output:ref() as any, #output)
-        return consumed, written, status, nil
+        local consumed, chunk, status = deflate.write(self.state, text(input), #output)
+        return consumed as integer, publish(chunk, output), status as integer, nil
     end
 
     function flush(exclusive self, exclusive output: span.ByteWriteSpan): (integer?, integer?, string?)
-        local written, status = deflate.flush(self.state, output:ref() as any, #output)
-        return written, status, nil
+        local chunk, status = deflate.flush(self.state, #output)
+        return publish(chunk, output), status as integer, nil
     end
 
     function finish(exclusive self, exclusive output: span.ByteWriteSpan): (integer?, integer?, string?)
-        local written, status = deflate.finish(self.state, output:ref() as any, #output)
-        return written, status, nil
+        local chunk, status = deflate.finish(self.state, #output)
+        return publish(chunk, output), status as integer, nil
     end
 end
 
@@ -54,24 +68,33 @@ local record Decoder is contract.Decoder
     function close(takes self): nil
     end
 
+    --- Copies the codec's `count` decoded bytes to the start of `output`.
+    @private
+    function publish(self, count: integer, exclusive output: span.ByteWriteSpan): integer
+        if count > 0 then
+            copyInto(output:ref(), self.state.output, count)
+        end
+        return count
+    end
+
     function read(
         exclusive self,
         borrows input: span.Span<uint8>,
         exclusive output: span.ByteWriteSpan
     ): (integer?, integer?, integer?, string?)
-        local consumed, written, status, problem = inflate.read(self.state, text(input), output:ref() as any, #output)
+        local consumed, written, status, problem = inflate.read(self.state, text(input), #output)
         if problem ~= nil then
             return nil, nil, nil, "compression decode failed: " .. problem
         end
-        return consumed, written, status, nil
+        return consumed as integer, self:publish(written as integer, output), status as integer, nil
     end
 
     function finishinput(exclusive self, exclusive output: span.ByteWriteSpan): (integer?, integer?, string?)
-        local written, status, problem = inflate.finishinput(self.state, output:ref() as any, #output)
+        local written, status, problem = inflate.finishinput(self.state, #output)
         if problem ~= nil then
             return nil, nil, "compression decode failed: " .. problem
         end
-        return written, status, nil
+        return self:publish(written as integer, output), status as integer, nil
     end
 end
 

@@ -44,7 +44,7 @@ local record Tuning
     chain: integer
 end
 
-local TUNING: {Tuning} = {
+local TUNING: any = {
     Tuning(good = 4, lazy = 0, nice = 8, chain = 4),
     Tuning(good = 4, lazy = 0, nice = 16, chain = 8),
     Tuning(good = 4, lazy = 0, nice = 32, chain = 32),
@@ -56,21 +56,21 @@ local TUNING: {Tuning} = {
     Tuning(good = 32, lazy = 258, nice = 258, chain = 4096),
 }
 
-local LENGTH_BASE: {integer} = {
+local LENGTH_BASE: any = {
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
 }
-local LENGTH_EXTRA: {integer} = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
-local DISTANCE_BASE: {integer} = {
+local LENGTH_EXTRA: any = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
+local DISTANCE_BASE: any = {
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
     8193, 12289, 16385, 24577
 }
-local DISTANCE_EXTRA: {integer} = {
+local DISTANCE_EXTRA: any = {
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
 }
-local CODE_LENGTH_ORDER: {integer} = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
+local CODE_LENGTH_ORDER: any = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
 
 -- Symbol lookups by length (3..258) and distance (1..32768), zero-based codes.
-local LENGTH_CODE: {integer} = {}
+local LENGTH_CODE: any = {}
 for index = 1, 29 do
     local top = index < 29 and LENGTH_BASE[index + 1] - 1 or 258
     for length = LENGTH_BASE[index], top do
@@ -79,7 +79,7 @@ for index = 1, 29 do
 end
 LENGTH_CODE[258] = 28
 
-local function distanceCode(distance: integer): integer
+local function distanceCode(distance: number): number
     local low = 1
     local high = 30
     while low < high do
@@ -95,16 +95,16 @@ end
 
 --- Writes bits least significant first into a byte list.
 local record Bits
-    bytes: {integer}
-    value: integer
-    count: integer
+    bytes: any
+    value: number
+    count: number
 end
 
 local function newBits(): Bits
     return Bits(bytes = {}, value = 0, count = 0)
 end
 
-local function put(writer: Bits, value: integer, count: integer): nil
+local function put(writer: Bits, value: number, count: number): nil
     writer.value = bit.bor(writer.value, bit.lshift(value, writer.count))
     writer.count = writer.count + count
     while writer.count >= 8 do
@@ -134,7 +134,7 @@ local function drainBits(writer: Bits): string
     return table.concat(parts)
 end
 
-local function reverse(code: integer, length: integer): integer
+local function reverse(code: number, length: number): number
     local result = 0
     for _ = 1, length do
         result = bit.bor(bit.lshift(result, 1), bit.band(code, 1))
@@ -144,8 +144,8 @@ local function reverse(code: integer, length: integer): integer
 end
 
 --- Canonical codes for `lengths` (symbols 0..count-1), bit-reversed for writing.
-local function canonical(lengths: {integer}, count: integer): {integer}
-    local perLength: {integer} = {}
+local function canonical(lengths: any, count: number): any
+    local perLength: any = {}
     for length = 0, 15 do
         perLength[length] = 0
     end
@@ -155,14 +155,14 @@ local function canonical(lengths: {integer}, count: integer): {integer}
             perLength[length] = perLength[length] + 1
         end
     end
-    local nextCode: {integer} = {}
+    local nextCode: any = {}
     local code = 0
     for length = 1, 15 do
         code = (code + perLength[length - 1]) * 2
         nextCode[length] = code
     end
     perLength[0] = 0
-    local codes: {integer} = {}
+    local codes: any = {}
     for symbol = 0, count - 1 do
         local length = lengths[symbol]
         if length > 0 then
@@ -177,9 +177,9 @@ end
 
 --- Huffman code lengths for `frequencies` (symbols 0..count-1), none longer
 --- than `limit`. Unused symbols get zero; a lone used symbol gets one bit.
-local function lengthsFor(frequencies: {integer}, count: integer, limit: integer): {integer}
-    local lengths: {integer} = {}
-    local used: {integer} = {}
+local function lengthsFor(frequencies: any, count: number, limit: number): any
+    local lengths: any = {}
+    local used: any = {}
     for symbol = 0, count - 1 do
         lengths[symbol] = 0
         if frequencies[symbol] > 0 then
@@ -195,16 +195,16 @@ local function lengthsFor(frequencies: {integer}, count: integer, limit: integer
     end
     -- Nodes are leaves 1..#used and internal nodes after them; a binary heap of
     -- node indices ordered by weight builds the tree bottom up.
-    local weight: {integer} = {}
-    local parent: {integer} = {}
+    local weight: any = {}
+    local parent: any = {}
     for index, symbol in ipairs(used) do
         weight[index] = frequencies[symbol]
     end
-    local heap: {integer} = {}
-    local function less(a: integer, b: integer): boolean
+    local heap: any = {}
+    local function less(a: number, b: number): boolean
         return weight[a] < weight[b] or weight[a] == weight[b] and a < b
     end
-    local function push(node: integer): nil
+    local function push(node: number): nil
         heap[#heap + 1] = node
         local at = #heap
         while at > 1 do
@@ -217,7 +217,7 @@ local function lengthsFor(frequencies: {integer}, count: integer, limit: integer
             end
         end
     end
-    local function pop(): integer
+    local function pop(): number
         local top = heap[1]
         local last = heap[#heap]
         heap[#heap] = nil
@@ -256,7 +256,7 @@ local function lengthsFor(frequencies: {integer}, count: integer, limit: integer
         parent[b] = nodes
         push(nodes)
     end
-    local depth: {integer} = {}
+    local depth: any = {}
     depth[nodes] = 0
     for node = nodes - 1, 1, -1 do
         depth[node] = depth[parent[node]] + 1
@@ -279,7 +279,7 @@ local function lengthsFor(frequencies: {integer}, count: integer, limit: integer
         for _, symbol in ipairs(used) do
             total = total + bit.lshift(1, limit - lengths[symbol])
         end
-        table.sort(used, function(a: integer, b: integer): boolean
+        table.sort(used, function(a: number, b: number): boolean
             return frequencies[a] < frequencies[b] or frequencies[a] == frequencies[b] and a < b
         end)
         while total > capacity do
@@ -309,15 +309,15 @@ export record Encoder
     writer: Bits
     -- Encoded bytes not yet handed out, and how many of the first were.
     queue: {string}
-    queueAt: integer
+    queueAt: number
     flushing: boolean
     finishing: boolean
     finished: boolean
     -- Integrity of all input.
     checksum: uint64
-    adlerLow: integer
-    adlerHigh: integer
-    size: integer
+    adlerLow: number
+    adlerHigh: number
+    size: number
 end
 
 local crc32 = crc.lookup(1) as crc.Algorithm
@@ -383,24 +383,24 @@ end
 --- Matches `data` from `start` (1-based) to its end against itself, the bytes
 --- before `start` serving as history. Answers parallel lists: each entry is a
 --- literal byte with distance zero, or a match length and its distance.
-local function match(self: Encoder, data: string, start: integer): ({integer}, {integer})
+local function match(self: Encoder, data: string, start: number): (any, any)
     local tuning = self.tuning as Tuning
     local bytes: any = ffi.cast("const uint8_t *", data)
     local size = #data
-    local head: {integer} = {}
-    local previous: {integer} = {}
-    local function hash(at: integer): integer
+    local head: any = {}
+    local previous: any = {}
+    local function hash(at: number): number
         -- `at` is zero-based here.
         return bit.band(bit.bxor(bit.lshift(bytes[at], 10), bit.lshift(bytes[at + 1], 5), bytes[at + 2]), HASH_SIZE - 1)
     end
-    local function insert(at: integer): nil
+    local function insert(at: number): nil
         if at + 2 < size then
             local key = hash(at)
             previous[at] = head[key] or -1
             head[key] = at
         end
     end
-    local function longest(at: integer, atLeast: integer): (integer, integer)
+    local function longest(at: number, atLeast: number): (number, number)
         local bestLength = atLeast
         local bestDistance = 0
         if at + 2 >= size then
@@ -438,9 +438,9 @@ local function match(self: Encoder, data: string, start: integer): ({integer}, {
     for at = math.max(0, start - 1 - WINDOW), start - 2 do
         insert(at)
     end
-    local symbols: {integer} = {}
-    local distances: {integer} = {}
-    local function literal(at: integer): nil
+    local symbols: any = {}
+    local distances: any = {}
+    local function literal(at: number): nil
         symbols[#symbols + 1] = bytes[at]
         distances[#distances + 1] = 0
     end
@@ -484,11 +484,11 @@ local function match(self: Encoder, data: string, start: integer): ({integer}, {
     return symbols, distances
 end
 
-local fixedLiteralLengths: {integer} = {}
+local fixedLiteralLengths: any = {}
 for symbol = 0, 287 do
     fixedLiteralLengths[symbol] = symbol < 144 and 8 or symbol < 256 and 9 or symbol < 280 and 7 or 8
 end
-local fixedDistanceLengths: {integer} = {}
+local fixedDistanceLengths: any = {}
 for symbol = 0, 29 do
     fixedDistanceLengths[symbol] = 5
 end
@@ -497,11 +497,11 @@ local fixedDistanceCodes = canonical(fixedDistanceLengths, 30)
 
 --- Bits the symbols take under the given code lengths, extra bits included.
 local function cost(
-    symbols: {integer},
-    distances: {integer},
-    literalLengths: {integer},
-    distanceLengths: {integer}
-): integer
+    symbols: any,
+    distances: any,
+    literalLengths: any,
+    distanceLengths: any
+): number
     local total = literalLengths[256]
     for index = 1, #symbols do
         local distance = distances[index]
@@ -519,12 +519,12 @@ end
 
 local function writeSymbols(
     writer: Bits,
-    symbols: {integer},
-    distances: {integer},
-    literalCodes: {integer},
-    literalLengths: {integer},
-    distanceCodes: {integer},
-    distanceLengths: {integer}
+    symbols: any,
+    distances: any,
+    literalCodes: any,
+    literalLengths: any,
+    distanceCodes: any,
+    distanceLengths: any
 ): nil
     for index = 1, #symbols do
         local distance = distances[index]
@@ -551,9 +551,9 @@ end
 
 --- The run-length encoding of the concatenated code lengths, as code-length
 --- symbols and their extra-bit values.
-local function runLengths(lengths: {integer}, count: integer): ({integer}, {integer})
-    local symbols: {integer} = {}
-    local extras: {integer} = {}
+local function runLengths(lengths: any, count: number): (any, any)
+    local symbols: any = {}
+    local extras: any = {}
     local index = 0
     while index < count do
         local length = lengths[index]
@@ -594,7 +594,7 @@ local function runLengths(lengths: {integer}, count: integer): ({integer}, {inte
     return symbols, extras
 end
 
-local CODE_LENGTH_EXTRA: {[integer]: integer} = {[16] = 2, [17] = 3, [18] = 7}
+local CODE_LENGTH_EXTRA: any = {[16] = 2, [17] = 3, [18] = 7}
 
 --- Writes `raw` (the block's input) as stored blocks, the last one final when
 --- `last` is set.
@@ -628,11 +628,11 @@ local function writeBlock(self: Encoder, raw: string, last: boolean): nil
     local data = self.history .. raw
     local symbols, distances = match(self, data, #self.history + 1)
 
-    local literalFrequencies: {integer} = {}
+    local literalFrequencies: any = {}
     for symbol = 0, 285 do
         literalFrequencies[symbol] = 0
     end
-    local distanceFrequencies: {integer} = {}
+    local distanceFrequencies: any = {}
     for symbol = 0, 29 do
         distanceFrequencies[symbol] = 0
     end
@@ -662,7 +662,7 @@ local function writeBlock(self: Encoder, raw: string, last: boolean): nil
     if distanceLengths[0] == 0 and distanceCount == 1 then
         distanceLengths[0] = 1
     end
-    local all: {integer} = {}
+    local all: any = {}
     for symbol = 0, literalCount - 1 do
         all[symbol] = literalLengths[symbol]
     end
@@ -670,7 +670,7 @@ local function writeBlock(self: Encoder, raw: string, last: boolean): nil
         all[literalCount + symbol] = distanceLengths[symbol]
     end
     local runSymbols, runExtras = runLengths(all, literalCount + distanceCount)
-    local runFrequencies: {integer} = {}
+    local runFrequencies: any = {}
     for symbol = 0, 18 do
         runFrequencies[symbol] = 0
     end
@@ -747,16 +747,17 @@ local function encodeWaiting(self: Encoder, all: boolean, last: boolean): nil
     enqueue(self, drainBits(self.writer))
 end
 
---- Copies queued bytes into `room` bytes at `output`, answering how many.
-local function deliver(self: Encoder, output: any, room: integer): integer
-    local written = 0
+--- Takes up to `room` queued bytes.
+local function deliver(self: Encoder, room: number): string
+    local parts: {string} = {}
+    local taken = 0
     local queue = self.queue
-    while written < room and #queue > 0 do
+    while taken < room and #queue > 0 do
         local first = queue[1]
         local available = #first - self.queueAt + 1
-        local count = math.min(available, room - written)
-        ffi.copy(output + written, first:sub(self.queueAt, self.queueAt + count - 1), count)
-        written = written + count
+        local count = math.min(available, room - taken)
+        parts[#parts + 1] = first:sub(self.queueAt, self.queueAt + count - 1)
+        taken = taken + count
         if count == available then
             table.remove(queue, 1)
             self.queueAt = 1
@@ -764,22 +765,22 @@ local function deliver(self: Encoder, output: any, room: integer): integer
             self.queueAt = self.queueAt + count
         end
     end
-    return written
+    return table.concat(parts)
 end
 
 local function pending(self: Encoder): boolean
     return #self.queue > 0
 end
 
---- Consumes `input` and writes encoded bytes into `room` bytes at `output`.
---- Answers bytes consumed, bytes written and a status.
-export function write(self: Encoder, input: string, output: any, room: integer): (integer, integer, integer)
+--- Consumes `input` and answers bytes consumed, at most `room` encoded bytes,
+--- and a status.
+export function write(self: Encoder, input: string, room: number): (number, string, number)
     if self.finished then
-        return 0, 0, FINISHED
+        return 0, "", FINISHED
     end
-    local written = deliver(self, output, room)
+    local first = deliver(self, room)
     if pending(self) then
-        return 0, written, NEED_OUTPUT
+        return 0, first, NEED_OUTPUT
     end
     self.flushing = false
     if #input > 0 then
@@ -790,26 +791,23 @@ export function write(self: Encoder, input: string, output: any, room: integer):
             encodeWaiting(self, false, false)
         end
     end
-    written = written + deliver(self, output + written, room - written)
-    local status = (written == room and room > 0) and NEED_OUTPUT or NEED_INPUT
-    return #input, written, status
+    local chunk = first .. deliver(self, room - #first)
+    local status = (#chunk == room and room > 0) and NEED_OUTPUT or NEED_INPUT
+    return #input, chunk, status
 end
 
---- Ends the current block and makes everything written so far decodable.
---- Answers bytes written and a status.
-export function flush(self: Encoder, output: any, room: integer): (integer, integer)
+--- Ends the current block so everything written so far can be decoded, and
+--- answers at most `room` encoded bytes and a status.
+export function flush(self: Encoder, room: number): (string, number)
     if self.finished then
-        return 0, FINISHED
+        return "", FINISHED
     end
+    local first = ""
     if not self.flushing then
+        -- Bytes from earlier writes come out first.
+        first = deliver(self, room)
         if pending(self) then
-            -- Bytes from earlier writes come out first.
-            local written = deliver(self, output, room)
-            if pending(self) then
-                return written, NEED_OUTPUT
-            end
-            local more, status = flush(self, output + written, room - written)
-            return written + more, status
+            return first, NEED_OUTPUT
         end
         self.flushing = true
         encodeWaiting(self, true, false)
@@ -820,19 +818,19 @@ export function flush(self: Encoder, output: any, room: integer): (integer, inte
         put(writer, 0xffff, 16)
         enqueue(self, drainBits(writer))
     end
-    local written = deliver(self, output, room)
+    local chunk = first .. deliver(self, room - #first)
     if pending(self) then
-        return written, NEED_OUTPUT
+        return chunk, NEED_OUTPUT
     end
     self.flushing = false
-    return written, NEED_INPUT
+    return chunk, NEED_INPUT
 end
 
---- Writes the final block and the wrapper trailer. Answers bytes written and a
---- status, FINISHED once the last byte is out.
-export function finish(self: Encoder, output: any, room: integer): (integer, integer)
+--- Writes the final block and the wrapper trailer, answering at most `room`
+--- encoded bytes and a status, FINISHED once the last byte is out.
+export function finish(self: Encoder, room: number): (string, number)
     if self.finished then
-        return 0, FINISHED
+        return "", FINISHED
     end
     if not self.finishing then
         self.finishing = true
@@ -849,7 +847,7 @@ export function finish(self: Encoder, output: any, room: integer): (integer, int
         if self.format == GZIP then
             local value = crc.finish(crc32, self.checksum)
             for _ = 1, 4 do
-                put(writer, tonumber(value & 0xffULL) as integer, 8)
+                put(writer, tonumber(value & 0xffULL) as number, 8)
                 value = value >> 8
             end
             local size = self.size % 4294967296
@@ -865,10 +863,10 @@ export function finish(self: Encoder, output: any, room: integer): (integer, int
         end
         enqueue(self, drainBits(writer))
     end
-    local written = deliver(self, output, room)
+    local chunk = deliver(self, room)
     if pending(self) then
-        return written, NEED_OUTPUT
+        return chunk, NEED_OUTPUT
     end
     self.finished = true
-    return written, FINISHED
+    return chunk, FINISHED
 end

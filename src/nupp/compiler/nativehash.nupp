@@ -17,7 +17,7 @@ const P5 = 0x27D4EB2F165667C5ULL
 const SECOND_SEED = 0x9E3779B97F4A7C15ULL
 const HEX = "0123456789abcdef"
 
-local function rotl(value: uint64, count: integer): uint64
+local function rotl(value: uint64, count: number): uint64
     return (value << count) | (value >> (64 - count))
 end
 
@@ -29,7 +29,7 @@ local function merge(hash: uint64, lane: uint64): uint64
     return (hash ~ round(0ULL, lane)) * P1 + P4
 end
 
-local function read64(bytes: any, at: integer): uint64
+local function read64(bytes: any, at: number): uint64
     local value = 0ULL
     for index = 7, 0, -1 do
         value = (value << 8) | bytes[at + index]
@@ -37,7 +37,7 @@ local function read64(bytes: any, at: integer): uint64
     return value
 end
 
-local function read32(bytes: any, at: integer): uint64
+local function read32(bytes: any, at: number): uint64
     return 0ULL + bytes[at] + bytes[at + 1] * 0x100 + bytes[at + 2] * 0x10000 + bytes[at + 3] * 0x1000000
 end
 
