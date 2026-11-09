@@ -1,0 +1,1152 @@
+--[[
+A native program: a checked Nupp file whose `main` is the executable's own.
+
+An `@aot` function is a body an already-running LuaJIT host calls into. A native
+program is the other way round: its `main` is what the C runtime calls, and it
+reaches LuaJIT, or any other C library, through the `cdef function`
+declarations beside it. So the vocabulary is C's rather than the kernel IR's:
+calls to declared C functions, opaque pointers, C strings, pointer reads and
+writes, and Nupp functions handed to C as function pointers, such as a
+`lua_CFunction` registered with `lua_pushcclosure`.
+
+The file's top level holds only `cdef function` declarations and functions, and
+every function is lowered as a C function. A function's parameters and result
+must have C types, written out. `main` takes nothing or `(argc, argv)` and
+returns its exit status. Everything outside that subset is refused where it was
+written rather than approximated, because there is no Lua state to fall back to.
+
+Arithmetic keeps the language's meaning where C's would differ: `/` is binary64
+division, and `//` and `%` floor. Integers wrap at their width.
+]]
+module nupp.compiler.aot.llvm.native
+
+local T = require("nupp.compiler.types")
+local builder = require("nupp.compiler.aot.llvm.builder")
+local cst = require("nupp.compiler.syntax.cst")
+local lexer = require("nupp.compiler.syntax.lexer")
+local llvmText = require("nupp.compiler.aot.llvm.text")
+
+local native = {}
+
+--- Something the program does that a native program cannot.
+record native.Problem
+    line: integer
+    column: integer
+    message: string
+end
+
+--- A C value as LLVM holds it: its type, whether integer conversions extend it
+--- as signed, and, for a pointer that can be indexed, what it points at.
+record Kind
+    llvm: string
+    signed: boolean
+    elem: Kind?
+end
+
+const VOID = Kind(llvm = "void", signed = false)
+const BOOL = Kind(llvm = "i1", signed = false)
+const F64 = Kind(llvm = "double", signed = true)
+const F32 = Kind(llvm = "float", signed = true)
+const I32 = Kind(llvm = "i32", signed = true)
+const PTR = Kind(llvm = "ptr", signed = false)
+
+const INTEGERS: {
+    [string]: Kind
+} = {
+    integer = I32,
+    int8 = Kind(llvm = "i8", signed = true),
+    uint8 = Kind(llvm = "i8", signed = false),
+    int16 = Kind(llvm = "i16", signed = true),
+    uint16 = Kind(llvm = "i16", signed = false),
+    int32 = I32,
+    uint32 = Kind(llvm = "i32", signed = false),
+    int64 = Kind(llvm = "i64", signed = true),
+    uint64 = Kind(llvm = "i64", signed = false),
+}
+
+const WIDTHS: {[string]: integer} = {i1 = 1, i8 = 8, i16 = 16, i32 = 32, i64 = 64}
+
+local function isInteger(kind: Kind): boolean
+    return kind.llvm ~= "i1" and WIDTHS[kind.llvm] ~= nil
+end
+
+local function isFloat(kind: Kind): boolean
+    return kind.llvm == "double" or kind.llvm == "float"
+end
+
+--- Raised to stop lowering at the first refusal; caught by `module`.
+record Refusal
+    problem: native.Problem
+end
+
+local function site(node: any): (integer, integer)
+    local token = node ~= nil and cst.firstToken(node as cst.Child) or nil
+    if token == nil then
+        return 1, 1
+    end
+
+    return (token as lexer.Token).line, (token as lexer.Token).col
+end
+
+local function refuse(node: any, message: string): never
+    local line, column = site(node)
+    error(Refusal(problem = native.Problem(line = line, column = column, message = message)), 0)
+end
+
+--- The C kind of a checked type, or nil when it has none.
+local function kindOf(t: any): Kind?
+    if t == nil then
+        return nil
+    end
+    local raw = T.unwrapOwnership(t)
+    while raw.tag == "genericAlias" and #(raw.paramKinds or {}) == 0 do
+        raw = T.unwrapOwnership(raw.body)
+    end
+    local tag = raw.tag
+    if tag == "literal" then
+        return kindOf(raw.base)
+    elseif tag == "const" then
+        return kindOf(raw.inner)
+    elseif tag == "boolean" then
+        return BOOL
+    elseif tag == "number" then
+        return F64
+    elseif tag == "float" then
+        return F32
+    elseif INTEGERS[tag] ~= nil then
+        return INTEGERS[tag]
+    elseif tag == "nil" then
+        return VOID
+    elseif tag == "voidptr" or tag == "func" then
+        return PTR
+    elseif tag == "cstring" then
+        return Kind(llvm = "ptr", signed = false, elem = INTEGERS.uint8)
+    elseif tag == "ptr" then
+        local elem = kindOf(raw.elem)
+        if elem == nil or (elem as Kind).llvm == "void" then
+            return PTR
+        end
+        return Kind(llvm = "ptr", signed = false, elem = elem)
+    elseif tag == "union" and raw.hasNil and #(raw.members or {}) == 2 then
+        local other = raw.members[1].tag == "nil" and raw.members[2] or raw.members[1]
+        local kind = kindOf(other)
+        if kind ~= nil and (kind as Kind).llvm == "ptr" then
+            return kind
+        end
+    end
+
+    return nil
+end
+
+--- The C kind a written type annotation names.
+local function annotated(node: any, what: string): Kind
+    if node == nil then
+        refuse(node, what .. " needs a written C type in a native program")
+    end
+    local kind = kindOf((node as any).resolvedType)
+    if kind == nil then
+        refuse(node, what .. " has type " .. cst.textOf(node as cst.Child) .. ", which has no C representation")
+    end
+
+    return kind as Kind
+end
+
+--- The attribute an argument or result of a C call carries for its width.
+local function extension(kind: Kind): string
+    if kind.llvm == "i1" or (kind.llvm == "i8" or kind.llvm == "i16") and not kind.signed then
+        return " zeroext"
+    elseif kind.llvm == "i8" or kind.llvm == "i16" then
+        return " signext"
+    end
+
+    return ""
+end
+
+--- A function the program can call: one it defines, or a C one it declares.
+record Callee
+    symbol: string
+    params: {Kind}
+    result: Kind
+    varargs: boolean
+    foreign: boolean
+end
+
+--- A name a body can read: a local's stack slot.
+record Local
+    slot: string
+    kind: Kind
+end
+
+--- The lexical scopes of one body, innermost last.
+record Scope
+    names: {[string]: Local}
+    parent: Scope?
+end
+
+--- The function being filled.
+record Body
+    f: builder.Function
+    scope: Scope
+    result: Kind
+
+    --- The labels a `break` leaves through, innermost last.
+    exits: {string}
+end
+
+--- A lowered value.
+record Value
+    text: string
+    kind: Kind
+end
+
+--- One program's lowering.
+record Program
+    module: builder.Module
+    callees: {[string]: Callee}
+end
+
+local function lookup(scope: Scope?, name: string): Local?
+    local current = scope
+    while current ~= nil do
+        local found = (current as Scope).names[name]
+        if found ~= nil then
+            return found
+        end
+        current = (current as Scope).parent
+    end
+
+    return nil
+end
+
+local function declareLocal(body: Body, name: string, kind: Kind): Local
+    local slot = builder.alloca(body.f, kind.llvm)
+    local entry = Local(slot = slot, kind = kind)
+    body.scope.names[name] = entry
+
+    return entry
+end
+
+local function enter(body: Body): nil
+    body.scope = Scope(names = {}, parent = body.scope)
+end
+
+local function leave(body: Body): nil
+    body.scope = body.scope.parent as Scope
+end
+
+local function value(body: Body, instruction: string): string
+    return builder.value(body.f, instruction)
+end
+
+--- `v` as `to`. `explicit` admits what only an `as` cast may do: pointers to
+--- and from integers.
+local function convert(body: Body, v: Value, to: Kind, node: any, explicit: boolean?): Value
+    local from = v.kind
+    if from.llvm == to.llvm then
+        return Value(text = v.text, kind = to)
+    end
+    if to.llvm == "i1" then
+        if from.llvm == "ptr" then
+            return Value(text = value(body, "icmp ne ptr " .. v.text .. ", null"), kind = BOOL)
+        elseif isInteger(from) then
+            return Value(text = value(body, ("icmp ne %s %s, 0"):format(from.llvm, v.text)), kind = BOOL)
+        end
+    elseif isInteger(to) and (isInteger(from) or from.llvm == "i1") then
+        local wide, narrow = WIDTHS[to.llvm] as integer, WIDTHS[from.llvm] as integer
+        local op = wide < narrow and "trunc" or (from.signed and from.llvm ~= "i1") and "sext" or "zext"
+        return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
+    elseif isFloat(to) and isInteger(from) then
+        local op = from.signed and "sitofp" or "uitofp"
+        return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
+    elseif isInteger(to) and isFloat(from) then
+        local op = to.signed and "fptosi" or "fptoui"
+        return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
+    elseif isFloat(to) and isFloat(from) then
+        local op = to.llvm == "double" and "fpext" or "fptrunc"
+        return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
+    elseif explicit and to.llvm == "ptr" and isInteger(from) then
+        return Value(text = value(body, ("inttoptr %s %s to ptr"):format(from.llvm, v.text)), kind = to)
+    elseif explicit and isInteger(to) and from.llvm == "ptr" then
+        return Value(text = value(body, ("ptrtoint ptr %s to %s"):format(v.text, to.llvm)), kind = to)
+    end
+    refuse(node, ("a native program cannot convert %s to %s here"):format(from.llvm, to.llvm))
+end
+
+local expression: function(Program, Body, any, Kind?): Value
+
+--- A numeric literal, in the kind it is wanted in when there is one, negated
+--- when it is the operand of a unary minus.
+local function number(node: cst.NumberLit, want: Kind?, negated: boolean?): Value
+    local spelling = (node.token as lexer.Token).text
+    local parsed = tonumber(spelling)
+    if parsed ~= nil and negated then
+        parsed = -(parsed as number)
+    end
+    if parsed == nil then
+        refuse(node, "a native program cannot represent the number " .. spelling)
+    end
+    local amount = parsed as number
+    local integral = amount == math.floor(amount) and math.abs(amount) < 2 ^ 63
+    local kind = want
+    if kind == nil or not isInteger(kind as Kind) and not isFloat(kind as Kind) then
+        local written = spelling:find("[%.eEpP]") == nil or spelling:match("^0[xX]") ~= nil
+            and spelling:find("[pP%.]") == nil
+        kind = integral and written and amount >= -2 ^ 31 and amount < 2 ^ 31 and I32 or F64
+    end
+    local selected = kind as Kind
+    if isInteger(selected) then
+        if not integral then
+            refuse(node, spelling .. " is not an integer")
+        end
+        return Value(text = llvmText.integer(amount), kind = selected)
+    end
+    if selected.llvm == "float" then
+        return Value(text = llvmText.float(llvmText.roundToFloat(amount)), kind = selected)
+    end
+
+    return Value(text = llvmText.double(amount), kind = selected)
+end
+
+--- A string literal as a pointer to its NUL-terminated bytes.
+local function stringConstant(program: Program, node: any): Value
+    local token = (node as any).token as lexer.Token
+    local bytes = lexer.stringValue(token.text)
+    if bytes == nil then
+        refuse(node, "a native program cannot read this string literal")
+    end
+    local name = builder.bytes(program.module, (bytes as string) .. "\0")
+
+    return Value(text = name, kind = Kind(llvm = "ptr", signed = false, elem = INTEGERS.uint8))
+end
+
+--- The callee a call or a function value names, if it names one.
+local function calleeOf(program: Program, body: Body, node: any): Callee?
+    if node == nil or node.kind ~= "name" then
+        return nil
+    end
+    local name = ((node as cst.NameExpr).token as lexer.Token).text
+    if lookup(body.scope, name) ~= nil then
+        return nil
+    end
+
+    return program.callees[name]
+end
+
+local function call(program: Program, body: Body, node: cst.Call): Value
+    local callee = calleeOf(program, body, node.obj)
+    if callee == nil then
+        refuse(node, "a native program calls only the functions it defines and the C functions it declares")
+    end
+    local target = callee as Callee
+    local written = node.args ~= nil and ((node.args as cst.Args).exprs or {}) or {}
+    if node.args ~= nil and ((node.args as cst.Args).str ~= nil or (node.args as cst.Args).table ~= nil) then
+        refuse(node, "a native call takes parenthesized arguments")
+    end
+    if #written < #target.params or #written > #target.params and not target.varargs then
+        refuse(node, ("%s takes %d arguments, not %d"):format(target.symbol, #target.params, #written))
+    end
+    local arguments: {string} = {}
+    local types: {string} = {}
+    for index, argument in ipairs(written) do
+        local wanted = target.params[index]
+        local lowered = expression(program, body, argument, wanted)
+        if wanted == nil then
+            -- C's default promotions for what a variadic parameter receives.
+            if lowered.kind.llvm == "float" then
+                lowered = convert(body, lowered, F64, argument)
+            elseif lowered.kind.llvm == "i1" or isInteger(lowered.kind) and WIDTHS[lowered.kind.llvm] < 32 then
+                lowered = convert(body, lowered, I32, argument)
+            end
+        else
+            lowered = convert(body, lowered, wanted as Kind, argument)
+        end
+        arguments[index] = lowered.kind.llvm .. extension(lowered.kind) .. " " .. lowered.text
+        types[index] = lowered.kind.llvm
+    end
+    local signature = target.result.llvm
+    if target.varargs then
+        local fixed: {string} = {}
+        for index, kind in ipairs(target.params) do
+            fixed[index] = kind.llvm
+        end
+        fixed[#fixed + 1] = "..."
+        signature = signature .. " (" .. table.concat(fixed, ", ") .. ")"
+    end
+    local text = ("call %s @%s(%s)"):format(signature, target.symbol, table.concat(arguments, ", "))
+    if target.result.llvm == "void" then
+        builder.emit(body.f, text)
+        return Value(text = "", kind = VOID)
+    end
+
+    return Value(text = value(body, text), kind = target.result)
+end
+
+--- The kind two operands of an arithmetic operator meet in.
+local function common(left: Kind, right: Kind): Kind
+    if isFloat(left) or isFloat(right) then
+        return (left.llvm == "float" and right.llvm == "float") and F32 or F64
+    end
+    local wide = math.max(WIDTHS[left.llvm] as integer, WIDTHS[right.llvm] as integer, 32)
+    local signed = left.signed or right.signed
+
+    return Kind(llvm = "i" .. tostring(wide), signed = signed)
+end
+
+local function libm(program: Program, name: string, kind: Kind): string
+    local intrinsic = ("llvm.%s.%s"):format(name, kind.llvm == "float" and "f32" or "f64")
+    local params = name == "pow" and kind.llvm .. ", " .. kind.llvm or kind.llvm
+    builder.declare(program.module, "@" .. intrinsic, ("declare %s @%s(%s)"):format(kind.llvm, intrinsic, params))
+
+    return "@" .. intrinsic
+end
+
+--- `left op right` for integers, flooring `//` and `%` as the language does.
+local function integerArithmetic(body: Body, op: string, a: string, b: string, kind: Kind): string
+    local t = kind.llvm
+    if op == "+" then
+        return value(body, ("add %s %s, %s"):format(t, a, b))
+    elseif op == "-" then
+        return value(body, ("sub %s %s, %s"):format(t, a, b))
+    elseif op == "*" then
+        return value(body, ("mul %s %s, %s"):format(t, a, b))
+    elseif op == "&" then
+        return value(body, ("and %s %s, %s"):format(t, a, b))
+    elseif op == "|" then
+        return value(body, ("or %s %s, %s"):format(t, a, b))
+    elseif op == "~" then
+        return value(body, ("xor %s %s, %s"):format(t, a, b))
+    elseif op == "<<" then
+        return value(body, ("shl %s %s, %s"):format(t, a, b))
+    elseif op == ">>" then
+        return value(body, ("%s %s %s, %s"):format(kind.signed and "ashr" or "lshr", t, a, b))
+    end
+    if not kind.signed then
+        return value(body, ("%s %s %s, %s"):format(op == "//" and "udiv" or "urem", t, a, b))
+    end
+    -- A remainder whose sign differs from the divisor's moves one step down.
+    local quotient = value(body, ("sdiv %s %s, %s"):format(t, a, b))
+    local remainder = value(body, ("srem %s %s, %s"):format(t, a, b))
+    local nonzero = value(body, ("icmp ne %s %s, 0"):format(t, remainder))
+    local signs = value(body, ("xor %s %s, %s"):format(t, remainder, b))
+    local negative = value(body, ("icmp slt %s %s, 0"):format(t, signs))
+    local adjust = value(body, "and i1 " .. nonzero .. ", " .. negative)
+    if op == "//" then
+        local step = value(body, ("zext i1 %s to %s"):format(adjust, t))
+        return value(body, ("sub %s %s, %s"):format(t, quotient, step))
+    end
+    local shifted = value(body, ("add %s %s, %s"):format(t, remainder, b))
+
+    return value(body, ("select i1 %s, %s %s, %s %s"):format(adjust, t, shifted, t, remainder))
+end
+
+local function floatArithmetic(program: Program, body: Body, op: string, a: string, b: string, kind: Kind): string
+    local t = kind.llvm
+    if op == "+" then
+        return value(body, ("fadd %s %s, %s"):format(t, a, b))
+    elseif op == "-" then
+        return value(body, ("fsub %s %s, %s"):format(t, a, b))
+    elseif op == "*" then
+        return value(body, ("fmul %s %s, %s"):format(t, a, b))
+    elseif op == "/" then
+        return value(body, ("fdiv %s %s, %s"):format(t, a, b))
+    elseif op == "^" then
+        return value(body, ("call %s %s(%s %s, %s %s)"):format(t, libm(program, "pow", kind), t, a, t, b))
+    end
+    local quotient = value(body, ("fdiv %s %s, %s"):format(t, a, b))
+    local floored = value(body, ("call %s %s(%s %s)"):format(t, libm(program, "floor", kind), t, quotient))
+    if op == "//" then
+        return floored
+    end
+    local product = value(body, ("fmul %s %s, %s"):format(t, floored, b))
+
+    return value(body, ("fsub %s %s, %s"):format(t, a, product))
+end
+
+const ORDERS: {[string]: {string}} = {
+    ["=="] = {"eq", "eq", "oeq"},
+    ["~="] = {"ne", "ne", "une"},
+    ["<"] = {"slt", "ult", "olt"},
+    ["<="] = {"sle", "ule", "ole"},
+    [">"] = {"sgt", "ugt", "ogt"},
+    [">="] = {"sge", "uge", "oge"},
+}
+
+--- `and` or `or` over booleans, evaluating the right side only when needed.
+local function logical(program: Program, body: Body, node: cst.Binop, op: string): Value
+    local slot = builder.alloca(body.f, "i1", 1)
+    local left = convert(body, expression(program, body, node.lhs, BOOL), BOOL, node.lhs)
+    builder.emit(body.f, "store i1 " .. left.text .. ", ptr " .. slot)
+    local right = builder.label(body.f, op)
+    local done = builder.label(body.f, op .. ".done")
+    if op == "and" then
+        builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(left.text, right, done))
+    else
+        builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(left.text, done, right))
+    end
+    builder.start(body.f, right)
+    local second = convert(body, expression(program, body, node.rhs, BOOL), BOOL, node.rhs)
+    builder.emit(body.f, "store i1 " .. second.text .. ", ptr " .. slot)
+    builder.start(body.f, done)
+
+    return Value(text = value(body, "load i1, ptr " .. slot), kind = BOOL)
+end
+
+--- `left op right` once both sides are lowered. `node` is what a refusal names;
+--- `lhs` and `rhs`, the operands' own nodes.
+local function binaryValues(
+    program: Program,
+    body: Body,
+    node: any,
+    op: string,
+    left: Value,
+    right: Value,
+    lhs: any,
+    rhs: any
+): Value
+    local order = ORDERS[op]
+    if order ~= nil then
+        if left.kind.llvm == "ptr" or right.kind.llvm == "ptr" then
+            if op ~= "==" and op ~= "~=" then
+                refuse(node, "pointers compare only for equality")
+            end
+            local a = left.kind.llvm == "ptr" and left.text or "null"
+            local b = right.kind.llvm == "ptr" and right.text or "null"
+            return Value(text = value(body, ("icmp %s ptr %s, %s"):format(order[1], a, b)), kind = BOOL)
+        end
+        if left.kind.llvm == "i1" and right.kind.llvm == "i1" then
+            if op ~= "==" and op ~= "~=" then
+                refuse(node, "booleans compare only for equality")
+            end
+            return Value(text = value(body, ("icmp %s i1 %s, %s"):format(order[1], left.text, right.text)), kind = BOOL)
+        end
+    end
+    local arithmetic = left.kind.llvm ~= "ptr" and left.kind.llvm ~= "i1" and left.kind.llvm ~= "void"
+        and right.kind.llvm ~= "ptr" and right.kind.llvm ~= "i1" and right.kind.llvm ~= "void"
+    if not arithmetic then
+        refuse(node, "the operands of " .. op .. " must be numbers in a native program")
+    end
+    local meet = common(left.kind, right.kind)
+    if op == "/" or op == "^" then
+        meet = isFloat(meet) and meet or F64
+    elseif (op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>") and isFloat(meet) then
+        refuse(node, "bitwise operators take integers in a native program")
+    end
+    local a = convert(body, left, meet, lhs).text
+    local b = convert(body, right, meet, rhs).text
+    if order ~= nil then
+        if isFloat(meet) then
+            return Value(text = value(body, ("fcmp %s %s %s, %s"):format(order[3], meet.llvm, a, b)), kind = BOOL)
+        end
+        local predicate = meet.signed and order[1] or order[2]
+        return Value(text = value(body, ("icmp %s %s %s, %s"):format(predicate, meet.llvm, a, b)), kind = BOOL)
+    end
+    if isFloat(meet) then
+        return Value(text = floatArithmetic(program, body, op, a, b, meet), kind = meet)
+    end
+
+    return Value(text = integerArithmetic(body, op, a, b, meet), kind = meet)
+end
+
+local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?): Value
+    local op = (node.op as lexer.Token).text
+    if op == "and" or op == "or" then
+        return logical(program, body, node, op)
+    end
+    if op == ".." then
+        refuse(node, "a native program cannot concatenate strings")
+    end
+    -- A literal operand takes the other side's kind, so `n < 10` compares in
+    -- `n`'s width rather than widening it. A literal has no effects, so reading
+    -- the other side first changes nothing.
+    local function operand(v: Value): Kind?
+        return (v.kind.llvm ~= "ptr" and v.kind.llvm ~= "void") and v.kind or nil
+    end
+    local left, right: Value, Value
+    if (node.lhs as any).kind == "number" and (node.rhs as any).kind ~= "number" then
+        right = expression(program, body, node.rhs, nil)
+        left = expression(program, body, node.lhs, operand(right))
+    else
+        left = expression(program, body, node.lhs, ORDERS[op] == nil and want or nil)
+        right = expression(program, body, node.rhs, operand(left))
+    end
+
+    return binaryValues(program, body, node, op, left, right, node.lhs, node.rhs)
+end
+
+local function unary(program: Program, body: Body, node: cst.Unop, want: Kind?): Value
+    local op = (node.op as lexer.Token).text
+    if op == "not" then
+        local operand = convert(body, expression(program, body, node.operand, BOOL), BOOL, node.operand)
+        return Value(text = value(body, "xor i1 " .. operand.text .. ", true"), kind = BOOL)
+    elseif op == "-" then
+        if (node.operand as any).kind == "number" then
+            return number(node.operand as cst.NumberLit, want, true)
+        end
+        local operand = expression(program, body, node.operand, want)
+        if isFloat(operand.kind) then
+            return Value(text = value(body, ("fneg %s %s"):format(operand.kind.llvm, operand.text)), kind = operand.kind)
+        elseif isInteger(operand.kind) then
+            return Value(text = value(body, ("sub %s 0, %s"):format(operand.kind.llvm, operand.text)), kind = operand.kind)
+        end
+    elseif op == "~" then
+        local operand = expression(program, body, node.operand, want)
+        if isInteger(operand.kind) then
+            return Value(text = value(body, ("xor %s %s, -1"):format(operand.kind.llvm, operand.text)), kind = operand.kind)
+        end
+    end
+    refuse(node, "a native program cannot apply " .. op .. " here")
+end
+
+--- The address of `p[i]`, and what is stored there.
+local function element(program: Program, body: Body, node: cst.BracketIndex): (string, Kind)
+    local base = expression(program, body, node.obj, nil)
+    if base.kind.llvm ~= "ptr" or base.kind.elem == nil then
+        refuse(node, "a native program indexes only pointers to C scalars and pointers")
+    end
+    local elem = base.kind.elem as Kind
+    local index = expression(program, body, node.expr, Kind(llvm = "i64", signed = true))
+    if not isInteger(index.kind) then
+        refuse(node.expr, "a pointer index must be an integer")
+    end
+    local wide = convert(body, index, Kind(llvm = "i64", signed = true), node.expr)
+    local address = value(body, ("getelementptr %s, ptr %s, i64 %s"):format(elem.llvm, base.text, wide.text))
+
+    return address, elem
+end
+
+local function expressionRaw(program: Program, body: Body, node: any, want: Kind?): Value
+    local kind = node ~= nil and node.kind or nil
+    if kind == "paren" then
+        return expression(program, body, (node as cst.Paren).expr, want)
+    elseif kind == "number" then
+        return number(node as cst.NumberLit, want)
+    elseif kind == "string" then
+        return stringConstant(program, node)
+    elseif kind == "nilExpr" then
+        return Value(text = "null", kind = PTR)
+    elseif kind == "trueExpr" then
+        return Value(text = "true", kind = BOOL)
+    elseif kind == "falseExpr" then
+        return Value(text = "false", kind = BOOL)
+    elseif kind == "name" then
+        local name = ((node as cst.NameExpr).token as lexer.Token).text
+        local found = lookup(body.scope, name)
+        if found ~= nil then
+            local entry = found as Local
+            return Value(text = value(body, ("load %s, ptr %s"):format(entry.kind.llvm, entry.slot)), kind = entry.kind)
+        end
+        local callee = program.callees[name]
+        if callee ~= nil then
+            -- A function as a value is its address: what C takes as a callback.
+            return Value(text = "@" .. (callee as Callee).symbol, kind = PTR)
+        end
+        refuse(node, name .. " is not a local, a parameter or a function of this native program")
+    elseif kind == "call" then
+        return call(program, body, node as cst.Call)
+    elseif kind == "binop" then
+        return binary(program, body, node as cst.Binop, want)
+    elseif kind == "unop" then
+        return unary(program, body, node as cst.Unop, want)
+    elseif kind == "castExpr" then
+        local cast = node as cst.CastExpr
+        local to = annotated(cast.type, "a cast")
+        local inner = expression(program, body, cast.expr, nil)
+        if to.llvm == "ptr" and inner.kind.llvm == "ptr" then
+            return Value(text = inner.text, kind = to)
+        end
+        return convert(body, inner, to, node, true)
+    elseif kind == "bracketIndex" then
+        local address, elem = element(program, body, node as cst.BracketIndex)
+        return Value(text = value(body, ("load %s, ptr %s"):format(elem.llvm, address)), kind = elem)
+    end
+    refuse(node, "a native program cannot evaluate " .. tostring(kind) .. " expressions")
+end
+
+expression = function(program: Program, body: Body, node: any, want: Kind?): Value
+    return expressionRaw(program, body, node, want)
+end
+
+local block: function(Program, Body, any): nil
+
+local function condition(program: Program, body: Body, node: any): string
+    return convert(body, expression(program, body, node, BOOL), BOOL, node).text
+end
+
+local function store(body: Body, entry: Local, v: Value, node: any): nil
+    local converted = convert(body, v, entry.kind, node)
+    builder.emit(body.f, ("store %s %s, ptr %s"):format(entry.kind.llvm, converted.text, entry.slot))
+end
+
+local function localStmt(program: Program, body: Body, stat: cst.LocalStmt): nil
+    if stat.pattern ~= nil then
+        refuse(stat, "a native program cannot destructure")
+    end
+    local exprs = stat.exprs or {}
+    if #exprs > #stat.names then
+        refuse(stat, "a native local binds one value per name")
+    end
+    local values: {Value} = {}
+    local kinds: {Kind} = {}
+    for index, name in ipairs(stat.names) do
+        local written = stat.types[index]
+        local kind: Kind? = written ~= nil and annotated(written, "local " .. name.text) or nil
+        local initial = exprs[index]
+        if initial ~= nil then
+            values[index] = expression(program, body, initial, kind)
+            if kind == nil then
+                kind = values[index].kind
+                if kind.llvm == "void" then
+                    refuse(initial, "local " .. name.text .. " is bound to a call with no result")
+                end
+                if kind.llvm == "ptr" and (initial as any).kind == "nilExpr" then
+                    refuse(stat, "local " .. name.text .. " needs a written pointer type")
+                end
+            end
+        elseif kind == nil then
+            refuse(stat, "local " .. name.text .. " needs a written C type or a value")
+        end
+        kinds[index] = kind as Kind
+    end
+    -- Bound after every value is read, as `local a, b = b, a` reads the outer names.
+    for index, name in ipairs(stat.names) do
+        local entry = declareLocal(body, name.text, kinds[index])
+        if values[index] ~= nil then
+            store(body, entry, values[index], exprs[index])
+        elseif kinds[index].llvm == "ptr" then
+            builder.emit(body.f, "store ptr null, ptr " .. entry.slot)
+        elseif isFloat(kinds[index]) then
+            builder.emit(body.f, ("store %s 0.0, ptr %s"):format(kinds[index].llvm, entry.slot))
+        else
+            builder.emit(body.f, ("store %s 0, ptr %s"):format(kinds[index].llvm, entry.slot))
+        end
+    end
+end
+
+local function assign(program: Program, body: Body, target: any, v: any): nil
+    if target.kind == "name" then
+        local name = ((target as cst.NameExpr).token as lexer.Token).text
+        local found = lookup(body.scope, name)
+        if found == nil then
+            refuse(target, "a native program assigns only its own locals")
+        end
+        local entry = found as Local
+        store(body, entry, expression(program, body, v, entry.kind), v)
+        return
+    elseif target.kind == "bracketIndex" then
+        local address, elem = element(program, body, target as cst.BracketIndex)
+        local converted = convert(body, expression(program, body, v, elem), elem, v)
+        builder.emit(body.f, ("store %s %s, ptr %s"):format(elem.llvm, converted.text, address))
+        return
+    end
+    refuse(target, "a native program cannot assign to this")
+end
+
+local function returnStmt(program: Program, body: Body, stat: cst.ReturnStmt): nil
+    if #stat.exprs > 1 then
+        refuse(stat, "a native function returns at most one value")
+    end
+    if body.result.llvm == "void" then
+        if #stat.exprs == 1 then
+            refuse(stat, "this native function returns nothing")
+        end
+        builder.terminate(body.f, "ret void")
+        return
+    end
+    if #stat.exprs == 0 then
+        refuse(stat, "this native function must return a value")
+    end
+    local returned = convert(body, expression(program, body, stat.exprs[1], body.result), body.result, stat.exprs[1])
+    builder.terminate(body.f, ("ret %s %s"):format(body.result.llvm, returned.text))
+end
+
+local function ifStmt(program: Program, body: Body, stat: cst.IfStmt): nil
+    local done = builder.label(body.f, "if.done")
+    for _, clause in ipairs(stat.clauses) do
+        if (clause as any).binding ~= nil then
+            refuse(clause, "a native condition cannot bind a name")
+        end
+        local test = condition(program, body, (clause as any).cond)
+        local taken = builder.label(body.f, "if.then")
+        local otherwise = builder.label(body.f, "if.else")
+        builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(test, taken, otherwise))
+        builder.start(body.f, taken)
+        block(program, body, (clause as any).body)
+        builder.jump(body.f, done)
+        builder.start(body.f, otherwise)
+    end
+    if stat.elseClause ~= nil then
+        block(program, body, (stat.elseClause as cst.ElseClause).body)
+    end
+    builder.start(body.f, done)
+end
+
+local function whileStmt(program: Program, body: Body, stat: cst.WhileStmt): nil
+    local head = builder.label(body.f, "while.head")
+    local loop = builder.label(body.f, "while.body")
+    local done = builder.label(body.f, "while.done")
+    builder.start(body.f, head)
+    local test = condition(program, body, stat.cond)
+    builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(test, loop, done))
+    builder.start(body.f, loop)
+    body.exits[#body.exits + 1] = done
+    block(program, body, stat.body)
+    body.exits[#body.exits] = nil
+    builder.jump(body.f, head)
+    builder.start(body.f, done)
+end
+
+local function repeatStmt(program: Program, body: Body, stat: cst.RepeatStmt): nil
+    local loop = builder.label(body.f, "repeat.body")
+    local done = builder.label(body.f, "repeat.done")
+    builder.start(body.f, loop)
+    body.exits[#body.exits + 1] = done
+    -- The condition sees the body's locals.
+    enter(body)
+    local statements = stat.body ~= nil and ((stat.body as cst.Block).stats or {}) or {}
+    for _, inner in ipairs(statements) do
+        block(program, body, inner)
+    end
+    local test = condition(program, body, stat.cond)
+    leave(body)
+    body.exits[#body.exits] = nil
+    builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(test, done, loop))
+    builder.start(body.f, done)
+end
+
+local function fornumStmt(program: Program, body: Body, stat: cst.FornumStmt): nil
+    local first = expression(program, body, stat.start, nil)
+    local last = expression(program, body, stat.stop, first.kind)
+    local step = stat.step ~= nil and expression(program, body, stat.step, first.kind) or nil
+    local kind = common(first.kind, last.kind)
+    if step ~= nil then
+        kind = common(kind, (step as Value).kind)
+    end
+    if not isInteger(kind) and not isFloat(kind) then
+        refuse(stat, "a numeric for counts with numbers")
+    end
+    local stepValue = step ~= nil and convert(body, step as Value, kind, stat.step)
+        or Value(text = isFloat(kind) and llvmText.double(1) or "1", kind = kind)
+    local stopValue = convert(body, last, kind, stat.stop)
+    enter(body)
+    local counter = declareLocal(body, "\0counter", kind)
+    store(body, counter, first, stat.start)
+    local head = builder.label(body.f, "for.head")
+    local loop = builder.label(body.f, "for.body")
+    local continue = builder.label(body.f, "for.next")
+    local done = builder.label(body.f, "for.done")
+    builder.start(body.f, head)
+    local current = value(body, ("load %s, ptr %s"):format(kind.llvm, counter.slot))
+    -- The direction is the step's sign, decided when the loop runs.
+    local up, within, down: string, string, string
+    if isFloat(kind) then
+        up = value(body, ("fcmp oge %s %s, 0.0"):format(kind.llvm, stepValue.text))
+        within = value(body, ("fcmp ole %s %s, %s"):format(kind.llvm, current, stopValue.text))
+        down = value(body, ("fcmp oge %s %s, %s"):format(kind.llvm, current, stopValue.text))
+    else
+        local s = kind.signed and "s" or "u"
+        up = kind.signed and value(body, ("icmp sge %s %s, 0"):format(kind.llvm, stepValue.text)) or "true"
+        within = value(body, ("icmp %sle %s %s, %s"):format(s, kind.llvm, current, stopValue.text))
+        down = value(body, ("icmp %sge %s %s, %s"):format(s, kind.llvm, current, stopValue.text))
+    end
+    local test = value(body, ("select i1 %s, i1 %s, i1 %s"):format(up, within, down))
+    builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(test, loop, done))
+    builder.start(body.f, loop)
+    enter(body)
+    local variable = declareLocal(body, (stat.var as lexer.Token).text, kind)
+    builder.emit(body.f, ("store %s %s, ptr %s"):format(kind.llvm, current, variable.slot))
+    body.exits[#body.exits + 1] = done
+    block(program, body, stat.body)
+    body.exits[#body.exits] = nil
+    leave(body)
+    builder.start(body.f, continue)
+    local now = value(body, ("load %s, ptr %s"):format(kind.llvm, counter.slot))
+    local nextValue = isFloat(kind) and value(body, ("fadd %s %s, %s"):format(kind.llvm, now, stepValue.text))
+        or value(body, ("add %s %s, %s"):format(kind.llvm, now, stepValue.text))
+    builder.emit(body.f, ("store %s %s, ptr %s"):format(kind.llvm, nextValue, counter.slot))
+    builder.jump(body.f, head)
+    builder.start(body.f, done)
+    leave(body)
+end
+
+local function statement(program: Program, body: Body, stat: any): nil
+    local kind = stat.kind
+    if kind == "block" then
+        enter(body)
+        for _, inner in ipairs((stat as cst.Block).stats or {}) do
+            statement(program, body, inner)
+        end
+        leave(body)
+    elseif kind == "emptyStmt" then
+        return
+    elseif kind == "localStmt" then
+        localStmt(program, body, stat as cst.LocalStmt)
+    elseif kind == "assignStmt" then
+        local assignment = stat as cst.AssignStmt
+        if #assignment.targets ~= 1 or #assignment.exprs ~= 1 then
+            refuse(stat, "a native assignment sets one target")
+        end
+        assign(program, body, assignment.targets[1], assignment.exprs[1])
+    elseif kind == "compoundAssign" then
+        local compound = stat as cst.CompoundAssign
+        local op = ((compound.op as lexer.Token).text):sub(1, -2)
+        local target = compound.target
+        local found = target ~= nil and (target as any).kind == "name"
+            and lookup(body.scope, ((target as cst.NameExpr).token as lexer.Token).text) or nil
+        if found == nil then
+            refuse(stat, "a native compound assignment updates a local")
+        end
+        local current = expression(program, body, target, nil)
+        local operand = expression(program, body, compound.value, current.kind)
+        store(
+            body,
+            found as Local,
+            binaryValues(program, body, stat, op, current, operand, target, compound.value),
+            stat
+        )
+    elseif kind == "callStmt" then
+        local expr = (stat as cst.CallStmt).expr
+        if expr == nil or (expr as any).kind ~= "call" then
+            refuse(stat, "a native program cannot call this")
+        end
+        call(program, body, expr as cst.Call)
+    elseif kind == "returnStmt" then
+        returnStmt(program, body, stat as cst.ReturnStmt)
+    elseif kind == "ifStmt" then
+        ifStmt(program, body, stat as cst.IfStmt)
+    elseif kind == "whileStmt" then
+        whileStmt(program, body, stat as cst.WhileStmt)
+    elseif kind == "repeatStmt" then
+        repeatStmt(program, body, stat as cst.RepeatStmt)
+    elseif kind == "fornumStmt" then
+        fornumStmt(program, body, stat as cst.FornumStmt)
+    elseif kind == "doStmt" then
+        block(program, body, (stat as cst.DoStmt).body)
+    elseif kind == "breakStmt" then
+        local exit = body.exits[#body.exits]
+        if exit == nil then
+            refuse(stat, "break outside a loop")
+        end
+        builder.terminate(body.f, "br label %" .. exit)
+    else
+        refuse(stat, "a native program cannot run a " .. tostring(kind))
+    end
+end
+
+block = function(program: Program, body: Body, node: any): nil
+    if node ~= nil then
+        statement(program, body, node)
+    end
+end
+
+--- A function the program defines: its name, body, and C signature.
+record Definition
+    name: string
+    node: any
+    funcbody: cst.Funcbody
+    callee: Callee
+    paramNames: {string}
+end
+
+local function definition(stat: any): (string?, cst.Funcbody?)
+    if stat.kind == "localFuncStmt" then
+        local named = stat as cst.LocalFuncStmt
+        return named.name ~= nil and (named.name as lexer.Token).text or nil, named.body as cst.Funcbody?
+    elseif stat.kind == "funcStmt" then
+        local named = stat as cst.FuncStmt
+        local funcname = named.name
+        if funcname == nil or (funcname as any).kind ~= "funcname" then
+            return nil, nil
+        end
+        local parts = funcname as cst.Funcname
+        if parts.method ~= nil or cst.textOf(parts):find("[.:]") ~= nil then
+            refuse(stat, "a native program defines plain functions, not methods or fields")
+        end
+        return parts.base ~= nil and (parts.base as lexer.Token).text or nil, named.body as cst.Funcbody?
+    end
+
+    return nil, nil
+end
+
+local function signature(name: string, stat: any, funcbody: cst.Funcbody): Definition
+    local params: {Kind} = {}
+    local names: {string} = {}
+    for index, param in ipairs(funcbody.params) do
+        local p = param as cst.Param
+        if p.vararg or p.name == nil then
+            refuse(param, "a native function takes named parameters")
+        end
+        names[index] = (p.name as lexer.Token).text
+        params[index] = annotated(p.type, "parameter " .. names[index])
+        if params[index].llvm == "void" then
+            refuse(param, "parameter " .. names[index] .. " cannot be nil")
+        end
+    end
+    local rets = funcbody.rets or {}
+    if #rets > 1 or funcbody.returnPack ~= nil then
+        refuse(stat, "a native function returns at most one value")
+    end
+    local result = #rets == 1 and annotated(rets[1], "the result of " .. name) or VOID
+    local symbol = "nupp." .. name
+    if name == "main" then
+        symbol = "main"
+        local integral = result.llvm == "void" or result.llvm == "i32"
+        if not integral then
+            refuse(stat, "main returns its exit status as an int32")
+        end
+        if #params ~= 0 and (#params ~= 2 or params[1].llvm ~= "i32" or params[2].llvm ~= "ptr") then
+            refuse(stat, "main takes nothing, or (argc: int32, argv: cstring*)")
+        end
+    end
+
+    return Definition(
+        name = name,
+        node = stat,
+        funcbody = funcbody,
+        callee = Callee(symbol = symbol, params = params, result = result, varargs = false, foreign = false),
+        paramNames = names
+    )
+end
+
+local function foreign(stat: cst.CdefFunc): Callee
+    local name = (stat.name as lexer.Token).text
+    local physical = stat.physicalSignatureType
+    if physical == nil or physical.tag ~= "func" then
+        refuse(stat, "the checker did not resolve the C signature of " .. name)
+    end
+    local params: {Kind} = {}
+    for index, t in ipairs(physical.params) do
+        local kind = kindOf(t)
+        if kind == nil or (kind as Kind).llvm == "void" then
+            refuse(stat.params[index] or stat, "parameter " .. tostring(index) .. " of " .. name .. " has no C representation")
+        end
+        params[index] = kind as Kind
+    end
+    local result = VOID
+    if #physical.rets > 1 then
+        refuse(stat, name .. " returns more than one value")
+    elseif #physical.rets == 1 then
+        local kind = kindOf(physical.rets[1])
+        if kind == nil then
+            refuse(stat.ret or stat, "the result of " .. name .. " has no C representation")
+        end
+        result = kind as Kind
+    end
+
+    return Callee(symbol = name, params = params, result = result, varargs = stat.varargs or false, foreign = true)
+end
+
+local function lowerDefinition(program: Program, attributes: string, item: Definition): nil
+    local callee = item.callee
+    local params: {string} = {}
+    for index, kind in ipairs(callee.params) do
+        params[index] = kind.llvm .. " %arg" .. tostring(index)
+    end
+    if callee.symbol == "main" and #params == 0 then
+        params = {"i32 %arg1", "ptr %arg2"}
+    end
+    local linkage = callee.symbol == "main" and "" or "internal "
+    local header = ("define %s%s @%s(%s) %s {"):format(
+        linkage,
+        callee.symbol == "main" and "i32" or callee.result.llvm,
+        llvmText.name("", callee.symbol),
+        table.concat(params, ", "),
+        attributes
+    )
+    local body = Body(
+        f = builder.func(program.module, header),
+        scope = Scope(names = {}),
+        result = callee.symbol == "main" and I32 or callee.result,
+        exits = {}
+    )
+    for index, kind in ipairs(callee.params) do
+        local entry = declareLocal(body, item.paramNames[index], kind)
+        builder.emit(body.f, ("store %s %%arg%d, ptr %s"):format(kind.llvm, index, entry.slot))
+    end
+    block(program, body, item.funcbody.body)
+    if callee.result.llvm == "void" then
+        builder.finish(body.f, callee.symbol == "main" and "ret i32 0" or "ret void")
+    else
+        -- Falling off the end of a function with a result is a path the
+        -- checker already refuses; LLVM still needs the block closed.
+        builder.finish(body.f, "unreachable")
+    end
+end
+
+--- The program in `tree` as one LLVM IR module, or nil and what it does that
+--- a native program cannot. `functionAttributes` are the target profile's.
+function native.module(tree: cst.Chunk, functionAttributes: string): (string?, native.Problem?)
+    local program = Program(module = builder.module(), callees = {})
+    local definitions: {Definition} = {}
+    local ok, err = pcall(function(): nil
+        local hasMain = false
+        for _, top in ipairs(tree.blocks) do
+            for _, stat in ipairs(top.stats or {}) do
+                local kind = (stat as any).kind
+                if kind == "cdefFunc" then
+                    local declared = foreign(stat as cst.CdefFunc)
+                    if program.callees[declared.symbol] ~= nil then
+                        refuse(stat, declared.symbol .. " is declared twice")
+                    end
+                    program.callees[declared.symbol] = declared
+                elseif kind == "localFuncStmt" or kind == "funcStmt" then
+                    local name, funcbody = definition(stat)
+                    if name == nil or funcbody == nil then
+                        refuse(stat, "a native program defines plain named functions")
+                    end
+                    if program.callees[name as string] ~= nil then
+                        refuse(stat, (name as string) .. " is defined twice")
+                    end
+                    local item = signature(name as string, stat, funcbody as cst.Funcbody)
+                    definitions[#definitions + 1] = item
+                    program.callees[name as string] = item.callee
+                    hasMain = hasMain or name == "main"
+                elseif kind ~= "emptyStmt" and kind ~= "moduleStmt" and kind ~= "cdefStruct" then
+                    refuse(stat, "a native program's top level holds only cdef declarations and functions")
+                end
+            end
+        end
+        if not hasMain then
+            refuse(tree, "a native program defines main")
+        end
+        for _, callee in pairs(program.callees) do
+            if callee.foreign then
+                local params: {string} = {}
+                for index, kind in ipairs(callee.params) do
+                    params[index] = kind.llvm .. extension(kind)
+                end
+                if callee.varargs then
+                    params[#params + 1] = "..."
+                end
+                builder.declare(
+                    program.module,
+                    "@" .. callee.symbol,
+                    ("declare %s%s @%s(%s)"):format(
+                        callee.result.llvm,
+                        extension(callee.result),
+                        callee.symbol,
+                        table.concat(params, ", ")
+                    )
+                )
+            end
+        end
+        -- Unwind tables, because a C function a Nupp callback calls may raise a
+        -- Lua error that unwinds through it to the VM's protected call.
+        local attributes = builder.attributes(
+            program.module,
+            (("uwtable " .. functionAttributes):gsub("%s+$", ""))
+        )
+        for _, item in ipairs(definitions) do
+            lowerDefinition(program, attributes, item)
+        end
+    end)
+    if not ok then
+        if type(err) == "table" and (err as any).problem ~= nil then
+            return nil, (err as Refusal).problem
+        end
+        error(err, 0)
+    end
+
+    return builder.render(program.module), nil
+end
+
+export = native

@@ -1676,7 +1676,7 @@ build_kit() {
     build_host stub "$features"
     host_out=$HOST_OUT
     # Public feature sets can share a Rust host but advertise different kit metadata.
-    digest=$(printf 'kit-4|%s|%s' "$(basename "$host_out")" "$features" | sha256_stdin | cut -c1-16)
+    digest=$(printf 'kit-5|%s|%s' "$(basename "$host_out")" "$features" | sha256_stdin | cut -c1-16)
     out="$PREFIX/kits/$digest"
     KIT_OUT=$out
     take_lock "kit-$digest" "$out/.complete" || return 0
@@ -1691,6 +1691,7 @@ build_kit() {
     rm -rf "$out"
     mkdir -p "$out/sdk"
     cp "$host_out/libnupp-host.a" "$out/libnupp-runtime.a"
+    cp "$PREFIX/luajit/lib/libluajit-5.1.a" "$out/libluajit-5.1.a"
 
     probe="$out/probe"
     {
@@ -1768,6 +1769,7 @@ build_kit_windows() {
     rm -rf "$out"
     mkdir -p "$out/lib"
     cp "$host_out/libnupp-host.a" "$out/libnupp-runtime.a"
+    cp "$PREFIX/luajit/lib/libluajit-5.1.a" "$out/libluajit-5.1.a"
     cp "$host_out/libnupp-host-imports.a" "$out/lib/libnupp-host-imports.a"
 
     probe="$out/probe"
@@ -1859,6 +1861,7 @@ build_kit_linux() {
     rm -rf "$out"
     mkdir -p "$out/lib" "$out/stubs"
     cp "$host_out/libnupp-host.a" "$out/libnupp-runtime.a"
+    cp "$PREFIX/luajit/lib/libluajit-5.1.a" "$out/libluajit-5.1.a"
     for object in Scrt1.o crti.o crtbeginS.o crtendS.o crtn.o; do
         found=$("$CC" -print-file-name="$object")
         [ -f "$found" ] || die "the C compiler has no $object"

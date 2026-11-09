@@ -174,6 +174,35 @@ function stage.linkHost(
     return output, nil
 end
 
+--- Compiles a native program's LLVM IR `ir` for `triple` and links it into
+--- the executable `output` against the static LuaJIT of that platform's link
+--- kit. A source checkout builds its own platform's kit when it has none.
+function stage.linkProgram(triple: string, output: string, ir: string): (string?, string?)
+    local aotllvm = require("nupp.tools.build.aotllvm")
+    local available, availableErr = aotllvm.selected()
+    if available ~= true then
+        return nil, tostring(availableErr)
+    end
+    local host = require("nupp.tools.build.platform").hostKey()
+    local compilerRoot = envMod.compilerRoot()
+    local build: (function(): (string?, string?))? = nil
+    if compilerRoot ~= nil and triple == host then
+        build = function(): (string?, string?)
+            return driven(compilerRoot as string, "kit", {})
+        end
+    end
+    local kit, kitErr = require("nupp.tools.build.kits").resolve(triple, {}, build)
+    if kit == nil then
+        return nil, kitErr
+    end
+    local linkErr = aotllvm.program(ir, triple, kit as string, output)
+    if linkErr ~= nil then
+        return nil, linkErr
+    end
+
+    return output, nil
+end
+
 local libraryFile = deps.sharedLibraryName
 
 --- Builds and stages every native feature in `effects`, returning its files.
