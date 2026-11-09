@@ -31,15 +31,100 @@ local WINDOW = 32768
 local WINDOW_MASK = WINDOW - 1
 
 local LENGTH_BASE: any = {
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    13,
+    15,
+    17,
+    19,
+    23,
+    27,
+    31,
+    35,
+    43,
+    51,
+    59,
+    67,
+    83,
+    99,
+    115,
+    131,
+    163,
+    195,
+    227,
+    258
 }
 local LENGTH_EXTRA: any = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
 local DISTANCE_BASE: any = {
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
-    8193, 12289, 16385, 24577
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    9,
+    13,
+    17,
+    25,
+    33,
+    49,
+    65,
+    97,
+    129,
+    193,
+    257,
+    385,
+    513,
+    769,
+    1025,
+    1537,
+    2049,
+    3073,
+    4097,
+    6145,
+    8193,
+    12289,
+    16385,
+    24577
 }
 local DISTANCE_EXTRA: any = {
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13
 }
 local CODE_LENGTH_ORDER: any = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
 
@@ -98,6 +183,7 @@ local function build(lengths: any, count: number, incompleteAllowed: boolean, la
         end
     end
     counts[0] = 0
+
     return Code(counts = counts, symbols = symbols)
 end
 
@@ -117,6 +203,7 @@ local function fixedCodes(): (Code, Code)
         end
         fixedDistances = build(distances, 30, true, "fixed distance")
     end
+
     return fixedLiterals as Code, fixedDistances as Code
 end
 
@@ -216,6 +303,7 @@ export function create(format: integer, concatenated: boolean): Decoder
         accounted = 0
     )
     startMember(decoder)
+
     return decoder
 end
 
@@ -253,6 +341,7 @@ local function take(self: Decoder, wanted: number): number
     local value = bit.band(self.bits, bit.lshift(1, wanted) - 1)
     self.bits = bit.rshift(self.bits, wanted)
     self.count = self.count - wanted
+
     return value
 end
 
@@ -282,6 +371,7 @@ local function decode(self: Decoder, code: Code): number
         value = value * 2
     end
     fail("invalid Huffman code")
+
     return 0
 end
 
@@ -458,7 +548,8 @@ local function trailer(self: Decoder): nil
 end
 
 --- Advances as far as the input and `room` output bytes allow.
---- @raises Failure when the stream is malformed; ending mid-item also unwinds, to the rollback in `step`
+--- @raises Failure when the stream is malformed; ending mid-item also unwinds, to the
+---     rollback in `step`
 local function run(self: Decoder, room: number): nil
     while not self.finished do
         mark(self)
@@ -576,6 +667,7 @@ local function step(self: Decoder, room: number): (boolean, string?)
         rewind(self)
     end
     account(self)
+
     return true, nil
 end
 
@@ -604,6 +696,7 @@ export function read(self: Decoder, input: string, room: number): (number?, numb
         self.position = 1
         return consumed, written, FINISHED, nil
     end
+
     return consumed, written, (written == room and room > 0) and NEED_OUTPUT or NEED_INPUT, nil
 end
 
@@ -636,5 +729,6 @@ export function finishinput(self: Decoder, room: number): (number?, number?, str
         self.failed = "compressed stream has trailing bytes that are not a complete member"
         return nil, nil, self.failed
     end
+
     return written, NEED_INPUT, nil
 end

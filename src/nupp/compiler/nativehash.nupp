@@ -34,6 +34,7 @@ local function read64(bytes: any, at: number): uint64
     for index = 7, 0, -1 do
         value = (value << 8) | bytes[at + index]
     end
+
     return value
 end
 
@@ -87,6 +88,7 @@ local function xxh64(input: string, seed: uint64): uint64
     hash = hash * P2
     hash = hash ~ (hash >> 29)
     hash = hash * P3
+
     return hash ~ (hash >> 32)
 end
 
@@ -97,6 +99,7 @@ local function hex(value: uint64): string
         digits[index] = HEX:sub(nibble, nibble)
         value = value >> 4
     end
+
     return table.concat(digits)
 end
 

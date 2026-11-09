@@ -48,10 +48,17 @@ local function lookupTable(polynomial: uint64, reflected: boolean): {uint64}
         end
         entries[index + 1] = value
     end
+
     return entries
 end
 
-local function algorithm(id: integer, polynomial: uint64, reflected: boolean, initial: uint64, outputXor: uint64): Algorithm
+local function algorithm(
+    id: integer,
+    polynomial: uint64,
+    reflected: boolean,
+    initial: uint64,
+    outputXor: uint64
+): Algorithm
     return Algorithm(
         id = id,
         reflected = reflected,
@@ -61,7 +68,9 @@ local function algorithm(id: integer, polynomial: uint64, reflected: boolean, in
     )
 end
 
-const ALGORITHMS: {Algorithm} = {
+const ALGORITHMS: {
+    Algorithm
+} = {
     algorithm(1, 0xEDB88320ULL, true, 0xFFFFFFFFULL, 0xFFFFFFFFULL),
     algorithm(2, 0x82F63B78ULL, true, 0xFFFFFFFFULL, 0xFFFFFFFFULL),
     algorithm(3, 0x42F0E1EBA9EA3693ULL, false, 0ULL, 0ULL),
@@ -95,6 +104,7 @@ export function update(algorithm: Algorithm, register: uint64, borrows bytes: sp
             value = (value << 8) ~ entries[(tonumber((value >> 56) ~ bytes[index]) as integer) + 1]
         end
     end
+
     return value
 end
 
@@ -116,5 +126,6 @@ export function updatebytes(algorithm: Algorithm, register: uint64, bytes: any, 
             value = (value << 8) ~ entries[(tonumber((value >> 56) ~ bytes[index]) as integer) + 1]
         end
     end
+
     return value
 end

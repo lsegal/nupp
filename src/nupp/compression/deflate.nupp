@@ -57,15 +57,100 @@ local TUNING: any = {
 }
 
 local LENGTH_BASE: any = {
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    13,
+    15,
+    17,
+    19,
+    23,
+    27,
+    31,
+    35,
+    43,
+    51,
+    59,
+    67,
+    83,
+    99,
+    115,
+    131,
+    163,
+    195,
+    227,
+    258
 }
 local LENGTH_EXTRA: any = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
 local DISTANCE_BASE: any = {
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
-    8193, 12289, 16385, 24577
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    9,
+    13,
+    17,
+    25,
+    33,
+    49,
+    65,
+    97,
+    129,
+    193,
+    257,
+    385,
+    513,
+    769,
+    1025,
+    1537,
+    2049,
+    3073,
+    4097,
+    6145,
+    8193,
+    12289,
+    16385,
+    24577
 }
 local DISTANCE_EXTRA: any = {
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13
 }
 local CODE_LENGTH_ORDER: any = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
 
@@ -90,6 +175,7 @@ local function distanceCode(distance: number): number
             high = middle - 1
         end
     end
+
     return low - 1
 end
 
@@ -131,6 +217,7 @@ local function drainBits(writer: Bits): string
         index = last + 1
     end
     writer.bytes = {}
+
     return table.concat(parts)
 end
 
@@ -140,6 +227,7 @@ local function reverse(code: number, length: number): number
         result = bit.bor(bit.lshift(result, 1), bit.band(code, 1))
         code = bit.rshift(code, 1)
     end
+
     return result
 end
 
@@ -172,6 +260,7 @@ local function canonical(lengths: any, count: number): any
             codes[symbol] = 0
         end
     end
+
     return codes
 end
 
@@ -201,9 +290,11 @@ local function lengthsFor(frequencies: any, count: number, limit: number): any
         weight[index] = frequencies[symbol]
     end
     local heap: any = {}
+
     local function less(a: number, b: number): boolean
         return weight[a] < weight[b] or weight[a] == weight[b] and a < b
     end
+
     local function push(node: number): nil
         heap[#heap + 1] = node
         local at = #heap
@@ -217,6 +308,7 @@ local function lengthsFor(frequencies: any, count: number, limit: number): any
             end
         end
     end
+
     local function pop(): number
         local top = heap[1]
         local last = heap[#heap]
@@ -241,8 +333,10 @@ local function lengthsFor(frequencies: any, count: number, limit: number): any
                 at = smallest
             end
         end
+
         return top
     end
+
     for index = 1, #used do
         push(index)
     end
@@ -294,6 +388,7 @@ local function lengthsFor(frequencies: any, count: number, limit: number): any
             lengths[best] = lengths[best] + 1
         end
     end
+
     return lengths
 end
 
@@ -357,6 +452,7 @@ export function create(format: integer, level: integer): Encoder
         flags = flags + 31 - (0x78 * 256 + flags) % 31
         enqueue(encoder, string.char(0x78, flags))
     end
+
     return encoder
 end
 
@@ -389,10 +485,12 @@ local function match(self: Encoder, data: string, start: number): (any, any)
     local size = #data
     local head: any = {}
     local previous: any = {}
+
     local function hash(at: number): number
         -- `at` is zero-based here.
         return bit.band(bit.bxor(bit.lshift(bytes[at], 10), bit.lshift(bytes[at + 1], 5), bytes[at + 2]), HASH_SIZE - 1)
     end
+
     local function insert(at: number): nil
         if at + 2 < size then
             local key = hash(at)
@@ -400,6 +498,7 @@ local function match(self: Encoder, data: string, start: number): (any, any)
             head[key] = at
         end
     end
+
     local function longest(at: number, atLeast: number): (number, number)
         local bestLength = atLeast
         local bestDistance = 0
@@ -433,17 +532,21 @@ local function match(self: Encoder, data: string, start: number): (any, any)
         if bestDistance == 0 then
             return 0, 0
         end
+
         return bestLength, bestDistance
     end
+
     for at = math.max(0, start - 1 - WINDOW), start - 2 do
         insert(at)
     end
     local symbols: any = {}
     local distances: any = {}
+
     local function literal(at: number): nil
         symbols[#symbols + 1] = bytes[at]
         distances[#distances + 1] = 0
     end
+
     local at = start - 1
     local lazy = tuning.lazy
     while at < size do
@@ -481,6 +584,7 @@ local function match(self: Encoder, data: string, start: number): (any, any)
         end
         ::continue::
     end
+
     return symbols, distances
 end
 
@@ -496,12 +600,7 @@ local fixedLiteralCodes = canonical(fixedLiteralLengths, 288)
 local fixedDistanceCodes = canonical(fixedDistanceLengths, 30)
 
 --- Bits the symbols take under the given code lengths, extra bits included.
-local function cost(
-    symbols: any,
-    distances: any,
-    literalLengths: any,
-    distanceLengths: any
-): number
+local function cost(symbols: any, distances: any, literalLengths: any, distanceLengths: any): number
     local total = literalLengths[256]
     for index = 1, #symbols do
         local distance = distances[index]
@@ -510,10 +609,12 @@ local function cost(
         else
             local code = LENGTH_CODE[symbols[index]]
             local distanceSymbol = distanceCode(distance)
-            total = total + literalLengths[257 + code] + LENGTH_EXTRA[code + 1] + distanceLengths[distanceSymbol]
-                + DISTANCE_EXTRA[distanceSymbol + 1]
+            total = total + literalLengths[
+                257 + code
+            ] + LENGTH_EXTRA[code + 1] + distanceLengths[distanceSymbol] + DISTANCE_EXTRA[distanceSymbol + 1]
         end
     end
+
     return total
 end
 
@@ -591,6 +692,7 @@ local function runLengths(lengths: any, count: number): (any, any)
         end
         index = index + run
     end
+
     return symbols, extras
 end
 
@@ -696,7 +798,15 @@ local function writeBlock(self: Encoder, raw: string, last: boolean): nil
     elseif fixedBits <= dynamicBits then
         put(writer, last and 1 or 0, 1)
         put(writer, 1, 2)
-        writeSymbols(writer, symbols, distances, fixedLiteralCodes, fixedLiteralLengths, fixedDistanceCodes, fixedDistanceLengths)
+        writeSymbols(
+            writer,
+            symbols,
+            distances,
+            fixedLiteralCodes,
+            fixedLiteralLengths,
+            fixedDistanceCodes,
+            fixedDistanceLengths
+        )
     else
         put(writer, last and 1 or 0, 1)
         put(writer, 2, 2)
@@ -765,6 +875,7 @@ local function deliver(self: Encoder, room: number): string
             self.queueAt = self.queueAt + count
         end
     end
+
     return table.concat(parts)
 end
 
@@ -793,6 +904,7 @@ export function write(self: Encoder, input: string, room: number): (number, stri
     end
     local chunk = first .. deliver(self, room - #first)
     local status = (#chunk == room and room > 0) and NEED_OUTPUT or NEED_INPUT
+
     return #input, chunk, status
 end
 
@@ -823,6 +935,7 @@ export function flush(self: Encoder, room: number): (string, number)
         return chunk, NEED_OUTPUT
     end
     self.flushing = false
+
     return chunk, NEED_INPUT
 end
 
@@ -868,5 +981,6 @@ export function finish(self: Encoder, room: number): (string, number)
         return chunk, NEED_OUTPUT
     end
     self.finished = true
+
     return chunk, FINISHED
 end

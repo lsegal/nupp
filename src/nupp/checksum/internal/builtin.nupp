@@ -55,6 +55,7 @@ local record Algorithm is provider.Algorithm
             return AdlerState(high = 0, low = 1)
         end
         local algorithm = crc.lookup(self.id) as crc.Algorithm
+
         return CrcState(algorithm = algorithm, register = crc.initial(algorithm))
     end
 end

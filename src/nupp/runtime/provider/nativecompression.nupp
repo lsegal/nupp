@@ -24,6 +24,7 @@ local function text(borrows input: span.Span<uint8>): string
     if count == 0 then
         return ""
     end
+
     return ffiString(input:ref(), count)
 end
 
@@ -33,6 +34,7 @@ local function publish(chunk: string, exclusive output: span.ByteWriteSpan): int
     if count > 0 then
         copyInto(output:ref(), chunk, count)
     end
+
     return count
 end
 
@@ -85,6 +87,7 @@ local record Decoder is contract.Decoder
         if problem ~= nil then
             return nil, nil, nil, "compression decode failed: " .. problem
         end
+
         return consumed as integer, self:publish(written as integer, output), status as integer, nil
     end
 
@@ -93,6 +96,7 @@ local record Decoder is contract.Decoder
         if problem ~= nil then
             return nil, nil, "compression decode failed: " .. problem
         end
+
         return self:publish(written as integer, output), status as integer, nil
     end
 end

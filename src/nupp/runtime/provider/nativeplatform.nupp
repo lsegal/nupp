@@ -80,6 +80,7 @@ if windows then
         if intervals < EPOCH_OFFSET then
             return 0ULL
         end
+
         return (intervals - EPOCH_OFFSET) // 10000ULL
     end
 
@@ -122,6 +123,7 @@ if windows then
         if status ~= 0 then
             return false, ("BCryptGenRandom failed with status 0x%08x"):format(bit.band(status, 0xFFFFFFFF))
         end
+
         return true, nil
     end
 else
@@ -129,6 +131,7 @@ else
     local CLOCK_REALTIME = 0
     local CLOCK_MONOTONIC = 1
     local now: any = ffi.new("nupp_platform_timespec")
+
     local function reading(clock: number): uint64
         assert(C.clock_gettime(clock, now) == 0, "clock_gettime failed")
         return (0ULL + now.seconds) * 1000000000ULL + now.nanoseconds
@@ -181,6 +184,7 @@ else
             end
             offset = offset + length
         end
+
         return true, nil
     end
 end
@@ -243,6 +247,7 @@ local function uuid(version: integer, timestamp: uint64?): string
         local low = bit.band(byte, 15) + 1
         parts[#parts + 1] = HEX:sub(high, high) .. HEX:sub(low, low)
     end
+
     return table.concat(parts)
 end
 

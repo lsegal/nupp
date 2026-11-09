@@ -647,12 +647,7 @@ local FEATURES: {[string]: native.Feature} = {
         requires = {"runtime.uri_whatwg"}
     },
     ["runtime.uri_whatwg"] = {name = "uri_whatwg", runtimeModule = "nupp.io.uri.whatwg", portableRuntime = true},
-    [
-        "native.uuid"
-    ] = {
-        name = "uuid",
-        modules = {"nupp.runtime.provider.nativeuuid"},
-    },
+    ["native.uuid"] = {name = "uuid", modules = {"nupp.runtime.provider.nativeuuid"},},
     ["native.files"] = {
         name = "files",
         modules = {"nupp.runtime.provider.nativefiles"},
@@ -888,9 +883,7 @@ local FEATURES: {[string]: native.Feature} = {
         requires = {"runtime.suspension"},
     },
     ["native.host"] = {name = "host", module = "nupp.runtime.provider.nativehost", requires = {"runtime.suspension"}},
-    [
-        "native.crypto"
-    ] = {name = "crypto", module = "nupp.runtime.provider.nativecrypto"},
+    ["native.crypto"] = {name = "crypto", module = "nupp.runtime.provider.nativecrypto"},
 }
 
 local byGlobal: {[string]: string} = {}
