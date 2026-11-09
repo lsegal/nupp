@@ -32,7 +32,7 @@ local PROGRAM = [[
 #include "game.h"
 
 int main(void) {
-    printf("%d %.1f %.1f\n", (int)game_add(2, 3), game_scale(4, 1.5f, true), game_scale(4, 1.5f, false));
+    printf("%d %.1f %.1f\n", (int)game_add(2, 3), game_scale(5, 1.5f, true), game_scale(5, 1.5f, false));
     return 0;
 }
 ]]
@@ -68,7 +68,7 @@ end
 local function run(dir, program)
     local code, text = process.capture({program})
     testAssert.eq(code, 0, text)
-    testAssert.eq(text:match("[^\r\n]+"), "5 7.5 4.0", "C reaches every exported function through the header")
+    testAssert.eq(text:match("[^\r\n]+"), "5 7.5 5.0", "C reaches every exported function through the header")
     remove(dir)
 end
 
