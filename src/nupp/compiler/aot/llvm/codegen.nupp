@@ -2,9 +2,11 @@
 The code generator linked into the host: LLVM and lld, reached through the
 versioned native provider.
 
-Everything here is a thin call. What goes in is LLVM IR text and `key=value`
-options, and what comes out is an object, a report, and optionally the
-assembly; the crate behind it knows nothing about Nupp. A host built without
+The calls into the provider are thin. What goes in is LLVM IR text and the
+options, checked here from `key=value` form, and what comes out is an object,
+the phase timings, and optionally the assembly and optimized IR; the crate
+behind it knows nothing about Nupp. The numeric-contract checks
+([](nupp.compiler.aot.llvm.contract)) and the report run here. A host built without
 the pinned LLVM answers `available()` with the reason.
 ]]
 module nupp.compiler.aot.llvm.codegen
@@ -31,7 +33,7 @@ int32_t nuppCodegenCompile(
     const char *ir, size_t irLength,
     const char *name, size_t nameLength,
     const char *options, size_t optionsLength,
-    uint64_t *object, uint64_t *report, uint64_t *assembly, uint64_t *optimizedIr);
+    uint64_t *object, uint64_t *timings, uint64_t *assembly, uint64_t *optimizedIr);
 int32_t nuppCodegenLink(const char *argv, size_t length, uint64_t *messages);
 int32_t nuppCodegenUnexitable(void);
 void nuppCodegenEndProcess(int32_t code);
@@ -47,13 +49,7 @@ int32_t nuppCodegenArchive(
 int32_t nuppCodegenKitFetch(
     const char *url, size_t urlLength,
     const char *path, size_t pathLength,
-    const char *sha256, size_t sha256Length,
     uint64_t size);
-int32_t nuppCodegenKitUnpack(
-    const char *archive, size_t archiveLength,
-    const char *sha256, size_t sha256Length,
-    uint64_t size,
-    const char *root, size_t rootLength);
 ]]
 end
 
@@ -108,6 +104,107 @@ record codegen.Compiled
     optimizedIr: string?
 end
 
+--- What a compile is for. `triple` is the LLVM code-generation triple (never
+--- a public Nupp platform name); `cpu` and `features` are the module's
+--- baseline, which per-function `"target-cpu"`/`"target-features"` attributes
+--- override for tiered functions.
+record codegen.Options
+    triple: string
+    cpu: string
+    features: string
+    --- 0-3: `default<O0>` .. `default<O3>`, and the matching code-generation level.
+    opt: integer
+    --- Also return the assembly listing (a second code generation).
+    assembly: boolean
+    --- Also return the optimized IR.
+    optimizedIr: boolean
+    --- Run the numeric-contract checks over the optimized IR, and over the
+    --- assembly when it is produced.
+    verify: boolean
+end
+
+--- Reads `key=value` lines: triple, cpu, features, opt, assembly,
+--- optimized-ir, verify. Unknown keys are refused.
+--- @return the options, or nil and why they are refused
+function codegen.parseOptions(text: string): (codegen.Options?, string?)
+    local options = codegen.Options(
+        triple = "",
+        cpu = "",
+        features = "",
+        opt = 3,
+        assembly = false,
+        optimizedIr = false,
+        verify = false
+    )
+    for raw in (text .. "\n"):gmatch("([^\n]*)\n") do
+        local line = (raw:match("^%s*(.-)%s*$")) as string
+        if line ~= "" then
+            local key, value = line:match("^([^=]*)=(.*)$")
+            if key == nil then
+                return nil, ("codegen option `%s` has no `=`"):format(line)
+            end
+            local flag = value == "1" or value == "true"
+            if key == "triple" then
+                options.triple = value as string
+            elseif key == "cpu" then
+                options.cpu = value as string
+            elseif key == "features" then
+                options.features = value as string
+            elseif key == "opt" then
+                local level = (value as string):match("^%d+$") and tonumber(value) or nil
+                if level == nil or level > 3 then
+                    return nil, ("codegen opt `%s` is not 0-3"):format(value)
+                end
+                options.opt = level as integer
+            elseif key == "assembly" then
+                options.assembly = flag
+            elseif key == "optimized-ir" then
+                options.optimizedIr = flag
+            elseif key == "verify" then
+                options.verify = flag
+            else
+                return nil, ("unknown codegen option `%s`"):format(key)
+            end
+        end
+    end
+    if options.triple == "" then
+        return nil, "codegen options name no triple"
+    end
+
+    return options, nil
+end
+
+--- A plain-text report of one compile: its phase timings in microseconds,
+--- the object's size, then one contract violation per line.
+function codegen.report(timings: {number}, objectBytes: integer, violations: {string}): string
+    local lines: {string} = {
+        ("parse-us=%.0f\noptimize-us=%.0f\ncodegen-us=%.0f\nobject-bytes=%d\n"):format(
+            timings[1] or 0,
+            timings[2] or 0,
+            timings[3] or 0,
+            objectBytes
+        ),
+    }
+    for _, violation in ipairs(violations) do
+        lines[#lines + 1] = "violation=" .. violation:gsub("\n", " ") .. "\n"
+    end
+
+    return table.concat(lines)
+end
+
+--- The contract violations in a compile's optimized IR and assembly.
+local function violations(optimizedIr: string, assembly: string?): {string}
+    local contract = require("nupp.compiler.aot.llvm.contract")
+    local found = contract.ir(optimizedIr)
+    if assembly ~= nil then
+        for _, violation in ipairs(contract.fusedInstructions(assembly as string, optimizedIr)) do
+            found[#found + 1] = violation
+        end
+    end
+
+    return found
+end
+
 --- `key=value` lines from an options table, in a stable order.
 local function optionText(options: {[string]: string}): string
     local keys: {string} = {}
@@ -123,6 +220,38 @@ local function optionText(options: {[string]: string}): string
     return table.concat(lines, "\n")
 end
 
+--- The checked options an options table names, in the provider's positional
+--- form: triple, cpu, features, opt, then whether to return the assembly and
+--- the optimized IR. Verifying needs the optimized IR, and the assembly when it
+--- is asked for; outputs nobody keeps are produced only to verify.
+local function nativeOptions(options: {[string]: string}, kept: boolean): (codegen.Options, string)
+    local parsed, err = codegen.parseOptions(optionText(options))
+    if parsed == nil then
+        error(err, 0)
+    end
+    local checked = parsed as codegen.Options
+    local fields = {
+        checked.triple,
+        checked.cpu,
+        checked.features,
+        tostring(checked.opt),
+        checked.assembly and (kept or checked.verify) and "1" or "0",
+        ((kept and checked.optimizedIr) or checked.verify) and "1" or "0",
+    }
+
+    return checked, table.concat(fields, "\31")
+end
+
+--- The phase timings a provider answers: microseconds, space-separated.
+local function timings(text: string): {number}
+    local out: {number} = {}
+    for number in text:gmatch("%S+") do
+        out[#out + 1] = tonumber(number) or 0
+    end
+
+    return out
+end
+
 --- Compiles LLVM IR text. Options: `triple` (required), `cpu`, `features`,
 --- `opt` (0-3), `assembly`, `optimized-ir`, `verify` ("1" to enable).
 --- @return the compiled module, or nil and why not
@@ -131,21 +260,25 @@ function codegen.compile(ir: string, name: string, options: {[string]: string}):
         declare()
         local ffi: any = native.ffi
         local C: any = native.C
-        local text = optionText(options)
+        local checked, text = nativeOptions(options, true)
         local object = ffi.new("uint64_t[1]")
-        local report = ffi.new("uint64_t[1]")
+        local spent = ffi.new("uint64_t[1]")
         local assembly = ffi.new("uint64_t[1]")
         local optimized = ffi.new("uint64_t[1]")
         native.succeeded(
-            C.nuppCodegenCompile(ir, #ir, name, #name, text, #text, object, report, assembly, optimized),
+            C.nuppCodegenCompile(ir, #ir, name, #name, text, #text, object, spent, assembly, optimized),
             2
         )
+        local objectBytes = take(object[0]) or ""
+        local listing = take(assembly[0])
+        local optimizedIr = take(optimized[0])
+        local found: {string} = checked.verify and violations(optimizedIr or "", listing) or {}
 
         return codegen.Compiled(
-            object = take(object[0]) or "",
-            report = take(report[0]) or "",
-            assembly = take(assembly[0]),
-            optimizedIr = take(optimized[0])
+            object = objectBytes,
+            report = codegen.report(timings(take(spent[0]) or ""), #objectBytes, found),
+            assembly = listing,
+            optimizedIr = checked.optimizedIr and optimizedIr or nil
         )
     end)
     if not ok then
@@ -168,9 +301,36 @@ record codegen.Outcome
     error: string?
 end
 
+--- Reads and removes a file a compile job wrote beside its object.
+local function consume(path: string): string?
+    local file = io.open(path, "rb")
+    if file == nil then
+        return nil
+    end
+    local text = file:read("*a") as string
+    file:close()
+    os.remove(path)
+
+    return text
+end
+
+--- An object file's size in bytes, or zero when it cannot be read.
+local function fileSize(path: string): integer
+    local file = io.open(path, "rb")
+    if file == nil then
+        return 0
+    end
+    local size = file:seek("end") as integer
+    file:close()
+
+    return size
+end
+
 --- Compiles IR files to objects, `width` at a time, each where LLVM's
 --- ending the process on an internal error ends only that job: a job that
 --- crashes is an outcome with an error, and the build goes on to report it.
+--- A job that verifies has its optimized IR and assembly written beside its
+--- object as `.ll` and `.s`, which are checked here and then removed.
 --- @return one outcome per job, in order, or nil and why none ran
 function codegen.compileFiles(jobs: {codegen.Job}, width: integer): ({codegen.Outcome}?, string?)
     local ok, result = pcall(function(): {codegen.Outcome}
@@ -178,8 +338,11 @@ function codegen.compileFiles(jobs: {codegen.Job}, width: integer): ({codegen.Ou
         local ffi: any = native.ffi
         local C: any = native.C
         local records: {string} = {}
+        local checked: {codegen.Options} = {}
         for position, job in ipairs(jobs) do
-            records[position] = job.ir .. "\31" .. job.object .. "\31" .. optionText(job.options)
+            local options, text = nativeOptions(job.options, false)
+            checked[position] = options
+            records[position] = job.ir .. "\31" .. job.object .. "\31" .. text
         end
         local joined = table.concat(records, "\0") .. "\0"
         local handle = ffi.new("uint64_t[1]")
@@ -187,9 +350,18 @@ function codegen.compileFiles(jobs: {codegen.Job}, width: integer): ({codegen.Ou
         local text = take(handle[0]) or ""
         local outcomes: {codegen.Outcome} = {}
         for record in text:gmatch("([^%z]*)%z") do
+            local position = #outcomes + 1
+            local job = jobs[position]
+            local optimizedIr = job ~= nil and consume(job.object .. ".ll") or nil
+            local listing = job ~= nil and consume(job.object .. ".s") or nil
             local kind, body = record:match("^(%a+)\31(.*)$")
-            outcomes[#outcomes + 1] = kind == "ok" and codegen.Outcome(report = body, error = nil)
-                or codegen.Outcome(report = nil, error = body or record)
+            if kind == "ok" and job ~= nil then
+                local found = checked[position].verify and violations(optimizedIr or "", listing) or {}
+                local report = codegen.report(timings(body as string), fileSize(job.object), found)
+                outcomes[position] = codegen.Outcome(report = report, error = nil)
+            else
+                outcomes[position] = codegen.Outcome(report = nil, error = body or record)
+            end
         end
 
         return outcomes
@@ -283,29 +455,14 @@ function codegen.archive(path: string, members: {string}, format: string): strin
 end
 
 --- Fetches the link kit archive at the HTTPS `url` into `path`, which is
---- written only once the body is `size` bytes with SHA-256 `sha256`.
+--- written only once the whole body of `size` bytes has arrived. Its digest is
+--- the caller's to check ([](nupp.tools.build.kitarchive)).
 --- @return nil, or why it could not be fetched
-function codegen.fetchKit(url: string, path: string, sha256: string, size: integer): string?
+function codegen.fetchKit(url: string, path: string, size: integer): string?
     local ok, err = pcall(function(): nil
         declare()
         local C: any = native.C
-        native.succeeded(C.nuppCodegenKitFetch(url, #url, path, #path, sha256, #sha256, size), 2)
-    end)
-    if not ok then
-        return tostring(err)
-    end
-
-    return nil
-end
-
---- Checks the link kit archive at `archive` against `size` and `sha256` and
---- unpacks it into the existing directory `root`.
---- @return nil, or why it could not be unpacked
-function codegen.unpackKit(archive: string, sha256: string, size: integer, root: string): string?
-    local ok, err = pcall(function(): nil
-        declare()
-        local C: any = native.C
-        native.succeeded(C.nuppCodegenKitUnpack(archive, #archive, sha256, #sha256, size, root, #root), 2)
+        native.succeeded(C.nuppCodegenKitFetch(url, #url, path, #path, size), 2)
     end)
     if not ok then
         return tostring(err)

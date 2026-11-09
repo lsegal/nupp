@@ -30,6 +30,29 @@ fn status(result: Result<(), i32>) -> i32 {
     }
 }
 
+/// Compile options in the compiler's positional form, already checked there:
+/// triple, cpu, features, opt (0-3), then `1` to return the assembly and `1`
+/// to return the optimized IR, separated by U+001F.
+fn compile_options(text: &str) -> Result<codegen::CompileOptions, i32> {
+    let fields: Vec<&str> = text.split('{1f}').collect();
+    let [triple, cpu, features, opt, assembly, optimized_ir] = fields[..] else {
+        return Err(super::failed(Status::InvalidArgument, "codegen options need six fields"));
+    };
+    let opt = opt
+        .parse()
+        .ok()
+        .filter(|level: &u8| *level <= 3)
+        .ok_or_else(|| super::failed(Status::InvalidArgument, "codegen opt is not 0-3"))?;
+    Ok(codegen::CompileOptions {
+        triple: triple.to_string(),
+        cpu: cpu.to_string(),
+        features: features.to_string(),
+        opt,
+        assembly: assembly == "1",
+        optimized_ir: optimized_ir == "1",
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nuppCodegenAvailable() -> u32 {
     guard(0, || codegen::available() as u32)
@@ -43,9 +66,10 @@ pub unsafe extern "C" fn nuppCodegenVersion(result: *mut u64) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-/// Compiles one LLVM IR module. `options` is `key=value` lines (see
-/// `CompileOptions::parse`). Each non-null output slot receives a byte handle,
-/// or 0 when that output was not asked for.
+/// Compiles one LLVM IR module. `options` is the positional form
+/// `compile_options` reads. `timings` receives the phase timings in microseconds, space-separated;
+/// each other non-null output slot receives a byte handle, or 0 when that output
+/// was not asked for.
 ///
 /// # Safety
 /// Each input range must be readable for its length; each non-null output
@@ -58,7 +82,7 @@ pub unsafe extern "C" fn nuppCodegenCompile(
     options: *const u8,
     options_length: usize,
     object: *mut u64,
-    report: *mut u64,
+    timings: *mut u64,
     assembly: *mut u64,
     optimized_ir: *mut u64,
 ) -> i32 {
@@ -66,14 +90,11 @@ pub unsafe extern "C" fn nuppCodegenCompile(
         status((|| {
             let ir = text(ir, ir_length, "LLVM IR")?;
             let name = text(name, name_length, "module name")?;
-            let options =
-                codegen::CompileOptions::parse(text(options, options_length, "codegen options")?)
-                    .map_err(|e| super::failed(Status::InvalidArgument, &e))?;
+            let options = compile_options(text(options, options_length, "codegen options")?)?;
             let compiled = codegen::compile(ir, name, &options)
                 .map_err(|e| super::failed(Status::InvalidArgument, &e))?;
-            let report_text = compiled.report();
             output(object, Some(compiled.object))?;
-            output(report, Some(report_text.into_bytes()))?;
+            output(timings, Some(compiled.timings.text().into_bytes()))?;
             output(assembly, compiled.assembly.map(String::into_bytes))?;
             output(optimized_ir, compiled.optimized_ir.map(String::into_bytes))
         })())
@@ -182,7 +203,9 @@ pub unsafe extern "C" fn nuppCodegenArchive(
 /// Compiles IR files to objects, `width` at a time, each isolated from this
 /// process where the platform can fork. `jobs` is NUL-separated records of
 /// `irPath \x1f objectPath \x1f options`; `results` receives one record per
-/// job, in order, of `ok \x1f report` or `error \x1f message`, NUL-separated.
+/// job, in order, of `ok \x1f timings` or `error \x1f message`, NUL-separated.
+/// A job asking for its optimized IR or assembly finds them beside its object
+/// as `.ll` and `.s`.
 ///
 /// # Safety
 /// `jobs` must be readable for `length` bytes; `results` writable for one u64.
@@ -208,8 +231,7 @@ pub unsafe extern "C" fn nuppCodegenCompileFiles(
                         "a compile job needs an IR path, an object path and options",
                     ));
                 };
-                let options = codegen::CompileOptions::parse(options)
-                    .map_err(|e| super::failed(Status::InvalidArgument, &e))?;
+                let options = compile_options(options)?;
                 parsed.push(codegen::Job {
                     ir: ir.into(),
                     object: object.into(),
@@ -220,7 +242,7 @@ pub unsafe extern "C" fn nuppCodegenCompileFiles(
             let mut out = String::new();
             for answer in answers {
                 match answer {
-                    Ok(report) => out.push_str(&format!("ok\u{1f}{report}")),
+                    Ok(timings) => out.push_str(&format!("ok\u{1f}{timings}")),
                     Err(error) => out.push_str(&format!("error\u{1f}{error}")),
                 }
                 out.push('\0');
@@ -232,7 +254,8 @@ pub unsafe extern "C" fn nuppCodegenCompileFiles(
 
 #[unsafe(no_mangle)]
 /// Fetches a link kit archive from an HTTPS `url` into `path`, written only
-/// once it matches `size` bytes and the lowercase SHA-256 `sha256`.
+/// once the whole body of `size` bytes has arrived. The compiler checks its
+/// digest before unpacking it.
 ///
 /// # Safety
 /// Each input range must be readable for its length.
@@ -241,51 +264,15 @@ pub unsafe extern "C" fn nuppCodegenKitFetch(
     url_length: usize,
     path: *const u8,
     path_length: usize,
-    sha256: *const u8,
-    sha256_length: usize,
     size: u64,
 ) -> i32 {
     boundary(|| {
         status((|| {
             let url = text(url, url_length, "kit URL")?;
             let path = text(path, path_length, "kit archive path")?;
-            let sha256 = text(sha256, sha256_length, "kit digest")?;
-            codegen::kit::fetch(url, std::path::Path::new(path), size, sha256)
+            codegen::kit::fetch(url, std::path::Path::new(path), size)
                 .map_err(|e| super::failed(Status::InvalidArgument, &e))
         })())
     })
 }
 
-#[unsafe(no_mangle)]
-/// Checks the link kit archive at `archive` against `size` and `sha256`, then
-/// unpacks it into the existing directory `root`.
-///
-/// # Safety
-/// Each input range must be readable for its length.
-pub unsafe extern "C" fn nuppCodegenKitUnpack(
-    archive: *const u8,
-    archive_length: usize,
-    sha256: *const u8,
-    sha256_length: usize,
-    size: u64,
-    root: *const u8,
-    root_length: usize,
-) -> i32 {
-    boundary(|| {
-        status((|| {
-            let archive = text(archive, archive_length, "kit archive path")?;
-            let sha256 = text(sha256, sha256_length, "kit digest")?;
-            let root = text(root, root_length, "kit directory")?;
-            let bytes = std::fs::read(archive).map_err(|e| {
-                super::failed(
-                    Status::InvalidArgument,
-                    &format!("cannot read {archive}: {e}"),
-                )
-            })?;
-            codegen::kit::verify(&bytes, size, sha256)
-                .map_err(|e| super::failed(Status::InvalidArgument, &e))?;
-            codegen::kit::unpack(&bytes, std::path::Path::new(root))
-                .map_err(|e| super::failed(Status::InvalidArgument, &e))
-        })())
-    })
-}
