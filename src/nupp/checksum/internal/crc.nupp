@@ -102,3 +102,19 @@ end
 export function finish(algorithm: Algorithm, register: uint64): uint64
     return register ~ algorithm.outputXor
 end
+
+--- Advances `register` over `count` bytes at a C pointer, from offset zero.
+export function updatebytes(algorithm: Algorithm, register: uint64, bytes: any, count: integer): uint64
+    local entries = algorithm.entries
+    local value = register
+    if algorithm.reflected then
+        for index = 0, count - 1 do
+            value = (value >> 8) ~ entries[(tonumber((value ~ bytes[index]) & 0xFFULL) as integer) + 1]
+        end
+    else
+        for index = 0, count - 1 do
+            value = (value << 8) ~ entries[(tonumber((value >> 56) ~ bytes[index]) as integer) + 1]
+        end
+    end
+    return value
+end
