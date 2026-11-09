@@ -246,7 +246,7 @@ build_native() {
     # already built (or named by NUPP_LLVM_PREFIX): building LLVM takes minutes
     # to an hour, and nothing but AOT compilation needs it. A tree without it
     # still builds and runs the compiler; `@aot` then says what is missing.
-    features=base,compression,files,gpu,http,net,process,tls,uri,uuid
+    features=base,compression,files,gpu,http,net,process,tls,uri
     if llvm_is_available; then
         features=$features,codegen
     fi

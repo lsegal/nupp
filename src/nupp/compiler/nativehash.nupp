@@ -4,21 +4,103 @@ module nupp.compiler.nativehash
 
 -- The native spelling of the compiler's portable content digest. This lives in host
 -- services rather than `nupp.compiler.hash` because the portable lua51 compiler has no
--- FFI and must remain able to compute every cache key itself.
-const native = require("nupp.runtime.native")
+-- FFI and must remain able to compute every cache key itself. Here the same XXH64
+-- runs on `uint64` values over the string's bytes in place, which LuaJIT compiles
+-- to native 64-bit arithmetic rather than the portable module's 32-bit halves.
+const ffi = require("ffi")
 
-native.ffi.cdef[[
-int32_t nuppNativeXxh64Digest(const uint8_t *, size_t, uint8_t *, size_t);
-]]
+const P1 = 0x9E3779B185EBCA87ULL
+const P2 = 0xC2B2AE3D27D4EB4FULL
+const P3 = 0x165667B19E3779F9ULL
+const P4 = 0x85EBCA77C2B2AE63ULL
+const P5 = 0x27D4EB2F165667C5ULL
+const SECOND_SEED = 0x9E3779B97F4A7C15ULL
+const HEX = "0123456789abcdef"
 
-local ffi = native.ffi
-const C = native.C
-local ffiString: function(borrows source: const uint8[?], count: integer): string = ffi.string as any
+local function rotl(value: uint64, count: integer): uint64
+    return (value << count) | (value >> (64 - count))
+end
+
+local function round(lane: uint64, input: uint64): uint64
+    return rotl(lane + input * P2, 31) * P1
+end
+
+local function merge(hash: uint64, lane: uint64): uint64
+    return (hash ~ round(0ULL, lane)) * P1 + P4
+end
+
+local function read64(bytes: any, at: integer): uint64
+    local value = 0ULL
+    for index = 7, 0, -1 do
+        value = (value << 8) | bytes[at + index]
+    end
+    return value
+end
+
+local function read32(bytes: any, at: integer): uint64
+    return 0ULL + bytes[at] + bytes[at + 1] * 0x100 + bytes[at + 2] * 0x10000 + bytes[at + 3] * 0x1000000
+end
+
+--- XXH64 of `input` under `seed`.
+local function xxh64(input: string, seed: uint64): uint64
+    local bytes: any = ffi.cast("const uint8_t *", input)
+    local size = #input
+    local at = 0
+    local hash: uint64
+    if size >= 32 then
+        local v1 = seed + P1 + P2
+        local v2 = seed + P2
+        local v3 = seed
+        local v4 = seed - P1
+        while at <= size - 32 do
+            v1 = round(v1, read64(bytes, at))
+            v2 = round(v2, read64(bytes, at + 8))
+            v3 = round(v3, read64(bytes, at + 16))
+            v4 = round(v4, read64(bytes, at + 24))
+            at = at + 32
+        end
+        hash = rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18)
+        hash = merge(hash, v1)
+        hash = merge(hash, v2)
+        hash = merge(hash, v3)
+        hash = merge(hash, v4)
+    else
+        hash = seed + P5
+    end
+    hash = hash + size
+    while at + 8 <= size do
+        hash = hash ~ round(0ULL, read64(bytes, at))
+        hash = rotl(hash, 27) * P1 + P4
+        at = at + 8
+    end
+    if at + 4 <= size then
+        hash = hash ~ (read32(bytes, at) * P1)
+        hash = rotl(hash, 23) * P2 + P3
+        at = at + 4
+    end
+    while at < size do
+        hash = hash ~ ((0ULL + bytes[at]) * P5)
+        hash = rotl(hash, 11) * P1
+        at = at + 1
+    end
+    hash = hash ~ (hash >> 33)
+    hash = hash * P2
+    hash = hash ~ (hash >> 29)
+    hash = hash * P3
+    return hash ~ (hash >> 32)
+end
+
+local function hex(value: uint64): string
+    local digits: {string} = {}
+    for index = 16, 1, -1 do
+        local nibble = (tonumber(value & 0xFULL) as integer) + 1
+        digits[index] = HEX:sub(nibble, nibble)
+        value = value >> 4
+    end
+    return table.concat(digits)
+end
 
 --- The same 32 lowercase hex digits as `nupp.compiler.hash.digest`.
 export function digest(input: string): string
-    local output = ffi.new<uint8[32]>()
-    native.succeeded(C.nuppNativeXxh64Digest(input, #input, output, 32), 2)
-
-    return ffiString(ffi.cast<const uint8[?]>(output), 32)
+    return hex(xxh64(input, 0ULL)) .. hex(xxh64(input, SECOND_SEED))
 end

@@ -76,8 +76,8 @@ rustc=$(rustup which rustc)
 # path on Windows and is not reliably consumable by POSIX tools in Git Bash.
 exact_root=${TMPDIR:-/tmp}/nupp-gpu-exact-$$
 trap 'rm -rf "$exact_root"' EXIT HUP INT TERM
-non_gpu_features=base,files,http,net,process,tls,uri,uuid
-gpu_features=base,files,gpu,http,net,process,tls,uri,uuid
+non_gpu_features=base,files,http,net,process,tls,uri
+gpu_features=base,files,gpu,http,net,process,tls,uri
 
 measure_provider non_gpu "$non_gpu_features" "$exact_root/non-gpu"
 measure_provider gpu "$gpu_features" "$exact_root/gpu"

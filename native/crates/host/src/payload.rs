@@ -4,7 +4,7 @@
 //! little-endian 64-bit Mach-O instead puts that trailer immediately before
 //! the zero alignment padding and final code-signature blob.
 
-use nupp_native_platform::trailer_digest;
+use crate::platform::trailer_digest;
 use std::fmt;
 use std::path::{Path, PathBuf};
 

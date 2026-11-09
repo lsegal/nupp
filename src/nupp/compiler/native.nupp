@@ -652,12 +652,6 @@ local FEATURES: {[string]: native.Feature} = {
     ] = {
         name = "uuid",
         modules = {"nupp.runtime.provider.nativeuuid"},
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "uuid",
-        library = "nupp_native",
-        binary = true,
-        requires = {"runtime.native"},
     },
     ["native.files"] = {
         name = "files",
@@ -719,12 +713,7 @@ local FEATURES: {[string]: native.Feature} = {
         host = "native-time",
         module = "nupp.runtime.provider.nativetime",
         runtimeModule = "nupp.runtime.provider.nativetime",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "base",
-        library = "nupp_native",
-        binary = true,
-        requires = {"runtime.suspension", "runtime.native"},
+        requires = {"runtime.suspension"},
     },
     ["native.net"] = {
         name = "net",
@@ -906,7 +895,7 @@ local FEATURES: {[string]: native.Feature} = {
     ["native.host"] = {name = "host", module = "nupp.runtime.provider.nativehost", requires = {"runtime.suspension"}},
     [
         "native.crypto"
-    ] = {name = "crypto", module = "nupp.runtime.provider.nativecrypto", requires = {"runtime.native"},},
+    ] = {name = "crypto", module = "nupp.runtime.provider.nativecrypto"},
 }
 
 local byGlobal: {[string]: string} = {}

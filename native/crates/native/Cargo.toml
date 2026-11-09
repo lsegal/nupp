@@ -13,7 +13,6 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 [features]
 default = ["base"]
 base = []
-uuid = ["nupp-native-platform/uuid"]
 gpu = ["base", "dep:nupp-native-gpu"]
 uri = ["base", "dep:url"]
 http = ["base", "dep:nupp-native-http"]
@@ -33,7 +32,6 @@ nupp-native-http = { path = "../http", optional = true }
 nupp-native-net = { path = "../net", optional = true }
 nupp-native-tls = { path = "../tls", optional = true }
 nupp-native-files = { path = "../files", optional = true, default-features = false }
-nupp-native-platform = { path = "../platform" }
 nupp-native-process = { path = "../process", optional = true }
 nupp-native-runtime = { path = "../runtime" }
 nupp-native-compression = { path = "../compression", optional = true }

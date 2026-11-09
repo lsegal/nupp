@@ -1,0 +1,257 @@
+@!internal
+
+--[[Clocks, sleeping and system randomness for native targets.
+
+Each operation calls the operating system through LuaJIT's FFI, choosing the
+same source the former Rust platform crate used so that readings agree with the
+executable host's own clock:
+
+- the monotonic clock is `QueryPerformanceCounter` on Windows,
+  `mach_absolute_time` on Darwin and `CLOCK_MONOTONIC` elsewhere;
+- wall time is `GetSystemTimePreciseAsFileTime` on Windows and
+  `CLOCK_REALTIME` elsewhere;
+- a sleep keeps its sub-millisecond part, through a high-resolution waitable
+  timer on Windows and `nanosleep` elsewhere;
+- randomness is `BCryptGenRandom` with the system-preferred generator on
+  Windows and `getentropy` elsewhere.
+
+UUIDs are assembled here from that randomness and the wall clock.
+]]
+module nupp.runtime.provider.nativeplatform
+
+const ffi = require("ffi")
+
+local C: any = ffi.C
+local system: string = (ffi as any).os
+local windows = system == "Windows"
+local darwin = system == "OSX"
+
+--- Declares one C prototype, tolerating another module having declared it first.
+local function declare(text: string): nil
+    pcall(ffi.cdef, text)
+end
+
+--- The largest wait one call may request, the former provider's bound: callers
+--- use deadlines and repeat bounded waits rather than relying on one long sleep.
+local MAX_SLEEP_MS = 4294967294
+
+local monotonicNs: function(): uint64
+local wallMs: function(): uint64
+local pause: function(milliseconds: number): nil
+local fill: function(output: any, count: integer): (boolean, string?)
+
+if windows then
+    declare("int32_t QueryPerformanceCounter(int64_t *);")
+    declare("int32_t QueryPerformanceFrequency(int64_t *);")
+    declare("void GetSystemTimePreciseAsFileTime(uint64_t *);")
+    declare("void *CreateWaitableTimerExW(void *, const uint16_t *, uint32_t, uint32_t);")
+    declare("int32_t SetWaitableTimer(void *, const int64_t *, int32_t, void *, void *, int32_t);")
+    declare("uint32_t WaitForSingleObject(void *, uint32_t);")
+    declare("int32_t CloseHandle(void *);")
+    declare("void Sleep(uint32_t);")
+    declare("int32_t BCryptGenRandom(void *, uint8_t *, uint32_t, uint32_t);")
+
+    local counter = ffi.new("int64_t[1]")
+    assert(C.QueryPerformanceFrequency(counter) ~= 0, "QueryPerformanceFrequency failed")
+    local frequency: uint64 = 0ULL + counter[0]
+    monotonicNs = function(): uint64
+        assert(C.QueryPerformanceCounter(counter) ~= 0, "QueryPerformanceCounter failed")
+        local ticks: uint64 = 0ULL + counter[0]
+        -- Whole seconds and the remainder separately, so the multiplication by a
+        -- billion cannot overflow however long the machine has been up.
+        return ticks // frequency * 1000000000ULL + ticks % frequency * 1000000000ULL // frequency
+    end
+
+    local filetime = ffi.new("uint64_t[1]")
+    -- 100-nanosecond intervals between 1601-01-01 and 1970-01-01.
+    local EPOCH_OFFSET = 116444736000000000ULL
+    wallMs = function(): uint64
+        C.GetSystemTimePreciseAsFileTime(filetime)
+        local intervals: uint64 = filetime[0]
+        if intervals < EPOCH_OFFSET then
+            return 0ULL
+        end
+        return (intervals - EPOCH_OFFSET) // 10000ULL
+    end
+
+    local CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002
+    local TIMER_ALL_ACCESS = 0x001F0003
+    local INFINITE = 0xFFFFFFFF
+    local due = ffi.new("int64_t[1]")
+    local timer: any = nil
+    pause = function(milliseconds: number): nil
+        if timer == nil then
+            local created = C.CreateWaitableTimerExW(nil, nil, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+            if created ~= nil then
+                timer = ffi.gc(created, C.CloseHandle)
+            else
+                timer = false
+            end
+        end
+        if timer then
+            -- A negative due time is relative, in 100-nanosecond units.
+            due[0] = -math.max(1, math.floor(milliseconds * 10000))
+            if C.SetWaitableTimer(timer, due, 0, nil, nil, 0) ~= 0 then
+                C.WaitForSingleObject(timer, INFINITE)
+                return
+            end
+        end
+        C.Sleep(math.ceil(milliseconds))
+    end
+
+    local BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2
+    local bcrypt: any = nil
+    fill = function(output: any, count: integer): (boolean, string?)
+        if bcrypt == nil then
+            local loaded, library = pcall(ffi.load, "bcrypt")
+            if not loaded then
+                return false, tostring(library)
+            end
+            bcrypt = library
+        end
+        local status = bcrypt.BCryptGenRandom(nil, output, count, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+        if status ~= 0 then
+            return false, ("BCryptGenRandom failed with status 0x%08x"):format(bit.band(status, 0xFFFFFFFF))
+        end
+        return true, nil
+    end
+else
+    declare("typedef struct { long seconds; long nanoseconds; } nupp_platform_timespec;")
+    declare("int clock_gettime(int, nupp_platform_timespec *);")
+    declare("int nanosleep(const nupp_platform_timespec *, nupp_platform_timespec *);")
+    declare("int getentropy(void *, size_t);")
+
+    local CLOCK_REALTIME = 0
+    local CLOCK_MONOTONIC = 1
+    local now = ffi.new("nupp_platform_timespec")
+    local function reading(clock: integer): uint64
+        assert(C.clock_gettime(clock, now) == 0, "clock_gettime failed")
+        return (0ULL + now.seconds) * 1000000000ULL + now.nanoseconds
+    end
+
+    if darwin then
+        declare("typedef struct { uint32_t numer; uint32_t denom; } nupp_platform_timebase;")
+        declare("uint64_t mach_absolute_time(void);")
+        declare("int mach_timebase_info(nupp_platform_timebase *);")
+        local timebase = ffi.new("nupp_platform_timebase")
+        assert(C.mach_timebase_info(timebase) == 0 and timebase.denom ~= 0, "mach_timebase_info failed")
+        local numer: uint64 = 0ULL + timebase.numer
+        local denom: uint64 = 0ULL + timebase.denom
+        monotonicNs = function(): uint64
+            local ticks: uint64 = C.mach_absolute_time()
+            return ticks // denom * numer + ticks % denom * numer // denom
+        end
+    else
+        monotonicNs = function(): uint64
+            return reading(CLOCK_MONOTONIC)
+        end
+    end
+
+    wallMs = function(): uint64
+        return reading(CLOCK_REALTIME) // 1000000ULL
+    end
+
+    local request = ffi.new("nupp_platform_timespec")
+    local remaining = ffi.new("nupp_platform_timespec")
+    pause = function(milliseconds: number): nil
+        local seconds = math.floor(milliseconds / 1000)
+        request.seconds = seconds
+        request.nanoseconds = math.floor((milliseconds - seconds * 1000) * 1000000)
+        -- An interrupted sleep reports what was left; carry on with that.
+        while C.nanosleep(request, remaining) ~= 0 do
+            if ffi.errno() ~= 4 then
+                return
+            end
+            request.seconds = remaining.seconds
+            request.nanoseconds = remaining.nanoseconds
+        end
+    end
+
+    -- getentropy answers at most 256 bytes a call.
+    local ENTROPY_CHUNK = 256
+    fill = function(output: any, count: integer): (boolean, string?)
+        local bytes = ffi.cast("uint8_t *", output)
+        local offset = 0
+        while offset < count do
+            local length = math.min(ENTROPY_CHUNK, count - offset)
+            if C.getentropy(bytes + offset, length) ~= 0 then
+                return false, "getentropy failed with errno " .. tostring(ffi.errno())
+            end
+            offset = offset + length
+        end
+        return true, nil
+    end
+end
+
+--- Nanoseconds on the monotonic clock, from an unspecified origin.
+export function monotonic(): uint64
+    return monotonicNs()
+end
+
+--- Milliseconds since the Unix epoch.
+export function walltime(): uint64
+    return wallMs()
+end
+
+--- Blocks the calling thread for `milliseconds`, keeping the fractional part.
+--- @raises string when the duration is negative, infinite or not a number
+export function sleep(milliseconds: number): nil
+    if milliseconds ~= milliseconds or milliseconds < 0 or milliseconds == math.huge then
+        error("sleep duration must be a finite non-negative number", 2)
+    end
+    if milliseconds == 0 then
+        return
+    end
+    pause(math.min(milliseconds, MAX_SLEEP_MS))
+end
+
+--- Fills `count` bytes at `output` from the operating system's secure source.
+--- @raises string when the system has no randomness to draw on
+export function fillrandom(output: any, count: integer): nil
+    if count == 0 then
+        return
+    end
+    local ok, problem = fill(output, count)
+    if not ok then
+        error("the system has no randomness to draw on: " .. tostring(problem), 2)
+    end
+end
+
+local HEX = "0123456789abcdef"
+
+local function uuid(version: integer, timestamp: uint64?): string
+    local bytes = ffi.new("uint8_t[16]")
+    fillrandom(bytes, 16)
+    if timestamp ~= nil then
+        local value: uint64 = timestamp
+        for index = 5, 0, -1 do
+            bytes[index] = tonumber(value % 256ULL)
+            value = value // 256ULL
+        end
+    end
+    bytes[6] = bit.bor(bit.band(bytes[6], 0x0f), bit.lshift(version, 4))
+    bytes[8] = bit.bor(bit.band(bytes[8], 0x3f), 0x80)
+    local parts: {string} = {}
+    for index = 0, 15 do
+        if index == 4 or index == 6 or index == 8 or index == 10 then
+            parts[#parts + 1] = "-"
+        end
+        local byte = bytes[index] as integer
+        local high = bit.rshift(byte, 4) + 1
+        local low = bit.band(byte, 15) + 1
+        parts[#parts + 1] = HEX:sub(high, high) .. HEX:sub(low, low)
+    end
+    return table.concat(parts)
+end
+
+--- A random version 4 UUID, hyphenated and lowercase.
+--- @raises string when the system has no randomness to draw on
+export function uuid4(): string
+    return uuid(4, nil)
+end
+
+--- A time-ordered version 7 UUID, hyphenated and lowercase.
+--- @raises string when the system has no randomness to draw on
+export function uuid7(): string
+    return uuid(7, wallMs())
+end

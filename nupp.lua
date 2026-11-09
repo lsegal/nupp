@@ -221,6 +221,10 @@ local RESOURCES = {
         output = "nupp/compiler/nupp/runtime/provider/nativetime.nupp"
     },
     {
+        source = "src/nupp/runtime/provider/nativeplatform.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativeplatform.nupp"
+    },
+    {
         source = "src/nupp/runtime/provider/nativestorage.nupp",
         output = "nupp/compiler/nupp/runtime/provider/nativestorage.nupp"
     },

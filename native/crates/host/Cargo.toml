@@ -16,7 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 nupp-native = { path = "../native", default-features = false, features = ["base"] }
-nupp-native-platform = { path = "../platform" }
 nupp-native-runtime = { path = "../runtime" }
 
 [target.'cfg(unix)'.dependencies]
