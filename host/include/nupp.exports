@@ -211,20 +211,14 @@ nuppNativeLastError
 nuppAotRuntime
 nuppNativeBytesCopy
 nuppNativeBytesRelease
+nuppNativeMonotonicNs
+nuppNativeWallMs
+nuppNativeSleepMs
 nuppNativePoll
 nuppNativeWait
 nuppNativeAvailableParallelism
-
-[native-compression]
-nuppNativeCompressionEncoderCreate
-nuppNativeCompressionEncoderWrite
-nuppNativeCompressionEncoderFlush
-nuppNativeCompressionEncoderFinish
-nuppNativeCompressionEncoderRelease
-nuppNativeCompressionDecoderCreate
-nuppNativeCompressionDecoderRead
-nuppNativeCompressionDecoderFinishInput
-nuppNativeCompressionDecoderRelease
+nuppNativeRandomBytes
+nuppNativeXxh64Digest
 
 [native-files]
 nuppNativeFilesInfo

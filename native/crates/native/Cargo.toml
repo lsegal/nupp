@@ -13,6 +13,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 [features]
 default = ["base"]
 base = []
+uuid = ["nupp-native-platform/uuid"]
 gpu = ["base", "dep:nupp-native-gpu"]
 uri = ["base", "dep:url"]
 http = ["base", "dep:nupp-native-http"]
@@ -21,7 +22,6 @@ net = ["base", "dep:nupp-native-net"]
 tls = ["net", "dep:nupp-native-tls"]
 filesystem = ["base", "dep:nupp-native-files"]
 files = ["filesystem", "nupp-native-files/lane"]
-compression = ["base", "dep:nupp-native-compression"]
 # The AOT code generator: LLVM and lld, linked in (NUPP_LLVM_PREFIX).
 codegen = ["base", "dep:nupp-native-codegen", "nupp-native-codegen/llvm"]
 
@@ -32,9 +32,9 @@ nupp-native-http = { path = "../http", optional = true }
 nupp-native-net = { path = "../net", optional = true }
 nupp-native-tls = { path = "../tls", optional = true }
 nupp-native-files = { path = "../files", optional = true, default-features = false }
+nupp-native-platform = { path = "../platform" }
 nupp-native-process = { path = "../process", optional = true }
 nupp-native-runtime = { path = "../runtime" }
-nupp-native-compression = { path = "../compression", optional = true }
 nupp-native-codegen = { path = "../codegen", optional = true }
 url = { version = "2.5.7", optional = true }
 

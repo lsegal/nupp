@@ -45,9 +45,12 @@
 /* A call that copies bytes into caller-owned storage writes the byte count to
  * its length output first, then returns BUFFER_TOO_SMALL when the capacity is
  * short. A zero-capacity call therefore asks the size of a nonempty value, and
- * no copied output carries a trailing NUL. */
+ * no copied output carries a trailing NUL. The UUID and digest calls, whose
+ * outputs have a fixed size and no length output, are the exceptions, and a
+ * UUID does end in a NUL. */
 
 #define NUPP_NATIVE_FEATURE_BASE (UINT64_C(1) << 0)
+#define NUPP_NATIVE_FEATURE_UUID (UINT64_C(1) << 1)
 #define NUPP_NATIVE_FEATURE_GPU (UINT64_C(1) << 2)
 #define NUPP_NATIVE_FEATURE_URI (UINT64_C(1) << 3)
 #define NUPP_NATIVE_FEATURE_HTTP (UINT64_C(1) << 4)
@@ -56,7 +59,6 @@
 #define NUPP_NATIVE_FEATURE_FILE_TRANSFER (UINT64_C(1) << 7)
 #define NUPP_NATIVE_FEATURE_NET (UINT64_C(1) << 8)
 #define NUPP_NATIVE_FEATURE_TLS (UINT64_C(1) << 9)
-#define NUPP_NATIVE_FEATURE_COMPRESSION (UINT64_C(1) << 10)
 /* The code generator. Its exports belong to the compiler, which declares
  * them itself; this header does not. */
 #define NUPP_NATIVE_FEATURE_CODEGEN (UINT64_C(1) << 11)
@@ -94,7 +96,14 @@ NUPP_NATIVE_EXPORT int32_t nuppNativeBytesCopy(
     uint64_t handle, uint8_t *data, size_t capacity, size_t *length);
 NUPP_NATIVE_EXPORT int32_t nuppNativeBytesRelease(uint64_t handle);
 
+NUPP_NATIVE_EXPORT uint64_t nuppNativeMonotonicNs(void);
+NUPP_NATIVE_EXPORT uint64_t nuppNativeWallMs(void);
+NUPP_NATIVE_EXPORT int32_t nuppNativeSleepMs(double milliseconds);
+
 NUPP_NATIVE_EXPORT size_t nuppNativeAvailableParallelism(void);
+NUPP_NATIVE_EXPORT int32_t nuppNativeRandomBytes(uint8_t *output, size_t length);
+NUPP_NATIVE_EXPORT int32_t nuppNativeXxh64Digest(
+    const uint8_t *data, size_t length, uint8_t *output, size_t capacity);
 
 /* Present when NUPP_NATIVE_FEATURE_READINESS is set. One process-wide
  * generation that every family advances when something a caller could be
@@ -111,40 +120,6 @@ NUPP_NATIVE_EXPORT size_t nuppNativeAvailableParallelism(void);
 NUPP_NATIVE_EXPORT int32_t nuppNativePoll(uint64_t *generation);
 NUPP_NATIVE_EXPORT int32_t nuppNativeWait(
     uint64_t generation, uint64_t timeout_ms, uint64_t *output_generation);
-
-/* Present when NUPP_NATIVE_FEATURE_COMPRESSION is set. Input and output
- * ranges are borrowed only for one call. */
-#define NUPP_NATIVE_COMPRESSION_GZIP 1u
-#define NUPP_NATIVE_COMPRESSION_ZLIB 2u
-#define NUPP_NATIVE_COMPRESSION_DEFLATE_RAW 3u
-#define NUPP_NATIVE_COMPRESSION_NEED_INPUT 1u
-#define NUPP_NATIVE_COMPRESSION_NEED_OUTPUT 2u
-#define NUPP_NATIVE_COMPRESSION_FINISHED 3u
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderCreate(
-    uint32_t format, uint32_t level, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderWrite(
-    uint64_t encoder, const uint8_t *input, size_t input_length,
-    uint8_t *output, size_t output_capacity, size_t *consumed,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderFlush(
-    uint64_t encoder, uint8_t *output, size_t output_capacity,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderFinish(
-    uint64_t encoder, uint8_t *output, size_t output_capacity,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderRelease(
-    uint64_t encoder);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionDecoderCreate(
-    uint32_t format, int32_t concatenated_members, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionDecoderRead(
-    uint64_t decoder, const uint8_t *input, size_t input_length,
-    uint8_t *output, size_t output_capacity, size_t *consumed,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionDecoderFinishInput(
-    uint64_t decoder, uint8_t *output, size_t output_capacity,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionDecoderRelease(
-    uint64_t decoder);
 
 /* Present when NUPP_NATIVE_FEATURE_FILESYSTEM is set. Path values are
  * length-delimited platform-native bytes and variable outputs are owned byte
@@ -520,6 +495,11 @@ NUPP_NATIVE_EXPORT int32_t nuppNativeTlsProtocol(
     uint64_t session, uint8_t *output, size_t capacity,
     size_t *length, int32_t *present);
 NUPP_NATIVE_EXPORT int32_t nuppNativeTlsRelease(uint64_t session);
+
+/* Present when NUPP_NATIVE_FEATURE_UUID is set. Both outputs require a
+ * capacity of at least 37 bytes and include their trailing NUL. */
+NUPP_NATIVE_EXPORT int32_t nuppNativeUuid4(uint8_t *output, size_t capacity);
+NUPP_NATIVE_EXPORT int32_t nuppNativeUuid7(uint8_t *output, size_t capacity);
 
 /* Present when NUPP_NATIVE_FEATURE_URI is set. URI values are immutable
  * generational handles. Text and components are copied into caller-owned

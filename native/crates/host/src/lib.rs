@@ -14,7 +14,6 @@ mod host_channel;
 mod lua;
 mod mcode;
 mod payload;
-mod platform;
 mod sharedbytes;
 mod worker_adapter;
 mod workers;

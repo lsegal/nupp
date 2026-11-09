@@ -11,8 +11,6 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "codegen")]
 mod codegen;
-#[cfg(feature = "compression")]
-mod compression;
 #[cfg(any(feature = "files", feature = "filesystem"))]
 mod files;
 #[cfg(feature = "gpu")]
@@ -32,6 +30,7 @@ mod uri;
 static PANICKED: &std::ffi::CStr = c"native provider panicked";
 
 const FEATURE_BASE: u64 = 1 << 0;
+const FEATURE_UUID: u64 = 1 << 1;
 const FEATURE_GPU: u64 = 1 << 2;
 const FEATURE_URI: u64 = 1 << 3;
 const FEATURE_HTTP: u64 = 1 << 4;
@@ -40,7 +39,6 @@ const FEATURE_FILESYSTEM: u64 = 1 << 6;
 const FEATURE_FILE_TRANSFER: u64 = 1 << 7;
 const FEATURE_NET: u64 = 1 << 8;
 const FEATURE_TLS: u64 = 1 << 9;
-const FEATURE_COMPRESSION: u64 = 1 << 10;
 const FEATURE_CODEGEN: u64 = 1 << 11;
 const FEATURE_AOT_RUNTIME: u64 = 1 << 12;
 const FEATURE_NET_ENDPOINT: u64 = 1 << 13;
@@ -95,6 +93,11 @@ pub extern "C" fn nuppNativeFeatures() -> u64 {
     guard(0, || {
         FEATURE_BASE
             | FEATURE_READINESS
+            | if cfg!(feature = "uuid") {
+                FEATURE_UUID
+            } else {
+                0
+            }
             | if cfg!(feature = "gpu") {
                 FEATURE_GPU
             } else {
@@ -132,11 +135,6 @@ pub extern "C" fn nuppNativeFeatures() -> u64 {
             }
             | if cfg!(feature = "tls") {
                 FEATURE_TLS
-            } else {
-                0
-            }
-            | if cfg!(feature = "compression") {
-                FEATURE_COMPRESSION
             } else {
                 0
             }
@@ -238,9 +236,50 @@ pub extern "C" fn nuppNativeBytesRelease(raw: u64) -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nuppNativeMonotonicNs() -> u64 {
+    guard(0, || nupp_native_platform::monotonic_ns())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nuppNativeAvailableParallelism() -> usize {
     guard(1, || {
         std::thread::available_parallelism().map_or(1, usize::from)
+    })
+}
+
+/// Fills a caller-owned buffer with cryptographically secure random bytes.
+///
+/// # Safety
+///
+/// When length is nonzero, output must be writable for length bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nuppNativeRandomBytes(output: *mut u8, length: usize) -> i32 {
+    boundary(|| {
+        if length == 0 {
+            return Status::Ok.code();
+        }
+        if output.is_null() {
+            return failed(Status::InvalidArgument, "random byte output is null");
+        }
+        // SAFETY: the caller guarantees the checked non-null range is writable.
+        let destination = unsafe { std::slice::from_raw_parts_mut(output, length) };
+        match nupp_native_platform::random_bytes(destination) {
+            Ok(()) => Status::Ok.code(),
+            Err(message) => failed(Status::Internal, &message),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nuppNativeWallMs() -> u64 {
+    guard(0, || nupp_native_platform::wall_ms())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nuppNativeSleepMs(milliseconds: f64) -> i32 {
+    boundary(|| match nupp_native_platform::sleep_ms(milliseconds) {
+        Ok(()) => Status::Ok.code(),
+        Err(message) => failed(Status::InvalidArgument, message),
     })
 }
 
@@ -291,6 +330,82 @@ pub unsafe extern "C" fn nuppNativeWait(
         unsafe { output_generation.write(found) };
         Status::Ok.code()
     })
+}
+
+#[unsafe(no_mangle)]
+/// Writes the two-seed, lowercase XXH64 cache digest.
+///
+/// # Safety
+///
+/// When `length` is nonzero, `data` must be readable for `length` bytes.
+/// `output` must be writable for at least `capacity` bytes.
+pub unsafe extern "C" fn nuppNativeXxh64Digest(
+    data: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    boundary(|| {
+        if capacity < 32 {
+            return failed(Status::BufferTooSmall, "XXH64 digest output needs 32 bytes");
+        }
+        if output.is_null() {
+            return failed(Status::InvalidArgument, "XXH64 digest output is null");
+        }
+        let value = match input(data, length) {
+            Ok(value) => nupp_native_platform::cache_digest(value),
+            Err(status) => return status,
+        };
+        // SAFETY: the output capacity was checked above.
+        unsafe { ptr::copy_nonoverlapping(value.as_ptr(), output, value.len()) };
+        Status::Ok.code()
+    })
+}
+
+#[cfg(feature = "uuid")]
+unsafe fn write_uuid(
+    make: fn() -> Result<String, String>,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    if capacity < 37 {
+        return failed(Status::BufferTooSmall, "UUID output needs 37 bytes");
+    }
+    if output.is_null() {
+        return failed(Status::InvalidArgument, "UUID output is null");
+    }
+    let value = match make() {
+        Ok(value) => value,
+        Err(error) => return failed(Status::Internal, &error),
+    };
+    // SAFETY: the output capacity was checked and a canonical UUID is 36 bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(value.as_ptr(), output, value.len());
+        output.add(value.len()).write(0);
+    }
+    Status::Ok.code()
+}
+
+#[cfg(feature = "uuid")]
+#[unsafe(no_mangle)]
+/// Writes a canonical UUIDv4 followed by a NUL byte.
+///
+/// # Safety
+///
+/// `output` must be writable for at least `capacity` bytes.
+pub unsafe extern "C" fn nuppNativeUuid4(output: *mut u8, capacity: usize) -> i32 {
+    boundary(|| unsafe { write_uuid(nupp_native_platform::uuid4, output, capacity) })
+}
+
+#[cfg(feature = "uuid")]
+#[unsafe(no_mangle)]
+/// Writes a canonical UUIDv7 followed by a NUL byte.
+///
+/// # Safety
+///
+/// `output` must be writable for at least `capacity` bytes.
+pub unsafe extern "C" fn nuppNativeUuid7(output: *mut u8, capacity: usize) -> i32 {
+    boundary(|| unsafe { write_uuid(nupp_native_platform::uuid7, output, capacity) })
 }
 
 #[cfg(test)]
@@ -345,6 +460,7 @@ mod tests {
         let header = std::fs::read_to_string(root.join("../../include/nupp_native.h")).unwrap();
         for (name, value) in [
             ("BASE", FEATURE_BASE),
+            ("UUID", FEATURE_UUID),
             ("GPU", FEATURE_GPU),
             ("URI", FEATURE_URI),
             ("HTTP", FEATURE_HTTP),
@@ -353,7 +469,6 @@ mod tests {
             ("FILE_TRANSFER", FEATURE_FILE_TRANSFER),
             ("NET", FEATURE_NET),
             ("TLS", FEATURE_TLS),
-            ("COMPRESSION", FEATURE_COMPRESSION),
             ("CODEGEN", FEATURE_CODEGEN),
             ("AOT_RUNTIME", FEATURE_AOT_RUNTIME),
             ("NET_ENDPOINT", FEATURE_NET_ENDPOINT),
@@ -403,6 +518,21 @@ mod tests {
     }
 
     #[test]
+    fn digest_outputs_are_capacity_checked() {
+        let mut short = [0; 31];
+        assert_eq!(
+            unsafe { nuppNativeXxh64Digest(ptr::null(), 0, short.as_mut_ptr(), short.len()) },
+            Status::BufferTooSmall.code()
+        );
+        let mut output = [0; 32];
+        assert_eq!(
+            unsafe { nuppNativeXxh64Digest(ptr::null(), 0, output.as_mut_ptr(), output.len()) },
+            0
+        );
+        assert_eq!(&output[..16], b"ef46db3751d8e999");
+    }
+
+    #[test]
     fn one_readiness_generation_answers_poll_and_wait() {
         let mut seen = 0;
         assert_eq!(unsafe { nuppNativePoll(&mut seen) }, 0);
@@ -418,6 +548,29 @@ mod tests {
         assert_eq!(
             unsafe { nuppNativeWait(0, 0, ptr::null_mut()) },
             Status::InvalidArgument.code()
+        );
+    }
+
+    #[test]
+    fn sleep_rejects_non_finite_and_negative_durations() {
+        assert_eq!(nuppNativeSleepMs(0.0), 0);
+        assert_eq!(nuppNativeSleepMs(-1.0), Status::InvalidArgument.code());
+        assert_eq!(nuppNativeSleepMs(f64::NAN), Status::InvalidArgument.code());
+    }
+
+    #[cfg(feature = "uuid")]
+    #[test]
+    fn uuid_outputs_are_canonical_and_checked() {
+        let mut output = [0; 37];
+        assert_eq!(
+            unsafe { nuppNativeUuid4(output.as_mut_ptr(), output.len()) },
+            0
+        );
+        assert_eq!(output[14], b'4');
+        assert_eq!(output[36], 0);
+        assert_eq!(
+            unsafe { nuppNativeUuid7(output.as_mut_ptr(), 36) },
+            Status::BufferTooSmall.code()
         );
     }
 }

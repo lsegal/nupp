@@ -420,8 +420,8 @@ function M.gpuProviderMeasurementsCompareExactFeatureUnions()
     local workflow = read(ROOT .. "/.github/workflows/measurements.yml")
     local measure = read(ROOT .. "/.github/scripts/measure-gpu-provider.sh")
 
-    assert(measure:find("base,files,http,net,process,tls,uri", 1, true))
-    assert(measure:find("base,files,gpu,http,net,process,tls,uri", 1, true))
+    assert(measure:find("base,files,http,net,process,tls,uri,uuid", 1, true))
+    assert(measure:find("base,files,gpu,http,net,process,tls,uri,uuid", 1, true))
     assert(measure:find('"$exact_root/non-gpu"', 1, true), "the non-GPU cold build has no isolated target")
     assert(measure:find('"$exact_root/gpu"', 1, true), "the GPU cold build has no isolated target")
     assert(not measure:find("${RUNNER_TEMP", 1, true), "Git Bash receives a native Windows temporary path")
@@ -823,7 +823,6 @@ function M.retainedPlatformsGateTheExactRustNativeArtifacts()
         "the gate does not select the production host feature set"
     )
     for _, package in ipairs({
-        "nupp-native-compression",
         "nupp-native-files",
         "nupp-native-process",
         "nupp-native-net",

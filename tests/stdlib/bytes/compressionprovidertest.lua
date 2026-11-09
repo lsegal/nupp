@@ -1,5 +1,6 @@
 local state = require("helpers.providerstate")
 local io2 = require("io")
+local ffi = require("ffi")
 local M = {}
 
 local NEED_INPUT = 1
@@ -7,111 +8,7 @@ local NEED_OUTPUT = 2
 local FINISHED = 3
 
 local function nativeProvider()
-    local calls = {releaseCode = 0, stepCode = 0}
-    local C = {}
-    function C.nuppNativeCompressionEncoderCreate(format, level, output)
-        calls.encoderCreate = {format, level}
-        output[0] = 101
-        return 0
-    end
-
-    function C.nuppNativeCompressionEncoderWrite(
-        handle,
-        input,
-        inputLength,
-        output,
-        outputLength,
-        consumed,
-        written,
-        status
-    )
-        calls.encoderWrite = {handle, input, inputLength, output, outputLength}
-        if calls.stepCode ~= 0 then
-            return calls.stepCode
-        end
-        consumed[0], written[0], status[0] = inputLength, 2, NEED_INPUT
-
-        return 0
-    end
-
-    function C.nuppNativeCompressionEncoderFlush(handle, output, outputLength, written, status)
-        calls.encoderFlush = {handle, output, outputLength}
-        written[0], status[0] = outputLength, NEED_OUTPUT
-        return 0
-    end
-
-    function C.nuppNativeCompressionEncoderFinish(handle, output, outputLength, written, status)
-        calls.encoderFinish = {handle, output, outputLength}
-        written[0], status[0] = 1, FINISHED
-        return 0
-    end
-
-    function C.nuppNativeCompressionEncoderRelease(handle)
-        calls.encoderRelease = handle
-        return calls.releaseCode
-    end
-
-    function C.nuppNativeCompressionDecoderCreate(format, concatenated, output)
-        calls.decoderCreate = {format, concatenated}
-        output[0] = 202
-        return 0
-    end
-
-    function C.nuppNativeCompressionDecoderRead(
-        handle,
-        input,
-        inputLength,
-        output,
-        outputLength,
-        consumed,
-        written,
-        status
-    )
-        calls.decoderRead = {handle, input, inputLength, output, outputLength}
-        consumed[0], written[0], status[0] = inputLength, 3, NEED_INPUT
-        return 0
-    end
-
-    function C.nuppNativeCompressionDecoderFinishInput(handle, output, outputLength, written, status)
-        calls.decoderFinish = {handle, output, outputLength}
-        written[0], status[0] = 0, FINISHED
-        return 0
-    end
-
-    function C.nuppNativeCompressionDecoderRelease(handle)
-        calls.decoderRelease = handle
-        return calls.releaseCode
-    end
-
-    function C.nuppNativeLastError()
-        return "fixture failure"
-    end
-
-    local native = {
-        C = C,
-        ffi = {
-            cdef = function()
-            end,
-            new = function()
-                return {[0] = 0}
-            end,
-            string = tostring,
-        },
-        requireFeature = function(bit, name)
-            assert(bit == 1024 and name == "compression")
-        end,
-        succeeded = function(status)
-            if status ~= 0 then
-                error("nupp: " .. C.nuppNativeLastError(), 2)
-            end
-        end,
-    }
-    local load = state.instance({["nupp.runtime.provider.nativecompression"] = true}, {
-        ["nupp.runtime.native"] = native,
-        ["nupp.mem.span"] = {},
-    })
-
-    return load("nupp.runtime.provider.nativecompression"), calls
+    return require("nupp.runtime.provider.nativecompression")
 end
 
 local function view(pointer, count)
@@ -350,58 +247,209 @@ function M.targetBindingRetainsCatalogWithoutDiscovery()
     assert(counts.resolutions == 1, "builtin implementation initializes once")
 end
 
-function M.nativeProviderMapsTheCompressionAbi()
-    local native, calls = nativeProvider()
-    assert(native.formats.gzip.name == "gzip")
-    assert(native.formats.zlib.name == "zlib")
-    assert(native.formats["deflate-raw"].name == "deflate-raw")
-
-    local encoder = native.formats.gzip:createencoder()
-    assert(calls.encoderCreate[1] == 1 and calls.encoderCreate[2] == 6)
-    local consumed, written, status = encoder:write(view("input", 5), view("output", 7))
-    assert(consumed == 5 and written == 2 and status == NEED_INPUT)
-    assert(calls.encoderWrite[1] == 101 and calls.encoderWrite[2] == "input")
-    written, status = encoder:flush(view("flush", 7))
-    assert(written == 7 and status == NEED_OUTPUT)
-    written, status = encoder:finish(view("finish", 7))
-    assert(written == 1 and status == FINISHED)
-    encoder:close()
-    assert(calls.encoderRelease == 101)
-
-    native.formats.zlib:createencoder({level = 9}):close()
-    assert(calls.encoderCreate[1] == 2 and calls.encoderCreate[2] == 9)
-    native.formats["deflate-raw"]:createencoder({level = 0}):close()
-    assert(calls.encoderCreate[1] == 3 and calls.encoderCreate[2] == 0)
-
-    local decoder = native.formats.gzip:createdecoder()
-    assert(calls.decoderCreate[1] == 1 and calls.decoderCreate[2] == 1)
-    consumed, written, status = decoder:read(view("encoded", 4), view("decoded", 8))
-    assert(consumed == 4 and written == 3 and status == NEED_INPUT)
-    written, status = decoder:finishinput(view("tail", 8))
-    assert(written == 0 and status == FINISHED)
-    decoder:close()
-    assert(calls.decoderRelease == 202)
-
-    native.formats.gzip:createdecoder({concatenatedmembers = false}):close()
-    assert(calls.decoderCreate[2] == 0)
-    native.formats.zlib:createdecoder():close()
-    assert(calls.decoderCreate[1] == 2 and calls.decoderCreate[2] == 0)
+local function buffer(count)
+    local storage = ffi.new("uint8_t[?]", math.max(count, 1))
+    return storage, view(storage, count)
 end
 
-function M.nativeProviderMapsStepAndReleaseFailures()
-    local native, calls = nativeProvider()
-    local encoder = native.formats.gzip:createencoder()
-    calls.stepCode = 7
-    local consumed, written, status, reason = encoder:write(view("input", 1), view("output", 1))
-    assert(consumed == nil and written == nil and status == nil)
-    assert(reason == "compression encode failed: fixture failure")
-    calls.releaseCode = 8
-    local ok, problem = pcall(encoder.close, encoder)
-    assert(not ok and tostring(problem):find("nupp: fixture failure", 1, true), tostring(problem))
+local function bytesOf(text)
+    local storage = ffi.new("uint8_t[?]", math.max(#text, 1))
+    ffi.copy(storage, text, #text)
+    return storage
+end
 
-    local decoder = native.formats.gzip:createdecoder()
-    ok, problem = pcall(decoder.close, decoder)
-    assert(not ok and tostring(problem):find("nupp: fixture failure", 1, true), tostring(problem))
+local function encode(name, input, chunk, options)
+    local encoder = nativeProvider().formats[name]:createencoder(options)
+    local answer = {}
+    local at = 0
+    local source = bytesOf(input)
+    while at < #input do
+        local storage, output = buffer(chunk)
+        local consumed, written, status = encoder:write(view(source + at, #input - at), output)
+        assert(consumed ~= nil, status)
+        at = at + consumed
+        answer[#answer + 1] = ffi.string(storage, written)
+    end
+    while true do
+        local storage, output = buffer(chunk)
+        local written, status = encoder:finish(output)
+        answer[#answer + 1] = ffi.string(storage, written)
+        if status == FINISHED then
+            break
+        end
+    end
+    encoder:close()
+    return table.concat(answer)
+end
+
+local function decode(name, input, chunk, options)
+    local decoder = nativeProvider().formats[name]:createdecoder(options)
+    local answer = {}
+    local at = 0
+    local source = bytesOf(input)
+    while at < #input do
+        local storage, output = buffer(chunk)
+        local consumed, written, status, reason = decoder:read(view(source + at, #input - at), output)
+        if consumed == nil then
+            decoder:close()
+            return nil, reason
+        end
+        at = at + consumed
+        answer[#answer + 1] = ffi.string(storage, written)
+        if status == FINISHED then
+            assert(at == #input, "a finished stream left input unread")
+            decoder:close()
+            return table.concat(answer)
+        end
+    end
+    while true do
+        local storage, output = buffer(chunk)
+        local written, status, reason = decoder:finishinput(output)
+        if written == nil then
+            decoder:close()
+            return nil, reason
+        end
+        answer[#answer + 1] = ffi.string(storage, written)
+        if status == FINISHED then
+            decoder:close()
+            return table.concat(answer)
+        end
+        if status == NEED_INPUT then
+            decoder:close()
+            return nil, "truncated"
+        end
+    end
+end
+
+local function sample(count)
+    local parts = {}
+    local seed = 7
+    for index = 1, count do
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        -- Mostly a small alphabet, with runs, so matches of every length occur.
+        if seed % 5 == 0 then
+            parts[index] = string.rep(string.char(97 + seed % 7), seed % 40)
+        else
+            parts[index] = string.char(32 + seed % 90)
+        end
+    end
+    return table.concat(parts)
+end
+
+function M.nativeProviderRoundTripsEveryFormatAcrossOneByteBoundaries()
+    local provider = nativeProvider()
+    assert(provider.formats.gzip.name == "gzip")
+    assert(provider.formats.zlib.name == "zlib")
+    assert(provider.formats["deflate-raw"].name == "deflate-raw")
+    local input = "a bounded stream can cross any input and output boundary"
+    for _, name in ipairs({"gzip", "zlib", "deflate-raw"}) do
+        local compressed = encode(name, input, 1)
+        assert(decode(name, compressed, 1) == input, name)
+    end
+end
+
+function M.nativeProviderRoundTripsEveryLevelAndBlockShape()
+    local inputs = {"", "x", string.rep("abc", 40000), sample(30000), sample(5000) .. string.rep("\0", 70000)}
+    for _, name in ipairs({"gzip", "zlib", "deflate-raw"}) do
+        for level = 0, 9 do
+            for _, input in ipairs(inputs) do
+                local compressed = encode(name, input, 4096, {level = level})
+                local decoded, reason = decode(name, compressed, 3000)
+                assert(decoded == input, ("%s level %d length %d: %s"):format(name, level, #input, tostring(reason)))
+            end
+        end
+    end
+    local repetitive = string.rep("compression-level", 1000)
+    assert(#encode("gzip", repetitive, 65536, {level = 9}) < #encode("gzip", repetitive, 65536, {level = 0}))
+end
+
+function M.nativeProviderFlushFinishesWithAnyOutputRoom()
+    for room = 1, 8 do
+        local encoder = nativeProvider().formats.gzip:createencoder()
+        local encoded = {}
+        local storage, output = buffer(64)
+        local consumed, written = encoder:write(view(bytesOf("hello"), 5), output)
+        assert(consumed == 5)
+        encoded[#encoded + 1] = ffi.string(storage, written)
+        local calls = 0
+        repeat
+            calls = calls + 1
+            assert(calls < 1000, "a flush with " .. room .. " bytes of room never finished")
+            local small, smallView = buffer(room)
+            local flushed, status = encoder:flush(smallView)
+            encoded[#encoded + 1] = ffi.string(small, flushed)
+        until status ~= NEED_OUTPUT
+        -- Everything written so far decodes before the stream is finished.
+        local partial = nativeProvider().formats.gzip:createdecoder()
+        local joined = table.concat(encoded)
+        local out, outView = buffer(64)
+        local _, made = partial:read(view(bytesOf(joined), #joined), outView)
+        assert(ffi.string(out, made) == "hello")
+        partial:close()
+        repeat
+            local tail, tailView = buffer(64)
+            local finished, status = encoder:finish(tailView)
+            encoded[#encoded + 1] = ffi.string(tail, finished)
+        until status == FINISHED
+        assert(decode("gzip", table.concat(encoded), 7) == "hello")
+    end
+end
+
+function M.nativeProviderDeliversStagedFlushBytesFirst()
+    local encoder = nativeProvider().formats.zlib:createencoder()
+    local encoded = {}
+    local storage, output = buffer(64)
+    local _, written = encoder:write(view(bytesOf("hello"), 5), output)
+    encoded[#encoded + 1] = ffi.string(storage, written)
+    local small, smallView = buffer(2)
+    local flushed, status = encoder:flush(smallView)
+    assert(status == NEED_OUTPUT)
+    encoded[#encoded + 1] = ffi.string(small, flushed)
+    repeat
+        local consumed
+        consumed, written, status = encoder:write(view(bytesOf("abc"), 3), output)
+        encoded[#encoded + 1] = ffi.string(storage, written)
+    until consumed == 3
+    repeat
+        written, status = encoder:finish(output)
+        encoded[#encoded + 1] = ffi.string(storage, written)
+    until status == FINISHED
+    assert(decode("zlib", table.concat(encoded), 5) == "helloabc")
+end
+
+function M.nativeProviderValidatesMembersTrailersAndTruncation()
+    local compressed = encode("gzip", "hello", 64)
+    local decoded, reason = decode("gzip", compressed .. "\31", 64)
+    assert(decoded == nil and reason:find("trailing bytes", 1, true), tostring(reason))
+
+    decoded, reason = decode("gzip", compressed:sub(1, -2), 64)
+    assert(decoded == nil and reason == "truncated", tostring(reason))
+
+    local damaged = compressed:sub(1, -2) .. string.char(bit.bxor(compressed:byte(-1), 1))
+    decoded, reason = decode("gzip", damaged, 64)
+    assert(decoded == nil and reason:find("length check", 1, true), tostring(reason))
+    damaged = compressed:sub(1, -9) .. string.char(bit.bxor(compressed:byte(-8), 1)) .. compressed:sub(-7)
+    decoded, reason = decode("gzip", damaged, 64)
+    assert(decoded == nil and reason:find("data check", 1, true), tostring(reason))
+
+    local joined = encode("gzip", "hello", 2) .. encode("gzip", " world", 2)
+    assert(decode("gzip", joined, 2) == "hello world")
+    decoded = decode("gzip", joined, 64, {concatenatedmembers = false})
+    assert(decoded == nil, "a single-member decoder stops at the first member")
+end
+
+function M.nativeProviderDecodesIndependentStandardFixtures()
+    local gzip = string.char(
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x86,
+        0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00
+    )
+    local zlib = string.char(0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15)
+    local raw = string.char(0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00)
+    assert(decode("gzip", gzip, 2) == "hello")
+    assert(decode("zlib", zlib, 2) == "hello")
+    assert(decode("deflate-raw", raw, 2) == "hello")
+    local decoded, reason = decode("zlib", string.char(0x78, 0x9d) .. zlib:sub(3), 2)
+    assert(decoded == nil and reason:find("header check", 1, true), tostring(reason))
 end
 
 function M.unavailableTargetsListNoCompressionWithoutLoadingTheBackend()

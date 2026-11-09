@@ -248,6 +248,8 @@ static const char *absent_gpu_backend(void) {
 
 int main(void) {
     size_t length = 0;
+    uint8_t uuid[37];
+    uint8_t digest[32];
     uint8_t adapter[64];
     size_t adapter_length = 0;
     uint64_t uri = 0;
@@ -364,6 +366,34 @@ int main(void) {
     if (status != NUPP_NATIVE_OK) return failed("file release", status);
     if (nuppNativeFileRelease(file) != NUPP_NATIVE_STALE_HANDLE) {
         fprintf(stderr, "released file handle was revived\n");
+        return 1;
+    }
+    status = nuppNativeUuid4(uuid, sizeof uuid);
+    if (status != NUPP_NATIVE_OK) return failed("uuid4", status);
+    if (uuid[14] != '4' || uuid[36] != '\0') {
+        fprintf(stderr, "uuid4 is not canonical\n");
+        return 1;
+    }
+    status = nuppNativeUuid7(uuid, sizeof uuid);
+    if (status != NUPP_NATIVE_OK) return failed("uuid7", status);
+    if (uuid[14] != '7' || uuid[36] != '\0') {
+        fprintf(stderr, "uuid7 is not canonical\n");
+        return 1;
+    }
+    if (nuppNativeUuid4(uuid, sizeof uuid - 1)
+        != NUPP_NATIVE_BUFFER_TOO_SMALL) {
+        fprintf(stderr, "uuid4 accepted a short output\n");
+        return 1;
+    }
+    status = nuppNativeXxh64Digest(NULL, 0, digest, sizeof digest);
+    if (status != NUPP_NATIVE_OK) return failed("xxh64", status);
+    status = nuppNativeSleepMs(-1.0);
+    if (status != NUPP_NATIVE_INVALID_ARGUMENT) {
+        fprintf(stderr, "negative sleep duration was accepted\n");
+        return 1;
+    }
+    if (memcmp(digest, "ef46db3751d8e999", 16) != 0) {
+        fprintf(stderr, "XXH64 digest changed\n");
         return 1;
     }
     status = nuppNativeUriParse((const uint8_t *)"https://EXAMPLE.com",

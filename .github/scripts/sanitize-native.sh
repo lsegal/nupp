@@ -122,9 +122,9 @@ cargo_test() {
 }
 
 cargo_test --package nupp-native-abi
+cargo_test --package nupp-native-platform --features uuid
 cargo_test --package nupp-native-runtime --features async
 cargo_test --package nupp-native-files --features lane
-cargo_test --package nupp-native-compression
 # ThreadSanitizer on macOS defers a signal until its thread next enters an
 # interceptor it counts as blocking, and kevent is not one. Tokio learns of a
 # child's exit through SIGCHLD there, so every wait on a child stalls until the
@@ -138,7 +138,7 @@ cargo_test --package nupp-native-net
 cargo_test --package nupp-native-tls
 cargo_test --package nupp-native-http
 cargo_test --package nupp-native --no-default-features \
-    --features compression,files,http,net,process,tls,uri
+    --features files,http,net,process,tls,uri,uuid
 cargo_test --package nupp-native-host --no-default-features \
     --features lpeg,native-compression,native-files,native-net,native-process,native-tls,workers
 
@@ -146,7 +146,7 @@ cargo_test --package nupp-native-host --no-default-features \
 # in because the smoke test asserts the feature set and that invalid GPU
 # handles are refused; it never opens an adapter, so no driver is loaded.
 cargo build --locked -Zbuild-std --target "$TARGET" --package nupp-native \
-    --no-default-features --features files,gpu,http,net,process,tls,uri --lib
+    --no-default-features --features files,gpu,http,net,process,tls,uri,uuid --lib
 DIRECTORY=$CARGO_TARGET_DIR/$TARGET/debug
 # Where the sanitizer runtime comes from differs. On Linux rustc links its
 # static runtime into executables only, so the C side is instrumented and

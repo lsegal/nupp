@@ -44,7 +44,6 @@ NUPP_LPEG_PREFIX=$(./scripts/toolchain lpeg)
 export NUPP_LUAJIT_PREFIX NUPP_LPEG_PREFIX
 
 "$CARGO" test --locked --package nupp-native-files --features lane
-"$CARGO" test --locked --package nupp-native-compression
 "$CARGO" test --locked --package nupp-native-process
 "$CARGO" test --locked --package nupp-native-net
 "$CARGO" test --locked --package nupp-native-tls

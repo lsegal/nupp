@@ -259,7 +259,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn monotonic_ms() -> f64 {
-    crate::platform::monotonic_ns() as f64 / 1.0e6
+    nupp_native_platform::monotonic_ns() as f64 / 1.0e6
 }
 
 fn borrowed_arc<T>(pointer: *const T) -> Option<ManuallyDrop<Arc<T>>> {
