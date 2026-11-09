@@ -37,7 +37,7 @@ local MAX_STORED = 65535
 --- zlib's per-level search configuration: a match this long cuts the chain to a
 --- quarter, a match this long is not lazily improved, a match this long ends the
 --- search, and the most chain links followed.
-local record Tuning
+export record Tuning
     good: integer
     lazy: integer
     nice: integer
@@ -94,7 +94,7 @@ local function distanceCode(distance: number): number
 end
 
 --- Writes bits least significant first into a byte list.
-local record Bits
+export record Bits
     bytes: any
     value: number
     count: number

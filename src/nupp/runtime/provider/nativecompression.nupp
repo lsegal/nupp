@@ -69,7 +69,6 @@ local record Decoder is contract.Decoder
     end
 
     --- Copies the codec's `count` decoded bytes to the start of `output`.
-    @private
     function publish(self, count: integer, exclusive output: span.ByteWriteSpan): integer
         if count > 0 then
             copyInto(output:ref(), self.state.output, count)

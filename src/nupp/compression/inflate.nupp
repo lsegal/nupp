@@ -45,7 +45,7 @@ local CODE_LENGTH_ORDER: any = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 
 
 --- A canonical Huffman code: how many codes each length has, and the symbols
 --- in code order.
-local record Code
+export record Code
     counts: any
     symbols: any
 end
@@ -458,7 +458,7 @@ local function trailer(self: Decoder): nil
 end
 
 --- Advances as far as the input and `room` output bytes allow.
---- @raises UNDERFLOW when the input ends mid-item, or a Failure on a malformed stream
+--- @raises Failure when the stream is malformed; ending mid-item also unwinds, to the rollback in `step`
 local function run(self: Decoder, room: number): nil
     while not self.finished do
         mark(self)
