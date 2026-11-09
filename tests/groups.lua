@@ -329,6 +329,7 @@ scopes.projectctest = "integration"
 scopes.projectbinarytest = "integration"
 scopes.projectfixpointtest = "integration"
 scopes.projectaottest = "integration"
+scopes.projectaotcexporttest = "integration"
 scopes.projectclinktest = "integration"
 scopes.projectcargotest = "integration"
 scopes.projectgeneratortest = "integration"
@@ -428,6 +429,7 @@ scopes.projectlayoutcachetest = "integration"
 scopes.projectaotlinktest = "integration"
 
 scopes.projectaottest = "integration"
+scopes.projectaotcexporttest = "integration"
 
 scopes.projectcrosstest = "integration"
 
