@@ -181,7 +181,7 @@ local function run(options: any): integer
             if signature then
                 functions[qualified] = signature
             else
-                unexportable[qualified], unexportableFiles[qualified] = why, context.path
+                unexportable[qualified], unexportableFiles[qualified] = tostring(why), context.path
             end
         elseif node.kind == "fieldDecl" and node.name and node.bitWidth then
             bitfields[node.name] = node.bitWidth
