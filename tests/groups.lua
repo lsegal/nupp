@@ -429,7 +429,6 @@ scopes.projectlayoutcachetest = "integration"
 scopes.projectaotlinktest = "integration"
 
 scopes.projectaottest = "integration"
-scopes.projectaotcexporttest = "integration"
 
 scopes.projectcrosstest = "integration"
 
