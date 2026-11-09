@@ -34,7 +34,7 @@ function M.nativeFacilitiesSharingAProviderBuildAsOneUnion()
     compilerEnv.compilerRoot = function()
         return "."
     end
-    local ok, outputs, problem = pcall(nativeStage.build, ".", "out", {["native.path"] = true, ["native.uuid"] = true,})
+    local ok, outputs, problem = pcall(nativeStage.build, ".", "out", {["native.path"] = true, ["native.uri"] = true,})
     process.capture, fs.copyFile = originalCapture, originalCopy
     compilerEnv.compilerRoot = originalCompilerRoot
     assert(ok, outputs)
@@ -42,7 +42,7 @@ function M.nativeFacilitiesSharingAProviderBuildAsOneUnion()
     testAssert.eq(#calls, 1, "one provider union is built once")
     testAssert.eq(#copies, 2, "the shared library and path runtime are staged")
     local command = "\n" .. table.concat(calls[1], "\n") .. "\n"
-    assert(command:find("\nnative%-rust\nfilesystem,uuid\n"), "path and UUID select one sorted Rust feature union")
+    assert(command:find("\nnative%-rust\nfilesystem,uri\n"), "path and URI select one sorted Rust feature union")
     testAssert.eq(copies[1][1], "/built/libnupp_native.dylib", "the Rust provider union has one source artifact")
     assert(copies[1][2]:find("out/lib/nupp_native", 1, true), "the Rust provider union keeps its stable sidecar name")
 end

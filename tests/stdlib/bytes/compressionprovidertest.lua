@@ -434,8 +434,14 @@ function M.nativeProviderValidatesMembersTrailersAndTruncation()
 
     local joined = encode("gzip", "hello", 2) .. encode("gzip", " world", 2)
     assert(decode("gzip", joined, 2) == "hello world")
-    decoded = decode("gzip", joined, 64, {concatenatedmembers = false})
-    assert(decoded == nil, "a single-member decoder stops at the first member")
+    -- A single-member decoder finishes at the end of the first member and
+    -- leaves the next one unread.
+    local single = nativeProvider().formats.gzip:createdecoder({concatenatedmembers = false})
+    local storage, output = buffer(64)
+    local consumed, written, status = single:read(view(bytesOf(joined), #joined), output)
+    assert(status == FINISHED and ffi.string(storage, written) == "hello")
+    assert(consumed == #encode("gzip", "hello", 2), "the second member was consumed")
+    single:close()
 end
 
 function M.nativeProviderDecodesIndependentStandardFixtures()
