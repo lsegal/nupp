@@ -817,27 +817,30 @@ function M.theProviderIsSelectedOnlyByReachingIt()
     test.eq(native.forModuleMember("nupp.runtime.standardos", "monotonic"), nil)
     test.eq(native.forModule("nupp.runtime.provider.nativefiles"), "native.files")
     local feature = assert(native.feature("native.files"))
-    test.eq(feature.providerFeature, "files")
-    test.eq(feature.providerDriver, "native-rust")
-    test.eq(feature.provider, "nupp_native")
-    test.eq(feature.library, "nupp_native")
+    -- The provider calls the operating system itself, so selecting it stages no
+    -- Rust library and asks nothing of the native ABI loader.
+    test.eq(feature.providerFeature, nil)
+    test.eq(feature.providerDriver, nil)
+    test.eq(feature.provider, nil)
+    test.eq(feature.library, nil)
     test.eq(feature.runtimeModule, "nupp.runtime.provider.nativefiles")
     test.eq(
         table.concat(feature.requires or {}, ","),
-        "runtime.files,native.path,stdlib.io,runtime.spanview,runtime.suspension,runtime.native"
+        "runtime.files,native.path,stdlib.io,runtime.spanview,runtime.suspension"
     )
-    -- The declarations belong to the module that calls them rather than to the
-    -- bootstrap, so selecting the feature stages the provider and installs nothing.
     assert(
         not stdlib.bootstrap({
             ["native.files"] = true
-        }):find("nuppNativeFilesInfo", 1, true),
-        "the files ABI is the module's, not the bootstrap's"
+        }):find("nuppNativeFiles", 1, true),
+        "selecting the feature installs no files ABI"
     )
-    local handle = assert(io.open("src/nupp/runtime/provider/nativefiles.nupp", "rb"))
-    local source = handle:read("*a")
-    handle:close()
-    assert(source:find("nuppNativeFilesInfo", 1, true), "the module declares the ABI it calls")
+    for _, name in ipairs({"nativefiles", "nativepath", "nativefsposix", "nativefswindows", "nativefslane", "nativefsglob"}) do
+        local handle = assert(io.open("src/nupp/runtime/provider/" .. name .. ".nupp", "rb"))
+        local source = handle:read("*a")
+        handle:close()
+        assert(not source:find("nuppNativeFile", 1, true), name .. " calls none of the Rust files exports")
+        assert(not source:find("nupp.runtime.native", 1, true), name .. " does not load the Rust provider")
+    end
 end
 
 function M.appPathsAreScopedPortableAndStable()
@@ -933,6 +936,340 @@ function M.nativeCapabilitiesAreReportedOnce()
     end
     assert(rawequal(os.info().fs, caps), "the report is built once and shared")
     assert(files.persiststorage())
+end
+
+----------------------------------------------------------------------------
+-- The provider's own mechanisms, each case the former Rust crate's tests held
+----------------------------------------------------------------------------
+
+local onWindows = package.config:sub(1, 1) == "\\"
+
+local function platformSystem()
+    if onWindows then
+        return require("nupp.runtime.provider.nativefswindows")
+    end
+    return require("nupp.runtime.provider.nativefsposix")
+end
+
+function M.globGrammarIsExplicitAndBytewise()
+    ready()
+    local globbing = require("nupp.runtime.provider.nativefsglob")
+    assert(globbing.matchesName("a?c", "abc"))
+    assert(globbing.matchesName("[!a]bc", "xbc"))
+    assert(globbing.matchesName("[a-c]x", "bx"))
+    assert(not globbing.matchesName("[!a]bc", "abc"))
+    assert(globbing.matchesName("*.nupp", "file.nupp"))
+    assert(not globbing.matchesName("*.nupp", "file.lua"))
+    assert(globbing.matchesName("caf\233*", "caf\233.txt"), "a byte that is not UTF-8 matches itself")
+    assert(globbing.parse("root/**/file?.nupp", false))
+    test.eq(select(3, globbing.parse("root/a**b", false)), "a recursive wildcard must be a whole path component")
+    test.eq(select(3, globbing.parse("root/[", false)), "the pattern has an unclosed [")
+end
+
+function M.longLiteralGlobPatternsNeitherOverflowNorMatch()
+    local files = ready()
+    local depth = require("nupp.runtime.provider.nativefsglob").MAX_WALK_DEPTH
+    local deep = ("a/"):rep(depth - 1) .. "b"
+    test.eq(#assert(files.glob(deep)), 0)
+    local refused, reason = files.glob(("a/"):rep(depth) .. "b")
+    test.eq(refused, nil)
+    assert(isIoError(reason), "a pattern longer than any reachable path is refused")
+end
+
+function M.repeatedRecursiveWildcardsReadEachDirectoryABoundedNumberOfTimes()
+    local files = ready()
+    local globbing = require("nupp.runtime.provider.nativefsglob")
+    local base = inRoot("glob-repeated")
+    local deepest = base
+    for level = 0, 11 do
+        deepest = deepest .. "/d" .. level
+    end
+    assert(files.mkdir(deepest))
+    write(deepest .. "/x", "x")
+    local system = platformSystem()
+    local expected = assert(globbing.expand(base .. "/**/x", system, onWindows))
+    test.eq(#expected, 1)
+    for _, pattern in ipairs({base .. "/" .. ("**/"):rep(8) .. "x", base .. "/**/d3/**/d7/**/x"}) do
+        local found, reason, reads = globbing.expand(pattern, system, onWindows)
+        assert(found, reason)
+        test.eq(table.concat(found, "|"), table.concat(expected, "|"))
+        assert(reads < 200, pattern .. " read directories " .. reads .. " times")
+    end
+end
+
+function M.recursiveGlobMatchesAreSortedAndUnique()
+    local files = ready()
+    assert(files.mkdir(inRoot("glob-sorted/nested/deep")))
+    write(inRoot("glob-sorted/root.nupp"), "root")
+    write(inRoot("glob-sorted/nested/child.nupp"), "child")
+    write(inRoot("glob-sorted/nested/deep/leaf.nupp"), "leaf")
+    local found = assert(files.glob(inRoot("glob-sorted/**/**/[a-z]*.nupp")))
+    test.eq(#found, 3)
+    for index = 2, #found do
+        assert(found[index - 1]:tostring() < found[index]:tostring(), "matches are sorted and unique")
+    end
+end
+
+function M.aRecursiveGlobDoesNotFollowDirectoryLinks()
+    local files = ready()
+    assert(files.mkdir(inRoot("glob-links/real")))
+    write(inRoot("glob-links/real/file.txt"), "x")
+    assert(files.symlink(inRoot("glob-links"), inRoot("glob-links/real/loop"), "directory"))
+    test.eq(#assert(files.glob(inRoot("glob-links/**/*.txt"))), 1)
+end
+
+function M.theLaneEnforcesItsRequestAndByteLimits()
+    local files = ready()
+    local lane = require("nupp.runtime.provider.nativefslane")
+    assert(files.mkdir(inRoot("limits")))
+    -- A one-byte step leaves every two-byte write pending after its first step, so
+    -- each one holds its admission until it is cancelled.
+    local requests, bytes, requestBytes, step = lane.configure(4, 7, 3, 1)
+    local held = {}
+    local ok, problem = pcall(function()
+        for index = 1, 3 do
+            held[index] = assert(lane.submitWrite(inRoot("limits/" .. index .. ".bin"), "ab", "replace"))
+            test.eq(lane.status(held[index]), lane.PENDING)
+        end
+        test.eq(select(2, lane.admitted()), 6)
+        local refused, reason = lane.submitWrite(inRoot("limits/over.bin"), "ab", "replace")
+        test.eq(refused, nil)
+        test.eq(reason, "transfers in flight would hold more than 7 bytes")
+        local large, why = lane.submitWrite(inRoot("limits/large.bin"), "abcd", "replace")
+        test.eq(large, nil)
+        test.eq(why, "the transfer is larger than the 3-byte limit")
+        held[4] = assert(lane.submitWrite(inRoot("limits/4.bin"), "a", "replace"))
+        test.eq(lane.status(held[4]), lane.READY, "a write that fits one step settles on submission")
+        lane.release(held[4])
+        held[4] = assert(lane.submitWrite(inRoot("limits/4.bin"), "", "replace"))
+        held[5] = assert(lane.submitWrite(inRoot("limits/5.bin"), "", "replace"))
+        local crowded, crowdedReason = lane.submitCopy(inRoot("limits/4.bin"), inRoot("limits/6.bin"))
+        test.eq(crowded, nil)
+        test.eq(crowdedReason, "more than 4 transfers are in flight")
+    end)
+    for _, transfer in pairs(held) do
+        lane.cancel(transfer)
+        lane.release(transfer)
+    end
+    lane.configure(requests, bytes, requestBytes, step)
+    assert(ok, problem)
+    test.eq(select(1, lane.admitted()), 0, "every cancelled transfer gave its slot back")
+    test.eq(select(2, lane.admitted()), 0, "and its bytes")
+    test.eq(lane.pending(), 0)
+end
+
+function M.aCancelledAtomicWriteLeavesNoTemporaryAndTheDestinationAlone()
+    local files = ready()
+    local lane = require("nupp.runtime.provider.nativefslane")
+    assert(files.mkdir(inRoot("atomic-cancel")))
+    assert(writeFile(inRoot("atomic-cancel/kept.txt"), "original"))
+    local requests, bytes, requestBytes, step = lane.configure(128, 1048576, 1048576, 1)
+    local transfer = lane.submitWrite(inRoot("atomic-cancel/kept.txt"), "replacement", "atomic")
+    lane.configure(requests, bytes, requestBytes, step)
+    assert(transfer)
+    test.eq(lane.status(transfer), lane.PENDING)
+    assert(lane.cancel(transfer))
+    test.eq(lane.status(transfer), lane.CANCELED)
+    assert(not lane.cancel(transfer), "a settled transfer cannot be cancelled again")
+    test.eq(select(2, lane.take(transfer)), "the transfer was canceled")
+    lane.release(transfer)
+    test.eq(assert(readFile(inRoot("atomic-cancel/kept.txt"))), "original")
+    for name in files.list(inRoot("atomic-cancel")) do
+        test.eq(name, "kept.txt", "the cancelled write removed its temporary")
+    end
+end
+
+function M.anAtomicWriteReplacesContentsAndKeepsTheModeItFound()
+    local files = ready()
+    assert(files.mkdir(inRoot("atomic-mode")))
+    assert(writeFile(inRoot("atomic-mode/value.bin"), "old"))
+    assert(files.writeatomic(inRoot("atomic-mode/value.bin"), "new"))
+    test.eq(assert(readFile(inRoot("atomic-mode/value.bin"))), "new")
+    for name in files.list(inRoot("atomic-mode")) do
+        assert(not name:find("^%.nupp%-write%-"), "no temporary is left behind: " .. name)
+    end
+    if not onWindows then
+        local system = platformSystem()
+        assert(writeFile(inRoot("atomic-mode/plain.bin"), "plain"))
+        assert(files.writeatomic(inRoot("atomic-mode/atomic.bin"), "atomic"))
+        test.eq(
+            system.permissions(inRoot("atomic-mode/atomic.bin")),
+            system.permissions(inRoot("atomic-mode/plain.bin")),
+            "a new file gets the mode a plain write gives"
+        )
+        os.execute("chmod 640 '" .. inRoot("atomic-mode/value.bin") .. "'")
+        assert(files.writeatomic(inRoot("atomic-mode/value.bin"), "newer"))
+        test.eq(system.permissions(inRoot("atomic-mode/value.bin")), tonumber("640", 8), "a replacement keeps the mode")
+    end
+    test.eq(platformSystem().parent("bare.txt"), ".", "a bare name's temporary goes in the working directory")
+end
+
+function M.aRecursiveRemoveNeverLeavesTheTree()
+    local files = ready()
+    assert(files.mkdir(inRoot("remove-links/tree/sub")))
+    assert(files.mkdir(inRoot("remove-links/outside")))
+    write(inRoot("remove-links/outside/victim"), "outside")
+    write(inRoot("remove-links/tree/sub/victim"), "inside")
+    assert(files.symlink(inRoot("remove-links/outside"), inRoot("remove-links/tree/link"), "directory"))
+    assert(os.remove(inRoot("remove-links/tree"), true))
+    assert(not files.exists(inRoot("remove-links/tree")))
+    test.eq(assert(readFile(inRoot("remove-links/outside/victim"))), "outside", "a link inside the tree is not followed")
+end
+
+function M.aRecursiveRemoveNeverFollowsADirectorySwappedForALink()
+    local files = ready()
+    if onWindows then
+        test.suite.skip("the swap is a POSIX descriptor race")
+    end
+    local system = platformSystem()
+    assert(files.mkdir(inRoot("remove-race/tree/sub")))
+    assert(files.mkdir(inRoot("remove-race/outside")))
+    write(inRoot("remove-race/tree/sub/victim"), "inside")
+    write(inRoot("remove-race/outside/victim"), "outside")
+    system.setBeforeDescend(function(name)
+        if name == "sub" then
+            assert(os.rename(inRoot("remove-race/tree/sub"), inRoot("remove-race/aside")))
+            assert(files.symlink(inRoot("remove-race/outside"), inRoot("remove-race/tree/sub")))
+        end
+    end)
+    local removed, reason = pcall(os.remove, inRoot("remove-race/tree"), true)
+    system.setBeforeDescend(nil)
+    test.eq(assert(readFile(inRoot("remove-race/outside/victim"))), "outside")
+    assert(removed, reason)
+    assert(not files.exists(inRoot("remove-race/tree")))
+end
+
+function M.namesThatAreNotUtf8RoundTripAsBytes()
+    local files = ready()
+    local name = "caf\233.txt"
+    if onWindows then
+        local kind, _, _, _, reason = files.stat(inRoot(name))
+        test.eq(kind, nil)
+        assert(tostring(reason):find("not valid UTF-8", 1, true), "Windows names are UTF-8: " .. tostring(reason))
+        return
+    end
+    assert(files.mkdir(inRoot("bytes")))
+    local written = writeFile(inRoot("bytes/" .. name), "x")
+    if not written then
+        -- APFS refuses a name that is not UTF-8; only Linux filesystems take one.
+        test.suite.skip("this filesystem refuses names that are not UTF-8")
+    end
+    test.eq(files.stat(inRoot("bytes/" .. name)), "file")
+    local listed = {}
+    for entry in files.list(inRoot("bytes")) do
+        listed[#listed + 1] = entry
+    end
+    test.eq(table.concat(listed, "|"), name)
+    local found = assert(files.glob(inRoot("bytes/*.txt")))
+    test.eq(#found, 1)
+    assert(found[1]:tostring():sub(-#name) == name, "a glob answers the name's own bytes")
+    local canonical = assert(require("nupp.runtime.provider.nativepath").canonicalize(inRoot("bytes/" .. name)))
+    test.eq(canonical:sub(-#name), name)
+end
+
+function M.anAppendCursorReportsTheEndWhereTheWriteLanded()
+    ready()
+    local nativeFiles = require("nupp.runtime.provider.nativefiles")
+    assert(writeFile(inRoot("append-cursor.bin"), "prefix"))
+    local file = assert(nativeFiles.open(inRoot("append-cursor.bin"), "a+"))
+    test.eq(assert(file:position()), 0)
+    assert(file:write(":body"))
+    test.eq(assert(file:position()), 11)
+    test.eq(assert(file:seek(-4, "current")), 7)
+    test.eq(file:read(4), "body")
+    assert(file:flush())
+    file:close()
+
+    local update = assert(nativeFiles.open(inRoot("append-cursor.bin"), "r+"))
+    test.eq(update:read(5), "prefi")
+    local refused, reason = update:seek(-100, "current")
+    test.eq(refused, nil)
+    assert(isIoError(reason))
+    test.eq(assert(update:position()), 5, "a failed seek leaves the cursor alone")
+    test.eq(assert(update:seek(-1, "end")), 10)
+    test.eq(update:read(2), "y")
+    update:close()
+end
+
+function M.temporaryNameFragmentsCannotEscapeTheSelectedDirectory()
+    local files = ready()
+    local nativeFiles = require("nupp.runtime.provider.nativefiles")
+    assert(files.mkdir(inRoot("temporary-fragments")))
+    local escaped, reason = nativeFiles.createTemporary(false, "../outside-", nil, inRoot("temporary-fragments"))
+    test.eq(escaped, nil)
+    test.eq(reason, "temporary name fragments must not contain a path separator")
+    test.eq(nativeFiles.createTemporary(false, nil, "/outside", inRoot("temporary-fragments")), nil)
+    for _ in files.list(inRoot("temporary-fragments")) do
+        error("a refused temporary created nothing")
+    end
+    local made = assert(nativeFiles.createTemporary(true, "directory-", "", inRoot("temporary-fragments")))
+    test.eq(files.stat(made:tostring()), "directory")
+    assert(made:tostring():find("directory-", 1, true))
+    made:close()
+end
+
+function M.theReadOnlyStateCanBeSetAndCleared()
+    ready()
+    local nativeFiles = require("nupp.runtime.provider.nativefiles")
+    assert(writeFile(inRoot("read-only.txt"), "value"))
+    assert(nativeFiles.setReadOnly(inRoot("read-only.txt"), true))
+    test.eq(select(4, nativeFiles.stat(inRoot("read-only.txt"), true)), true)
+    assert(nativeFiles.setReadOnly(inRoot("read-only.txt"), false))
+    test.eq(select(4, nativeFiles.stat(inRoot("read-only.txt"), true)), false)
+end
+
+function M.applicationBasesFollowEachPlatformContract()
+    ready()
+    local nativeFiles = require("nupp.runtime.provider.nativefiles")
+    local environment = {
+        HOME = "/home/test",
+        USERPROFILE = "C:/Users/Test",
+        APPDATA = "C:\\Users\\Test\\AppData\\Roaming",
+        LOCALAPPDATA = "C:/Users/Test/AppData/Local",
+        XDG_CONFIG_HOME = "/xdg/config",
+        XDG_DATA_HOME = "relative/data",
+    }
+    local function read(name)
+        return environment[name]
+    end
+    local expected = {
+        windows = {"C:/Users/Test/AppData/Roaming", "C:/Users/Test/AppData/Local", "C:/Users/Test/AppData/Local/Temp"},
+        apple = {"/home/test/Library/Preferences", "/home/test/Library/Application Support", "/home/test/Library/Caches"},
+        xdg = {"/xdg/config", "/home/test/.local/share", "/home/test/.cache"},
+    }
+    for platform, bases in pairs(expected) do
+        local distinct = {}
+        for which = 0, 2 do
+            local base = assert(nativeFiles.applicationBase(which, platform, read))
+            test.eq(base, bases[which + 1], platform .. " base " .. which)
+            assert(not distinct[base], "three kinds, three directories")
+            distinct[base] = true
+        end
+        test.eq(select(2, nativeFiles.applicationBase(3, platform, read)), "unknown application base")
+    end
+    local function nothing()
+        return nil
+    end
+    test.eq(select(2, nativeFiles.applicationBase(0, "xdg", nothing)), "the home directory is not set")
+end
+
+function M.whereThingsLiveIsAnsweredByTheSystem()
+    local files = ready()
+    local nativeFiles = require("nupp.runtime.provider.nativefiles")
+    local nativePath = require("nupp.runtime.provider.nativepath")
+    local executable = assert(nativeFiles.executablePath())
+    test.eq(files.stat(executable), "file")
+    local home = assert(nativeFiles.userFolder(0))
+    test.eq(files.stat(home), "directory")
+    test.eq(select(2, nativeFiles.userFolder(9)), "unknown user folder")
+    local cwd = assert(nativePath.cwd())
+    test.eq(files.stat(cwd), "directory")
+    assert(not cwd:find("\\", 1, true), "paths come back with forward slashes")
+    local canonical = assert(nativePath.canonicalize("."))
+    test.eq(files.stat(canonical), "directory")
+    local missing, reason = nativePath.canonicalize(inRoot("absent/deeper"))
+    test.eq(missing, nil)
+    assert(isIoError(require("nupp.io").toError(reason), "notfound"), tostring(reason))
 end
 
 return M

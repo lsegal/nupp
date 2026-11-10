@@ -233,6 +233,22 @@ local RESOURCES = {
         output = "nupp/compiler/nupp/runtime/provider/nativepath.nupp"
     },
     {
+        source = "src/nupp/runtime/provider/nativefsposix.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativefsposix.nupp"
+    },
+    {
+        source = "src/nupp/runtime/provider/nativefswindows.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativefswindows.nupp"
+    },
+    {
+        source = "src/nupp/runtime/provider/nativefsglob.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativefsglob.nupp"
+    },
+    {
+        source = "src/nupp/runtime/provider/nativefslane.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativefslane.nupp"
+    },
+    {
         source = "src/nupp/runtime/provider/nativenet.nupp",
         output = "nupp/compiler/nupp/runtime/provider/nativenet.nupp"
     },

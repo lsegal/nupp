@@ -44,13 +44,43 @@ export const FAILED = 2
 --- A transfer that was cancelled before it finished.
 export const CANCELED = 3
 
-local TOO_LARGE = "the transfer is larger than the " .. tostring(MAX_REQUEST_BYTES) .. "-byte limit"
 
 --- How a write lands: in place, at the end, or through a temporary beside it.
 export type WriteMode = "replace" | "append" | "atomic"
 
 --- One submitted transfer. Its fields are the lane's own.
 export type Transfer = {[string]: any}
+
+-- The bounds in force, which a test may lower to reach each one cheaply.
+local maxRequests: integer = MAX_REQUESTS
+local maxBytes: integer = MAX_BYTES
+local maxRequestBytes: integer = MAX_REQUEST_BYTES
+local stepBytes: integer = STEP_BYTES
+
+local function tooLarge(): string
+    return "the transfer is larger than the " .. tostring(maxRequestBytes) .. "-byte limit"
+end
+
+local function overBudget(): string
+    return "transfers in flight would hold more than " .. tostring(maxBytes) .. " bytes"
+end
+
+--- Replaces the lane's bounds and its step size, answering the ones it replaced.
+--- Tests lower them to reach each bound without holding hundreds of megabytes.
+export function configure(
+    requestLimit: integer,
+    byteLimit: integer,
+    requestByteLimit: integer,
+    step: integer
+): (integer, integer, integer, integer)
+    local previous = {maxRequests, maxBytes, maxRequestBytes, stepBytes}
+    maxRequests = requestLimit
+    maxBytes = byteLimit
+    maxRequestBytes = requestByteLimit
+    stepBytes = step
+
+    return previous[1], previous[2], previous[3], previous[4]
+end
 
 local requests: integer = 0
 local bytesHeld: integer = 0
@@ -62,14 +92,14 @@ local active: {Transfer} = {}
 ----------------------------------------------------------------------------
 
 local function admit(charge: integer): string?
-    if charge > MAX_REQUEST_BYTES then
-        return TOO_LARGE
+    if charge > maxRequestBytes then
+        return tooLarge()
     end
-    if requests == MAX_REQUESTS then
-        return "more than " .. tostring(MAX_REQUESTS) .. " transfers are in flight"
+    if requests >= maxRequests then
+        return "more than " .. tostring(maxRequests) .. " transfers are in flight"
     end
-    if bytesHeld + charge > MAX_BYTES then
-        return "transfers in flight would hold more than " .. tostring(MAX_BYTES) .. " bytes"
+    if bytesHeld + charge > maxBytes then
+        return overBudget()
     end
     requests = requests + 1
     bytesHeld = bytesHeld + charge
@@ -83,11 +113,11 @@ local function grow(transfer: Transfer, charge: integer): string?
     if charge <= held then
         return nil
     end
-    if charge > MAX_REQUEST_BYTES then
-        return TOO_LARGE
+    if charge > maxRequestBytes then
+        return tooLarge()
     end
-    if bytesHeld + charge - held > MAX_BYTES then
-        return "transfers in flight would hold more than " .. tostring(MAX_BYTES) .. " bytes"
+    if bytesHeld + charge - held > maxBytes then
+        return overBudget()
     end
     bytesHeld = bytesHeld + charge - held
     transfer.charge = charge
@@ -195,7 +225,7 @@ local function readStep(transfer: Transfer): nil
         end
     end
     local size = transfer.size as integer
-    local budget = STEP_BYTES
+    local budget = stepBytes
     if size > 0 then
         while budget > 0 do
             local got = transfer.got as integer
@@ -230,10 +260,10 @@ local function readStep(transfer: Transfer): nil
     while budget > 0 do
         local got = transfer.got as integer
         local wanted = READ_CHUNK
-        if got == MAX_REQUEST_BYTES then
+        if got == maxRequestBytes then
             wanted = 1
         end
-        local refused = grow(transfer, math.min(got + wanted, MAX_REQUEST_BYTES))
+        local refused = grow(transfer, math.min(got + wanted, maxRequestBytes))
         if refused ~= nil then
             settle(transfer, refused, nil)
             return
@@ -250,8 +280,8 @@ local function readStep(transfer: Transfer): nil
             settle(transfer, nil, table.concat(transfer.pieces as {string}))
             return
         end
-        if got == MAX_REQUEST_BYTES then
-            settle(transfer, TOO_LARGE, nil)
+        if got == maxRequestBytes then
+            settle(transfer, tooLarge(), nil)
             return
         end
         local pieces = transfer.pieces as {string}
@@ -266,7 +296,7 @@ end
 local function writePart(transfer: Transfer, appending: boolean): (boolean, string?)
     local contents = transfer.contents as string
     local total = #contents
-    local budget = STEP_BYTES
+    local budget = stepBytes
     local base: any = ffi.cast("const uint8_t *", contents)
     while budget > 0 do
         local done = transfer.done as integer
@@ -423,7 +453,7 @@ local function copyStep(transfer: Transfer): nil
         transfer.done = 0
     end
     local chunk: any = transfer.chunk
-    local budget = STEP_BYTES
+    local budget = stepBytes
     while budget > 0 do
         local count, reason, blocked = system.streamRead(transfer.file, chunk, READ_CHUNK)
         if count == nil then
