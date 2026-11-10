@@ -186,7 +186,10 @@ function M.aStoredVectorFieldAgreesBetweenLuaAndNative()
         end
     end
     local tier = hostTier()
-    local llvm = assert(read(dir .. "/build/native/aot/src/particles." .. tier .. ".ll"), "the " .. tier .. " unit is emitted")
+    local llvm = assert(
+        read(dir .. "/build/native/aot/src/particles." .. tier .. ".ll"),
+        "the " .. tier .. " unit is emitted"
+    )
     assert(
         llvm:find("%struct.KsParticle = type { float, [12 x i8], [4 x float], [3 x float], [4 x i8] }", 1, true),
         "the struct is spelled with the model's padding:\n" .. llvm
