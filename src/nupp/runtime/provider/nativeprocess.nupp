@@ -1,22 +1,28 @@
 @!internal
 
---[[The native process provider adapts the host ABI to `io.Process.Provider`.
+--[[The native process provider implements `io.Process.Provider` through
+LuaJIT's FFI.
 
-Loading requires the native process feature. Spawn translates the shared
-`io.Process.Options` options into native argument, environment, directory,
-and stream descriptors. A successful result owns a child handle and any piped
-stdin, stdout, and stderr handles; inherited and redirected streams may have no
-separate pipe value.
+Windows starts a child with `CreateProcessW` and talks to it over overlapped
+named pipes; POSIX starts it with `posix_spawn` and talks over nonblocking
+pipes, reaping it with `waitpid`. Each operation is a single non-blocking system
+call, so nothing here owns a thread: a read that finds nothing reports pending,
+a write that finds a full pipe reports backpressure, and readiness waits sleep
+in one `WaitForMultipleObjects` or `poll` call.
 
-Reads distinguish pending input from EOF, writes report accepted bytes and a
-closed-pipe flag, and readiness waits use the native process reactor. Exit values
-are constructed with the shared `exited` function. Per-stream scratch storage and
-release flags belong to this Lua state. Counts and status tags are checked before
-they become Lua strings or state-machine progress.
+That one call also holds the runtime's wake handle (see
+[](nupp.runtime.native)), which every native family signals when it advances
+the shared readiness generation. A wait on a child or a pipe therefore parks
+until the child moves, its pipes move, or a socket, file transfer or GPU job
+anywhere in the process does.
 
-The `io.popen` facade resolves this table once. Closing streams and
-reaping the child remain distinct operations. Cleanup releases every native
-handle even when a process is killed or a caller stops reading its output.
+Reads distinguish pending input from EOF and writes report accepted bytes and a
+closed-pipe flag. One write is in flight on a pipe at a time. A child's exit is
+news to every wait until `poll` has handed it over; after that a wait is left
+to the streams, which something the child started may hold open long after the
+child itself is gone. Closing streams and reaping the child remain distinct
+operations, and a child or pipe that is dropped without either is killed or
+closed when it is collected.
 ]]
 module nupp.runtime.provider.nativeprocess
 
@@ -27,64 +33,12 @@ local shared = require("io.internal.process.types")
 
 const native = require("nupp.runtime.native")
 
-native.ffi.cdef[[
-typedef struct {
-    const uint8_t *data;
-    size_t length;
-} NuppNativeProcessSlice;
+const ffi: any = native.ffi
+local C: any = ffi.C
+local system: string = ffi.os
+local windows = system == "Windows"
+local darwin = system == "OSX"
 
-typedef struct {
-    NuppNativeProcessSlice name;
-    NuppNativeProcessSlice value;
-} NuppNativeProcessEnv;
-
-typedef struct {
-    const NuppNativeProcessSlice *args;
-    size_t arg_count;
-    const NuppNativeProcessEnv *env;
-    size_t env_count;
-    NuppNativeProcessSlice cwd;
-    int32_t cwd_present;
-    int32_t clear_env;
-    uint8_t stdin_mode;
-    uint8_t stdout_mode;
-    uint8_t stderr_mode;
-} NuppNativeProcessSpawn;
-
-typedef struct {
-    uint64_t process;
-    uint64_t stdin_stream;
-    uint64_t stdout_stream;
-    uint64_t stderr_stream;
-    uint32_t pid;
-} NuppNativeProcessStarted;
-
-typedef struct {
-    int32_t ready;
-    int32_t code;
-    int32_t killed;
-} NuppNativeProcessExit;
-
-int32_t nuppNativeProcessSpawn(
-    const NuppNativeProcessSpawn *, NuppNativeProcessStarted *);
-int32_t nuppNativeProcessSpawnWithError(
-    const NuppNativeProcessSpawn *, NuppNativeProcessStarted *, int32_t *);
-int32_t nuppNativeProcessPollExit(uint64_t, NuppNativeProcessExit *);
-int32_t nuppNativeProcessPollExitWithSignal(uint64_t, NuppNativeProcessExit *, int32_t *);
-int32_t nuppNativeProcessKill(uint64_t, int32_t);
-int32_t nuppNativeProcessRelease(uint64_t);
-int32_t nuppNativeProcessStreamRead(
-    uint64_t, uint8_t *, size_t, uint32_t *, size_t *);
-int32_t nuppNativeProcessStreamWrite(
-    uint64_t, const uint8_t *, size_t, uint32_t *, size_t *);
-int32_t nuppNativeProcessStreamRelease(uint64_t);
-int32_t nuppNativeProcessWait(
-    uint64_t, const uint64_t *, size_t, const uint64_t *, size_t,
-    uint64_t, size_t *);
-]]
-
-const C = native.C
-const PROCESS_FEATURE = 32
 const MODE: {[string]: integer} = {pipe = 0, inherit = 1, ["null"] = 2, stdout = 3}
 const READ_DATA = 0
 const READ_PENDING = 1
@@ -93,34 +47,12 @@ const WRITE_ACCEPTED = 0
 const WRITE_PENDING = 1
 const WRITE_GONE = 2
 const READ_SIZE = 65536
+const WRITE_SIZE = 65536
 const INT32_MAX = 2147483647
-
-local function reason(prefix: string): string
-    return prefix .. ": " .. native.ffi.string(C.nuppNativeLastError())
-end
-
-local function configured(status: integer, what: string): nil
-    if status ~= 0 then
-        error(reason("nupp: could not " .. what), 0)
-    end
-end
-
-local function makeArray(streams: {any}): (any, integer)
-    local count = #streams
-    if count == 0 then
-        return nil, 0
-    end
-    local out = native.ffi.new("uint64_t[?]", count)
-    for index, stream in ipairs(streams) do
-        local handle = stream and stream.handle
-        if handle == nil then
-            error("nupp: readiness interest named a released process stream", 0)
-        end
-        out[index - 1] = handle
-    end
-
-    return out, count
-end
+-- How long a wait sleeps at most when something it waits for has no handle to
+-- sleep on: an old runtime without a wake handle, or a child whose exit this
+-- kernel cannot signal.
+const UNWAKEABLE_MS = 10
 
 local function whole(value: number?): integer
     local number = tonumber(value) or 0
@@ -131,286 +63,1690 @@ local function whole(value: number?): integer
     return math.floor(number) as integer
 end
 
-local function wrap(owner: any, handle: any): any
-    if handle == 0 then
+local function clamp(value: integer, low: integer, high: integer): integer
+    if value < low then
+        return low
+    elseif value > high then
+        return high
+    end
+
+    return value
+end
+
+local function failure(what: string, message: string, code: integer): string
+    return ("nupp: could not %s: %s (os error %d)"):format(what, message, code)
+end
+
+-- Rejects what a child could never be given, the checks every platform shares.
+local function validate(options: shared.SpawnOptions): (string, string, string)
+    local inputMode = options.stdin or "pipe"
+    local outputMode = options.stdout or "pipe"
+    local errorMode = options.stderr or "pipe"
+    if MODE[inputMode] == nil or inputMode == "stdout" then
+        error("nupp: process has no stdin mode named " .. tostring(inputMode), 0)
+    end
+    if MODE[outputMode] == nil or outputMode == "stdout" then
+        error("nupp: process has no stdout mode named " .. tostring(outputMode), 0)
+    end
+    if MODE[errorMode] == nil then
+        error("nupp: process has no stderr mode named " .. tostring(errorMode), 0)
+    end
+
+    return inputMode, outputMode, errorMode
+end
+
+local function textual(value: any, what: string): string
+    local text = tostring(value)
+    if text:find("\0", 1, true) then
+        error("nupp: could not start process: " .. what .. " contains an embedded NUL", 0)
+    end
+
+    return text
+end
+
+-- The environment overrides, checked: a name holding `=` cannot be expressed in
+-- an environment block, since the child would split it at the first `=` and see
+-- some other variable.
+local function overrides(options: shared.SpawnOptions): {any}
+    local entries: {any} = {}
+    for key, value in pairs(options.env or {}) do
+        local name = textual(key, "an environment name")
+        if name == "" or name:find("=", 1, true) then
+            error(("nupp: could not start process: environment variable name %q must be non-empty and contain no '='"):format(name), 0)
+        end
+        entries[#entries + 1] = {name = name, value = textual(value, "an environment value")}
+    end
+    table.sort(entries, function(left: any, right: any): boolean
+        return left.name < right.name
+    end)
+
+    return entries
+end
+
+local function directory(options: shared.SpawnOptions): string?
+    if options.cwd == nil then
+        return nil
+    end
+    local cwd = type(options.cwd) == "string" and options.cwd as string or (options.cwd as any):tostring()
+
+    return textual(cwd, "the working directory")
+end
+
+local function newOwner(pid: integer): any
+    return {handle = true, released = false, pid = pid, exit = nil, collected = false, killRequested = false}
+end
+
+local function newStream(owner: any, readable: boolean): any
+    return {owner = owner, handle = true, released = false, readable = readable, scratch = nil, capacity = 0}
+end
+
+-- The backend: one implementation of each primitive per platform family.
+local spawnChild: function(options: shared.SpawnOptions): (any?, any?, any?, any?, integer, string?, integer?)
+local reapExit: function(owner: any): nil
+local signalChild: function(owner: any, force: boolean): nil
+local releaseChild: function(owner: any): nil
+local readInto: function(stream: any, pointer: any, wanted: integer): (integer, integer)
+local writeFrom: function(stream: any, pointer: any, count: integer): (integer, integer)
+local releaseStream: function(stream: any): nil
+local streamReady: function(stream: any): boolean
+local sleepOn: function(interest: shared.Interest, timeout: integer): nil
+
+if windows then
+    if not pcall(ffi.typeof, "NuppProcessOverlapped") then
+        ffi.cdef[[
+        typedef struct {
+            uint32_t nLength;
+            void *lpSecurityDescriptor;
+            int32_t bInheritHandle;
+        } NuppProcessSecurity;
+        typedef struct {
+            uintptr_t Internal;
+            uintptr_t InternalHigh;
+            uint32_t Offset;
+            uint32_t OffsetHigh;
+            void *hEvent;
+        } NuppProcessOverlapped;
+        typedef struct {
+            uint32_t cb;
+            uint16_t *lpReserved;
+            uint16_t *lpDesktop;
+            uint16_t *lpTitle;
+            uint32_t dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars;
+            uint32_t dwFillAttribute;
+            uint32_t dwFlags;
+            uint16_t wShowWindow;
+            uint16_t cbReserved2;
+            uint8_t *lpReserved2;
+            void *hStdInput;
+            void *hStdOutput;
+            void *hStdError;
+        } NuppProcessStartup;
+        typedef struct {
+            NuppProcessStartup StartupInfo;
+            void *lpAttributeList;
+        } NuppProcessStartupEx;
+        typedef struct {
+            void *hProcess;
+            void *hThread;
+            uint32_t dwProcessId;
+            uint32_t dwThreadId;
+        } NuppProcessInformation;
+        typedef struct {
+            void *handle;
+            void *event;
+            NuppProcessOverlapped overlapped;
+            int32_t pending;
+            int32_t eof;
+            uint32_t failed;
+            uint32_t offset;
+            uint32_t filled;
+            uint8_t buffer[65536];
+        } NuppProcessPipe;
+        typedef struct {
+            void *process;
+        } NuppProcessChild;
+        int32_t CreateProcessW(const uint16_t *, uint16_t *, void *, void *, int32_t, uint32_t,
+            void *, const uint16_t *, NuppProcessStartup *, NuppProcessInformation *);
+        void *CreateNamedPipeW(const uint16_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+            uint32_t, NuppProcessSecurity *);
+        void *CreateFileW(const uint16_t *, uint32_t, uint32_t, NuppProcessSecurity *, uint32_t,
+            uint32_t, void *);
+        void *CreateEventW(void *, int32_t, int32_t, const uint16_t *);
+        int32_t ResetEvent(void *);
+        int32_t ReadFile(void *, void *, uint32_t, uint32_t *, NuppProcessOverlapped *);
+        int32_t WriteFile(void *, const void *, uint32_t, uint32_t *, NuppProcessOverlapped *);
+        int32_t GetOverlappedResult(void *, NuppProcessOverlapped *, uint32_t *, int32_t);
+        int32_t CancelIoEx(void *, NuppProcessOverlapped *);
+        int32_t CloseHandle(void *);
+        uint32_t GetLastError(void);
+        uint32_t WaitForSingleObject(void *, uint32_t);
+        uint32_t WaitForMultipleObjects(uint32_t, void *const *, int32_t, uint32_t);
+        int32_t GetExitCodeProcess(void *, uint32_t *);
+        int32_t TerminateProcess(void *, uint32_t);
+        void *GetStdHandle(uint32_t);
+        void *GetCurrentProcess(void);
+        uint32_t GetCurrentProcessId(void);
+        int32_t DuplicateHandle(void *, void *, void *, void **, uint32_t, int32_t, uint32_t);
+        int32_t InitializeProcThreadAttributeList(void *, uint32_t, uint32_t, size_t *);
+        int32_t UpdateProcThreadAttribute(void *, uint32_t, uintptr_t, void *, size_t, void *, size_t *);
+        void DeleteProcThreadAttributeList(void *);
+        int32_t MultiByteToWideChar(uint32_t, uint32_t, const char *, int32_t, uint16_t *, int32_t);
+        int32_t WideCharToMultiByte(uint32_t, uint32_t, const uint16_t *, int32_t, char *, int32_t,
+            const char *, int32_t *);
+        uint16_t *GetEnvironmentStringsW(void);
+        int32_t FreeEnvironmentStringsW(uint16_t *);
+        uint32_t FormatMessageW(uint32_t, const void *, uint32_t, uint32_t, uint16_t *, uint32_t, void *);
+        uint32_t GetFileAttributesW(const uint16_t *);
+        ]]
+    end
+
+    local GENERIC_READ = 0x80000000
+    local GENERIC_WRITE = 0x40000000
+    local FILE_READ_ATTRIBUTES = 0x80
+    local FILE_WRITE_ATTRIBUTES = 0x100
+    local FILE_SHARE_READ = 1
+    local FILE_SHARE_WRITE = 2
+    local OPEN_EXISTING = 3
+    local PIPE_ACCESS_INBOUND = 1
+    local PIPE_ACCESS_OUTBOUND = 2
+    local FILE_FLAG_OVERLAPPED = 0x40000000
+    local FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+    local PIPE_REJECT_REMOTE_CLIENTS = 8
+    local ERROR_FILE_NOT_FOUND = 2
+    local ERROR_ACCESS_DENIED = 5
+    local ERROR_HANDLE_EOF = 38
+    local ERROR_BROKEN_PIPE = 109
+    local ERROR_NO_DATA = 232
+    local ERROR_PIPE_NOT_CONNECTED = 233
+    local ERROR_PIPE_BUSY = 231
+    local ERROR_IO_INCOMPLETE = 996
+    local ERROR_IO_PENDING = 997
+    local WAIT_OBJECT_0 = 0
+    local WAIT_TIMEOUT = 0x102
+    local STARTF_USESTDHANDLES = 0x100
+    local CREATE_UNICODE_ENVIRONMENT = 0x400
+    local EXTENDED_STARTUPINFO_PRESENT = 0x80000
+    local PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002
+    local STD_HANDLE = {0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4}
+    local DUPLICATE_SAME_ACCESS = 2
+    local CP_UTF8 = 65001
+    local MB_ERR_INVALID_CHARS = 8
+    local FORMAT_MESSAGE_FROM_SYSTEM = 0x1000
+    local FORMAT_MESSAGE_IGNORE_INSERTS = 0x200
+    local INVALID_ATTRIBUTES = 0xFFFFFFFF
+    local FILE_ATTRIBUTE_DIRECTORY = 0x10
+    local MAXIMUM_WAIT_OBJECTS = 64
+    local INVALID_HANDLE: any = ffi.cast("void *", -1)
+
+    local transferred: any = ffi.new("uint32_t[1]")
+    local exitCode: any = ffi.new("uint32_t[1]")
+
+    local function wide(text: string): any
+        local count = 0
+        if #text > 0 then
+            count = C.MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, #text, nil, 0)
+            if count == 0 then
+                error("nupp: could not start process: " .. ("%q"):format(text) .. " is not valid UTF-8", 0)
+            end
+        end
+        local out = ffi.new("uint16_t[?]", count + 1)
+        if count > 0 then
+            C.MultiByteToWideChar(CP_UTF8, 0, text, #text, out, count)
+        end
+
+        return out
+    end
+
+    local function narrow(text: any, count: integer): string
+        local bytes = C.WideCharToMultiByte(CP_UTF8, 0, text, count, nil, 0, nil, nil)
+        if bytes <= 0 then
+            return ""
+        end
+        local out = ffi.new("char[?]", bytes)
+        C.WideCharToMultiByte(CP_UTF8, 0, text, count, out, bytes, nil, nil)
+
+        return ffi.string(out, bytes)
+    end
+
+    local function describe(code: integer): string
+        local buffer = ffi.new("uint16_t[512]")
+        local count = C.FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM + FORMAT_MESSAGE_IGNORE_INSERTS,
+            nil,
+            code,
+            0,
+            buffer,
+            512,
+            nil
+        )
+        local text = narrow(buffer, count):gsub("%s+$", "")
+        if text == "" then
+            return "Windows error " .. tostring(code)
+        end
+
+        return text
+    end
+
+    local function lastError(what: string): string
+        local code = C.GetLastError()
+
+        return failure(what, describe(code), code)
+    end
+
+    -- Quotes one argument the way the Microsoft C runtime splits a command line:
+    -- backslashes are literal except before a quote, so the ones that precede a
+    -- quote, or the closing quote, are doubled.
+    local function quoted(argument: string, always: boolean): string
+        if not always and argument ~= "" and not argument:find("[ \t]") then
+            return argument
+        end
+        local out: {string} = {"\""}
+        local backslashes = 0
+        for index = 1, #argument do
+            local character = argument:sub(index, index)
+            if character == "\\" then
+                backslashes = backslashes + 1
+            else
+                if character == "\"" then
+                    out[#out + 1] = string.rep("\\", backslashes + 1)
+                end
+                backslashes = 0
+            end
+            out[#out + 1] = character
+        end
+        out[#out + 1] = string.rep("\\", backslashes)
+        out[#out + 1] = "\""
+
+        return table.concat(out)
+    end
+
+    local function commandLine(arguments: {string}): string
+        local program = arguments[1]
+        if program:find("\"", 1, true) then
+            error("nupp: could not start process: a program name cannot contain a quote", 0)
+        end
+        local parts: {string} = {quoted(program, true)}
+        for index = 2, #arguments do
+            parts[#parts + 1] = quoted(arguments[index], false)
+        end
+
+        return table.concat(parts, " ")
+    end
+
+    -- The parent's environment, as names in their original case and values.
+    local function inherited(): {any}
+        local entries: {any} = {}
+        local block = C.GetEnvironmentStringsW()
+        if block == nil then
+            return entries
+        end
+        local position = 0
+        while block[position] ~= 0 do
+            local length = 0
+            while block[position + length] ~= 0 do
+                length = length + 1
+            end
+            local entry = narrow(block + position, length)
+            -- `=C:` style entries name a drive's current directory: their name
+            -- starts with `=`, so the separator is the next one.
+            local split = entry:find("=", 2, true)
+            if split ~= nil then
+                entries[#entries + 1] = {name = entry:sub(1, split - 1), value = entry:sub(split + 1)}
+            end
+            position = position + length + 1
+        end
+        C.FreeEnvironmentStringsW(block)
+
+        return entries
+    end
+
+    -- A Unicode environment block, or nil to inherit the parent's unchanged.
+    -- Names are case-insensitive, and the block is sorted the way Windows
+    -- expects it.
+    local function environmentBlock(options: shared.SpawnOptions, entries: {any}): (any, string?)
+        if #entries == 0 and options.clearenv ~= true then
+            return nil, nil
+        end
+        local merged: {[string]: any} = {}
+        if options.clearenv ~= true then
+            for _, entry in ipairs(inherited()) do
+                merged[entry.name:upper()] = entry
+            end
+        end
+        for _, entry in ipairs(entries) do
+            merged[entry.name:upper()] = entry
+        end
+        local keys: {string} = {}
+        for key in pairs(merged) do
+            keys[#keys + 1] = key
+        end
+        table.sort(keys)
+        local lines: {string} = {}
+        for _, key in ipairs(keys) do
+            lines[#lines + 1] = merged[key].name .. "=" .. merged[key].value .. "\0"
+        end
+        local path = merged["PATH"]
+        local text = table.concat(lines) .. "\0"
+        if #lines == 0 then
+            text = "\0\0"
+        end
+        local count = C.MultiByteToWideChar(CP_UTF8, 0, text, #text, nil, 0)
+        local block = ffi.new("uint16_t[?]", count)
+        C.MultiByteToWideChar(CP_UTF8, 0, text, #text, block, count)
+
+        return block, path and path.value or nil
+    end
+
+    -- A program named without a directory is looked up on the child's PATH when
+    -- the spawn changes it, as it would be by a shell. Otherwise CreateProcessW
+    -- searches the usual places itself.
+    local function resolve(program: string, path: string?): any
+        if path == nil or program:find("[/\\:]") then
+            return nil
+        end
+        local names = {program}
+        if not program:find("%.[^.]*$") then
+            names[2] = program .. ".exe"
+        end
+        for folder in path:gmatch("[^;]+") do
+            local base = folder:gsub("[/\\]+$", "")
+            for _, name in ipairs(names) do
+                local candidate = wide(base .. "\\" .. name)
+                local attributes = C.GetFileAttributesW(candidate)
+                if attributes ~= INVALID_ATTRIBUTES and attributes & FILE_ATTRIBUTE_DIRECTORY == 0 then
+                    return candidate
+                end
+            end
+        end
+
         return nil
     end
 
-    return {owner = owner, handle = handle, released = false, scratch = nil, capacity = 0}
+    local function closeHandle(handle: any): nil
+        if handle ~= nil and handle ~= INVALID_HANDLE then
+            C.CloseHandle(handle)
+        end
+    end
+
+    local function settlePipe(pipe: any): nil
+        if pipe.handle == nil then
+            return
+        end
+        if pipe.pending ~= 0 then
+            C.CancelIoEx(pipe.handle, pipe.overlapped)
+            C.GetOverlappedResult(pipe.handle, pipe.overlapped, transferred, 1)
+            pipe.pending = 0
+        end
+        C.CloseHandle(pipe.handle)
+        C.CloseHandle(pipe.event)
+        pipe.handle = nil
+        pipe.event = nil
+    end
+
+    local inheritable: any = ffi.new("NuppProcessSecurity")
+    inheritable.nLength = ffi.sizeof("NuppProcessSecurity")
+    inheritable.bInheritHandle = 1
+    local pipeSerial = 0
+
+    -- A pipe whose parent end is overlapped and whose child end is inheritable.
+    -- Anonymous pipes cannot be overlapped, so this is a uniquely named pipe
+    -- that refuses remote clients and a second instance.
+    local function createPipe(inbound: boolean): (any, any, string?)
+        local name: any = nil
+        local server: any = INVALID_HANDLE
+        local access = inbound and PIPE_ACCESS_INBOUND or PIPE_ACCESS_OUTBOUND
+        for _ = 1, 8 do
+            pipeSerial = pipeSerial + 1
+            name = wide(
+                ("\\\\.\\pipe\\nupp-process-%d-%d-%d"):format(
+                    C.GetCurrentProcessId(),
+                    pipeSerial,
+                    math.random(0, 0x7FFFFFFF)
+                )
+            )
+            server = C.CreateNamedPipeW(
+                name,
+                access + FILE_FLAG_OVERLAPPED + FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                READ_SIZE,
+                READ_SIZE,
+                0,
+                nil
+            )
+            if server ~= INVALID_HANDLE or C.GetLastError() ~= ERROR_ACCESS_DENIED and C.GetLastError() ~= ERROR_PIPE_BUSY then
+                break
+            end
+        end
+        if server == INVALID_HANDLE then
+            return nil, nil, lastError("create a process pipe")
+        end
+        local childAccess = inbound and GENERIC_WRITE + FILE_READ_ATTRIBUTES or GENERIC_READ + FILE_WRITE_ATTRIBUTES
+        local client = C.CreateFileW(name, childAccess, 0, inheritable, OPEN_EXISTING, 0, nil)
+        if client == INVALID_HANDLE then
+            local problem = lastError("open a process pipe")
+            C.CloseHandle(server)
+            return nil, nil, problem
+        end
+        local event = C.CreateEventW(nil, 1, 0, nil)
+        if event == nil then
+            local problem = lastError("create a process pipe event")
+            C.CloseHandle(server)
+            C.CloseHandle(client)
+            return nil, nil, problem
+        end
+        local pipe: any = ffi.new("NuppProcessPipe")
+        pipe.handle = server
+        pipe.event = event
+        pipe.overlapped.hEvent = event
+
+        return ffi.gc(pipe, settlePipe), client, nil
+    end
+
+    local function openNull(): (any, string?)
+        local handle = C.CreateFileW(
+            wide("NUL"),
+            GENERIC_READ + GENERIC_WRITE,
+            FILE_SHARE_READ + FILE_SHARE_WRITE,
+            inheritable,
+            OPEN_EXISTING,
+            0,
+            nil
+        )
+        if handle == INVALID_HANDLE then
+            return nil, lastError("open the null device")
+        end
+
+        return handle, nil
+    end
+
+    -- The parent's standard handle, duplicated as inheritable so the handle list
+    -- can name it. Nil when the parent has none, which leaves the child none.
+    local function duplicateStandard(which: integer): (any, string?)
+        local source = C.GetStdHandle(STD_HANDLE[which])
+        if source == nil or source == INVALID_HANDLE then
+            return nil, nil
+        end
+        local out = ffi.new("void *[1]")
+        local process = C.GetCurrentProcess()
+        if C.DuplicateHandle(process, source, process, out, 0, 1, DUPLICATE_SAME_ACCESS) == 0 then
+            return nil, lastError("duplicate a standard handle")
+        end
+
+        return out[0], nil
+    end
+
+    local function closeChild(child: any): nil
+        if child.process ~= nil then
+            if C.WaitForSingleObject(child.process, 0) ~= WAIT_OBJECT_0 then
+                C.TerminateProcess(child.process, 1)
+            end
+            C.CloseHandle(child.process)
+            child.process = nil
+        end
+    end
+
+    -- Input pipes closed while a write was still in flight: the write is the
+    -- caller's, so the pipe stays open until it lands, and closes after.
+    local lingering: {any} = {}
+
+    local function finishWrite(pipe: any): nil
+        if pipe.pending == 0 then
+            return
+        end
+        if C.GetOverlappedResult(pipe.handle, pipe.overlapped, transferred, 0) ~= 0 then
+            pipe.offset = pipe.offset + transferred[0]
+            if pipe.offset < pipe.filled then
+                -- A pipe write completes whole, but a short one is resumed rather
+                -- than lost.
+                local ok = C.WriteFile(pipe.handle, pipe.buffer + pipe.offset, pipe.filled - pipe.offset, nil, pipe.overlapped)
+                if ok == 0 and C.GetLastError() ~= ERROR_IO_PENDING then
+                    pipe.pending = 0
+                    pipe.failed = C.GetLastError()
+                end
+                return
+            end
+            pipe.pending = 0
+            return
+        end
+        local code = C.GetLastError()
+        if code ~= ERROR_IO_INCOMPLETE then
+            pipe.pending = 0
+            pipe.failed = code
+        end
+    end
+
+    local function serviceLingering(): nil
+        local index = 1
+        while index <= #lingering do
+            local entry = lingering[index]
+            finishWrite(entry.pipe)
+            if entry.pipe.pending == 0 then
+                settlePipe(entry.pipe)
+                table.remove(lingering, index)
+            else
+                index = index + 1
+            end
+        end
+    end
+
+    local function finishRead(pipe: any): nil
+        if pipe.pending == 0 then
+            return
+        end
+        if C.GetOverlappedResult(pipe.handle, pipe.overlapped, transferred, 0) ~= 0 then
+            pipe.pending = 0
+            pipe.offset = 0
+            pipe.filled = transferred[0]
+            return
+        end
+        local code = C.GetLastError()
+        if code == ERROR_IO_INCOMPLETE then
+            return
+        end
+        pipe.pending = 0
+        if code == ERROR_BROKEN_PIPE or code == ERROR_HANDLE_EOF or code == ERROR_PIPE_NOT_CONNECTED then
+            pipe.eof = 1
+        else
+            pipe.failed = code
+        end
+    end
+
+    -- Keeps one read in flight while nothing is buffered, so there is always
+    -- an event to sleep on, and collects it if it already finished.
+    local function startRead(pipe: any): nil
+        if pipe.pending ~= 0 or pipe.filled > pipe.offset or pipe.eof ~= 0 or pipe.failed ~= 0 then
+            return
+        end
+        if C.ReadFile(pipe.handle, pipe.buffer, READ_SIZE, nil, pipe.overlapped) == 0 then
+            local code = C.GetLastError()
+            if code == ERROR_BROKEN_PIPE or code == ERROR_HANDLE_EOF or code == ERROR_PIPE_NOT_CONNECTED then
+                pipe.eof = 1
+                return
+            elseif code ~= ERROR_IO_PENDING then
+                pipe.failed = code
+                return
+            end
+        end
+        pipe.pending = 1
+        finishRead(pipe)
+    end
+
+    spawnChild = function(options: shared.SpawnOptions): (any?, any?, any?, any?, integer, string?, integer?)
+        local inputMode, outputMode, errorMode = validate(options)
+        local arguments: {string} = {}
+        for index, argument in ipairs(options.args or {}) do
+            arguments[index] = textual(argument, "an argument")
+        end
+        if #arguments == 0 then
+            error("nupp: could not start process: a spawn needs a program to run", 0)
+        end
+        local entries = overrides(options)
+        local cwd = directory(options)
+        local line = wide(commandLine(arguments))
+        local environment, path = environmentBlock(options, entries)
+        local application = resolve(arguments[1], path)
+        local cwdText: any = cwd ~= nil and wide(cwd) or nil
+
+        local pipes: {any} = {}
+        local childHandles: {any} = {}
+        local opened: {any} = {}
+        local problem: string? = nil
+        local function own(handle: any): any
+            if handle ~= nil then
+                opened[#opened + 1] = handle
+            end
+
+            return handle
+        end
+        local function prepare(index: integer, mode: string): nil
+            if problem ~= nil then
+                return
+            end
+            if mode == "pipe" then
+                local pipe, client, reason = createPipe(index ~= 1)
+                if reason ~= nil then
+                    problem = reason
+                    return
+                end
+                pipes[index] = pipe
+                childHandles[index] = own(client)
+            elseif mode == "inherit" then
+                local handle, reason = duplicateStandard(index)
+                problem = reason
+                childHandles[index] = own(handle)
+            elseif mode == "null" then
+                local handle, reason = openNull()
+                problem = reason
+                childHandles[index] = own(handle)
+            end
+        end
+        prepare(1, inputMode)
+        prepare(2, outputMode)
+        if errorMode == "stdout" then
+            -- The same destination as stdout, not the parent's stderr.
+            if outputMode == "pipe" then
+                childHandles[3] = childHandles[2]
+            elseif outputMode == "inherit" and problem == nil then
+                local handle, reason = duplicateStandard(2)
+                problem = reason
+                childHandles[3] = own(handle)
+            else
+                prepare(3, outputMode)
+            end
+        else
+            prepare(3, errorMode)
+        end
+
+        local function cleanup(): nil
+            for _, handle in ipairs(opened) do
+                closeHandle(handle)
+            end
+        end
+        local function abandon(reason: string, code: integer?): (any?, any?, any?, any?, integer, string?, integer?)
+            cleanup()
+            for index = 1, 3 do
+                if pipes[index] ~= nil then
+                    settlePipe(pipes[index])
+                end
+            end
+
+            return nil, nil, nil, nil, 0, reason, code
+        end
+        if problem ~= nil then
+            return abandon(problem as string, nil)
+        end
+
+        -- Only the handles named here reach the child, so a spawn racing on
+        -- another thread cannot leak its pipe ends into this child and keep
+        -- them open past this child's exit.
+        local distinct: {any} = {}
+        for index = 1, 3 do
+            local handle = childHandles[index]
+            if handle ~= nil then
+                local seen = false
+                for _, other in ipairs(distinct) do
+                    if other == handle then
+                        seen = true
+                    end
+                end
+                if not seen then
+                    distinct[#distinct + 1] = handle
+                end
+            end
+        end
+        local startup: any = ffi.new("NuppProcessStartupEx")
+        startup.StartupInfo.cb = ffi.sizeof("NuppProcessStartupEx")
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+        startup.StartupInfo.hStdInput = childHandles[1]
+        startup.StartupInfo.hStdOutput = childHandles[2]
+        startup.StartupInfo.hStdError = childHandles[3]
+        local flags = CREATE_UNICODE_ENVIRONMENT + EXTENDED_STARTUPINFO_PRESENT
+        local list: any = nil
+        local listHandles: any = nil
+        if #distinct > 0 then
+            local size = ffi.new("size_t[1]")
+            C.InitializeProcThreadAttributeList(nil, 1, 0, size)
+            list = ffi.new("uint8_t[?]", tonumber(size[0]) as integer)
+            if C.InitializeProcThreadAttributeList(list, 1, 0, size) == 0 then
+                return abandon(lastError("start process"), C.GetLastError())
+            end
+            listHandles = ffi.new("void *[?]", #distinct)
+            for index, handle in ipairs(distinct) do
+                listHandles[index - 1] = handle
+            end
+            if C.UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                listHandles,
+                ffi.sizeof("void *") * #distinct,
+                nil,
+                nil
+            ) == 0 then
+                local code = C.GetLastError()
+                C.DeleteProcThreadAttributeList(list)
+                return abandon(failure("start process", describe(code), code), code)
+            end
+            startup.lpAttributeList = list
+        end
+        local information: any = ffi.new("NuppProcessInformation")
+        local created = C.CreateProcessW(
+            application,
+            line,
+            nil,
+            nil,
+            #distinct > 0 and 1 or 0,
+            flags,
+            environment,
+            cwdText,
+            ffi.cast("NuppProcessStartup *", startup),
+            information
+        )
+        local code = C.GetLastError()
+        if list ~= nil then
+            C.DeleteProcThreadAttributeList(list)
+        end
+        if created == 0 then
+            return abandon(failure("start process", describe(code), code), code)
+        end
+        cleanup()
+        C.CloseHandle(information.hThread)
+
+        local owner = newOwner(tonumber(information.dwProcessId) as integer)
+        local child: any = ffi.new("NuppProcessChild")
+        child.process = information.hProcess
+        owner.child = ffi.gc(child, closeChild)
+        local streams: {any} = {}
+        for index = 1, 3 do
+            if pipes[index] ~= nil then
+                local stream = newStream(owner, index ~= 1)
+                stream.pipe = pipes[index]
+                if index ~= 1 then
+                    startRead(stream.pipe)
+                end
+                streams[index] = stream
+            end
+        end
+
+        return owner, streams[1], streams[2], streams[3], owner.pid
+    end
+
+    reapExit = function(owner: any): nil
+        local process = owner.child.process
+        if owner.exit ~= nil or process == nil or C.WaitForSingleObject(process, 0) ~= WAIT_OBJECT_0 then
+            return
+        end
+        local code = 1
+        if C.GetExitCodeProcess(process, exitCode) ~= 0 then
+            -- An NTSTATUS such as an access violation reads as the negative
+            -- number it is.
+            local unsigned = tonumber(exitCode[0]) as integer
+            code = unsigned >= 0x80000000 and unsigned - 0x100000000 or unsigned
+        end
+        -- Windows termination leaves exit code 1, so a requested kill counts
+        -- unless the child reported success.
+        owner.exit = {exitcode = code, killed = owner.killRequested and code ~= 0, timedout = false, signal = nil}
+    end
+
+    signalChild = function(owner: any, force: boolean): nil
+        local process = owner.child.process
+        if process == nil then
+            error("nupp: could not kill process: the child has been released", 0)
+        end
+        if C.WaitForSingleObject(process, 0) == WAIT_OBJECT_0 then
+            return
+        end
+        owner.killRequested = true
+        if C.TerminateProcess(process, 1) == 0 and C.WaitForSingleObject(process, 0) ~= WAIT_OBJECT_0 then
+            error(lastError("kill process"), 0)
+        end
+    end
+
+    releaseChild = function(owner: any): nil
+        local index = 1
+        while index <= #lingering do
+            if lingering[index].owner == owner then
+                settlePipe(lingering[index].pipe)
+                table.remove(lingering, index)
+            else
+                index = index + 1
+            end
+        end
+        closeChild(owner.child)
+    end
+
+    readInto = function(stream: any, pointer: any, wanted: integer): (integer, integer)
+        local pipe = stream.pipe
+        finishRead(pipe)
+        if pipe.filled <= pipe.offset then
+            startRead(pipe)
+        end
+        if pipe.filled > pipe.offset then
+            local count = math.min(wanted, pipe.filled - pipe.offset) as integer
+            ffi.copy(pointer, pipe.buffer + pipe.offset, count)
+            pipe.offset = pipe.offset + count
+            if pipe.offset >= pipe.filled then
+                pipe.offset = 0
+                pipe.filled = 0
+                startRead(pipe)
+            end
+
+            return READ_DATA, count
+        end
+        if pipe.failed ~= 0 then
+            error(failure("read process stream", describe(pipe.failed), pipe.failed), 0)
+        end
+        if pipe.eof ~= 0 then
+            return READ_EOF, 0
+        end
+
+        return READ_PENDING, 0
+    end
+
+    local function gone(code: integer): boolean
+        return code == ERROR_BROKEN_PIPE or code == ERROR_NO_DATA or code == ERROR_PIPE_NOT_CONNECTED
+    end
+
+    writeFrom = function(stream: any, pointer: any, count: integer): (integer, integer)
+        local pipe = stream.pipe
+        finishWrite(pipe)
+        if pipe.failed ~= 0 then
+            if gone(pipe.failed) then
+                return WRITE_GONE, 0
+            end
+            error(failure("write process stream", describe(pipe.failed), pipe.failed), 0)
+        end
+        if count == 0 then
+            return WRITE_ACCEPTED, 0
+        end
+        if pipe.pending ~= 0 then
+            return WRITE_PENDING, 0
+        end
+        local taken = math.min(count, WRITE_SIZE) as integer
+        ffi.copy(pipe.buffer, pointer, taken)
+        pipe.offset = 0
+        pipe.filled = taken
+        if C.WriteFile(pipe.handle, pipe.buffer, taken, nil, pipe.overlapped) == 0 then
+            local code = C.GetLastError()
+            if gone(code) then
+                pipe.failed = code
+                return WRITE_GONE, 0
+            elseif code ~= ERROR_IO_PENDING then
+                error(failure("write process stream", describe(code), code), 0)
+            end
+        end
+        pipe.pending = 1
+        finishWrite(pipe)
+
+        return WRITE_ACCEPTED, taken
+    end
+
+    releaseStream = function(stream: any): nil
+        local pipe = stream.pipe
+        if not stream.readable then
+            finishWrite(pipe)
+            if pipe.pending ~= 0 then
+                lingering[#lingering + 1] = {owner = stream.owner, pipe = pipe}
+                return
+            end
+        end
+        settlePipe(pipe)
+    end
+
+    streamReady = function(stream: any): boolean
+        local pipe = stream.pipe
+        if stream.readable then
+            finishRead(pipe)
+            startRead(pipe)
+            return pipe.filled > pipe.offset or pipe.eof ~= 0 or pipe.failed ~= 0
+        end
+        finishWrite(pipe)
+
+        return pipe.pending == 0
+    end
+
+    local waitHandles: any = ffi.new("void *[?]", MAXIMUM_WAIT_OBJECTS)
+
+    sleepOn = function(interest: shared.Interest, timeout: integer): nil
+        local count = 0
+        local function add(handle: any): nil
+            if handle ~= nil and count < MAXIMUM_WAIT_OBJECTS then
+                waitHandles[count] = handle
+                count = count + 1
+            end
+        end
+        local wake = native.wake()
+        if wake ~= nil then
+            local event: any = ffi.cast("void *", wake)
+            C.ResetEvent(event)
+            if not native.settle() then
+                return
+            end
+            add(event)
+        else
+            native.settle()
+            timeout = math.min(timeout, UNWAKEABLE_MS) as integer
+        end
+        local owner: any = interest.child
+        if owner ~= nil and owner.exit == nil and owner.child.process ~= nil then
+            add(owner.child.process)
+        end
+        for _, stream in ipairs(interest.read) do
+            if stream.pipe ~= nil and stream.pipe.pending ~= 0 then
+                add(stream.pipe.event)
+            end
+        end
+        for _, stream in ipairs(interest.write) do
+            if stream.pipe ~= nil and stream.pipe.pending ~= 0 then
+                add(stream.pipe.event)
+            end
+        end
+        for _, entry in ipairs(lingering) do
+            if entry.owner == owner then
+                add(entry.pipe.event)
+            end
+        end
+        if count == 0 then
+            return
+        end
+        local waited = C.WaitForMultipleObjects(count, waitHandles, 0, timeout)
+        if waited ~= WAIT_TIMEOUT and waited >= count then
+            error(lastError("wait for process readiness"), 0)
+        end
+        serviceLingering()
+    end
+
+    -- Keeps the lingering list moving whenever any provider call runs.
+    local baseReap = reapExit
+    reapExit = function(owner: any): nil
+        serviceLingering()
+        baseReap(owner)
+    end
+else
+    if not pcall(ffi.typeof, "NuppProcessPollFd") then
+        ffi.cdef[[
+        typedef struct {
+            int fd;
+            short events;
+            short revents;
+        } NuppProcessPollFd;
+        typedef struct {
+            long seconds;
+            long nanoseconds;
+        } NuppProcessTimespec;
+        typedef struct {
+            uintptr_t ident;
+            int16_t filter;
+            uint16_t flags;
+            uint32_t fflags;
+            intptr_t data;
+            void *udata;
+        } NuppProcessKevent;
+        typedef struct {
+            int32_t pid;
+            int32_t descriptor;
+            int32_t reaped;
+        } NuppProcessChild;
+        typedef struct {
+            int32_t descriptor;
+        } NuppProcessPipe;
+        int pipe(int *);
+        int pipe2(int *, int);
+        int fcntl(int, int, ...);
+        int close(int);
+        int open(const char *, int, ...);
+        int access(const char *, int);
+        ssize_t read(int, void *, size_t);
+        ssize_t write(int, const void *, size_t);
+        int poll(NuppProcessPollFd *, unsigned long, int);
+        int kill(int, int);
+        int waitpid(int, int *, int);
+        char *strerror(int);
+        long syscall(long, ...);
+        int kqueue(void);
+        int kevent(int, const NuppProcessKevent *, int, NuppProcessKevent *, int, const NuppProcessTimespec *);
+        int posix_spawn(int *, const char *, const void *, const void *, char *const *, char *const *);
+        int posix_spawnp(int *, const char *, const void *, const void *, char *const *, char *const *);
+        int posix_spawn_file_actions_init(void *);
+        int posix_spawn_file_actions_destroy(void *);
+        int posix_spawn_file_actions_adddup2(void *, int, int);
+        int posix_spawn_file_actions_addchdir_np(void *, const char *);
+        int posix_spawnattr_init(void *);
+        int posix_spawnattr_destroy(void *);
+        int posix_spawnattr_setflags(void *, short);
+        int posix_spawnattr_setsigmask(void *, const void *);
+        int posix_spawnattr_setsigdefault(void *, const void *);
+        int sigemptyset(void *);
+        int sigaddset(void *, int);
+        int sigismember(const void *, int);
+        int sigpending(void *);
+        int pthread_sigmask(int, const void *, void *);
+        int sigtimedwait(const void *, void *, const NuppProcessTimespec *);
+        char ***_NSGetEnviron(void);
+        extern char **environ;
+        ]]
+    end
+
+    local F_GETFL = 3
+    local F_SETFL = 4
+    local F_SETFD = 2
+    local FD_CLOEXEC = 1
+    local F_SETNOSIGPIPE = 73
+    local O_RDWR = 2
+    local O_NONBLOCK = darwin and 0x4 or 0x800
+    local O_CLOEXEC = darwin and 0x1000000 or 0x80000
+    local POLLIN = 0x1
+    local POLLOUT = 0x4
+    local EINTR = 4
+    local ESRCH = 3
+    local ENOENT = 2
+    local EPIPE = 32
+    local EAGAIN = darwin and 35 or 11
+    local SIGKILL = 9
+    local SIGPIPE = 13
+    local SIGTERM = 15
+    local SIG_BLOCK = darwin and 1 or 0
+    local SIG_SETMASK = darwin and 3 or 2
+    local WNOHANG = 1
+    local X_OK = 1
+    local POSIX_SPAWN_SETSIGDEF = 0x04
+    local POSIX_SPAWN_SETSIGMASK = 0x08
+    local SYS_PIDFD_OPEN = 434
+    local EVFILT_PROC = -5
+    local EV_ADD = 0x1
+    local EV_ONESHOT = 0x10
+    local NOTE_EXIT = 0x80000000
+    -- Generous for every libc's opaque spawn records and signal sets.
+    local OPAQUE_SIZE = 1024
+
+    local status: any = ffi.new("int[1]")
+    local pidOut: any = ffi.new("int[1]")
+    local ends: any = ffi.new("int[2]")
+    local blocked: any = ffi.new("uint8_t[?]", OPAQUE_SIZE)
+    local previous: any = ffi.new("uint8_t[?]", OPAQUE_SIZE)
+    local pendingSignals: any = ffi.new("uint8_t[?]", OPAQUE_SIZE)
+    local noTime: any = ffi.new("NuppProcessTimespec")
+    C.sigemptyset(blocked)
+    C.sigaddset(blocked, SIGPIPE)
+
+    local function describe(code: integer): string
+        return ffi.string(C.strerror(code))
+    end
+
+    local function closeDescriptor(cell: any): nil
+        if cell.descriptor >= 0 then
+            C.close(cell.descriptor)
+            cell.descriptor = -1
+        end
+    end
+
+    local function wrapDescriptor(descriptor: integer): any
+        local cell: any = ffi.new("NuppProcessPipe")
+        cell.descriptor = descriptor
+
+        return ffi.gc(cell, closeDescriptor)
+    end
+
+    local function closeOnExec(descriptor: integer): nil
+        C.fcntl(descriptor, F_SETFD, ffi.new("int", FD_CLOEXEC))
+    end
+
+    local function nonblocking(descriptor: integer): nil
+        local flags = C.fcntl(descriptor, F_GETFL)
+        C.fcntl(descriptor, F_SETFL, ffi.new("int", flags | O_NONBLOCK))
+    end
+
+    local hasPipe2 = not darwin and pcall(function(): any
+        return C.pipe2
+    end)
+
+    local function createPipe(): (integer, integer, integer?)
+        if hasPipe2 then
+            if C.pipe2(ends, O_CLOEXEC) ~= 0 then
+                return -1, -1, ffi.errno()
+            end
+        else
+            if C.pipe(ends) ~= 0 then
+                return -1, -1, ffi.errno()
+            end
+            closeOnExec(ends[0])
+            closeOnExec(ends[1])
+        end
+
+        return ends[0], ends[1], nil
+    end
+
+    local function environ(): any
+        if darwin then
+            return C._NSGetEnviron()[0]
+        end
+
+        return C.environ
+    end
+
+    local function inherited(): {any}
+        local entries: {any} = {}
+        local values = environ()
+        if values == nil then
+            return entries
+        end
+        local index = 0
+        while values[index] ~= nil do
+            local entry = ffi.string(values[index])
+            local split = entry:find("=", 1, true)
+            if split ~= nil and split > 1 then
+                entries[#entries + 1] = {name = entry:sub(1, split - 1), value = entry:sub(split + 1)}
+            end
+            index = index + 1
+        end
+
+        return entries
+    end
+
+    -- The child's environment, as a pointer array and the strings it holds, or
+    -- the parent's own when the spawn changes nothing.
+    local function environmentArray(options: shared.SpawnOptions, entries: {any}): (any, {string}, string?)
+        if #entries == 0 and options.clearenv ~= true then
+            return environ(), {}, nil
+        end
+        local order: {string} = {}
+        local merged: {[string]: string} = {}
+        if options.clearenv ~= true then
+            for _, entry in ipairs(inherited()) do
+                if merged[entry.name] == nil then
+                    order[#order + 1] = entry.name
+                end
+                merged[entry.name] = entry.value
+            end
+        end
+        for _, entry in ipairs(entries) do
+            if merged[entry.name] == nil then
+                order[#order + 1] = entry.name
+            end
+            merged[entry.name] = entry.value
+        end
+        local strings: {string} = {}
+        local array = ffi.new("char *[?]", #order + 1)
+        for index, name in ipairs(order) do
+            strings[index] = name .. "=" .. merged[name]
+            array[index - 1] = ffi.cast("char *", strings[index])
+        end
+
+        return array, strings, merged["PATH"]
+    end
+
+    -- A program named without a directory is looked up on the child's PATH when
+    -- the spawn changes it, the way a shell would run it.
+    local function resolve(program: string, path: string?): string?
+        if path == nil or program:find("/", 1, true) then
+            return nil
+        end
+        for folder in (path .. ":"):gmatch("([^:]*):") do
+            local candidate = (folder == "" and "." or folder) .. "/" .. program
+            if C.access(candidate, X_OK) == 0 then
+                return candidate
+            end
+        end
+
+        return nil
+    end
+
+    local hasChdir = pcall(function(): any
+        return C.posix_spawn_file_actions_addchdir_np
+    end)
+
+    local orphans: {integer} = {}
+
+    local function reapOrphans(): nil
+        local index = 1
+        while index <= #orphans do
+            local result = C.waitpid(orphans[index], status, WNOHANG)
+            if result ~= 0 then
+                table.remove(orphans, index)
+            else
+                index = index + 1
+            end
+        end
+    end
+
+    -- A child dropped unreaped is killed, and reaped once it has gone.
+    local function closeChild(child: any): nil
+        if child.reaped == 0 and child.pid > 0 then
+            C.kill(child.pid, SIGKILL)
+            if C.waitpid(child.pid, status, WNOHANG) == 0 then
+                orphans[#orphans + 1] = child.pid
+            end
+            child.reaped = 1
+        end
+        if child.descriptor >= 0 then
+            C.close(child.descriptor)
+            child.descriptor = -1
+        end
+    end
+
+    -- A descriptor that becomes readable when the child exits: a pidfd on Linux,
+    -- a kqueue holding a process-exit filter on macOS, and -1 where neither
+    -- exists, which leaves a wait on that child to bounded sleeps.
+    local function exitDescriptor(pid: integer): integer
+        if darwin then
+            local queue = C.kqueue()
+            if queue < 0 then
+                return -1
+            end
+            closeOnExec(queue)
+            local change: any = ffi.new("NuppProcessKevent")
+            change.ident = pid
+            change.filter = EVFILT_PROC
+            change.flags = EV_ADD + EV_ONESHOT
+            change.fflags = NOTE_EXIT
+            if C.kevent(queue, change, 1, nil, 0, nil) ~= 0 then
+                C.close(queue)
+                return -1
+            end
+            return queue
+        end
+        local ok, descriptor = pcall(function(): any
+            return C.syscall(SYS_PIDFD_OPEN, ffi.new("int", pid), ffi.new("unsigned int", 0))
+        end)
+        if not ok or tonumber(descriptor) as integer < 0 then
+            return -1
+        end
+
+        return tonumber(descriptor) as integer
+    end
+
+    spawnChild = function(options: shared.SpawnOptions): (any?, any?, any?, any?, integer, string?, integer?)
+        reapOrphans()
+        local inputMode, outputMode, errorMode = validate(options)
+        local arguments: {string} = {}
+        for index, argument in ipairs(options.args or {}) do
+            arguments[index] = textual(argument, "an argument")
+        end
+        if #arguments == 0 then
+            error("nupp: could not start process: a spawn needs a program to run", 0)
+        end
+        local entries = overrides(options)
+        local cwd = directory(options)
+        if cwd ~= nil and not hasChdir then
+            error("nupp: could not start process: this C library cannot start a child in another directory", 0)
+        end
+        local argv = ffi.new("char *[?]", #arguments + 1)
+        for index, argument in ipairs(arguments) do
+            argv[index - 1] = ffi.cast("char *", argument)
+        end
+        local envp, envStrings, path = environmentArray(options, entries)
+        local program = resolve(arguments[1], path)
+
+        local parentEnds: {integer} = {-1, -1, -1}
+        local childEnds: {integer} = {}
+        local toClose: {integer} = {}
+        local problem: integer? = nil
+        local nullDescriptor = -1
+        local function null(): integer
+            if nullDescriptor < 0 then
+                nullDescriptor = C.open("/dev/null", O_RDWR | O_CLOEXEC)
+                if nullDescriptor < 0 then
+                    problem = ffi.errno()
+                else
+                    toClose[#toClose + 1] = nullDescriptor
+                end
+            end
+
+            return nullDescriptor
+        end
+        local function prepare(index: integer, mode: string): nil
+            if problem ~= nil then
+                return
+            end
+            if mode == "pipe" then
+                local readEnd, writeEnd, code = createPipe()
+                if code ~= nil then
+                    problem = code
+                    return
+                end
+                if index == 1 then
+                    parentEnds[1], childEnds[1] = writeEnd, readEnd
+                else
+                    parentEnds[index], childEnds[index] = readEnd, writeEnd
+                end
+                toClose[#toClose + 1] = childEnds[index]
+                nonblocking(parentEnds[index])
+                if index == 1 and darwin then
+                    C.fcntl(parentEnds[1], F_SETNOSIGPIPE, ffi.new("int", 1))
+                end
+            elseif mode == "null" then
+                childEnds[index] = null()
+            end
+        end
+        prepare(1, inputMode)
+        prepare(2, outputMode)
+        if errorMode == "stdout" then
+            if outputMode == "pipe" then
+                childEnds[3] = childEnds[2]
+            elseif outputMode == "inherit" then
+                childEnds[3] = 1
+            else
+                childEnds[3] = null()
+            end
+        else
+            prepare(3, errorMode)
+        end
+
+        local function abandon(code: integer): (any?, any?, any?, any?, integer, string?, integer?)
+            for _, descriptor in ipairs(toClose) do
+                C.close(descriptor)
+            end
+            for index = 1, 3 do
+                if parentEnds[index] >= 0 then
+                    C.close(parentEnds[index])
+                end
+            end
+
+            return nil, nil, nil, nil, 0, failure("start process", describe(code), code), code
+        end
+        if problem ~= nil then
+            return abandon(problem as integer)
+        end
+
+        local actions = ffi.new("uint8_t[?]", OPAQUE_SIZE)
+        local attributes = ffi.new("uint8_t[?]", OPAQUE_SIZE)
+        local defaults = ffi.new("uint8_t[?]", OPAQUE_SIZE)
+        local mask = ffi.new("uint8_t[?]", OPAQUE_SIZE)
+        C.posix_spawn_file_actions_init(actions)
+        C.posix_spawnattr_init(attributes)
+        for index = 1, 3 do
+            local descriptor = childEnds[index]
+            if descriptor ~= nil then
+                C.posix_spawn_file_actions_adddup2(actions, descriptor, index - 1)
+            end
+        end
+        if cwd ~= nil then
+            C.posix_spawn_file_actions_addchdir_np(actions, cwd)
+        end
+        -- The child starts with no blocked signals and SIGPIPE at its default,
+        -- whatever this process does with them.
+        C.sigemptyset(mask)
+        C.sigemptyset(defaults)
+        C.sigaddset(defaults, SIGPIPE)
+        C.posix_spawnattr_setsigmask(attributes, mask)
+        C.posix_spawnattr_setsigdefault(attributes, defaults)
+        C.posix_spawnattr_setflags(attributes, POSIX_SPAWN_SETSIGMASK + POSIX_SPAWN_SETSIGDEF)
+        local result: integer
+        if program ~= nil then
+            result = C.posix_spawn(pidOut, program, actions, attributes, argv, envp)
+        elseif path ~= nil and not arguments[1]:find("/", 1, true) then
+            result = ENOENT
+        else
+            result = C.posix_spawnp(pidOut, arguments[1], actions, attributes, argv, envp)
+        end
+        C.posix_spawn_file_actions_destroy(actions)
+        C.posix_spawnattr_destroy(attributes)
+        local _ = envStrings
+        if result ~= 0 then
+            return abandon(result)
+        end
+        for _, descriptor in ipairs(toClose) do
+            C.close(descriptor)
+        end
+
+        local pid = pidOut[0]
+        local owner = newOwner(pid)
+        local child: any = ffi.new("NuppProcessChild")
+        child.pid = pid
+        child.descriptor = exitDescriptor(pid)
+        owner.child = ffi.gc(child, closeChild)
+        local streams: {any} = {}
+        for index = 1, 3 do
+            if parentEnds[index] >= 0 then
+                local stream = newStream(owner, index ~= 1)
+                stream.pipe = wrapDescriptor(parentEnds[index])
+                streams[index] = stream
+            end
+        end
+
+        return owner, streams[1], streams[2], streams[3], pid
+    end
+
+    reapExit = function(owner: any): nil
+        local child = owner.child
+        if owner.exit ~= nil or child.reaped ~= 0 then
+            return
+        end
+        local result = C.waitpid(child.pid, status, WNOHANG)
+        if result == 0 then
+            return
+        end
+        child.reaped = 1
+        if result < 0 then
+            owner.exit = {exitcode = 1, killed = false, timedout = false, signal = nil}
+            return
+        end
+        local value = status[0]
+        local terminating = value & 0x7f
+        -- The status itself says whether a signal ended the child, so a child
+        -- that exits on its own after a kill was requested was not killed.
+        if terminating == 0 then
+            owner.exit = {exitcode = (value >> 8) & 0xff, killed = false, timedout = false, signal = nil}
+        elseif terminating ~= 0x7f then
+            owner.exit = {exitcode = 128 + terminating, killed = true, timedout = false, signal = terminating}
+        end
+    end
+
+    signalChild = function(owner: any, force: boolean): nil
+        reapExit(owner)
+        local child = owner.child
+        if owner.exit ~= nil or child.reaped ~= 0 then
+            return
+        end
+        owner.killRequested = true
+        -- Only the direct child: what it started is its own to end.
+        if C.kill(child.pid, force and SIGKILL or SIGTERM) ~= 0 then
+            local code = ffi.errno()
+            if code ~= ESRCH then
+                error(failure("kill process", describe(code), code), 0)
+            end
+        end
+    end
+
+    releaseChild = function(owner: any): nil
+        closeChild(owner.child)
+    end
+
+    readInto = function(stream: any, pointer: any, wanted: integer): (integer, integer)
+        while true do
+            local count = tonumber(C.read(stream.pipe.descriptor, pointer, wanted)) as integer
+            if count > 0 then
+                return READ_DATA, count
+            elseif count == 0 then
+                return READ_EOF, 0
+            end
+            local code = ffi.errno()
+            if code == EAGAIN then
+                return READ_PENDING, 0
+            elseif code ~= EINTR then
+                error(failure("read process stream", describe(code), code), 0)
+            end
+        end
+    end
+
+    -- A write to a pipe the child has closed raises SIGPIPE, which would end
+    -- this whole process. macOS refuses it per descriptor; elsewhere it is
+    -- blocked across the one write, and consumed if that write raised it.
+    local function quietWrite(descriptor: integer, pointer: any, count: integer): (integer, integer)
+        if darwin then
+            local wrote = tonumber(C.write(descriptor, pointer, count)) as integer
+            return wrote, wrote < 0 and ffi.errno() or 0
+        end
+        C.pthread_sigmask(SIG_BLOCK, blocked, previous)
+        C.sigemptyset(pendingSignals)
+        C.sigpending(pendingSignals)
+        local already = C.sigismember(pendingSignals, SIGPIPE) == 1
+        local wrote = tonumber(C.write(descriptor, pointer, count)) as integer
+        local code = wrote < 0 and ffi.errno() or 0
+        if code == EPIPE and not already then
+            C.sigtimedwait(blocked, nil, noTime)
+        end
+        C.pthread_sigmask(SIG_SETMASK, previous, nil)
+
+        return wrote, code
+    end
+
+    writeFrom = function(stream: any, pointer: any, count: integer): (integer, integer)
+        if count == 0 then
+            return WRITE_ACCEPTED, 0
+        end
+        local taken = math.min(count, WRITE_SIZE) as integer
+        while true do
+            local wrote, code = quietWrite(stream.pipe.descriptor, pointer, taken)
+            if wrote >= 0 then
+                return WRITE_ACCEPTED, wrote
+            elseif code == EAGAIN then
+                return WRITE_PENDING, 0
+            elseif code == EPIPE then
+                return WRITE_GONE, 0
+            elseif code ~= EINTR then
+                error(failure("write process stream", describe(code), code), 0)
+            end
+        end
+    end
+
+    releaseStream = function(stream: any): nil
+        closeDescriptor(stream.pipe)
+    end
+
+    local single: any = ffi.new("NuppProcessPollFd[1]")
+
+    streamReady = function(stream: any): boolean
+        single[0].fd = stream.pipe.descriptor
+        single[0].events = stream.readable and POLLIN or POLLOUT
+        single[0].revents = 0
+        if C.poll(single, 1, 0) <= 0 then
+            return false
+        end
+
+        return single[0].revents ~= 0
+    end
+
+    local scratch: any = ffi.new("uint8_t[256]")
+    local capacity = 0
+    local descriptors: any = nil
+
+    sleepOn = function(interest: shared.Interest, timeout: integer): nil
+        local wanted = 1 + #interest.read + #interest.write + 1
+        if wanted > capacity then
+            capacity = wanted
+            descriptors = ffi.new("NuppProcessPollFd[?]", capacity)
+        end
+        local count = 0
+        local function add(descriptor: integer, events: integer): nil
+            if descriptor >= 0 then
+                descriptors[count].fd = descriptor
+                descriptors[count].events = events
+                descriptors[count].revents = 0
+                count = count + 1
+            end
+        end
+        local wake = native.wake()
+        if wake ~= nil then
+            local descriptor = tonumber(wake) as integer
+            while C.read(descriptor, scratch, 256) > 0 do
+            end
+            if not native.settle() then
+                return
+            end
+            add(descriptor, POLLIN)
+        else
+            native.settle()
+            timeout = math.min(timeout, UNWAKEABLE_MS) as integer
+        end
+        local owner: any = interest.child
+        if owner ~= nil and owner.exit == nil and owner.child.reaped == 0 then
+            if owner.child.descriptor >= 0 then
+                add(owner.child.descriptor, POLLIN)
+            else
+                timeout = math.min(timeout, UNWAKEABLE_MS) as integer
+            end
+        end
+        for _, stream in ipairs(interest.read) do
+            add(stream.pipe.descriptor, POLLIN)
+        end
+        for _, stream in ipairs(interest.write) do
+            add(stream.pipe.descriptor, POLLOUT)
+        end
+        if C.poll(descriptors, count, timeout) < 0 and ffi.errno() ~= EINTR then
+            local code = ffi.errno()
+            error(failure("wait for process readiness", describe(code), code), 0)
+        end
+    end
+end
+
+local function released(stream: any, what: string): nil
+    if stream == nil or stream.released then
+        error("nupp: could not " .. what .. ": the process stream has been closed", 0)
+    end
+end
+
+local function readResult(state: integer, count: integer): integer?
+    if state == READ_DATA then
+        return count
+    elseif state == READ_PENDING then
+        return 0
+    end
+
+    return nil
 end
 
 local function create(): contract.Provider
-    native.requireFeature(PROCESS_FEATURE, "process")
-    -- New symbols are optional while installed runtimes still use the pinned ABI.
-    local hasSpawnError, spawnWithError = pcall(function(): any
-        return C.nuppNativeProcessSpawnWithError
-    end)
-    local hasExitSignal, pollWithSignal = pcall(function(): any
-        return C.nuppNativeProcessPollExitWithSignal
-    end)
-
     return {
         spawn = function(
             self: contract.Provider,
             options: shared.SpawnOptions
         ): (any?, any?, any?, any?, integer, string?, integer?)
-            local inputMode = options.stdin or "pipe"
-            local outputMode = options.stdout or "pipe"
-            local errorMode = options.stderr or "pipe"
-            if MODE[inputMode] == nil then
-                error("nupp: process has no stdin mode named " .. tostring(inputMode), 0)
-            end
-            if MODE[outputMode] == nil or outputMode == "stdout" then
-                error("nupp: process has no stdout mode named " .. tostring(outputMode), 0)
-            end
-            if MODE[errorMode] == nil then
-                error("nupp: process has no stderr mode named " .. tostring(errorMode), 0)
-            end
-
-            local arguments = options.args or {}
-            local argumentSlices = native.ffi.new("NuppNativeProcessSlice[?]", #arguments)
-            for index, argument in ipairs(arguments) do
-                argumentSlices[index - 1].data = argument
-                argumentSlices[index - 1].length = #argument
-            end
-
-            local environment: {any} = {}
-            for key, value in pairs(options.env or {}) do
-                environment[#environment + 1] = {name = key, value = value}
-            end
-            local environmentEntries = native.ffi.new("NuppNativeProcessEnv[?]", #environment)
-            for index, entry in ipairs(environment) do
-                environmentEntries[index - 1].name.data = entry.name
-                environmentEntries[index - 1].name.length = #entry.name
-                environmentEntries[index - 1].value.data = entry.value
-                environmentEntries[index - 1].value.length = #entry.value
-            end
-
-            local cwd: string? = nil
-            if options.cwd ~= nil then
-                cwd = type(options.cwd) == "string" and options.cwd as string or (options.cwd as any):tostring()
-            end
-            local descriptor = native.ffi.new("NuppNativeProcessSpawn[1]")
-            local cwdLength = 0
-            if cwd ~= nil then
-                cwdLength = #cwd
-            end
-            descriptor[0].args = #arguments == 0 and nil or argumentSlices
-            descriptor[0].arg_count = #arguments
-            descriptor[0].env = #environment == 0 and nil or environmentEntries
-            descriptor[0].env_count = #environment
-            descriptor[0].cwd.data = cwd
-            descriptor[0].cwd.length = cwdLength
-            descriptor[0].cwd_present = cwd == nil and 0 or 1
-            descriptor[0].clear_env = options.clearenv == true and 1 or 0
-            descriptor[0].stdin_mode = MODE[inputMode]
-            descriptor[0].stdout_mode = MODE[outputMode]
-            descriptor[0].stderr_mode = MODE[errorMode]
-
-            local started = native.ffi.new("NuppNativeProcessStarted[1]")
-            local status: integer
-            local errorCode: integer? = nil
-            if hasSpawnError and spawnWithError ~= nil then
-                local output = native.ffi.new("int32_t[1]")
-                status = spawnWithError(descriptor, started, output)
-                local code = tonumber(output[0]) as integer
-                if code ~= 0 then
-                    errorCode = code
-                end
-            else
-                status = C.nuppNativeProcessSpawn(descriptor, started)
-            end
-            if status ~= 0 then
-                return nil, nil, nil, nil, 0, reason("nupp: could not start process"), errorCode
-            end
-            local owner = {handle = started[0].process, released = false}
-            local input = wrap(owner, started[0].stdin_stream)
-            local output = wrap(owner, started[0].stdout_stream)
-            local err = wrap(owner, started[0].stderr_stream)
-
-            return owner, input, output, err, tonumber(started[0].pid) as integer
+            return spawnChild(options)
         end,
         poll = function(self: contract.Provider, owner: any): shared.Exit?
-            local output = native.ffi.new("NuppNativeProcessExit[1]")
-            local signal: integer? = nil
-            if hasExitSignal and pollWithSignal ~= nil then
-                local result = native.ffi.new("int32_t[1]")
-                configured(pollWithSignal(owner.handle, output, result), "poll process")
-                local number = tonumber(result[0]) as integer
-                if number < 0 then
-                    error("nupp: native process provider returned an invalid signal", 0)
-                elseif number > 0 then
-                    signal = number
-                end
-            else
-                configured(C.nuppNativeProcessPollExit(owner.handle, output), "poll process")
-            end
-            local ready = tonumber(output[0].ready) as integer
-            local killed = tonumber(output[0].killed) as integer
-            if (ready ~= 0 and ready ~= 1) or (killed ~= 0 and killed ~= 1) then
-                error("nupp: native process provider returned an invalid exit status", 0)
-            end
-            if ready == 0 then
+            reapExit(owner)
+            local exit: any = owner.exit
+            if exit == nil then
                 return nil
             end
+            owner.collected = true
 
-            return {
-                exitcode = tonumber(output[0].code) as integer,
-                killed = killed ~= 0,
-                timedout = false,
-                signal = signal
-            }
+            return {exitcode = exit.exitcode, killed = exit.killed, timedout = false, signal = exit.signal}
         end,
         kill = function(self: contract.Provider, owner: any, force: boolean): nil
-            configured(C.nuppNativeProcessKill(owner.handle, force and 1 or 0), "kill process")
+            if owner.released then
+                error("nupp: could not kill process: the child has been released", 0)
+            end
+            reapExit(owner)
+            if owner.exit ~= nil then
+                return
+            end
+            signalChild(owner, force)
         end,
         read = function(self: contract.Provider, stream: any, limit: integer): string?
-            local wanted = whole(limit)
-            if wanted < 1 then
-                wanted = 1
-            elseif wanted > READ_SIZE then
-                wanted = READ_SIZE
-            end
+            released(stream, "read process stream")
+            local wanted = clamp(whole(limit), 1, READ_SIZE)
             if stream.capacity < wanted then
-                stream.scratch = native.ffi.new("uint8_t[?]", wanted)
+                stream.scratch = ffi.new("uint8_t[?]", wanted)
                 stream.capacity = wanted
             end
-            local state = native.ffi.new("uint32_t[1]")
-            local length = native.ffi.new("size_t[1]")
-            configured(
-                C.nuppNativeProcessStreamRead(stream.handle, stream.scratch, wanted, state, length),
-                "read process stream"
-            )
-            local got = tonumber(length[0]) as integer
-            if got < 0 or got > wanted then
-                error("nupp: native process provider returned an invalid read count", 0)
-            end
-            if state[0] == READ_DATA then
-                if got == 0 then
-                    error("nupp: native process provider returned empty read data", 0)
-                end
-                return native.ffi.string(stream.scratch, got)
-            end
-            if state[0] == READ_PENDING then
-                if got ~= 0 then
-                    error("nupp: native process provider returned pending read data", 0)
-                end
-                return ""
-            end
-            if state[0] == READ_EOF then
-                if got ~= 0 then
-                    error("nupp: native process provider returned data at end of stream", 0)
-                end
+            local state, count = readInto(stream, stream.scratch, wanted)
+            local got = readResult(state, count)
+            if got == nil then
                 return nil
             end
-            error("nupp: native process provider returned an invalid read state", 0)
-        end,
 
+            return got == 0 and "" or ffi.string(stream.scratch, got)
+        end,
         readspan = function(self: contract.Provider, stream: any, exclusive destination: span.ByteWriteSpan): integer?
+            released(stream, "read process stream")
             local wanted = #destination
-            local readInto = C.nuppNativeProcessStreamRead as function(
-                handle: any,
-                borrows pointer: uint8[?],
-                count: integer,
-                state: any,
-                length: any
-            ): integer
-            local state = native.ffi.new("uint32_t[1]")
-            local length = native.ffi.new("size_t[1]")
-            configured(readInto(stream.handle, destination:ref(), wanted, state, length), "read process stream")
-            local got = tonumber(length[0]) as integer
-            if got < 0 or got > wanted then
-                error("nupp: native process provider returned an invalid read count", 0)
+            if wanted < 1 then
+                error("nupp: could not read process stream: a read needs room for at least one byte", 0)
             end
-            if state[0] == READ_DATA then
-                if got == 0 then
-                    error("nupp: native process provider returned empty read data", 0)
-                end
-                return got
-            end
-            if state[0] == READ_PENDING then
-                if got ~= 0 then
-                    error("nupp: native process provider returned pending read data", 0)
-                end
-                return 0
-            end
-            if state[0] == READ_EOF then
-                if got ~= 0 then
-                    error("nupp: native process provider returned data at end of stream", 0)
-                end
-                return nil
-            end
-            error("nupp: native process provider returned an invalid read state", 0)
+            local state, count = readInto(stream, destination:ref(), wanted)
+
+            return readResult(state, count)
         end,
         write = function(self: contract.Provider, stream: any, bytes: string): (integer, boolean)
-            local state = native.ffi.new("uint32_t[1]")
-            local length = native.ffi.new("size_t[1]")
-            configured(
-                C.nuppNativeProcessStreamWrite(stream.handle, bytes, #bytes, state, length),
-                "write process stream"
-            )
-            local wrote = tonumber(length[0]) as integer
-            if wrote < 0 or wrote > #bytes then
-                error("nupp: native process provider returned an invalid write count", 0)
-            end
-            if state[0] == WRITE_ACCEPTED then
-                return wrote, false
-            end
-            if state[0] == WRITE_PENDING then
-                if wrote ~= 0 then
-                    error("nupp: native process provider returned data for a pending write", 0)
-                end
-                return 0, false
-            end
-            if state[0] == WRITE_GONE then
-                if wrote ~= 0 then
-                    error("nupp: native process provider returned data for a closed pipe", 0)
-                end
-                return 0, true
-            end
-            error("nupp: native process provider returned an invalid write state", 0)
-        end,
+            released(stream, "write process stream")
+            local state, count = writeFrom(stream, bytes, #bytes)
 
+            return count, state == WRITE_GONE
+        end,
         writespan = function(self: contract.Provider, stream: any, borrows source: span.Span<uint8>): (integer, boolean)
-            local writeFrom = C.nuppNativeProcessStreamWrite as function(
-                handle: any,
-                borrows pointer: const uint8[?],
-                count: integer,
-                state: any,
-                length: any
-            ): integer
-            local state = native.ffi.new("uint32_t[1]")
-            local length = native.ffi.new("size_t[1]")
-            configured(writeFrom(stream.handle, source:ref(), #source, state, length), "write process stream")
-            local wrote = tonumber(length[0]) as integer
-            if wrote < 0 or wrote > #source then
-                error("nupp: native process provider returned an invalid write count", 0)
-            end
-            if state[0] == WRITE_ACCEPTED then
-                return wrote, false
-            end
-            if state[0] == WRITE_PENDING then
-                if wrote ~= 0 then
-                    error("nupp: native process provider returned data for a pending write", 0)
-                end
-                return 0, false
-            end
-            if state[0] == WRITE_GONE then
-                if wrote ~= 0 then
-                    error("nupp: native process provider returned data for a closed pipe", 0)
-                end
-                return 0, true
-            end
-            error("nupp: native process provider returned an invalid write state", 0)
+            released(stream, "write process stream")
+            local state, count = writeFrom(stream, source:ref(), #source)
+
+            return count, state == WRITE_GONE
         end,
         closestream = function(self: contract.Provider, stream: any): (boolean, string?)
             if stream.released then
                 return true, nil
             end
-            local status = C.nuppNativeProcessStreamRelease(stream.handle)
-            if status ~= 0 then
-                return false, reason("nupp: could not close process stream")
-            end
+            releaseStream(stream)
             stream.released = true
             stream.handle = nil
 
@@ -420,10 +1756,11 @@ local function create(): contract.Provider
             if owner.released then
                 return true, nil
             end
-            local status = C.nuppNativeProcessRelease(owner.handle)
-            if status ~= 0 then
-                return false, reason("nupp: could not release process")
+            reapExit(owner)
+            if owner.exit == nil then
+                return false, "nupp: could not release process: the child has not ended, so there is nothing to reap"
             end
+            releaseChild(owner)
             owner.released = true
             owner.handle = nil
 
@@ -433,36 +1770,40 @@ local function create(): contract.Provider
             return os.monotonic()
         end,
         waitready = function(self: contract.Provider, interest: shared.Interest, timeoutMs: number): integer
-            local readable, readCount = makeArray(interest.read)
-            local writable, writeCount = makeArray(interest.write)
-            local timeout = whole(timeoutMs)
-            if timeout < 0 then
-                timeout = 0
-            elseif timeout > INT32_MAX then
-                timeout = INT32_MAX
-            end
-            local ready = native.ffi.new("size_t[1]")
-
+            local timeout = clamp(whole(timeoutMs), 0, INT32_MAX)
             local function probe(): integer
-                configured(
-                    C.nuppNativeProcessWait(interest.child.handle, readable, readCount, writable, writeCount, 0, ready),
-                    "wait for process readiness"
-                )
-                local count = tonumber(ready[0]) as integer
-                if count < 0 or count > readCount + writeCount + 1 then
-                    error("nupp: native process provider returned an invalid readiness count", 0)
+                local count = 0
+                local owner: any = interest.child
+                if owner ~= nil and not owner.released then
+                    reapExit(owner)
+                    if owner.exit ~= nil and not owner.collected then
+                        count = count + 1
+                    end
+                end
+                for _, stream in ipairs(interest.read) do
+                    released(stream, "wait for process readiness")
+                    if streamReady(stream) then
+                        count = count + 1
+                    end
+                end
+                for _, stream in ipairs(interest.write) do
+                    released(stream, "wait for process readiness")
+                    if streamReady(stream) then
+                        count = count + 1
+                    end
                 end
 
                 return count
             end
 
-            -- Snapshot, check, then sleep from the snapshot: the child and its pipes
-            -- advance the readiness generation every native family shares, so a
-            -- change after the check ends the sleep, and so does any other family's.
+            -- Snapshot, check, then sleep on the wake handle and the child's own
+            -- handles together: an edge any native family reports after the
+            -- check signals the handle, and the child or a pipe moving signals
+            -- its own.
             native.snapshot()
             local count = probe()
             if count == 0 and timeout > 0 then
-                native.sleep(timeout)
+                sleepOn(interest, timeout)
                 count = probe()
             end
 
