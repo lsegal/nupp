@@ -15,8 +15,8 @@ The boundary is deliberately narrow:
 
 | Layer | Owner | Responsibilities |
 | --- | --- | --- |
-| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission |
-| native provider | Rust | files, paths, clocks, UUIDs, URI, HTTP, TCP, UDP, path sockets, TLS, processes, and GPU resources |
+| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, and the filesystem services, which call the operating system through FFI |
+| native provider | Rust | clocks, UUIDs, URI, HTTP, TCP, UDP, path sockets, TLS, processes, and GPU resources |
 | host | Rust | payload discovery, LuaJIT state lifetime, native preload registration, workers, components, embedding handles, and shutdown |
 | VM and compatibility modules | C | LuaJIT and the retained LPeg module |
 | generated AOT | C, platform object code, or shader code | compiler-admitted kernels and their bindings |
@@ -37,8 +37,7 @@ GPU-free program does not acquire WGPU.
 | Nupp facility | Rust provider feature | Host feature when linked into a stub |
 | --- | --- | --- |
 | clocks and timer suspension | `base` | base host |
-| paths | `filesystem` | `native-files` |
-| asynchronous files | `files` | `native-files` |
+| paths and files | none: Nupp calls the operating system through FFI | none |
 | UUID | `uuid` | provider archive |
 | URI | `uri` | provider archive |
 | HTTP client | `http` | provider archive |
