@@ -232,16 +232,6 @@ local record Scope
     parent: Scope?
 end
 
---- The function being filled.
-local record Body
-    f: builder.Function
-    scope: Scope
-    result: Kind
-
-    --- The labels a `break` leaves through, innermost last.
-    exits: {string}
-end
-
 --- A lowered value.
 local record Value
     text: string
@@ -264,6 +254,19 @@ local record Program
 
     --- Each laid-out struct's size and field offsets, by its checked type.
     layouts: {[any]: any}
+end
+
+--- The function being filled.
+local record Body
+    f: builder.Function
+    scope: Scope
+    result: Kind
+
+    --- The labels a `break` leaves through, innermost last.
+    exits: {string}
+
+    --- The program the function belongs to.
+    program: Program
 end
 
 local function lookup(scope: Scope?, name: string): Local?
@@ -299,6 +302,53 @@ local function value(body: Body, instruction: string): string
     return builder.value(body.f, instruction)
 end
 
+--- A saturating conversion of the binary64 `wide`, which LLVM defines for every
+--- input: out of range it clamps, and NaN gives 0.
+local function saturate(body: Body, wide: string, signed: boolean): string
+    local intrinsic = signed and "llvm.fptosi.sat.i64.f64" or "llvm.fptoui.sat.i64.f64"
+    builder.declare(body.program.module, "@" .. intrinsic, ("declare i64 @%s(double)"):format(intrinsic))
+
+    return value(body, ("call i64 @%s(double %s)"):format(intrinsic, wide))
+end
+
+--- `wide` truncated toward zero as x86's `cvttsd2si` does it: out of range, and
+--- for NaN, it gives the "integer indefinite" value, -2^63.
+local function indefinite(body: Body, wide: string): string
+    local clamped = saturate(body, wide, true)
+    local fits = value(body, ("fcmp olt double %s, %s"):format(wide, llvmText.double(2 ^ 63)))
+
+    return value(body, ("select i1 %s, i64 %s, i64 -9223372036854775808"):format(fits, clamped))
+end
+
+--- The binary64 `wide` truncated toward zero to 64 bits, as `lj_num2i64` does,
+--- or, when `unsigned`, as `lj_num2u64` does. Their result out of range, and
+--- for NaN or an infinity, is what the target's instructions give, so it is
+--- reproduced per target: arm64's `fcvtzs` and `fcvtzu` saturate, and x86's
+--- `cvttsd2si` gives -2^63, which `lj_num2u64` retries 2^64 lower. LLVM's own
+--- `fptosi` and `fptoui` would give poison there instead.
+local function integer64(body: Body, wide: string, unsigned: boolean): string
+    local triple = body.program.triple
+    if triple:match("^aarch64") ~= nil or triple:match("^arm64") ~= nil then
+        local signed = saturate(body, wide, true)
+        if not unsigned then
+            return signed
+        end
+        local saturated = saturate(body, wide, false)
+        local overflowed = value(body, "icmp eq i64 " .. signed .. ", 9223372036854775807")
+
+        return value(body, ("select i1 %s, i64 %s, i64 %s"):format(overflowed, saturated, signed))
+    end
+    local first = indefinite(body, wide)
+    if not unsigned then
+        return first
+    end
+    local lowered = value(body, ("fsub double %s, %s"):format(wide, llvmText.double(2 ^ 64)))
+    local retried = indefinite(body, lowered)
+    local overflowed = value(body, "icmp eq i64 " .. first .. ", -9223372036854775808")
+
+    return value(body, ("select i1 %s, i64 %s, i64 %s"):format(overflowed, retried, first))
+end
+
 --- `v` as `to`. `explicit` admits what only an `as` cast may do: pointers to
 --- and from integers.
 local function convert(body: Body, v: Value, to: Kind, node: any, explicit: boolean?): Value
@@ -321,17 +371,16 @@ local function convert(body: Body, v: Value, to: Kind, node: any, explicit: bool
         local op = from.signed and "sitofp" or "uitofp"
         return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
     elseif isInteger(to) and isFloat(from) then
-        -- As LuaJIT converts a number to a C integer: through an `int32_t`
-        -- below 32 bits and for `int32_t`, through 64 bits for `uint32_t`, then
-        -- truncated, so a narrow field stored past its range wraps.
-        local width = WIDTHS[to.llvm] as integer
-        local through = (width < 32 or width == 32 and to.signed) and "i32" or width == 32 and "i64" or to.llvm
-        local op = (to.signed or through ~= to.llvm) and "fptosi" or "fptoui"
-        local whole = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, through))
-        if through == to.llvm then
+        -- As LuaJIT's `lj_cconv_ct_ct` converts a number to a C integer:
+        -- through binary64, then `lj_num2u64` for a `uint64_t` and `lj_num2i64`
+        -- for every other, truncated, so a narrow field stored past its range
+        -- wraps.
+        local wide = from.llvm == "double" and v.text or value(body, "fpext float " .. v.text .. " to double")
+        local whole = integer64(body, wide, to.llvm == "i64" and not to.signed)
+        if to.llvm == "i64" then
             return Value(text = whole, kind = to)
         end
-        return Value(text = value(body, ("trunc %s %s to %s"):format(through, whole, to.llvm)), kind = to)
+        return Value(text = value(body, ("trunc i64 %s to %s"):format(whole, to.llvm)), kind = to)
     elseif isFloat(to) and isFloat(from) then
         local op = to.llvm == "double" and "fpext" or "fptrunc"
         return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
@@ -828,57 +877,17 @@ local function word(body: Body, v: Value, node: any): string
     return value(body, "trunc i64 " .. bits .. " to i32")
 end
 
---- A saturating conversion of the binary64 `wide`, which LLVM defines for every
---- input: out of range it clamps, and NaN gives 0.
-local function saturate(program: Program, body: Body, wide: string, signed: boolean): string
-    local intrinsic = signed and "llvm.fptosi.sat.i64.f64" or "llvm.fptoui.sat.i64.f64"
-    builder.declare(program.module, "@" .. intrinsic, ("declare i64 @%s(double)"):format(intrinsic))
-
-    return value(body, ("call i64 @%s(double %s)"):format(intrinsic, wide))
-end
-
---- `wide` truncated toward zero as x86's `cvttsd2si` does it: out of range, and
---- for NaN, it gives the "integer indefinite" value, -2^63.
-local function indefinite(program: Program, body: Body, wide: string): string
-    local clamped = saturate(program, body, wide, true)
-    local fits = value(body, ("fcmp olt double %s, %s"):format(wide, llvmText.double(2 ^ 63)))
-
-    return value(body, ("select i1 %s, i64 %s, i64 -9223372036854775808"):format(fits, clamped))
-end
-
 --- An operand of a bit operator over 64-bit integers. A number truncates
 --- toward zero, as `lj_num2i64` does, or, beside a `uint64`, as `lj_num2u64`
---- does. Their result out of range, and for NaN or an infinity, is what the
---- target's instructions give, so it is reproduced per target: arm64's
---- `fcvtzs` and `fcvtzu` saturate, and x86's `cvttsd2si` gives -2^63, which
---- `lj_num2u64` retries 2^64 lower.
-local function word64(program: Program, body: Body, v: Value, kind: Kind, node: any): string
+--- does; see `integer64`.
+local function word64(body: Body, v: Value, kind: Kind, node: any): string
     if v.kind.llvm == "i64" then
         return v.text
     elseif isInteger(v.kind) then
         return convert(body, v, I64, node).text
     end
-    local wide = convert(body, v, F64, node).text
-    local arm = program.triple:match("^aarch64") ~= nil or program.triple:match("^arm64") ~= nil
-    if arm then
-        local signed = saturate(program, body, wide, true)
-        if kind.signed then
-            return signed
-        end
-        local unsigned = saturate(program, body, wide, false)
-        local overflowed = value(body, "icmp eq i64 " .. signed .. ", 9223372036854775807")
 
-        return value(body, ("select i1 %s, i64 %s, i64 %s"):format(overflowed, unsigned, signed))
-    end
-    local first = indefinite(program, body, wide)
-    if kind.signed then
-        return first
-    end
-    local lowered = value(body, ("fsub double %s, %s"):format(wide, llvmText.double(2 ^ 64)))
-    local retried = indefinite(program, body, lowered)
-    local overflowed = value(body, "icmp eq i64 " .. first .. ", -9223372036854775808")
-
-    return value(body, ("select i1 %s, i64 %s, i64 %s"):format(overflowed, retried, first))
+    return convert(body, v, kind, node).text
 end
 
 --- What a 32-bit bit operation gives: the signed word LuaJIT returns, as a
@@ -924,8 +933,8 @@ local function bitwise(
         return bitResult(body, node, value(body, ("%s i32 %s, %s"):format(instruction, a, b)))
     end
     local kind = shift and left.kind or common(left.kind, right.kind)
-    local a = word64(program, body, left, kind, lhs)
-    local b = word64(program, body, right, kind, rhs)
+    local a = word64(body, left, kind, lhs)
+    local b = word64(body, right, kind, rhs)
     if shift then
         b = value(body, "and i64 " .. b .. ", 63")
     end
@@ -1749,7 +1758,8 @@ local function lowerDefinition(program: Program, attributes: string, item: Defin
         f = builder.func(program.module, header),
         scope = Scope(names = {}),
         result = callee.symbol == "main" and I32 or callee.result,
-        exits = {}
+        exits = {},
+        program = program
     )
     for index, kind in ipairs(callee.params) do
         local entry = declareLocal(body, item.paramNames[index], kind)
