@@ -290,8 +290,8 @@ function M.nativeOnlyAggregatesAreValuesAcrossEntriesUnderBothPolicies()
     assert(
         llvm:find(
             "define hidden %%aggregate.KaOrbit @ks_%x+_advance__"
-                .. tier
-                .. "%(%%aggregate.KaOrbit %%p_orbit, %%aggregate.KaPair %%p_c%)"
+            .. tier
+            .. "%(%%aggregate.KaOrbit %%p_orbit, %%aggregate.KaPair %%p_c%)"
         ),
         llvm
     )
