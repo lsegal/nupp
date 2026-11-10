@@ -411,8 +411,10 @@ function M.gpuConformanceIsValidPosixShell()
         assert(script:find('"$root/bin/nupp" test gpudevicetest', 1, true), name .. " does not cross wgpu-native")
         assert(script:find("counted-wgsl.lua", 1, true), name .. " does not execute the emitted WGSL")
         assert(script:find("NUPP_WGPU_LIBRARY", 1, true), name .. " leaves LuaJIT without wgpu-native")
-        assert(not script:find("cargo test", 1, true) and not script:find("cargo\" test", 1, true),
-            name .. " still tests a Rust GPU crate")
+        assert(
+            not script:find("cargo test", 1, true) and not script:find("cargo\" test", 1, true),
+            name .. " still tests a Rust GPU crate"
+        )
     end
 end
 
@@ -969,8 +971,10 @@ function M.wgpuNativeRustDependenciesHaveANoticeForThePinnedTag()
     )
     assert(
         generated == pinned,
-        ("the wgpu-native Rust notice covers %s but WGPU_VERSION is %s; run "
-            .. "scripts/rust-dependency-notices --write wgpu-native"):format(generated, pinned)
+        (
+            "the wgpu-native Rust notice covers %s but WGPU_VERSION is %s; run "
+            .. "scripts/rust-dependency-notices --write wgpu-native"
+        ):format(generated, pinned)
     )
 
     local seen = {}
