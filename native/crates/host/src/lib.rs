@@ -7,9 +7,9 @@
 //! cannot unwind through Rust.
 
 mod channels;
-mod clock;
 #[doc(hidden)]
 pub mod cli;
+mod clock;
 mod embed;
 mod host_channel;
 mod lua;
