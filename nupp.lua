@@ -592,6 +592,7 @@ for _, resource in ipairs({
 }) do
     RESOURCES[#RESOURCES + 1] = {source = resource, output = resource:gsub("^src/", "nupp/compiler/"),}
 end
+
 -- What only the CLI reads: its test harness, the LLVM IR an AOT link pulls in,
 -- and the documentation theme. The browser bundles carry neither the linker nor
 -- `nupp doc`, and the compiler has to fit the guest's 7 MiB startup mailbox.
@@ -599,6 +600,7 @@ local function cliOnlyResource(resource)
     local path = type(resource) == "table" and resource.source or resource
     return path:match("^tests/") or path:match("%.ll$") or path == "src/nupp/tools/doc/theme.css"
 end
+
 local BROWSER_RESOURCES = {}
 local LUAJIT_BROWSER_RESOURCES = {}
 for _, resource in ipairs(RESOURCES) do
