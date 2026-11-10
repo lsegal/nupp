@@ -285,7 +285,6 @@ nuppCodegenCompileFiles
 nuppCodegenEndProcess
 nuppCodegenImportLibrary
 nuppCodegenKitFetch
-nuppCodegenKitUnpack
 nuppCodegenLink
 nuppCodegenUnexitable
 nuppCodegenVersion
