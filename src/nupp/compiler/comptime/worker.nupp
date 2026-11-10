@@ -451,7 +451,7 @@ function worker.evaluate(
     helpers: any,
     host: any?
 ): string?, worker.Failure?, any
-    local requestPath = os.tmpname()
+    local requestPath = process.tmpname()
     local serializedHelpers = {}
     for name, supplied in pairs(helpers or {}) do
         serializedHelpers[name] = serializedHelper(supplied)

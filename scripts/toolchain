@@ -39,6 +39,7 @@ usage: scripts/toolchain COMPONENT...
        scripts/toolchain --prefix
 
 Components: luajit luarocks lpeg lpeg-source stage0 migration-stage0 llvm wgpu
+            wgpu-static [PLATFORM]
             browser-sources browser-emulator browser-guest
             native-rust FEATURES
             rust-vendor OUTPUT
@@ -1670,12 +1671,24 @@ deterministic_archive() {
     return $archive_status
 }
 
+# The system libraries wgpu-native's static library calls into on macOS: the
+# native static libraries rustc reports for it, which are also what the
+# release's shared library loads.
+KIT_WGPU_LIBRARIES_DARWIN="-framework QuartzCore -framework Metal -framework Foundation
+-framework CoreFoundation -lobjc -liconv"
+
 build_kit() {
     features=${1:-}
     build_host stub "$features"
     host_out=$HOST_OUT
+    kit_wgpu=""
+    case "$PLATFORM" in
+        # Before the kit's lock: a run holds one lock at a time.
+        darwin) build_wgpu_static; kit_wgpu=$WGPU_STATIC ;;
+    esac
     # Public feature sets can share a Rust host but advertise different kit metadata.
-    digest=$(printf 'kit-5|%s|%s' "$(basename "$host_out")" "$features" | sha256_stdin | cut -c1-16)
+    digest=$(printf 'kit-6|%s|%s|%s' "$(basename "$host_out")" "$features" "${kit_wgpu:+$WGPU_VERSION}" \
+        | sha256_stdin | cut -c1-16)
     out="$PREFIX/kits/$digest"
     KIT_OUT=$out
     take_lock "kit-$digest" "$out/.complete" || return 0
@@ -1708,23 +1721,52 @@ build_kit() {
     set -- "$@" -Wl,-export_dynamic
     "$@" >&2
 
-    # Which library each symbol binds to, and what each library is.
+    # A second probe links wgpu-native's static library in as well, keeping
+    # every entry point it exports, so the stubs also carry what a standalone
+    # GPU program binds. The libraries only it needs are recorded apart from
+    # the kit's own, so a program without GPU never loads Metal.
     nm -m "$probe" | sed -n 's/^ *(undefined) [a-z ]*external \([^ ]*\) (from \([^)]*\)).*/\2 \1/p' \
-        | LC_ALL=C sort -u > "$out/binds"
+        > "$out/binds"
     otool -L "$probe" | sed -n '2,$p' > "$out/libraries"
+    : > "$out/gpu-libraries"
+    if [ -n "$kit_wgpu" ]; then
+        set -- "$CC" -o "$probe-gpu" "-Wl,-force_load,$out/libnupp-runtime.a" "-Wl,-force_load,$probe-aot.o"
+        while IFS= read -r flag; do
+            [ -z "$flag" ] || set -- "$@" "$flag"
+        done < "$probe-flags"
+        set -- "$@" "$kit_wgpu"
+        for symbol in $(nm -gUj "$kit_wgpu" | grep '^_wgpu' | LC_ALL=C sort -u); do
+            set -- "$@" "-Wl,-u,$symbol"
+        done
+        # shellcheck disable=SC2086 # one flag per word
+        set -- "$@" $KIT_WGPU_LIBRARIES_DARWIN -Wl,-export_dynamic
+        "$@" >&2
+        nm -m "$probe-gpu" | sed -n 's/^ *(undefined) [a-z ]*external \([^ ]*\) (from \([^)]*\)).*/\2 \1/p' \
+            >> "$out/binds"
+        otool -L "$probe-gpu" | sed -n '2,$p' | while read -r path rest; do
+            grep -qF "$path " "$out/libraries" || printf '\t%s %s\n' "$path" "$rest"
+        done > "$out/gpu-libraries"
+        cat "$out/gpu-libraries" >> "$out/libraries"
+    fi
+    LC_ALL=C sort -u -o "$out/binds" "$out/binds"
+
+    # Which library each symbol binds to, and what each library is.
     : > "$out/flags"
+    : > "$out/gpu-flags"
     while read -r path rest; do
         name=$(basename "$path")
+        listed="$out/flags"
+        ! grep -qF "$path " "$out/gpu-libraries" || listed="$out/gpu-flags"
         case "$path" in
             */Frameworks/*.framework/*)
                 short=$name
                 stub="$out/sdk/System/Library/Frameworks/$name.framework/$name.tbd"
-                printf '%s\n' "-framework" "$name" >> "$out/flags"
+                printf '%s\n' "-framework" "$name" >> "$listed"
                 ;;
             *)
-                short=$(printf '%s' "$name" | sed 's/\.dylib$//; s/\.[A-Z]$//')
+                short=$(printf '%s' "$name" | sed 's/\.dylib$//; s/\.[A-Z0-9]*$//')
                 stub="$out/sdk/usr/lib/$short.tbd"
-                printf '%s\n' "-l${short#lib}" >> "$out/flags"
+                printf '%s\n' "-l${short#lib}" >> "$listed"
                 ;;
         esac
         compatibility=$(printf '%s' "$rest" | sed -n 's/.*compatibility version \([0-9.]*\).*/\1/p')
@@ -1749,9 +1791,17 @@ build_kit() {
         printf '  "syslibroot": "sdk",\n'
         printf '  "libraries": ['
         awk '{ printf "%s\"%s\"", (NR > 1 ? ", " : ""), $0 }' "$out/flags"
-        printf ']\n}\n'
+        printf ']'
+        if [ -n "$kit_wgpu" ]; then
+            # What a standalone program linking a provider statically adds.
+            printf ',\n  "providers": {"wgpu": ['
+            awk '{ printf "%s\"%s\"", (NR > 1 ? ", " : ""), $0 }' "$out/gpu-flags"
+            printf ']}'
+        fi
+        printf '\n}\n'
     } > "$out/kit.json"
-    rm -f "$probe" "$probe-aot.c" "$probe-aot.o" "$probe-flags" "$out/binds" "$out/libraries" "$out/flags"
+    rm -f "$probe" "$probe-gpu" "$probe-aot.c" "$probe-aot.o" "$probe-flags" "$out/binds" "$out/libraries" \
+        "$out/gpu-libraries" "$out/flags" "$out/gpu-flags"
     printf 'ok\n' > "$out/.complete"
     release_lock
 }
@@ -2123,21 +2173,28 @@ build_wgpu() {
     fi
     case "$wgpu_platform" in
         x86_64-unknown-linux-gnu)
-            WGPU_TARGET=linux-x86_64; wgpu_digest=$WGPU_SHA256_LINUX_X86_64; wgpu_file=libwgpu_native.so ;;
+            WGPU_TARGET=linux-x86_64; wgpu_digest=$WGPU_SHA256_LINUX_X86_64; wgpu_file=libwgpu_native.so
+            wgpu_static_file=libwgpu_native.a ;;
         aarch64-unknown-linux-gnu)
-            WGPU_TARGET=linux-aarch64; wgpu_digest=$WGPU_SHA256_LINUX_AARCH64; wgpu_file=libwgpu_native.so ;;
+            WGPU_TARGET=linux-aarch64; wgpu_digest=$WGPU_SHA256_LINUX_AARCH64; wgpu_file=libwgpu_native.so
+            wgpu_static_file=libwgpu_native.a ;;
         aarch64-apple-darwin)
-            WGPU_TARGET=macos-aarch64; wgpu_digest=$WGPU_SHA256_MACOS_AARCH64; wgpu_file=libwgpu_native.dylib ;;
+            WGPU_TARGET=macos-aarch64; wgpu_digest=$WGPU_SHA256_MACOS_AARCH64; wgpu_file=libwgpu_native.dylib
+            wgpu_static_file=libwgpu_native.a ;;
         x86_64-apple-darwin)
-            WGPU_TARGET=macos-x86_64; wgpu_digest=$WGPU_SHA256_MACOS_X86_64; wgpu_file=libwgpu_native.dylib ;;
+            WGPU_TARGET=macos-x86_64; wgpu_digest=$WGPU_SHA256_MACOS_X86_64; wgpu_file=libwgpu_native.dylib
+            wgpu_static_file=libwgpu_native.a ;;
         x86_64-pc-windows-msvc|x86_64-pc-windows-gnu)
-            WGPU_TARGET=windows-x86_64-gnu; wgpu_digest=$WGPU_SHA256_WINDOWS_X86_64_GNU; wgpu_file=wgpu_native.dll ;;
+            WGPU_TARGET=windows-x86_64-gnu; wgpu_digest=$WGPU_SHA256_WINDOWS_X86_64_GNU; wgpu_file=wgpu_native.dll
+            wgpu_static_file=libwgpu_native.a ;;
         aarch64-pc-windows-msvc)
-            WGPU_TARGET=windows-aarch64-msvc; wgpu_digest=$WGPU_SHA256_WINDOWS_AARCH64_MSVC; wgpu_file=wgpu_native.dll ;;
+            WGPU_TARGET=windows-aarch64-msvc; wgpu_digest=$WGPU_SHA256_WINDOWS_AARCH64_MSVC; wgpu_file=wgpu_native.dll
+            wgpu_static_file=wgpu_native.lib ;;
         *) die "wgpu-native $WGPU_VERSION publishes no library for $wgpu_platform" ;;
     esac
     out="$CACHE/wgpu/$wgpu_digest"
     WGPU_LIBRARY="$out/$wgpu_file"
+    wgpu_name="wgpu-$WGPU_TARGET-$WGPU_VERSION"
     [ -f "$out/.complete" ] && [ -f "$WGPU_LIBRARY" ] && return 0
     take_lock "wgpu-$wgpu_digest" "$out/.complete" || return 0
     if [ -f "$out/.complete" ] && [ -f "$WGPU_LIBRARY" ]; then
@@ -2145,7 +2202,7 @@ build_wgpu() {
         return 0
     fi
     command -v unzip >/dev/null 2>&1 || die "unpacking wgpu-native needs unzip"
-    name="wgpu-$WGPU_TARGET-$WGPU_VERSION"
+    name=$wgpu_name
     file=$(archive "$name" "$(expand_pin "$WGPU_URL")" "$wgpu_digest" .zip)
     staging="$out.$$"
     rm -rf "$staging"
@@ -2157,6 +2214,48 @@ build_wgpu() {
     mv "$staging/lib/$wgpu_file" "$WGPU_LIBRARY"
     rm -rf "$staging"
     printf 'wgpu-native %s %s\n' "$WGPU_VERSION" "$WGPU_TARGET" > "$out/.complete"
+    release_lock
+}
+
+# The same release's static library, which a standalone program links in
+# rather than loading the shared one. It carries its own copy of Rust's
+# standard library, whose symbols are hashed apart from the runtime's except
+# for one: the unwinder's personality routine, which both define unmangled. The
+# staged copy has that name replaced everywhere it appears, byte for byte at
+# the same length, so wgpu-native unwinds through its own routine and the link
+# sees one definition of each.
+WGPU_STATIC=""
+build_wgpu_static() {
+    build_wgpu "${1:-}"
+    wgpu_out=$out
+    WGPU_STATIC="$wgpu_out/$wgpu_static_file"
+    [ -f "$wgpu_out/.static-complete" ] && [ -f "$WGPU_STATIC" ] && return 0
+    # Before the lock: a run holds one lock at a time.
+    build_luajit
+    take_lock "wgpu-static-$wgpu_digest" "$wgpu_out/.static-complete" || return 0
+    if [ -f "$wgpu_out/.static-complete" ] && [ -f "$WGPU_STATIC" ]; then
+        release_lock
+        return 0
+    fi
+    file=$(archive "$wgpu_name" "$(expand_pin "$WGPU_URL")" "$wgpu_digest" .zip)
+    staging="$wgpu_out.static.$$"
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    unzip -q -o "$file" "lib/$wgpu_static_file" -d "$staging" \
+        || die "$wgpu_name.zip did not contain lib/$wgpu_static_file"
+    WGPU_STATIC_IN=$(native_path "$staging/lib/$wgpu_static_file") \
+        WGPU_STATIC_OUT=$(native_path "$staging/$wgpu_static_file") \
+        "$PREFIX/luajit/bin/luajit" -e '
+            local input = assert(io.open(os.getenv("WGPU_STATIC_IN"), "rb"))
+            local bytes = input:read("*a")
+            input:close()
+            local output = assert(io.open(os.getenv("WGPU_STATIC_OUT"), "wb"))
+            assert(output:write((bytes:gsub("rust_eh_personality", "nupp_wgpu_eh_person"))))
+            assert(output:close())
+        ' || die "cannot stage the static library from $wgpu_name.zip"
+    mv "$staging/$wgpu_static_file" "$WGPU_STATIC"
+    rm -rf "$staging"
+    printf 'wgpu-native %s %s static\n' "$WGPU_VERSION" "$WGPU_TARGET" > "$wgpu_out/.static-complete"
     release_lock
 }
 
@@ -2184,6 +2283,14 @@ case "$1" in
             *)   build_wgpu ;;
         esac
         native_path "$WGPU_LIBRARY"
+        exit 0
+        ;;
+    wgpu-static)
+        case "${2:-}" in
+            *-*) build_wgpu_static "$2" ;;
+            *)   build_wgpu_static ;;
+        esac
+        native_path "$WGPU_STATIC"
         exit 0
         ;;
     native-rust)

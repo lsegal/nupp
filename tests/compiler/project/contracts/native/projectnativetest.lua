@@ -131,12 +131,112 @@ function M.aForeignTargetStagesItsOwnGpuLibrary()
             assert(command:find("\nwgpu\n" .. platform .. "\n", 1, true), command)
             assert(copies[1][2]:sub(-#name) == name, copies[1][2])
         end
+        -- A standalone binary links the provider in, so nothing is staged for it.
+        calls, copies = {}, {}
         local outputs, err = nativeStage.build(".", "out", {["native.gpu"] = true}, nil, nil, true)
-        assert(outputs == nil and err:find("standalone binary needs sidecar-only native feature gpu", 1, true), err)
+        assert(outputs, err)
+        testAssert.eq(#calls, 0, "a standalone build builds no GPU sidecar")
+        for output in pairs(outputs) do
+            assert(not output:find("wgpu_native", 1, true), output)
+        end
     end)
     process.capture, fs.copyFile = originalCapture, originalCopy
     compilerEnv.compilerRoot = originalCompilerRoot
     assert(ok, problem)
+end
+
+-- The standalone link reads that platform's static library and keeps the
+-- entry points the provider finds by name in the process.
+function M.aStandaloneLinkKeepsTheGpuProvidersEntryPoints()
+    local originalCapture = process.capture
+    local originalCompilerRoot = compilerEnv.compilerRoot
+    local calls = {}
+    process.capture = function(argv)
+        calls[#calls + 1] = argv
+        return 0, "fetching\n/built/libwgpu_native.a\n"
+    end
+    compilerEnv.compilerRoot = function()
+        return "."
+    end
+    local ok, problem = pcall(function()
+        local effects = nativeStage.resolve({["native.gpu"] = true})
+        local flags, err = nativeStage.linkedProviders(effects, "x86_64-unknown-linux-gnu")
+        assert(flags, err)
+        testAssert.eq(#calls, 1, "one static library is built")
+        local command = "\n" .. table.concat(calls[1], "\n") .. "\n"
+        assert(command:find("\nwgpu-static\nx86_64-unknown-linux-gnu\n", 1, true), command)
+        testAssert.eq(flags[1], "/built/libwgpu_native.a")
+        local kept = {}
+        for index = 2, #flags do
+            kept[assert(flags[index]:match("^%-%-undefined=(wgpu%w+)$"), flags[index])] = true
+        end
+        assert(kept.wgpuCreateInstance and kept.wgpuQueueSubmit, "the provider's entry points are kept")
+
+        -- A macOS kit stubs the provider's frameworks apart from its own
+        -- libraries; one built before it did is refused.
+        calls = {}
+        flags, err = nativeStage.linkedProviders(effects, "aarch64-apple-darwin")
+        assert(flags == nil and err:find("cannot link native feature gpu", 1, true), err)
+        local kit = tempProject({
+            ["old/kit.json"] = [[{"schemaVersion": 1, "platform": "macos", "libraries": ["-lSystem"]}]],
+            ["kit.json"] = [[{"schemaVersion": 1, "platform": "macos", "libraries": ["-lSystem"],
+  "providers": {"wgpu": ["-framework", "Metal", "-lobjc"]}}]],
+        })
+        flags, err = nativeStage.linkedProviders(effects, "aarch64-apple-darwin", kit .. "/old")
+        assert(flags == nil and err:find("no stubs for the system frameworks", 1, true), err)
+        testAssert.eq(#calls, 0, "a refused platform fetches nothing")
+
+        flags, err = nativeStage.linkedProviders(effects, "aarch64-apple-darwin", kit)
+        remove(kit)
+        assert(flags, err)
+        testAssert.eq(#calls, 1, "one static library is built")
+        command = "\n" .. table.concat(calls[1], "\n") .. "\n"
+        assert(command:find("\nwgpu-static\naarch64-apple-darwin\n", 1, true), command)
+        testAssert.eq(flags[1], "/built/libwgpu_native.a")
+        kept = {}
+        local index = 2
+        while flags[index] == "-u" do
+            kept[assert(flags[index + 1]:match("^_(wgpu%w+)$"), flags[index + 1])] = true
+            index = index + 2
+        end
+        assert(kept.wgpuCreateInstance and kept.wgpuQueueSubmit, "the provider's entry points are kept")
+        testAssert.eq(table.concat(flags, " ", index), "-framework Metal -lobjc", "the kit's frameworks follow")
+
+        flags, err = nativeStage.linkedProviders(
+            nativeStage.resolve({
+                ["native.path"] = true
+            }),
+            "x86_64-unknown-linux-gnu"
+        )
+        assert(flags, err)
+        testAssert.eq(#flags, 0, "a provider with a host implementation adds nothing")
+    end)
+    process.capture = originalCapture
+    compilerEnv.compilerRoot = originalCompilerRoot
+    assert(ok, problem)
+end
+
+-- What the standalone link keeps is what the binding declares: a function
+-- added to the declarations without being kept would be missing from a
+-- standalone binary, where only `ffi.C` can find it.
+function M.theGpuProvidersKeptEntryPointsAreTheOnesItDeclares()
+    local source = assert(fs.readFile("src/nupp/runtime/provider/wgpu.nupp"))
+    local declared, kept = {}, {}
+    for declarations in source:gmatch("ffi%.cdef%[%[(.-)%]%]") do
+        for name in declarations:gmatch("[%w_]+%s*%*?%s*(wgpu%u%w*)%s*%(") do
+            declared[#declared + 1] = name
+        end
+    end
+    local effects = nativeStage.resolve({["native.gpu"] = true})
+    for _, feature in ipairs(require("nupp.compiler.native").features(effects)) do
+        for _, name in ipairs(feature.linkedSymbols or {}) do
+            kept[#kept + 1] = name
+        end
+    end
+    table.sort(declared)
+    table.sort(kept)
+    assert(#declared > 0, "the binding declares wgpu functions")
+    testAssert.eq(table.concat(kept, " "), table.concat(declared, " "))
 end
 
 function M.aTargetKeepsTheRuntimeModuleItAlreadyBuilt()

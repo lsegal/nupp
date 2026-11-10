@@ -47,6 +47,51 @@ print(triangular(4))
     remove(dir)
 end
 
+--- A standalone binary links wgpu-native's static library into its host and
+--- finds it in its own process: no `lib/wgpu_native` is staged, and the
+--- program opens a device, or reports that the machine has none, with no
+--- library named in its environment.
+function M.standaloneBinaryLinksTheGpuProviderIntoItsOwnHost()
+    local dir = tempProject({
+        [
+            "src/main.nupp"
+        ] = [[
+local gpu = require("io.gpu")
+
+local ok, problem = pcall(function(): nil
+   local context = gpu.open()
+   context:close()
+end)
+print(ok and "opened" or tostring(problem))
+]],
+    })
+    write(
+        dir .. "/nupp.lua",
+        (
+            [=[return {include = {"src"}, build = {kind = "binary",
+      stub = "nupp", standalone = true, outDir = %q,
+      output = %q, entries = {"main"}}}]=]
+        ):format(dir .. "/out", dir .. "/out/app")
+    )
+    testAssert.eq(project.build(dir), 0)
+    assert(not exists(dir .. "/out/lib/wgpu_native"), "no GPU sidecar is staged")
+    assert(not exists(dir .. "/out/lib/wgpu_native.dll"), "no GPU sidecar is staged")
+    local program = dir .. "/out/app"
+    if jit.os == "Windows" and not exists(program) then
+        program = program .. ".exe"
+    end
+    local named = os.getenv("NUPP_WGPU_LIBRARY")
+    setEnvironment("NUPP_WGPU_LIBRARY", nil)
+    local ok, code, text = pcall(process.capture, {program})
+    setEnvironment("NUPP_WGPU_LIBRARY", named)
+    assert(ok, code)
+    testAssert.eq(code, 0, text)
+    local answer = text:match("[^\r\n]+") or ""
+    assert(not answer:find("cannot load wgpu-native", 1, true), answer)
+    assert(answer == "opened" or answer:find("no suitable compute adapter", 1, true), answer)
+    remove(dir)
+end
+
 --- A standalone program with AOT code links from a link kit with lld in
 --- process: no C compiler, system linker or SDK is run, and the program
 --- carries no LLVM of its own.

@@ -15,6 +15,26 @@ function M.windowsMkdirUsesNativePathAndIsIdempotent()
     testAssert.eq(table.concat(posix, " "), "mkdir -p build/nupp")
 end
 
+-- msvcrt's `tmpnam` names a file at the drive root, which an ordinary user
+-- cannot write, so every capture through it came back empty with "Access is
+-- denied." and no native facility could be built.
+function M.windowsTempNamesAtTheDriveRootMoveUnderTemp()
+    local temp = "C:\\Users\\me\\AppData\\Local\\Temp"
+    testAssert.eq(process.windowsTempName("\\s1c4.", temp), temp .. "\\s1c4")
+    testAssert.eq(process.windowsTempName("\\s1c4.2", temp .. "\\"), temp .. "\\s1c4.2")
+    testAssert.eq(process.windowsTempName("C:\\s1c4.", temp), temp .. "\\s1c4")
+    testAssert.eq(process.windowsTempName("/s1c4.", temp), temp .. "\\s1c4")
+    testAssert.eq(
+        process.windowsTempName(temp .. "\\lua_x", temp),
+        temp .. "\\lua_x",
+        "a name already under a directory is kept"
+    )
+    testAssert.eq(process.windowsTempName("/c/Users/me/x", temp), "/c/Users/me/x", "an MSYS path is kept")
+    testAssert.eq(process.windowsTempName("\\s1c4.", nil), "\\s1c4.", "no temporary directory keeps the name")
+    testAssert.eq(process.windowsTempName("\\s1c4.", ""), "\\s1c4.")
+    assert(type(process.tmpname()) == "string")
+end
+
 function M.windowsAbsolutePathsAreNotModulesUnderTheCurrentRoot()
     local path = "C:/Users/runner/AppData/Local/Temp/backend/source/example.nupp"
     testAssert.eq(

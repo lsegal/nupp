@@ -126,6 +126,64 @@ function stage.hostStub(root: string, outDir: string, target: Target, effects: {
     return built
 end
 
+--- The link arguments for each prebuilt provider a standalone binary links in
+--- rather than stages: the platform's static library, read like any other
+--- archive, and the provider's entry points kept, because the provider finds
+--- them by name in the process and nothing in the link refers to them. Every
+--- kit's link exports what it keeps, which is where LuaJIT's `ffi.C` looks.
+--- A macOS link also names the system frameworks the provider calls into,
+--- which the kit at `kit` stubs apart from its own libraries.
+function stage.linkedProviders(effects: {[string]: any}?, platform: string, kit: string?): ({string}?, string?)
+    local flags: {string} = {}
+    local compilerRoot = envMod.compilerRoot()
+    local macos = platform:find("apple-darwin", 1, true) ~= nil
+    for _, feature in ipairs(native.features(effects)) do
+        local symbols = feature.linkedSymbols
+        if symbols then
+            local libraries: {string}? = nil
+            if macos then
+                if kit ~= nil then
+                    local kits = require("nupp.tools.build.kits")
+                    libraries = kits.providerLibraries(kit as string, tostring(feature.providerDriver))
+                end
+                if libraries == nil then
+                    return nil, (
+                        "standalone binary for %s cannot link native feature %s; "
+                        .. "its link kit has no stubs for the system frameworks the provider needs"
+                    ):format(platform, feature.name)
+                end
+            end
+            if not compilerRoot then
+                return nil, "native feature "
+                    .. feature.name
+                    .. " needs compiler source to link statically; use a source checkout to build this target"
+            end
+            local archive, problem = driven(compilerRoot as string, tostring(feature.providerDriver) .. "-static", {
+                platform
+            })
+            if not archive then
+                return nil, ("cannot build native facilities %s:\n%s"):format(feature.name, problem)
+            end
+            flags[#flags + 1] = archive as string
+            for _, symbol in ipairs(symbols as {string}) do
+                -- Mach-O names carry a leading underscore and ld64 spells
+                -- the option its own way.
+                if macos then
+                    flags[#flags + 1] = "-u"
+                    flags[#flags + 1] = "_" .. symbol
+                else
+                    flags[#flags + 1] = "--undefined=" .. symbol
+                end
+            end
+            for _, library in ipairs(libraries or {}) do
+                flags[#flags + 1] = library
+            end
+        end
+    end
+
+    return flags, nil
+end
+
 --- Relinks the current-platform compiler host with an application's static
 --- native closure. The driver force-loads archives because FFI symbol lookups
 --- do not create ordinary undefined references for an archive linker to see.
@@ -166,7 +224,18 @@ function stage.linkHost(
     if kit == nil then
         return nil, kitErr
     end
-    local linkErr = aotllvm.linkStandalone(kit as string, output, archives, flags)
+    local linkedFlags, linkedErr = stage.linkedProviders(effects, linked as string, kit as string)
+    if linkedFlags == nil then
+        return nil, linkedErr
+    end
+    local allFlags: {string} = {}
+    for _, flag in ipairs(flags) do
+        allFlags[#allFlags + 1] = flag
+    end
+    for _, flag in ipairs(linkedFlags as {string}) do
+        allFlags[#allFlags + 1] = flag
+    end
+    local linkErr = aotllvm.linkStandalone(kit as string, output, archives, allFlags)
     if linkErr ~= nil then
         return nil, linkErr
     end
@@ -226,7 +295,7 @@ function stage.build(
     local providerKeys: {string} = {}
     for _, feature in ipairs(native.features(effects)) do
         if feature.provider then
-            if standalone and feature.host then
+            if standalone and (feature.host or feature.linkedSymbols) then
                 -- The relinked host contains this provider; no loadable sidecar
                 -- is part of a standalone binary's runtime closure.
                 goto continue
