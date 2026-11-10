@@ -436,6 +436,10 @@ With no artifact, reports whether each function uses scalar, explicit SIMD, or G
 execution. Select verified IR, LLVM IR, native GPU SPIR-V, browser GPU WGSL,
 native assembly, or the generated Nupp binding with `--emit`.
 
+`--emit executable` instead links the file as a native program: its `main` is
+the executable's own, and it reaches LuaJIT and other C libraries through
+its `cdef function` declarations. The program is written to `--output`.
+
 Examples:
 
     nupp aot bench/kernel-subset-spike/mandelbrot.nupp
@@ -444,6 +448,7 @@ Examples:
     nupp aot --emit asm --function scale src/kernel.nupp
     nupp aot --emit wgsl --function transform src/gpu.nupp
     nupp aot --format json src/kernel.nupp
+    nupp aot --emit executable --output build/host src/host.nupp
 
 Usage:
   nupp aot [options] FILE
@@ -452,7 +457,9 @@ Arguments:
   FILE  Source file to inspect.
 
 Options:
-  --emit ARTIFACT  Artifact to print: ir, llvm, spirv, wgsl, asm, or binding.
+  --emit ARTIFACT  Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or
+                   executable.
+  --output PATH    Where --emit executable writes the program.
   --function NAME  Show only this function.
   --triple TRIPLE  Target triple to compile for.
   --features TIER  CPU feature tier to promise.

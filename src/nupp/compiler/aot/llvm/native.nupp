@@ -256,11 +256,12 @@ local function convert(body: Body, v: Value, to: Kind, node: any, explicit: bool
         return Value(text = v.text, kind = to)
     end
     if to.llvm == "i1" then
+        -- A pointer tests against NULL, the nil of `T*?`. A number is always
+        -- true in the language, so testing one is written as a comparison.
         if from.llvm == "ptr" then
             return Value(text = value(body, "icmp ne ptr " .. v.text .. ", null"), kind = BOOL)
-        elseif isInteger(from) then
-            return Value(text = value(body, ("icmp ne %s %s, 0"):format(from.llvm, v.text)), kind = BOOL)
         end
+        refuse(node, "a native condition is a boolean or a pointer; compare a number explicitly")
     elseif isInteger(to) and (isInteger(from) or from.llvm == "i1") then
         local wide, narrow = WIDTHS[to.llvm] as integer, WIDTHS[from.llvm] as integer
         local op = wide < narrow and "trunc" or (from.signed and from.llvm ~= "i1") and "sext" or "zext"
@@ -370,22 +371,21 @@ local function call(program: Program, body: Body, node: cst.Call): Value
         refuse(node, ("%s takes %d arguments, not %d"):format(target.symbol, #target.params, #written))
     end
     local arguments: {string} = {}
-    local types: {string} = {}
     for index, argument in ipairs(written) do
         local wanted = target.params[index]
         local lowered = expression(program, body, argument, wanted)
         if wanted == nil then
-            -- C's default promotions for what a variadic parameter receives.
-            if lowered.kind.llvm == "float" then
+            -- What LuaJIT passes a variadic parameter: a number, refinements
+            -- included, as a double, a boolean as an int, an `int64` as itself.
+            if lowered.kind.llvm == "i1" then
+                lowered = Value(text = value(body, "zext i1 " .. lowered.text .. " to i32"), kind = I32)
+            elseif isFloat(lowered.kind) or isInteger(lowered.kind) and lowered.kind.llvm ~= "i64" then
                 lowered = convert(body, lowered, F64, argument)
-            elseif lowered.kind.llvm == "i1" or isInteger(lowered.kind) and WIDTHS[lowered.kind.llvm] < 32 then
-                lowered = convert(body, lowered, I32, argument)
             end
         else
             lowered = convert(body, lowered, wanted as Kind, argument)
         end
         arguments[index] = lowered.kind.llvm .. extension(lowered.kind) .. " " .. lowered.text
-        types[index] = lowered.kind.llvm
     end
     local signature = target.result.llvm
     if target.varargs then
@@ -646,17 +646,19 @@ local function element(program: Program, body: Body, node: cst.BracketIndex): (s
         refuse(node, "a native program indexes only pointers to C scalars and pointers")
     end
     local elem = base.kind.elem as Kind
-    local index = expression(program, body, node.expr, Kind(llvm = "i64", signed = true))
-    if not isInteger(index.kind) then
-        refuse(node.expr, "a pointer index must be an integer")
+    local index = expression(program, body, node.expr, I64)
+    if not isInteger(index.kind) and not isFloat(index.kind) then
+        refuse(node.expr, "a pointer index must be a number")
     end
-    local wide = convert(body, index, Kind(llvm = "i64", signed = true), node.expr)
+    local wide = convert(body, index, I64, node.expr)
     local address = value(body, ("getelementptr %s, ptr %s, i64 %s"):format(elem.llvm, base.text, wide.text))
 
     return address, elem
 end
 
-local function expressionRaw(program: Program, body: Body, node: any, want: Kind?): Value
+--- `node` as a value. `want` is the kind its context takes, which a literal
+--- is spelled in directly; the caller still converts whatever comes back.
+expression = function(program: Program, body: Body, node: any, want: Kind?): Value
     local kind = node ~= nil and node.kind or nil
     if kind == "paren" then
         return expression(program, body, (node as cst.Paren).expr, want)
@@ -706,10 +708,6 @@ local function expressionRaw(program: Program, body: Body, node: any, want: Kind
         return Value(text = value(body, ("load %s, ptr %s"):format(elem.llvm, address)), kind = elem)
     end
     refuse(node, "a native program cannot evaluate " .. tostring(kind) .. " expressions")
-end
-
-expression = function(program: Program, body: Body, node: any, want: Kind?): Value
-    return expressionRaw(program, body, node, want)
 end
 
 local block: function(Program, Body, any): nil
