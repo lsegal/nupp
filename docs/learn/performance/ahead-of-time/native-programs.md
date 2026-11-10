@@ -27,13 +27,13 @@ nupp aot --emit executable --output build/hello hello.nupp
 `--emit executable` checks the file, lowers it to LLVM IR, and compiles and
 links it in process with the same code generator `aot = "require"` uses, so no
 C compiler or system linker is run. The program is written to exactly the path
-`--output` names, so on Windows that path includes `.exe`. A `nupp` built without the code generator still reports
-every refusal below, and then refuses to link.
+`--output` names, so on Windows that path includes `.exe`. A `nupp` built
+without the code generator still reports every refusal below, and then refuses
+to link.
 
-The program links LuaJIT statically from the platform's link kit, and it
-exports the Lua C API the way a standalone host does, so a C module the program
-loads with `require` binds against the program's own copy of LuaJIT. It
-depends on nothing but the platform's C runtime.
+The program links LuaJIT statically from the platform's link kit, so it needs no
+LuaJIT shared library at run time, and it exports the Lua C API the way a
+standalone host does.
 
 ## The shape of a program
 
@@ -167,12 +167,12 @@ runtime of Nupp's own.
 ```nupp
 cdef function calloc(count: uint64, size: uint64): voidptr
 cdef function free(borrows p: voidptr)
-cdef function pthread_create(borrows thread: voidptr, attributes: voidptr?, start: function(arg: voidptr): voidptr, borrows arg: voidptr): int32
+cdef function pthread_create(borrows thread: voidptr, attributes: voidptr?, start: function(arg: voidptr): voidptr?, borrows arg: voidptr): int32
 cdef function pthread_join(thread: uint64, result: voidptr?): int32
 cdef function __atomic_fetch_add_8(borrows p: int64*, v: int64, order: int32): int64
 cdef function __atomic_load_8(borrows p: int64*, order: int32): int64
 
-local function count(context: voidptr): voidptr
+local function count(context: voidptr): voidptr?
     local counter = context as int64*
     for _ = 1, 10000 do
         -- 0 is a relaxed add: only the total matters.
@@ -220,9 +220,10 @@ compiler handles its `__atomic` builtins. No libatomic is linked.
 
 `N` is 1, 2, 4 or 8. The order arguments are GCC's constants, from 0 (relaxed)
 through 5 (sequentially consistent), written as number literals. Any other
-expression, a named `const` included, is sequentially consistent, as in C, and an order the access cannot have, such as a
-release load, is refused. So is a declaration whose shape differs from
-libatomic's, and an operation libatomic does not have, such as `fetch_min`.
+expression, a named `const` included, is sequentially consistent, as in C. An
+order the access cannot have, such as a release load, is refused. So is a
+declaration whose shape differs from libatomic's, and an operation libatomic
+does not have, such as `fetch_min`.
 
 ## What a program cannot do
 
