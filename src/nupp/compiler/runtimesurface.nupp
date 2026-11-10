@@ -303,6 +303,12 @@ export function requireIdentity(checker: any, root: string?, member: string?, at
     end
 end
 
+--- Reports whether stock Lua 5.1 supplies `root.member` itself.
+export function stockMember(root: string, member: string): boolean
+    local members = LUA51_MEMBERS[root]
+    return members ~= nil and members[member] == true
+end
+
 --- Reports an exact prelude token, before any local alias carries its root.
 export function requireRoot(checker: any, token: any, member: string?, at: any?): nil
     requireIdentity(checker, resolvedRoot(checker, token), member, at or token)
