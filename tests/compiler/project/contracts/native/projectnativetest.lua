@@ -42,7 +42,9 @@ function M.nativeFacilitiesSharingAProviderBuildAsOneUnion()
     testAssert.eq(#calls, 1, "one provider union is built once")
     testAssert.eq(#copies, 2, "the shared library and path runtime are staged")
     local command = "\n" .. table.concat(calls[1], "\n") .. "\n"
-    assert(command:find("\nnative%-rust\nfilesystem,uuid\n"), "path and UUID select one sorted Rust feature union")
+    -- The path provider asks the operating system itself, so only UUID reaches
+    -- the Rust union.
+    assert(command:find("\nnative%-rust\nuuid\n"), "path and UUID select one Rust feature union")
     testAssert.eq(copies[1][1], "/built/libnupp_native.dylib", "the Rust provider union has one source artifact")
     assert(copies[1][2]:find("out/lib/nupp_native", 1, true), "the Rust provider union keeps its stable sidecar name")
 end

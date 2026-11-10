@@ -551,6 +551,7 @@ local FEATURES: {[string]: native.Feature} = {
         -- provider records it when the module graph is followed directly.
         modules = {"nupp.runtime.provider.nativepath"},
         host = "native-files",
+        binary = true,
         runtimeModule = "nupp.runtime.provider.nativepath",
         requires = {"runtime.path"},
     },
@@ -658,6 +659,7 @@ local FEATURES: {[string]: native.Feature} = {
         name = "files",
         modules = {"nupp.runtime.provider.nativefiles"},
         host = "native-files",
+        binary = true,
         runtimeModule = "nupp.runtime.provider.nativefiles",
         -- A file operation that waits performs `suspend`, so the runtime that
         -- answers it has to be in the target beside the program.
