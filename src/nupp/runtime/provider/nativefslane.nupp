@@ -1,0 +1,598 @@
+@!internal
+
+--[[Whole-file transfers for the native filesystem provider.
+
+A transfer reads, writes, appends, atomically replaces or copies one whole file.
+It runs on the Lua thread in bounded steps: submitting one takes its first step at
+once, so a small file is done before the caller looks, and every later `step`
+moves each pending transfer on by at most `STEP_BYTES` of I/O. A caller that has
+to wait drives `step` from a readiness pump, which therefore never sleeps while a
+transfer can still move.
+
+The lane is bounded three ways, as the former Rust lane was: how many transfers
+may be live, how many bytes they may hold between them, and how large one may be.
+Past any of the three a submission answers a reason rather than queueing. A
+transfer gives its admission back the moment it settles or is cancelled, since
+nothing else is still working on it then.
+]]
+module nupp.runtime.provider.nativefslane
+
+const ffi = require("ffi")
+
+local windows = (ffi as any).os == "Windows"
+local system: any = windows and require("nupp.runtime.provider.nativefswindows")
+    or require("nupp.runtime.provider.nativefsposix")
+
+--- The most transfers that may be live at once.
+export const MAX_REQUESTS = 128
+--- The most bytes the live transfers may hold between them.
+export const MAX_BYTES = 268435456
+--- The largest one transfer may be.
+export const MAX_REQUEST_BYTES = 268435456
+
+--- The most I/O one step of one transfer performs.
+export const STEP_BYTES = 1048576
+local READ_CHUNK = 65536
+local TEMPORARY_ATTEMPTS = 64
+
+--- A transfer that is still moving.
+export const PENDING = 0
+--- A transfer that finished.
+export const READY = 1
+--- A transfer that stopped with a reason.
+export const FAILED = 2
+--- A transfer that was cancelled before it finished.
+export const CANCELED = 3
+
+local TOO_LARGE = "the transfer is larger than the " .. tostring(MAX_REQUEST_BYTES) .. "-byte limit"
+
+--- How a write lands: in place, at the end, or through a temporary beside it.
+export type WriteMode = "replace" | "append" | "atomic"
+
+--- One submitted transfer. Its fields are the lane's own.
+export type Transfer = {[string]: any}
+
+local requests: integer = 0
+local bytesHeld: integer = 0
+local live: integer = 0
+local active: {Transfer} = {}
+
+----------------------------------------------------------------------------
+-- Admission
+----------------------------------------------------------------------------
+
+local function admit(charge: integer): string?
+    if charge > MAX_REQUEST_BYTES then
+        return TOO_LARGE
+    end
+    if requests == MAX_REQUESTS then
+        return "more than " .. tostring(MAX_REQUESTS) .. " transfers are in flight"
+    end
+    if bytesHeld + charge > MAX_BYTES then
+        return "transfers in flight would hold more than " .. tostring(MAX_BYTES) .. " bytes"
+    end
+    requests = requests + 1
+    bytesHeld = bytesHeld + charge
+
+    return nil
+end
+
+-- Raises what a transfer holds to `charge`, refusing past either byte limit.
+local function grow(transfer: Transfer, charge: integer): string?
+    local held = transfer.charge as integer
+    if charge <= held then
+        return nil
+    end
+    if charge > MAX_REQUEST_BYTES then
+        return TOO_LARGE
+    end
+    if bytesHeld + charge - held > MAX_BYTES then
+        return "transfers in flight would hold more than " .. tostring(MAX_BYTES) .. " bytes"
+    end
+    bytesHeld = bytesHeld + charge - held
+    transfer.charge = charge
+
+    return nil
+end
+
+local function giveBack(transfer: Transfer): nil
+    if transfer.admitted then
+        transfer.admitted = false
+        requests = requests - 1
+        bytesHeld = bytesHeld - (transfer.charge as integer)
+        transfer.charge = 0
+    end
+end
+
+--- How many transfers hold admission, and how many bytes they hold.
+export function admitted(): (integer, integer)
+    return requests, bytesHeld
+end
+
+--- How many submitted transfers have not been released.
+export function pending(): integer
+    return live
+end
+
+----------------------------------------------------------------------------
+-- Settling
+----------------------------------------------------------------------------
+
+local function forget(transfer: Transfer): nil
+    for index = 1, #active do
+        if active[index] == transfer then
+            table.remove(active, index)
+            return
+        end
+    end
+end
+
+-- Closes whatever the transfer still has open and removes a temporary it made.
+local function cleanUp(transfer: Transfer): nil
+    if transfer.file ~= nil then
+        system.fileClose(transfer.file)
+        transfer.file = nil
+    end
+    if transfer.output ~= nil then
+        system.fileClose(transfer.output)
+        transfer.output = nil
+    end
+    if transfer.temporary ~= nil then
+        system.remove(transfer.temporary, false)
+        transfer.temporary = nil
+    end
+    transfer.buffer = nil
+    transfer.pieces = nil
+end
+
+-- Admission is given back before the state is published, so a caller that sees a
+-- terminal state may submit replacement work at once.
+local function settle(transfer: Transfer, failure: string?, result: string?): nil
+    cleanUp(transfer)
+    giveBack(transfer)
+    forget(transfer)
+    transfer.contents = nil
+    if failure ~= nil then
+        transfer.state = FAILED
+        transfer.failure = failure
+    else
+        transfer.state = READY
+        transfer.result = result
+    end
+end
+
+----------------------------------------------------------------------------
+-- Steps
+----------------------------------------------------------------------------
+
+-- Each step answers nothing to carry on, or settles the transfer itself.
+
+local function readStep(transfer: Transfer): nil
+    if transfer.file == nil then
+        local file, reason = system.openReading(transfer.path)
+        if file == nil then
+            settle(transfer, reason, nil)
+            return
+        end
+        transfer.file = file
+        local size, problem = system.fileSize(file)
+        if size == nil then
+            settle(transfer, problem, nil)
+            return
+        end
+        local refused = grow(transfer, size as integer)
+        if refused ~= nil then
+            settle(transfer, refused, nil)
+            return
+        end
+        transfer.size = size
+        transfer.got = 0
+        if (size as integer) > 0 then
+            transfer.buffer = ffi.new("uint8_t[?]", size as integer)
+        else
+            transfer.pieces = {}
+            transfer.chunk = ffi.new("uint8_t[?]", READ_CHUNK)
+        end
+    end
+    local size = transfer.size as integer
+    local budget = STEP_BYTES
+    if size > 0 then
+        while budget > 0 do
+            local got = transfer.got as integer
+            local wanted = math.min(size - got, budget)
+            if wanted == 0 then
+                break
+            end
+            local buffer: any = transfer.buffer
+            local count, reason, blocked = system.streamRead(transfer.file, buffer + got, wanted)
+            if count == nil then
+                settle(transfer, reason, nil)
+                return
+            end
+            if blocked then
+                return
+            end
+            if count == 0 then
+                break
+            end
+            transfer.got = got + (count as integer)
+            budget = budget - (count as integer)
+        end
+        if (transfer.got as integer) < size and budget == 0 then
+            return
+        end
+        settle(transfer, nil, ffi.string(transfer.buffer, transfer.got as integer))
+        return
+    end
+    -- The size was unknown, as a FIFO's or a generated file's is: read until the end,
+    -- holding no more than one transfer may.
+    local chunk: any = transfer.chunk
+    while budget > 0 do
+        local got = transfer.got as integer
+        local wanted = READ_CHUNK
+        if got == MAX_REQUEST_BYTES then
+            wanted = 1
+        end
+        local refused = grow(transfer, math.min(got + wanted, MAX_REQUEST_BYTES))
+        if refused ~= nil then
+            settle(transfer, refused, nil)
+            return
+        end
+        local count, reason, blocked = system.streamRead(transfer.file, chunk, wanted)
+        if count == nil then
+            settle(transfer, reason, nil)
+            return
+        end
+        if blocked then
+            return
+        end
+        if count == 0 then
+            settle(transfer, nil, table.concat(transfer.pieces as {string}))
+            return
+        end
+        if got == MAX_REQUEST_BYTES then
+            settle(transfer, TOO_LARGE, nil)
+            return
+        end
+        local pieces = transfer.pieces as {string}
+        pieces[#pieces + 1] = ffi.string(chunk, count as integer)
+        transfer.got = got + (count as integer)
+        budget = budget - (count as integer)
+    end
+end
+
+-- Writes the next part of `transfer.contents` to `transfer.output`, answering whether
+-- every byte has been written.
+local function writePart(transfer: Transfer, appending: boolean): (boolean, string?)
+    local contents = transfer.contents as string
+    local total = #contents
+    local budget = STEP_BYTES
+    local base: any = ffi.cast("const uint8_t *", contents)
+    while budget > 0 do
+        local done = transfer.done as integer
+        local wanted = math.min(total - done, budget)
+        if wanted == 0 then
+            return true, nil
+        end
+        local wrote, reason = system.fileWrite(transfer.output, base + done, wanted, (not appending) and done or nil)
+        if wrote == nil then
+            return false, reason
+        end
+        if wrote == 0 then
+            return false, "failed to write whole buffer"
+        end
+        transfer.done = done + (wrote as integer)
+        budget = budget - (wrote as integer)
+    end
+
+    return (transfer.done as integer) == total, nil
+end
+
+local function writeStep(transfer: Transfer): nil
+    local appending = transfer.mode == "append"
+    if transfer.output == nil then
+        local file, reason
+        if appending then
+            file, reason = system.openFile(transfer.path, 2)
+        else
+            file, reason = system.replaceFile(transfer.path, nil)
+        end
+        if file == nil then
+            settle(transfer, reason, nil)
+            return
+        end
+        transfer.output = file
+        transfer.done = 0
+    end
+    local finished, problem = writePart(transfer, appending)
+    if problem ~= nil then
+        settle(transfer, problem, nil)
+        return
+    end
+    if finished then
+        settle(transfer, nil, nil)
+    end
+end
+
+local function hexName(): (string?, string?)
+    local random, reason = system.randomBytes(8)
+    if random == nil then
+        return nil, "cannot create a temporary name: " .. tostring(reason)
+    end
+    local digits: {string} = {}
+    for index = 8, 1, -1 do
+        digits[#digits + 1] = ("%02x"):format((random as string):byte(index))
+    end
+
+    return table.concat(digits), nil
+end
+
+local function atomicStep(transfer: Transfer): nil
+    if transfer.output == nil then
+        local directory = system.parent(transfer.path)
+        -- A new file gets the mode a plain write would give it. Replacing one keeps
+        -- its mode, so the temporary stays private until it has it.
+        local replacing = system.info(transfer.path, true) ~= nil
+        local preserved = system.permissions(transfer.path)
+        local collision: string? = nil
+        for _ = 1, TEMPORARY_ATTEMPTS do
+            local stamp, problem = hexName()
+            if stamp == nil then
+                settle(transfer, problem, nil)
+                return
+            end
+            local temporary = system.join(directory, ".nupp-write-" .. (stamp as string))
+            local file, reason, taken = system.createFile(temporary, replacing)
+            if file ~= nil then
+                transfer.output = file
+                transfer.temporary = temporary
+                break
+            end
+            if not taken then
+                settle(transfer, reason, nil)
+                return
+            end
+            collision = reason
+        end
+        if transfer.output == nil then
+            settle(transfer, collision or "no unused atomic-write name was found", nil)
+            return
+        end
+        if preserved ~= nil then
+            local applied, reason = system.applyPermissions(transfer.output, preserved)
+            if not applied then
+                settle(transfer, reason, nil)
+                return
+            end
+        end
+        transfer.directory = directory
+        transfer.done = 0
+    end
+    local finished, problem = writePart(transfer, false)
+    if problem ~= nil then
+        settle(transfer, problem, nil)
+        return
+    end
+    if not finished then
+        return
+    end
+    local synced, reason = system.fileSync(transfer.output)
+    if not synced then
+        settle(transfer, reason, nil)
+        return
+    end
+    system.fileClose(transfer.output)
+    transfer.output = nil
+    local moved, why = system.rename(transfer.temporary, transfer.path)
+    if not moved then
+        settle(transfer, why, nil)
+        return
+    end
+    transfer.temporary = nil
+    local durable, failure = system.syncDirectory(transfer.directory)
+    settle(transfer, (not durable) and failure or nil, nil)
+end
+
+local function copyStep(transfer: Transfer): nil
+    if transfer.file == nil then
+        local kind, _, _, readOnly, reason = system.info(transfer.from, true)
+        if kind == nil then
+            settle(transfer, reason, nil)
+            return
+        end
+        if kind ~= 1 then
+            settle(transfer, "the source path is neither a regular file nor a symlink to a regular file", nil)
+            return
+        end
+        local file, problem = system.openReading(transfer.from)
+        if file == nil then
+            settle(transfer, problem, nil)
+            return
+        end
+        transfer.file = file
+        local bits = system.permissions(transfer.from)
+        local output, failure = system.replaceFile(transfer.path, bits)
+        if output == nil then
+            settle(transfer, failure, nil)
+            return
+        end
+        transfer.output = output
+        transfer.bits = bits
+        transfer.readOnly = readOnly
+        transfer.chunk = ffi.new("uint8_t[?]", READ_CHUNK)
+        transfer.done = 0
+    end
+    local chunk: any = transfer.chunk
+    local budget = STEP_BYTES
+    while budget > 0 do
+        local count, reason, blocked = system.streamRead(transfer.file, chunk, READ_CHUNK)
+        if count == nil then
+            settle(transfer, reason, nil)
+            return
+        end
+        if blocked then
+            return
+        end
+        if count == 0 then
+            if transfer.bits ~= nil then
+                local applied, failure = system.applyPermissions(transfer.output, transfer.bits)
+                if not applied then
+                    settle(transfer, failure, nil)
+                    return
+                end
+            end
+            system.fileClose(transfer.output)
+            transfer.output = nil
+            if windows and transfer.readOnly then
+                local marked, failure = system.setReadOnly(transfer.path, true)
+                if not marked then
+                    settle(transfer, failure, nil)
+                    return
+                end
+            end
+            settle(transfer, nil, nil)
+            return
+        end
+        local written = 0
+        while written < (count as integer) do
+            local wrote, failure = system.fileWrite(transfer.output, chunk + written, (count as integer) - written, nil)
+            if wrote == nil then
+                settle(transfer, failure, nil)
+                return
+            end
+            if wrote == 0 then
+                settle(transfer, "failed to write whole buffer", nil)
+                return
+            end
+            written = written + (wrote as integer)
+        end
+        budget = budget - (count as integer)
+    end
+end
+
+local STEPS = {read = readStep, write = writeStep, atomic = atomicStep, copy = copyStep,}
+
+local function advance(transfer: Transfer): nil
+    local step = STEPS[transfer.kind as string]
+    step(transfer)
+end
+
+--- Moves every pending transfer on by one step, and answers how many it moved.
+--- A nonzero answer is progress, so a driver that sees it polls again rather than
+--- sleeping.
+export function step(): integer
+    local moved = #active
+    if moved == 0 then
+        return 0
+    end
+    -- A step that settles removes its transfer, so walk a snapshot.
+    local snapshot: {Transfer} = {}
+    for index = 1, moved do
+        snapshot[index] = active[index]
+    end
+    for _, transfer in ipairs(snapshot) do
+        if transfer.state == PENDING then
+            advance(transfer)
+        end
+    end
+
+    return moved
+end
+
+--- Whether any transfer is still pending.
+export function busy(): boolean
+    return #active > 0
+end
+
+----------------------------------------------------------------------------
+-- Submitting
+----------------------------------------------------------------------------
+
+local function submitted(transfer: Transfer, charge: integer): (Transfer?, string?)
+    local refused = admit(charge)
+    if refused ~= nil then
+        return nil, refused
+    end
+    transfer.state = PENDING
+    transfer.charge = charge
+    transfer.admitted = true
+    live = live + 1
+    active[#active + 1] = transfer
+    advance(transfer)
+
+    return transfer, nil
+end
+
+--- Submits a whole-file read. A path that cannot be described is refused here.
+export function submitRead(path: string): (Transfer?, string?)
+    local kind, size, _, _, reason = system.info(path, true)
+    if kind == nil then
+        return nil, reason
+    end
+
+    return submitted({kind = "read", path = path,}, size as integer)
+end
+
+--- Submits a whole-file write in one of the three modes.
+export function submitWrite(path: string, contents: string, mode: WriteMode): (Transfer?, string?)
+    local kind = mode == "atomic" and "atomic" or "write"
+
+    return submitted({kind = kind, mode = mode, path = path, contents = contents,}, #contents)
+end
+
+--- Submits a copy of one file's contents over another.
+export function submitCopy(from: string, to: string): (Transfer?, string?)
+    return submitted({kind = "copy", from = from, path = to,}, 0)
+end
+
+----------------------------------------------------------------------------
+-- Answering
+----------------------------------------------------------------------------
+
+--- Where a transfer stands, and its reason when it failed.
+export function status(transfer: Transfer): (integer, string?)
+    return transfer.state as integer, transfer.failure as string?
+end
+
+--- Takes a finished read's bytes. A finished write or copy answers the empty string.
+export function take(transfer: Transfer): (string?, string?)
+    local state = transfer.state
+    if state == READY then
+        local result = transfer.result as string?
+        transfer.result = nil
+        return result or "", nil
+    elseif state == FAILED then
+        return nil, transfer.failure as string
+    elseif state == CANCELED then
+        return nil, "the transfer was canceled"
+    end
+
+    return nil, "the transfer is still pending"
+end
+
+--- Cancels a pending transfer: it stops where it is, closes what it opened, removes
+--- the temporary an atomic write made, and gives its admission back. Answers whether
+--- it was still pending.
+export function cancel(transfer: Transfer): boolean
+    if transfer.state ~= PENDING then
+        return false
+    end
+    cleanUp(transfer)
+    giveBack(transfer)
+    forget(transfer)
+    transfer.contents = nil
+    transfer.state = CANCELED
+
+    return true
+end
+
+--- Releases a transfer the caller is done with, cancelling it first when it is still
+--- pending. Repeated calls do nothing.
+export function release(transfer: Transfer): nil
+    if transfer.released then
+        return
+    end
+    cancel(transfer)
+    transfer.released = true
+    live = live - 1
+end

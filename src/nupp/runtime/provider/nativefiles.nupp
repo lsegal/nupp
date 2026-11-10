@@ -1,12 +1,14 @@
 @!internal
 --[[
 `nupp.runtime.provider.nativefiles` is the native filesystem provider behind the
-`os` filesystem functions and `io.open`. It reaches the compiler-owned Rust
-library, whose metadata, listing and cursor operations run on the caller's thread
-and whose whole-file transfers run on a bounded shared lane.
+`os` filesystem functions and `io.open`. It calls the operating system itself
+through LuaJIT's FFI -- the Win32 wide-character functions on Windows and the C
+library elsewhere -- by way of `nativefswindows` and `nativefsposix`.
 
-The lane is bounded three ways: how many transfers may be live, how many bytes
-they may hold between them, and how large one may be. Past any of the three a
+Metadata, listing and cursor operations run on the caller's thread. Whole-file
+transfers run through `nativefslane` in bounded steps on the Lua thread, and the
+lane is bounded three ways: how many transfers may be live, how many bytes they
+may hold between them, and how large one may be. Past any of the three a
 submission returns a reason rather than queueing, because a queue that grows with
 its callers eventually takes the process with it. `pendingTransfers` reports what
 the lane is holding. A transfer waits by suspending, so a `@nosuspend` region may
@@ -21,10 +23,10 @@ local valueType: function(borrows value: any): string = type as any
 const systeminfo = require("nupp.runtime.systeminfo")
 
 ----------------------------------------------------------------------------
--- The native binding
+-- The operating system
 ----------------------------------------------------------------------------
 
-const native = require("nupp.runtime.native")
+const ffi = require("ffi")
 const suspension = require("nupp.suspension")
 const paths = require("io.internal.path")
 const io = require("io")
@@ -33,137 +35,33 @@ local privateIo = require("nupp.io")
 const span = require("bytes.span")
 const messages = require("io.internal.files.messages")
 const appPaths = require("io.internal.files.path")
+const lane = require("nupp.runtime.provider.nativefslane")
+const globbing = require("nupp.runtime.provider.nativefsglob")
 
--- The record is declared here rather than in the runtime cdef below, because
--- `ffi.new` names it and the checker has to know the type to accept that. It reaches
--- LuaJIT as a bare `struct` rather than a typedef, which is why the prototype below
--- writes it that way. The functions stay in the runtime declaration: they are reached
--- through the handle `nupp.runtime.native` opened, not the default namespace a `cdef
--- function` binds to.
-cdef struct NuppNativeFilesInfo
-    kind: uint32
-    read_only: int32
-    size: uint64
-    modified: number
-end
+local windows = (ffi as any).os == "Windows"
+local darwin = (ffi as any).os == "OSX"
+local system: any = windows and require("nupp.runtime.provider.nativefswindows")
+    or require("nupp.runtime.provider.nativefsposix")
 
-cdef struct NuppNativeFilesSlice
-    data: cstring
-    length: uint64
-end
-
-native.ffi.cdef[[
-int32_t nuppNativeFilesInfo(
-    struct NuppNativeFilesSlice, int32_t, struct NuppNativeFilesInfo *);
-int32_t nuppNativeFilesReadLink(struct NuppNativeFilesSlice, uint64_t *);
-int32_t nuppNativeFilesCreateSymlink(
-    struct NuppNativeFilesSlice, struct NuppNativeFilesSlice, int32_t);
-int32_t nuppNativeFilesCreateDirectory(struct NuppNativeFilesSlice);
-int32_t nuppNativeFilesRemove(struct NuppNativeFilesSlice, int32_t);
-int32_t nuppNativeFilesRename(
-    struct NuppNativeFilesSlice, struct NuppNativeFilesSlice);
-int32_t nuppNativeFilesExists(struct NuppNativeFilesSlice);
-int32_t nuppNativeFilesListOpen(struct NuppNativeFilesSlice, uint64_t *);
-int32_t nuppNativeFilesListNext(uint64_t, uint64_t *);
-int32_t nuppNativeFilesListClose(uint64_t);
-int32_t nuppNativeFilesGlob(struct NuppNativeFilesSlice, uint64_t *);
-int32_t nuppNativeFilesCreateTemporary(
-    struct NuppNativeFilesSlice, struct NuppNativeFilesSlice,
-    struct NuppNativeFilesSlice,
-    int32_t, uint64_t *);
-int32_t nuppNativeFilesApplicationBase(uint32_t, uint64_t *);
-
-int32_t nuppNativeFileOpen(struct NuppNativeFilesSlice, uint32_t, uint64_t *);
-int32_t nuppNativeFileRead(uint64_t, uint8_t *, size_t, size_t *);
-int32_t nuppNativeFileWrite(uint64_t, const uint8_t *, size_t, size_t *);
-int32_t nuppNativeFileSeek(uint64_t, int64_t, uint32_t, int64_t *);
-int32_t nuppNativeFileSize(uint64_t, int64_t *);
-int32_t nuppNativeFileFlush(uint64_t);
-int32_t nuppNativeFileRelease(uint64_t);
-
-int32_t nuppNativeFilesTransferSubmitRead(
-    struct NuppNativeFilesSlice, uint64_t *);
-int32_t nuppNativeFilesTransferSubmitWrite(
-    struct NuppNativeFilesSlice, struct NuppNativeFilesSlice,
-    uint32_t, uint64_t *);
-int32_t nuppNativeFilesTransferSubmitCopy(
-    struct NuppNativeFilesSlice, struct NuppNativeFilesSlice, uint64_t *);
-int32_t nuppNativeFilesTransferStatus(uint64_t, uint32_t *);
-int32_t nuppNativeFilesTransferTakeBytes(uint64_t, uint64_t *);
-int32_t nuppNativeFilesTransferCancel(uint64_t);
-int32_t nuppNativeFilesTransferRelease(uint64_t);
-int32_t nuppNativeFilesTransferPending(size_t *);
-]]
-
-local ffi = native.ffi
-local C = native.C
-const FILES_FEATURE = 128
-local featureChecked = false
-
-local function requireFiles(): nil
-    if not featureChecked then
-        native.requireFeature(FILES_FEATURE, "files")
-        featureChecked = true
-    end
-end
-
-local function slice(text: string): any
-    requireFiles()
-    local value = ffi.new<NuppNativeFilesSlice>()
-    -- The slice points into the Lua string; every caller hands it to C and returns
-    -- while `text` is still a live argument of its own, so the string outlives the
-    -- call.
-    @unsafe do
-        value.data = text
-    end
-    value.length = #text
-
-    return value
-end
-
-local function fileRead(handle: any, borrows destination: uint8[?], count: integer, wrote: any): integer
-    local call = C.nuppNativeFileRead as function(
-        handle: any,
-        borrows destination: uint8[?],
-        count: integer,
-        wrote: any
-    ): integer
-
-    return call(handle, destination, count, wrote)
-end
-
-local function fileWrite(handle: any, borrows source: const uint8[?], count: integer, wrote: any): integer
-    local call = C.nuppNativeFileWrite as function(
-        handle: any,
-        borrows source: const uint8[?],
-        count: integer,
-        wrote: any
-    ): integer
-
-    return call(handle, source, count, wrote)
-end
-
--- The library numbers what a path is, what an entry is, which user folder, how a file
--- is opened, and what a seek is measured from. Each of these is its side of one of
--- those enumerations.
+-- The provider numbers what a path is, how a file is opened, and what a seek is
+-- measured from. Each of these is its side of one of those enumerations.
 local KINDS = {[1] = "file", [2] = "directory", [3] = "other", [4] = "symlink",}
-local ENTRIES = {f = "file", d = "directory", l = "symlink", o = "other",}
 local MODES = {r = 0, w = 1, a = 2, ["r+"] = 3, ["w+"] = 4, ["a+"] = 5,}
 local ORIGINS = {set = 0, current = 1, ["end"] = 2,}
 
 local READ_SIZE: integer = 65536
--- What `nuppNativeFilesExists` answers for a name that does not resolve.
-local ABSENT: integer = -1
 local MAX_EXACT_INTEGER: integer = 9007199254740991
-local PENDING: integer = 0
-local READY: integer = 1
-local FAILED: integer = 2
-local CANCELED: integer = 3
+local PENDING: integer = lane.PENDING
+local READY: integer = lane.READY
+local CANCELED: integer = lane.CANCELED
+local TEMPORARY_ATTEMPTS = 64
+local EXACT_RANGE = "the file cursor exceeds Nupp's exact integer range"
 
--- The readiness pump this module registers with whoever is handling suspensions. It
--- sleeps on the readiness generation every native family shares, which a settled
--- transfer advances.
+-- The readiness pump this module registers with whoever is handling suspensions.
+-- Its poll moves every pending transfer on by one step, so it answers progress
+-- while any transfer can move and a driver never sleeps past one.
 local SOURCE = "nupp-files"
+local SOURCE_PRIORITY = 20
 
 ----------------------------------------------------------------------------
 -- What the filesystem answers with
@@ -224,42 +122,71 @@ local function positive(value: any, what: string, level: integer): integer
     return answer
 end
 
--- A direct call answers a status, and a failure's reason lives on the provider's
--- thread-local error channel.
-local function done(status: integer): (boolean, string?)
-    if status == 0 then
-        return true, nil
-    end
+----------------------------------------------------------------------------
+-- The cursor
+----------------------------------------------------------------------------
 
-    return false, ffi.string(C.nuppNativeLastError())
+-- A file keeps its own cursor and reads and writes at it, so a read after an
+-- append, or a seek past the end, means what it does on every platform. Positions
+-- stay inside the exact integer range, where a cursor is still a number.
+
+local function readAt(state: any, into: any, count: integer): (integer?, string?)
+    local position = state._position as integer
+    local remaining = MAX_EXACT_INTEGER - position
+    if remaining == 0 then
+        local size = system.fileSize(state._handle)
+        if size ~= nil and (size as integer) > position then
+            return nil, EXACT_RANGE
+        end
+    end
+    local got, reason = system.fileRead(state._handle, into, math.min(count, remaining), position)
+    if got == nil then
+        return nil, reason
+    end
+    state._position = position + (got as integer)
+
+    return got as integer, nil
 end
 
--- Dynamic answers cross as native byte handles. `native.bytes` copies their
--- contents into a Lua string and releases the generational handle exactly once.
-local function answer(status: integer, output: any): (string?, string?)
-    if status ~= 0 then
-        return nil, ffi.string(C.nuppNativeLastError())
+local function writeAt(state: any, from: any, count: integer): (integer?, string?)
+    local appending = state._appending as boolean
+    local start: integer
+    if appending then
+        local size, reason = system.fileSize(state._handle)
+        if size == nil then
+            return nil, reason
+        end
+        start = size as integer
+    else
+        start = state._position as integer
+    end
+    if start + count > MAX_EXACT_INTEGER then
+        return nil, "the file cursor would exceed Nupp's exact integer range"
+    end
+    local written = 0
+    while written < count do
+        local wrote, reason = system.fileWrite(state._handle, from + written, count - written, (not appending) and (start + written) or nil)
+        if wrote == nil then
+            return nil, reason
+        end
+        if wrote == 0 then
+            return nil, "failed to write the complete file buffer"
+        end
+        written = written + (wrote as integer)
+    end
+    if appending then
+        -- Append mode writes at the then-current end whatever the cursor said, so the
+        -- cursor moves to where the write landed.
+        local size, reason = system.fileSize(state._handle)
+        if size == nil then
+            return nil, reason
+        end
+        state._position = size
+    else
+        state._position = start + written
     end
 
-    return native.bytes(output[0]), nil
-end
-
--- Reads through a caller-owned native buffer.
-local function readBytes(handle: any, into: any, count: integer): (string?, string?)
-    local output = ffi.new("size_t[1]")
-    local status = C.nuppNativeFileRead(handle, into, count, output)
-    if status ~= 0 then
-        return nil, ffi.string(C.nuppNativeLastError())
-    end
-    local got = tonumber(output[0]) as integer
-    if got < 0 or got > count then
-        return nil, "the native files provider returned an invalid read count"
-    end
-    if got == 0 then
-        return "", nil
-    end
-
-    return ffi.string(into, got), nil
+    return written, nil
 end
 
 ----------------------------------------------------------------------------
@@ -283,6 +210,8 @@ export record File is io.Reader, io.Writer
     @private _closed: boolean
     @private _scratch: any
     @private _capacity: integer
+    @private _position: integer
+    @private _appending: boolean
 
     --- Reads up to `count` bytes at the cursor.
     ---
@@ -298,8 +227,15 @@ export record File is io.Reader, io.Writer
         end
         local wanted = positive(count, "File:read count", 2)
         local into = scratch(self, wanted)
+        local got, reason = readAt(self, into, wanted)
+        if got == nil then
+            return nil, reason
+        end
+        if got == 0 then
+            return "", nil
+        end
 
-        return readBytes(self._handle, into, wanted)
+        return ffi.string(into, got as integer), nil
     end
 
     --- Reads at the cursor directly into a checked writable span.
@@ -312,19 +248,9 @@ export record File is io.Reader, io.Writer
             return nil, "the file is closed"
         end
         local wanted = positive(#destination, "File:readspan destination length", 2)
-        local pointer = destination:ref()
-        local output = ffi.new("size_t[1]")
-        local status = fileRead(self._handle, pointer, wanted, output)
-        if status ~= 0 then
-            return nil, ffi.string(C.nuppNativeLastError())
-        end
+        local pointer: any = destination:ref()
 
-        local got = tonumber(output[0]) as integer
-        if got < 0 or got > wanted then
-            return nil, "the native files provider returned an invalid read count"
-        end
-
-        return got, nil
+        return readAt(self, pointer, wanted)
     end
 
     --- Writes bytes at the cursor.
@@ -340,15 +266,13 @@ export record File is io.Reader, io.Writer
         if valueType(bytes) ~= "string" then
             error("nupp: io File:write needs a string", 2)
         end
-        local output = ffi.new("size_t[1]")
-        local status = C.nuppNativeFileWrite(self._handle, bytes, #bytes, output)
-        if status ~= 0 then
-            return false, ffi.string(C.nuppNativeLastError())
+        if #bytes == 0 then
+            return true, nil
         end
-
-        local wrote = tonumber(output[0]) as integer
-        if wrote ~= #bytes then
-            return false, "the native files provider performed a short write"
+        local from: any = ffi.cast("const uint8_t *", bytes)
+        local wrote, reason = writeAt(self, from, #bytes)
+        if wrote == nil then
+            return false, reason
         end
 
         return true, nil
@@ -367,19 +291,9 @@ export record File is io.Reader, io.Writer
         if count == 0 then
             return 0, nil
         end
-        local pointer = source:ref()
-        local output = ffi.new("size_t[1]")
-        local status = fileWrite(self._handle, pointer, count, output)
-        if status ~= 0 then
-            return nil, ffi.string(C.nuppNativeLastError())
-        end
+        local pointer: any = source:ref()
 
-        local wrote = tonumber(output[0]) as integer
-        if wrote < 0 or wrote > count then
-            return nil, "the native files provider returned an invalid write count"
-        end
-
-        return wrote, nil
+        return writeAt(self, pointer, count)
     end
 
     --- Returns the file's byte length without moving the cursor.
@@ -391,13 +305,15 @@ export record File is io.Reader, io.Writer
         if self._closed then
             error("nupp: io File is closed", 2)
         end
-        local output = ffi.new("int64_t[1]")
-        local status = C.nuppNativeFileSize(self._handle, output)
-        if status ~= 0 then
-            return nil, privateIo.toError(ffi.string(C.nuppNativeLastError()))
+        local length, reason = system.fileSize(self._handle)
+        if length == nil then
+            return nil, privateIo.toError(reason)
+        end
+        if (length as integer) > MAX_EXACT_INTEGER then
+            return nil, privateIo.toError("file size exceeds Nupp's exact integer range")
         end
 
-        return tonumber(output[0]) as integer, nil
+        return length as integer, nil
     end
 
     --- Moves the cursor and returns where it landed.
@@ -415,13 +331,24 @@ export record File is io.Reader, io.Writer
         if whence == nil then
             error("nupp: io has no seek origin named " .. tostring(origin), 2)
         end
-        local output = ffi.new("int64_t[1]")
-        local status = C.nuppNativeFileSeek(self._handle, whole(offset or 0, "seek offset", 2), whence, output)
-        if status ~= 0 then
-            return nil, privateIo.toError(ffi.string(C.nuppNativeLastError()))
+        local distance = whole(offset or 0, "seek offset", 2)
+        local base: integer = 0
+        if whence == 1 then
+            base = self._position
+        elseif whence == 2 then
+            local length, reason = system.fileSize(self._handle)
+            if length == nil then
+                return nil, privateIo.toError(reason)
+            end
+            base = length as integer
         end
+        local landed = base + distance
+        if landed < 0 or landed > MAX_EXACT_INTEGER then
+            return nil, privateIo.toError("the file cursor would be outside Nupp's exact integer range")
+        end
+        self._position = landed
 
-        return tonumber(output[0]) as integer, nil
+        return landed, nil
     end
 
     --- Returns the cursor's current position.
@@ -434,6 +361,9 @@ export record File is io.Reader, io.Writer
 
     --- Pushes buffered writes at the operating system, and reports a write that
     --- failed to land.
+    ---
+    --- Writes go straight to the operating system, so there is nothing buffered here
+    --- to push; this deliberately does not force the data to the device.
     --- @param self this file
     --- @return whether the flush succeeded
     --- @return a failure reason, when unsuccessful
@@ -442,7 +372,7 @@ export record File is io.Reader, io.Writer
             return false, "the file is closed"
         end
 
-        return done(C.nuppNativeFileFlush(self._handle))
+        return true, nil
     end
 
     --- Whether this file has been closed.
@@ -474,7 +404,7 @@ function File.close(takes self: File): nil
     state._handle = nil
     state._scratch = nil
     state._capacity = 0
-    C.nuppNativeFileRelease(handle)
+    system.fileClose(handle)
 end
 
 ----------------------------------------------------------------------------
@@ -516,7 +446,7 @@ export record TemporaryPath is own.Closeable
             return false, privateIo.toError("the temporary path is released", "closed")
         end
         local to = named(destination, "destination path", 2)
-        local moved, reason = done(C.nuppNativeFilesRename(slice(self._text), slice(to)))
+        local moved, reason = system.rename(self._text, to)
         if not moved then
             return false, privateIo.toError(reason)
         end
@@ -553,7 +483,7 @@ function TemporaryPath.close(takes self: TemporaryPath): nil
         return
     end
     state._closed = true
-    C.nuppNativeFilesRemove(slice(state._text), state._directory and 1 or 0)
+    system.remove(state._text, state._directory)
 end
 
     ;
@@ -580,41 +510,22 @@ scratch = function(borrows self: File, count: integer): any
     return state._scratch
 end
 
--- Every whole-file transfer this program submitted and has not yet consumed. The
--- lane that runs them is bounded, so a program that submits more than it waits for is
--- something a caller can ask about.
-local waits: {any} = {}
-
-local function transferState(handle: any): (integer, string?)
-    local output = ffi.new("uint32_t[1]")
-    local status = C.nuppNativeFilesTransferStatus(handle, output)
-    if status ~= 0 then
-        return FAILED, ffi.string(C.nuppNativeLastError())
-    end
-
-    local state = tonumber(output[0]) as integer
-    if state < PENDING or state > CANCELED then
-        return FAILED, "the native files provider returned an invalid transfer status"
-    end
-    if state == FAILED then
-        return state, ffi.string(C.nuppNativeLastError())
-    end
-
-    return state, nil
-end
-
 ----------------------------------------------------------------------------
 -- Driving the request loop
 ----------------------------------------------------------------------------
 
--- Moves every settled request off the wait list and resumes whoever was waiting for
--- it. Answers how many moved, which is what a readiness pump owes its driver.
+-- Every whole-file transfer a caller is waiting for.
+local waits: {any} = {}
+
+-- Moves every pending transfer on by one step, then resumes whoever was waiting for
+-- one that settled. Answers the steps taken plus the waits settled: either is
+-- progress, which is what tells a driver to poll again rather than sleep.
 local function harvest(): integer
-    local moved: integer = 0
+    local moved: integer = lane.step()
     local index = #waits
     while index > 0 do
         local entry = waits[index]
-        if transferState(entry.handle) ~= PENDING then
+        if lane.status(entry.transfer) ~= PENDING then
             waits[index] = waits[#waits]
             waits[#waits] = nil
             moved = moved + 1
@@ -624,6 +535,12 @@ local function harvest(): integer
     end
 
     return moved
+end
+
+-- Nothing here ever needs a sleep: a pending transfer moves on the next poll, and
+-- with none pending there is nothing of this source's to wait for.
+local function idle(_waitMs: integer): integer
+    return 0
 end
 
 local function forget(entry: any): nil
@@ -637,19 +554,19 @@ local function forget(entry: any): nil
     end
 end
 
--- A request that has already settled is not waited for at all, so the common small
--- read never reaches the suspension machinery.
-local function await(handle: any): nil
-    if transferState(handle) ~= PENDING then
+-- A transfer that settled on submission is not waited for at all, so the common
+-- small read never reaches the suspension machinery.
+local function await(transfer: any): nil
+    if lane.status(transfer) ~= PENDING then
         return
     end
     suspension.suspend("file transfer", function(resume: function(boolean), context: any): function()?
-        local entry = {handle = handle, resume = resume,}
-        context:source(SOURCE, native.READINESS_PRIORITY, native.pump(harvest))
+        local entry = {transfer = transfer, resume = resume,}
+        context:source(SOURCE, SOURCE_PRIORITY, harvest, idle)
         waits[#waits + 1] = entry
         -- Settled between the status check above and the subscription: resume now and
         -- answer no cancellation, which is what a subscription that did not park owes.
-        if transferState(handle) ~= PENDING then
+        if lane.status(transfer) ~= PENDING then
             forget(entry)
             resume(true)
 
@@ -657,11 +574,9 @@ local function await(handle: any): nil
         end
 
         -- Cancellation raises out of the suspension, so `settled` never runs to
-        -- destroy this handle; destroying it here is what gives the lane its
-        -- request and byte budget back. The worker holds its own reference to the
-        -- shared state, so a transfer already running is unaffected. An abandoned
-        -- park is cancelled twice by design, and the first call frees the handle,
-        -- so the whole body runs once and the second call finds nothing to do.
+        -- release this transfer; releasing it here is what gives the lane its request
+        -- and byte budget back. An abandoned park is cancelled twice by design, and the
+        -- first call releases the transfer, so the second finds nothing to do.
         local cancelled = false
 
         return function(): nil
@@ -670,57 +585,35 @@ local function await(handle: any): nil
             end
             cancelled = true
             forget(entry)
-            C.nuppNativeFilesTransferCancel(handle)
-            C.nuppNativeFilesTransferRelease(handle)
+            lane.cancel(transfer)
+            lane.release(transfer)
         end
     end)
 end
 
--- Waits for one submitted request and answers the handle when it is ready. A failed
--- request is destroyed here, because nothing else will read it.
-local function settled(handle: any): (any?, string?)
-    if handle == nil or handle == 0 then
-        return nil, ffi.string(C.nuppNativeLastError())
+-- Waits for one submitted transfer and answers what it produced: the bytes of a
+-- read, the empty string for anything else, or why it did not finish.
+local function settled(transfer: any, reason: string?): (string?, string?)
+    if transfer == nil then
+        return nil, reason
     end
-    await(handle)
-    local state, failure = transferState(handle)
+    await(transfer)
+    local state, failure = lane.status(transfer)
     if state ~= READY then
-        local reason = failure or (state == CANCELED and "file transfer was cancelled" or "file transfer failed")
-        C.nuppNativeFilesTransferRelease(handle)
+        lane.release(transfer)
 
-        return nil, reason
+        return nil, failure or (state == CANCELED and "file transfer was cancelled" or "file transfer failed")
     end
+    local bytes, problem = lane.take(transfer)
+    lane.release(transfer)
 
-    return handle, nil
+    return bytes, problem
 end
 
-local function transferred(handle: any): (boolean, string?)
-    local ready, reason = settled(handle)
-    if ready == nil then
-        return false, reason
-    end
-    C.nuppNativeFilesTransferRelease(ready)
+local function transferred(transfer: any, reason: string?): (boolean, string?)
+    local answer, problem = settled(transfer, reason)
 
-    return true, nil
-end
-
-local function fetched(handle: any): (string?, string?)
-    local ready, reason = settled(handle)
-    if ready == nil then
-        return nil, reason
-    end
-    local output = ffi.new("uint64_t[1]")
-    local status = C.nuppNativeFilesTransferTakeBytes(ready, output)
-    if status ~= 0 then
-        local failure = ffi.string(C.nuppNativeLastError())
-        C.nuppNativeFilesTransferRelease(ready)
-
-        return nil, failure
-    end
-    local out = native.bytes(output[0])
-    C.nuppNativeFilesTransferRelease(ready)
-
-    return out as string, nil
+    return answer ~= nil, problem
 end
 
 ----------------------------------------------------------------------------
@@ -739,22 +632,70 @@ local function fragment(value: any, what: string, level: integer): string
     return value as string
 end
 
+local function separated(text: string): boolean
+    return text:find("/", 1, true) ~= nil or (windows and text:find("\\", 1, true) ~= nil)
+end
+
+local function randomName(): (string?, string?)
+    local random, reason = system.randomBytes(8)
+    if random == nil then
+        return nil, "cannot create a temporary name: " .. tostring(reason)
+    end
+    local digits: {string} = {}
+    for index = 8, 1, -1 do
+        digits[#digits + 1] = ("%02x"):format((random as string):byte(index))
+    end
+
+    return table.concat(digits), nil
+end
+
 --- @raises string when an argument is not a string, or the directory not a path
 local function temporary(directory: boolean, prefix: any, suffix: any, within: any, level: integer): (string?, string?)
     local root = within ~= nil and named(within, "temporary directory", level + 1) or ""
     local before = fragment(prefix, "prefix", level + 1)
     local after = fragment(suffix, "suffix", level + 1)
+    if separated(before) or separated(after) then
+        return nil, "temporary name fragments must not contain a path separator"
+    end
+    if root == "" then
+        root = system.temporaryDirectory()
+    end
+    local collision: string? = nil
+    for _ = 1, TEMPORARY_ATTEMPTS do
+        local stamp, problem = randomName()
+        if stamp == nil then
+            return nil, problem
+        end
+        local candidate = system.join(root, before .. (stamp as string) .. after)
+        local made: boolean
+        local reason: string?
+        local taken: boolean
+        if directory then
+            local why: string?
+            made, reason, why = system.makeDirectory(candidate, true)
+            taken = why == "exists"
+        else
+            local file, failure, exists = system.createFile(candidate, true)
+            made = file ~= nil
+            reason = failure
+            taken = exists == true
+            if file ~= nil then
+                system.fileClose(file)
+            end
+        end
+        if made then
+            if windows then
+                return (candidate:gsub("\\", "/")), nil
+            end
+            return candidate, nil
+        end
+        if not taken then
+            return nil, reason
+        end
+        collision = reason
+    end
 
-    local output = ffi.new("uint64_t[1]")
-    local status = C.nuppNativeFilesCreateTemporary(
-        slice(root),
-        slice(before),
-        slice(after),
-        directory and 1 or 0,
-        output
-    )
-
-    return answer(status, output)
+    return nil, collision or "no unused temporary name was found"
 end
 
 local spanText: function(
@@ -762,16 +703,13 @@ local spanText: function(
     count: integer
 ): string = require("nupp.runtime.storage").string as any
 
-local function submitBytes(path: string, borrows bytes: string | span.Span<uint8>, mode: integer, output: any): integer
-    local payload: string
+local function payloadOf(borrows bytes: string | span.Span<uint8>): string
     if valueType(bytes) == "string" then
-        payload = tostring(bytes)
-    else
-        local source = bytes as span.Span<uint8>;
-        payload = spanText(source:ref(), #source)
+        return tostring(bytes)
     end
+    local source = bytes as span.Span<uint8>;
 
-    return C.nuppNativeFilesTransferSubmitWrite(slice(path), slice(payload), mode, output)
+    return spanText(source:ref(), #source)
 end
 
 ----------------------------------------------------------------------------
@@ -790,28 +728,17 @@ end
 --- @export
 export function stat(path: string | paths.Path, follow: boolean): (FileKind?, integer?, number?, boolean?, string?)
     local text = named(path, "path", 2)
-    local record = ffi.new<NuppNativeFilesInfo[1]>()
-    if C.nuppNativeFilesInfo(slice(text), follow and 1 or 0, record) ~= 0 then
-        return nil, nil, nil, nil, ffi.string(C.nuppNativeLastError())
+    local kind, size, modified, readonly, reason = system.info(text, follow and true or false)
+    if kind == nil then
+        return nil, nil, nil, nil, reason
     end
-    local kind: any = nil
-    local size: any = nil
-    local modified: any = nil
-    local readonly: any = nil
-    -- A pointer is not indexable in checked code, so the one-element array the library
-    -- filled is read through its own index, one scalar at a time.
-    @unsafe do
-        kind = record[0].kind
-        size = record[0].size
-        modified = record[0].modified
-        readonly = record[0].read_only
+    if (size as integer) > MAX_EXACT_INTEGER then
+        return nil, nil, nil, nil, "file size exceeds Nupp's exact integer range"
     end
 
-    -- The library answers seconds; `os` answers the milliseconds the clock does.
+    -- The system answers seconds; `os` answers the milliseconds the clock does.
 
-    return (
-        KINDS[tonumber(kind) as integer] or "other"
-    ) as FileKind, tonumber(size) as integer, (modified as number) * 1000, readonly ~= 0, nil
+    return (KINDS[kind as integer] or "other") as FileKind, size as integer, (modified as number) * 1000, readonly, nil
 end
 
 --- Whether a path resolves, following symbolic links. A lookup that cannot tell,
@@ -822,15 +749,8 @@ end
 --- @export
 export function exists(path: string | paths.Path): (boolean?, string?)
     local text = named(path, "path", 2)
-    local status = C.nuppNativeFilesExists(slice(text)) as integer
-    if status == 0 then
-        return true, nil
-    end
-    if status == ABSENT then
-        return false, nil
-    end
 
-    return nil, ffi.string(C.nuppNativeLastError())
+    return system.exists(text)
 end
 
 --- Reads a symbolic link's target without resolving it.
@@ -840,8 +760,7 @@ end
 --- @export
 export function readLink(path: string | paths.Path): (paths.Path?, string?)
     local text = named(path, "path", 2)
-    local output = ffi.new("uint64_t[1]")
-    local target, reason = answer(C.nuppNativeFilesReadLink(slice(text), output), output)
+    local target, reason = system.readLink(text)
     if target == nil then
         return nil, reason
     end
@@ -871,7 +790,52 @@ export function createSymlink(
         error("nupp: os symlink kind must be 'file' or 'directory'", 2)
     end
 
-    return done(C.nuppNativeFilesCreateSymlink(slice(to), slice(at), kind == "directory" and 1 or 0))
+    return system.createSymlink(to, at, kind == "directory")
+end
+
+--- Sets or clears a path's read-only state: its write permission bits on POSIX and
+--- its read-only attribute on Windows.
+--- @param path the path to change
+--- @param readOnly whether writes should be refused
+--- @return whether the change happened
+--- @return a failure reason, when unsuccessful
+--- @export
+export function setReadOnly(path: string | paths.Path, readOnly: boolean): (boolean, string?)
+    local text = named(path, "path", 2)
+
+    return system.setReadOnly(text, readOnly and true or false)
+end
+
+local makeTree: function(path: string, depth: integer): (boolean, string?)
+
+-- Creates a directory and every missing parent, the way Rust's `create_dir_all`
+-- does: an existing directory succeeds, and a parent another caller made in between
+-- is not a failure.
+makeTree = function(path: string, depth: integer): (boolean, string?)
+    local made, reason, why = system.makeDirectory(path, false)
+    if made then
+        return true, nil
+    end
+    if why ~= "missing" then
+        if system.isDirectory(path) then
+            return true, nil
+        end
+        return false, reason
+    end
+    local parent = system.parent(path)
+    if parent == path or depth == 0 then
+        return false, "failed to create whole tree"
+    end
+    local parentMade, problem = makeTree(parent, depth - 1)
+    if not parentMade then
+        return false, problem
+    end
+    made, reason = system.makeDirectory(path, false)
+    if made or system.isDirectory(path) then
+        return true, nil
+    end
+
+    return false, reason
 end
 
 --- Creates a directory and every missing parent.
@@ -883,11 +847,17 @@ end
 --- @export
 export function createDirectory(path: string | paths.Path): (boolean, string?)
     local text = named(path, "path", 2)
+    if text == "" then
+        return false, "the directory name is empty"
+    end
 
-    return done(C.nuppNativeFilesCreateDirectory(slice(text)))
+    return makeTree(text, globbing.MAX_WALK_DEPTH * 8)
 end
 
 --- Removes a file, a symbolic link, or a directory.
+---
+--- A recursive remove never follows a link: a link inside the tree is removed as
+--- the link it is, so the walk cannot reach outside the tree it was asked to remove.
 --- @param path the path to remove
 --- @param recursive whether to remove a directory's contents with it
 --- @return whether the path was removed
@@ -899,7 +869,7 @@ export function remove(path: string | paths.Path, recursive: boolean?): (boolean
         error("nupp: os recursive must be a boolean", 2)
     end
 
-    return done(C.nuppNativeFilesRemove(slice(text), recursive and 1 or 0))
+    return system.remove(text, recursive and true or false)
 end
 
 --- Renames a path, replacing an existing destination.
@@ -912,72 +882,49 @@ export function rename(from: string | paths.Path, to: string | paths.Path): (boo
     local source = named(from, "source path", 2)
     local destination = named(to, "destination path", 2)
 
-    return done(C.nuppNativeFilesRename(slice(source), slice(destination)))
+    return system.rename(source, destination)
 end
 
 --- Yields a directory's immediate children, then nil.
 --- @export
 export type Entries = function(): (string?, FileKind)
 
--- A listing abandoned before its end keeps its directory open until the collector
--- reaches the box holding its handle, the way an unfinished `io.lines` keeps its file.
-local function closeListing(box: any): nil
-    C.nuppNativeFilesListClose(box[0])
-end
-
---- Reads a directory's immediate children a batch at a time.
+--- Reads a directory's immediate children one at a time.
 ---
 --- Each name has no directory part, and each kind describes the entry itself, so a
---- link inside a listing reads as `symlink`. The order is the platform's.
+--- link inside a listing reads as `symlink`. The order is the platform's. A listing
+--- abandoned before its end keeps its directory open until the collector reaches it,
+--- the way an unfinished `io.lines` keeps its file.
 --- @param path the directory to list
 --- @return an iterator over the names and kinds, or nil on failure
 --- @return a failure reason, when unsuccessful
---- @raises string when a batch after the first cannot be read
+--- @raises string when an entry after the first cannot be read
 --- @export
 export function list(path: string | paths.Path): (Entries?, string?)
     local text = named(path, "path", 2)
-    local output = ffi.new("uint64_t[1]")
-    if C.nuppNativeFilesListOpen(slice(text), output) ~= 0 then
-        return nil, ffi.string(C.nuppNativeLastError())
+    local listing, reason = system.openDirectory(text)
+    if listing == nil then
+        return nil, reason
     end
-    local box: any = ffi.gc(output, closeListing)
-    -- The library answers each batch as one blob: a kind byte, the name, and a NUL,
-    -- repeated. An empty batch is the end.
-    local batch = ffi.new("uint64_t[1]")
-    local blob = ""
-    local at = 1
-
-    local function release(): nil
-        if box ~= nil then
-            ffi.gc(box, nil)
-            closeListing(box)
-            box = nil
-        end
-    end
+    local open: any = listing
 
     return function(): (string?, FileKind)
-        while at > #blob do
-            if box == nil then
-                return nil, nil as any
-            end
-            if C.nuppNativeFilesListNext(box[0], batch) ~= 0 then
-                local reason = ffi.string(C.nuppNativeLastError())
-                release()
-                error(text .. ": " .. reason, 2)
-            end
-            blob = native.bytes(batch[0])
-            at = 1
-            if blob == "" then
-                release()
-                return nil, nil as any
-            end
+        if open == nil then
+            return nil, nil as any
         end
-        local stop = blob:find("\0", at + 1, true) as integer
-        local kind = (ENTRIES[blob:sub(at, at)] or "other") as FileKind
-        local name = blob:sub(at + 1, stop - 1)
-        at = stop + 1
+        local name, kind, problem = system.readDirectory(open)
+        if problem ~= nil then
+            system.closeDirectory(open)
+            open = nil
+            error(text .. ": " .. tostring(problem), 2)
+        end
+        if name == nil then
+            system.closeDirectory(open)
+            open = nil
+            return nil, nil as any
+        end
 
-        return name, kind
+        return name, (KINDS[kind as integer] or "other") as FileKind
     end, nil
 end
 
@@ -995,23 +942,16 @@ export function glob(pattern: string): ({paths.Path}?, string?)
     if type(pattern) ~= "string" then
         error("nupp: os glob pattern must be a string", 2)
     end
-    local text = pattern
-    local output = ffi.new("uint64_t[1]")
-    local status = C.nuppNativeFilesGlob(slice(text), output)
-    if status ~= 0 then
-        return nil, ffi.string(C.nuppNativeLastError())
+    if pattern:find("\0", 1, true) ~= nil then
+        return nil, "pattern contains an embedded NUL"
     end
-    local blob = native.bytes(output[0])
+    local found, reason = globbing.expand(pattern, system, windows)
+    if found == nil then
+        return nil, reason
+    end
     local matches: {paths.Path} = {}
-    local at = 1
-    while at <= #blob do
-        local stop = blob:find("\0", at, true)
-        if stop == nil then
-            matches[#matches + 1] = paths.newpath(blob:sub(at))
-            break
-        end
-        matches[#matches + 1] = paths.newpath(blob:sub(at, (stop as integer) - 1))
-        at = (stop as integer) + 1
+    for index, text in ipairs(found as {string}) do
+        matches[index] = paths.newpath(text)
     end
 
     return matches, nil
@@ -1033,14 +973,8 @@ end
 --- @export
 export function read(path: string | paths.Path): (string?, string?)
     local text = named(path, "path", 2)
-    local output = ffi.new("uint64_t[1]")
-    local status = C.nuppNativeFilesTransferSubmitRead(slice(text), output)
 
-    if status ~= 0 then
-        return nil, ffi.string(C.nuppNativeLastError())
-    end
-
-    return fetched(output[0])
+    return settled(lane.submitRead(text))
 end
 
 --- Writes a whole file, replacing its contents.
@@ -1051,14 +985,8 @@ end
 --- @export
 export function write(path: string | paths.Path, borrows bytes: string | Span<uint8>): (boolean, string?)
     local text = named(path, "path", 2)
-    local output = ffi.new("uint64_t[1]")
-    local status = submitBytes(text, bytes, 0, output)
 
-    if status ~= 0 then
-        return false, ffi.string(C.nuppNativeLastError())
-    end
-
-    return transferred(output[0])
+    return transferred(lane.submitWrite(text, payloadOf(bytes), "replace"))
 end
 
 --- Adds to the end of a file, creating it when it does not exist.
@@ -1069,14 +997,8 @@ end
 --- @export
 export function append(path: string | paths.Path, borrows bytes: string | Span<uint8>): (boolean, string?)
     local text = named(path, "path", 2)
-    local output = ffi.new("uint64_t[1]")
-    local status = submitBytes(text, bytes, 1, output)
 
-    if status ~= 0 then
-        return false, ffi.string(C.nuppNativeLastError())
-    end
-
-    return transferred(output[0])
+    return transferred(lane.submitWrite(text, payloadOf(bytes), "append"))
 end
 
 --- Writes a whole file through a temporary beside it, so an interrupted write leaves
@@ -1091,14 +1013,8 @@ end
 --- @export
 export function writeAtomic(path: string | paths.Path, borrows bytes: string | Span<uint8>): (boolean, string?)
     local text = named(path, "path", 2)
-    local output = ffi.new("uint64_t[1]")
-    local status = submitBytes(text, bytes, 2, output)
 
-    if status ~= 0 then
-        return false, ffi.string(C.nuppNativeLastError())
-    end
-
-    return transferred(output[0])
+    return transferred(lane.submitWrite(text, payloadOf(bytes), "atomic"))
 end
 
 --- Copies a file's contents over a destination.
@@ -1110,31 +1026,19 @@ end
 export function copy(from: string | paths.Path, to: string | paths.Path): (boolean, string?)
     local source = named(from, "source path", 2)
     local destination = named(to, "destination path", 2)
-    local output = ffi.new("uint64_t[1]")
-    local status = C.nuppNativeFilesTransferSubmitCopy(slice(source), slice(destination), output)
 
-    if status ~= 0 then
-        return false, ffi.string(C.nuppNativeLastError())
-    end
-
-    return transferred(output[0])
+    return transferred(lane.submitCopy(source, destination))
 end
 
 --- How many whole-file transfers this program is still holding.
 ---
---- Whole-file reads, writes and copies settle on worker threads, and the lane
---- that runs them is bounded. This returns what it holds, which is what a
---- program that submitted more than it consumed needs to see.
+--- Whole-file reads, writes and copies move in bounded steps, and the lane that
+--- runs them is bounded. This returns what it holds, which is what a program that
+--- submitted more than it consumed needs to see.
 --- @return the number of live transfers
 --- @export
 export function pendingTransfers(): integer
-    requireFiles()
-    local output = ffi.new("size_t[1]")
-    if C.nuppNativeFilesTransferPending(output) ~= 0 then
-        return 0
-    end
-
-    return tonumber(output[0]) as integer
+    return lane.pending()
 end
 
 ----------------------------------------------------------------------------
@@ -1163,13 +1067,19 @@ export function open(path: string | paths.Path, mode: Mode?): (affine(File?), st
     if selected == nil then
         error("nupp: io has no mode named " .. tostring(mode), 2)
     end
-    local output = ffi.new("uint64_t[1]")
-    local status = C.nuppNativeFileOpen(slice(text), selected, output)
-    if status ~= 0 then
-        return nil, ffi.string(C.nuppNativeLastError())
+    local handle, reason = system.openFile(text, selected)
+    if handle == nil then
+        return nil, reason
     end
 
-    return File(_handle = output[0], _closed = false, _scratch = nil, _capacity = 0), nil
+    return File(
+        _handle = handle,
+        _closed = false,
+        _scratch = nil,
+        _capacity = 0,
+        _position = 0,
+        _appending = selected == 2 or selected == 5
+    ), nil
 end
 
 --- Creates a uniquely named empty file or directory and hands over the obligation
@@ -1205,6 +1115,116 @@ export function capabilities(): messages.FsCaps
     return systeminfo.filesystem()
 end
 
+----------------------------------------------------------------------------
+-- Where things live
+----------------------------------------------------------------------------
+
+local function configured(name: string): string?
+    local value = os.getenv(name)
+    if value == nil or value == "" then
+        return nil
+    end
+
+    return value
+end
+
+local function slashed(text: string): string
+    if windows then
+        return (text:gsub("\\", "/"))
+    end
+
+    return text
+end
+
+local function home(): (string?, string?)
+    local value = configured(system.HOME)
+    if value == nil then
+        return nil, "the home directory is not set"
+    end
+
+    return value, nil
+end
+
+--- The platform base an application's configuration (0), durable data (1) or
+--- disposable cache (2) lives under, without requiring it to exist. The three never
+--- alias: each is handed out as its own directory, and a recursive remove of one
+--- must not reach into another.
+---
+--- Windows uses roaming application data for configuration and local application
+--- data for the other two, macOS the Library folders, and everything else the XDG
+--- variables, falling back to their defaults beneath the home directory.
+--- @param which which base
+--- @param platform `windows`, `apple` or `xdg`, defaulting to the running system's
+--- @param environment reads a variable, defaulting to the process environment
+--- @return the base, or nil when the environment does not say
+--- @return a failure reason, when unsuccessful
+--- @export
+export function applicationBase(
+    which: integer,
+    platform: ("windows" | "apple" | "xdg")?,
+    environment: (function(string): string?)?
+): (string?, string?)
+    local chosen = platform or (windows and "windows" or (darwin and "apple" or "xdg"))
+    local read = environment or os.getenv
+    local function setting(name: string): string?
+        local value = read(name)
+        if value == nil or value == "" then
+            return nil
+        end
+        return value
+    end
+    local function homeDirectory(): (string?, string?)
+        local value = setting(chosen == "windows" and "USERPROFILE" or "HOME")
+        if value == nil then
+            return nil, "the home directory is not set"
+        end
+        return value, nil
+    end
+    if which ~= 0 and which ~= 1 and which ~= 2 then
+        return nil, "unknown application base"
+    end
+    if chosen == "windows" then
+        -- Roaming carries settings between machines, local does not, which is the
+        -- same split configuration and data already mean.
+        if which == 0 then
+            local roaming = setting("APPDATA")
+            if roaming == nil then
+                return nil, "APPDATA is not set"
+            end
+            return (roaming:gsub("\\", "/")), nil
+        end
+        local localData = setting("LOCALAPPDATA")
+        if localData == nil then
+            return nil, "LOCALAPPDATA is not set"
+        end
+        local base = localData:gsub("\\", "/")
+        if which == 2 then
+            return base:gsub("/$", "") .. "/Temp", nil
+        end
+        return base, nil
+    end
+    if chosen == "apple" then
+        local base, reason = homeDirectory()
+        if base == nil then
+            return nil, reason
+        end
+        local folders = {[0] = "Library/Preferences", [1] = "Library/Application Support", [2] = "Library/Caches",}
+        return (base as string):gsub("/$", "") .. "/" .. folders[which], nil
+    end
+    local variables = {[0] = "XDG_CONFIG_HOME", [1] = "XDG_DATA_HOME", [2] = "XDG_CACHE_HOME",}
+    local fallbacks = {[0] = ".config", [1] = ".local/share", [2] = ".cache",}
+    local value = setting(variables[which])
+    if value ~= nil and value:sub(1, 1) == "/" then
+        return value, nil
+    end
+    local base, reason = homeDirectory()
+    if base == nil then
+        return nil, reason
+    end
+
+    return (base as string):gsub("/$", "") .. "/" .. fallbacks[which], nil
+end
+
 local APP_BASES = {configuration = 0, data = 1, cache = 2,}
 
 export function apppath(kind: string, organization: string, app: string): (paths.Path?, string?)
@@ -1212,19 +1232,69 @@ export function apppath(kind: string, organization: string, app: string): (paths
     if code == nil then
         return nil, "unknown app path kind"
     end
-    requireFiles()
-    local output = ffi.new("uint64_t[1]")
-    local base, reason = answer(C.nuppNativeFilesApplicationBase(code, output), output)
+    local base, reason = applicationBase(code as integer, nil, nil)
     if base == nil then
         return nil, reason
     end
     local value = appPaths.native(base, organization, app)
-    local made, failure = done(C.nuppNativeFilesCreateDirectory(slice(value:tostring())))
+    local made, failure = createDirectory(value:tostring())
     if not made then
         return nil, failure
     end
 
     return value, nil
+end
+
+-- Which folder each user folder number names: its XDG variable, its macOS name, and
+-- its name everywhere else.
+local USER_FOLDERS = {
+    [1] = {"XDG_DOCUMENTS_DIR", "Documents", "Documents"},
+    [2] = {"XDG_DOWNLOAD_DIR", "Downloads", "Downloads"},
+    [3] = {"XDG_DESKTOP_DIR", "Desktop", "Desktop"},
+    [4] = {"XDG_PICTURES_DIR", "Pictures", "Pictures"},
+    [5] = {"XDG_MUSIC_DIR", "Music", "Music"},
+    [6] = {"XDG_VIDEOS_DIR", "Movies", "Videos"},
+}
+
+--- One of the user's folders: home (0), documents (1), downloads (2), desktop (3),
+--- pictures (4), music (5) or videos (6). Linux honours the XDG user-directory
+--- variables; a folder that is not there is a reason.
+--- @param which which folder
+--- @return the folder, or nil when the platform has none
+--- @return a failure reason, when unsuccessful
+--- @export
+export function userFolder(which: integer): (string?, string?)
+    local base, reason = home()
+    if base == nil then
+        return nil, reason
+    end
+    if which == 0 then
+        return slashed(base as string), nil
+    end
+    local names = USER_FOLDERS[which]
+    if names == nil then
+        return nil, "unknown user folder"
+    end
+    local folder: string? = nil
+    if not windows and not darwin then
+        folder = configured(names[1])
+    end
+    if folder == nil then
+        folder = system.join(base, darwin and names[2] or names[3])
+    end
+    if not system.isDirectory(folder) then
+        return nil, "the platform has no such folder"
+    end
+
+    return slashed(folder as string), nil
+end
+
+--- The running executable's path.
+--- @return the path, or nil when the platform cannot say
+--- @return a failure reason, when unsuccessful
+--- @export
+export function executablePath(): (string?, string?)
+    return system.executablePath()
 end
 
 export function requestPersistentStorage(): (boolean, string?)

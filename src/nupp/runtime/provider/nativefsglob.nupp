@@ -1,0 +1,355 @@
+@!internal
+
+--[[Filesystem pattern expansion for the native filesystem provider.
+
+A pattern is split on `/` into components. `*` and `?` match within one
+component, `[abc]`, `[a-c]` and `[!abc]` match one byte, and a component that is
+exactly `**` matches any number of directories. Matching is bytewise, so a name
+that is not UTF-8 matches like any other. The walk never follows a link to a
+directory while expanding `**`, and an unreadable directory is a branch with no
+matches rather than a failure.
+]]
+module nupp.runtime.provider.nativefsglob
+
+--- The deepest directory tree a walk enters, and so the most components a pattern
+--- may have.
+export const MAX_WALK_DEPTH = 512
+
+local DIRECTORY = 2
+
+--- The directory operations a walk needs, as the platform modules provide them.
+export type System = {
+    info: function(path: string, follow: boolean): (integer?, integer?, number?, boolean?, string?),
+    openDirectory: function(path: string): (any, string?),
+    readDirectory: function(listing: any): (string?, integer?, string?),
+    closeDirectory: function(listing: any): nil,
+}
+
+local BRACKET = string.byte("[")
+local CLOSE = string.byte("]")
+local STAR = string.byte("*")
+local QUESTION = string.byte("?")
+local BANG = string.byte("!")
+local CARET = string.byte("^")
+local DASH = string.byte("-")
+
+-- Where the class opened just before `at` closes, or nil when it never does. A `]`
+-- right after the opening, or after its negation, is a member rather than the end.
+local function classEnd(pattern: string, at: integer): integer?
+    local length = #pattern
+    if at > length then
+        return nil
+    end
+    local first = pattern:byte(at)
+    if first == BANG or first == CARET then
+        at = at + 1
+    end
+    if at <= length and pattern:byte(at) == CLOSE then
+        at = at + 1
+    end
+    while at <= length and pattern:byte(at) ~= CLOSE do
+        at = at + 1
+    end
+    if at > length then
+        return nil
+    end
+
+    return at
+end
+
+local function classAccepts(pattern: string, at: integer, stop: integer, candidate: integer): boolean
+    local negated = false
+    local found = false
+    if at ~= stop then
+        local first = pattern:byte(at)
+        if first == BANG or first == CARET then
+            negated = true
+            at = at + 1
+        end
+    end
+    while at ~= stop do
+        local low = pattern:byte(at)
+        at = at + 1
+        if at ~= stop and at + 1 ~= stop and pattern:byte(at) == DASH then
+            local high = pattern:byte(at + 1)
+            at = at + 2
+            if candidate >= low and candidate <= high then
+                found = true
+            end
+        elseif low == candidate then
+            found = true
+        end
+    end
+    if negated then
+        return not found
+    end
+
+    return found
+end
+
+--- Whether one name matches one pattern component.
+export function matchesName(pattern: string, name: string): boolean
+    local patternAt = 1
+    local nameAt = 1
+    local starAt: integer? = nil
+    local starName = 1
+    local patternLength = #pattern
+    local nameLength = #name
+
+    while nameAt <= nameLength do
+        local advanced = false
+        if patternAt <= patternLength then
+            local current = pattern:byte(patternAt)
+            if current == STAR then
+                starAt = patternAt
+                patternAt = patternAt + 1
+                starName = nameAt
+                advanced = true
+            elseif current == QUESTION then
+                patternAt = patternAt + 1
+                nameAt = nameAt + 1
+                advanced = true
+            elseif current == BRACKET then
+                local stop = classEnd(pattern, patternAt + 1)
+                if stop ~= nil and classAccepts(pattern, patternAt + 1, stop, name:byte(nameAt)) then
+                    patternAt = stop + 1
+                    nameAt = nameAt + 1
+                    advanced = true
+                end
+            elseif current == name:byte(nameAt) then
+                patternAt = patternAt + 1
+                nameAt = nameAt + 1
+                advanced = true
+            end
+        end
+        if not advanced then
+            if starAt == nil then
+                return false
+            end
+            starName = starName + 1
+            patternAt = (starAt as integer) + 1
+            nameAt = starName
+        end
+    end
+    while patternAt <= patternLength and pattern:byte(patternAt) == STAR do
+        patternAt = patternAt + 1
+    end
+
+    return patternAt > patternLength
+end
+
+local function hasWildcard(component: string): boolean
+    return component:find("[%*%?%[]") ~= nil
+end
+
+local function checkComponent(component: string): string?
+    local length = #component
+    local at = 1
+    while at <= length do
+        local current = component:byte(at)
+        if current == BRACKET then
+            local stop = classEnd(component, at + 1)
+            if stop == nil then
+                return "the pattern has an unclosed ["
+            end
+            at = stop + 1
+        else
+            if current == STAR and at < length and component:byte(at + 1) == STAR and length ~= 2 then
+                return "a recursive wildcard must be a whole path component"
+            end
+            at = at + 1
+        end
+    end
+
+    return nil
+end
+
+local function splitRoot(text: string, windows: boolean): (string, string)
+    if windows and text:match("^%a:/") then
+        return text:sub(1, 3), text:sub(4)
+    end
+    if text:sub(1, 1) == "/" then
+        return "/", text:sub(2)
+    end
+
+    return "", text
+end
+
+--- Splits a pattern into its root and components, or says why it names nothing.
+export function parse(text: string, windows: boolean): (string?, {string}?, string?)
+    local root, tail = splitRoot(text, windows)
+    local components: {string} = {}
+    for component in (tail .. "/"):gmatch("([^/]*)/") do
+        if component ~= "" then
+            local problem = checkComponent(component)
+            if problem ~= nil then
+                return nil, nil, problem
+            end
+            -- `**/**` names what `**` does.
+            if not (component == "**" and components[#components] == "**") then
+                components[#components + 1] = component
+            end
+        end
+    end
+    if #components == 0 and root == "" then
+        return nil, nil, "the pattern names no path"
+    end
+    -- Matching recurses once per wildcard component, and no tree the walk accepts
+    -- is deeper than this, so a longer pattern names nothing reachable.
+    if #components > MAX_WALK_DEPTH then
+        return nil, nil, "the pattern has more components than a path may have"
+    end
+
+    return root, components, nil
+end
+
+local function pushed(prefix: string, name: string): string
+    if prefix ~= "" and prefix:sub(-1) ~= "/" then
+        return prefix .. "/" .. name
+    end
+
+    return prefix .. name
+end
+
+local function opening(prefix: string): string
+    if prefix == "" then
+        return "."
+    end
+
+    return prefix
+end
+
+-- A walk's state: the pattern, what it found, and which recursive wildcards it has
+-- already expanded from which directory. Two recursive wildcards reach one directory
+-- at one pattern position by many routes, and walking it again finds nothing new.
+type Walk = {
+    system: System,
+    components: {string},
+    matches: {[string]: boolean},
+    expanded: {[string]: boolean},
+    reads: integer,
+}
+
+-- A directory's entries as name and kind pairs, or nil when it cannot be read; a
+-- failure partway through is a reason.
+local function entries(walk: Walk, prefix: string): ({any}?, string?)
+    walk.reads = walk.reads + 1
+    local listing = walk.system.openDirectory(opening(prefix))
+    if listing == nil then
+        return nil, nil
+    end
+    local found: {any} = {}
+    while true do
+        local name, kind, problem = walk.system.readDirectory(listing)
+        if problem ~= nil then
+            walk.system.closeDirectory(listing)
+            return nil, problem
+        end
+        if name == nil then
+            break
+        end
+        found[#found + 1] = {name = name, kind = kind,}
+    end
+    walk.system.closeDirectory(listing)
+
+    return found, nil
+end
+
+local descend: function(walk: Walk, prefix: string, component: integer, depth: integer): string?
+
+local function recurse(walk: Walk, prefix: string, component: integer, depth: integer): string?
+    if depth == 0 then
+        return "the directory tree is deeper than " .. tostring(MAX_WALK_DEPTH) .. " levels"
+    end
+    local key = tostring(component) .. "\0" .. prefix
+    if walk.expanded[key] then
+        return nil
+    end
+    walk.expanded[key] = true
+    local problem = descend(walk, prefix, component + 1, depth)
+    if problem ~= nil then
+        return problem
+    end
+    local children, failure = entries(walk, prefix)
+    if children == nil then
+        return failure
+    end
+    for _, child in ipairs(children) do
+        if child.kind == DIRECTORY then
+            local nested = recurse(walk, pushed(prefix, child.name as string), component, depth - 1)
+            if nested ~= nil then
+                return nested
+            end
+        end
+    end
+
+    return nil
+end
+
+descend = function(walk: Walk, prefix: string, component: integer, depth: integer): string?
+    local components = walk.components
+    if component > #components then
+        if prefix ~= "" and walk.system.info(prefix, false) ~= nil then
+            walk.matches[prefix] = true
+        end
+        return nil
+    end
+    local text = components[component]
+    if text == "**" then
+        return recurse(walk, prefix, component, depth)
+    end
+    if not hasWildcard(text) then
+        -- A run of literal components is one path, so it costs one frame rather than
+        -- one per component: recursion depth then follows the wildcards in the
+        -- pattern, not its length.
+        local path = prefix
+        local next = component
+        while next <= #components and components[next] ~= "**" and not hasWildcard(components[next]) do
+            path = pushed(path, components[next])
+            next = next + 1
+        end
+        return descend(walk, path, next, depth)
+    end
+    local children, failure = entries(walk, prefix)
+    if children == nil then
+        return failure
+    end
+    for _, child in ipairs(children) do
+        local name = child.name as string
+        if matchesName(text, name) then
+            local problem = descend(walk, pushed(prefix, name), component + 1, depth)
+            if problem ~= nil then
+                return problem
+            end
+        end
+    end
+
+    return nil
+end
+
+--- Expands a pattern to the sorted, unique paths it names. The third answer counts
+--- the directories the walk read, which is what bounds its cost.
+export function expand(pattern: string, system: System, windows: boolean): ({string}?, string?, integer)
+    local root, components, problem = parse(pattern, windows)
+    if root == nil then
+        return nil, problem, 0
+    end
+    local walk: Walk = {
+        system = system,
+        components = components as {string},
+        matches = {},
+        expanded = {},
+        reads = 0,
+    }
+    local failure = descend(walk, root as string, 1, MAX_WALK_DEPTH)
+    if failure ~= nil then
+        return nil, failure, walk.reads
+    end
+    local sorted: {string} = {}
+    for path in pairs(walk.matches) do
+        sorted[#sorted + 1] = path
+    end
+    table.sort(sorted)
+
+    return sorted, nil, walk.reads
+end
