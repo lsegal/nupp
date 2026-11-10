@@ -582,4 +582,17 @@ function M.browserCompilerOmitsTheCliTestHarness()
     end
 end
 
+-- The guest hands the compiler over through a 7 MiB startup mailbox, and nothing
+-- the browser bundle loads reads the AOT link's IR or the documentation theme.
+function M.browserCompilerOmitsCliOnlyResources()
+    local targets = assert(loadfile(ROOT .. "/nupp.lua"))().build.targets
+    for _, name in ipairs({"browserLuaJITCompiler", "browserLuaJITCompilerWithoutPrelude"}) do
+        for _, resource in ipairs(targets[name].resources) do
+            local path = type(resource) == "table" and resource.source or resource
+            assert(not path:match("%.ll$"), name .. " carries AOT link IR: " .. path)
+            assert(path ~= "src/nupp/tools/doc/theme.css", name .. " carries the documentation theme")
+        end
+    end
+end
+
 return M
