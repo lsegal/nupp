@@ -210,11 +210,7 @@ export function install(c: state.Checker): state.ExprHandlers
                 (node as any).namespacePath = written
                 if #suffix > 0 then
                     local member = table.concat(suffix, ".")
-                    node.exactCallExport = {
-                        module = candidate,
-                        member = member,
-                        identity = candidate .. "." .. member,
-                    }
+                    node.exactCallExport = {module = candidate, member = member, identity = candidate .. "." .. member,}
                 end
                 node.immutablePath = true
                 node.resolvedType = resolved

@@ -350,6 +350,53 @@ function M.lowercaseSimdDeclarationsKeepVerifiedOperations()
     end
 end
 
+function M.builtinSimdQualifiesHorizontalOperations()
+    local source = [[
+local array = table.Array
+local span = bytes.span
+local struct Particle
+    mass: float
+    velocity: simd.Vector<float, simd.Fixed<3>>
+end
+@aot
+local function energy(borrows particles: span.Span<Particle>): number
+    local total = 0.0
+    for i = 1, #particles do
+        local p = particles[i]
+        total = total + p.mass * simd.horizontal.orderedsum(p.velocity * p.velocity)
+    end
+    return total
+end
+@aot
+local function horizontal(): (int32, integer, float)
+    local integers = assert(simd.species(array.int32, 4))
+    local floats = assert(simd.species(array.float, 4))
+    local total: int32 = simd.horizontal.wrappingsum(integers:splat(3))
+    local at: integer = simd.horizontal.propagatingargmax(floats:splat(2.0))
+    local dot: float = simd.horizontal.pairwisedot(floats:splat(1.0), floats:splat(2.0))
+    return total, at, dot
+end
+]]
+    local parsed, diagnostics = checkedSimd(source, simdEnvironment(false))
+    test.eq(#diagnostics, 0, diagnostics[1] and diagnostics[1].msg)
+    local programs, problems = compile.lower(source, "simd-case.nupp", parsed)
+    test.eq(#problems, 0, problems[1] and problems[1].message)
+    test.eq(#programs, 2)
+    local _, refused = checkedSimd(
+        [[
+local array = table.Array
+@aot
+local function invalid(): number
+    local floats = assert(simd.species(array.float, 4))
+    return simd.horizontal.wrappingsum(floats:splat(1.0))
+end
+]],
+        simdEnvironment(false)
+    )
+    test.eq(#refused, 1, "the horizontal contract is checked through the builtin")
+    test.eq(refused[1].code, "NUPP2006")
+end
+
 function M.lowercaseSimdContractsKeepRefusalsAndMethodCase()
     local source = [[
 local array = table.Array
