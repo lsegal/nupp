@@ -257,6 +257,7 @@ if windows then
     local FILE_FLAG_FIRST_PIPE_INSTANCE: integer = 0x00080000
     local PIPE_REJECT_REMOTE_CLIENTS: integer = 8
     local ERROR_ACCESS_DENIED: integer = 5
+    local STILL_ACTIVE: integer = 259
     local ERROR_HANDLE_EOF: integer = 38
     local ERROR_BROKEN_PIPE: integer = 109
     local ERROR_NO_DATA: integer = 232
@@ -881,8 +882,13 @@ if windows then
             return
         end
         owner.killRequested = true
-        if C.TerminateProcess(process, 1) == 0 and C.WaitForSingleObject(process, 0) ~= WAIT_OBJECT_0 then
-            error(lastError("kill process"), 0)
+        if C.TerminateProcess(process, 1) == 0 then
+            local code = C.GetLastError()
+            -- A child already on its way out refuses termination; it has ended
+            -- once its exit code is set, which is all a kill asks for.
+            if code ~= ERROR_ACCESS_DENIED or C.GetExitCodeProcess(process, exitCode) == 0 or exitCode[0] == STILL_ACTIVE then
+                error(failure("kill process", describe(code), code), 0)
+            end
         end
     end
 
