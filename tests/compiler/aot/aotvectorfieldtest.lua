@@ -9,13 +9,6 @@ local HERE = require("helpers.paths").absoluteTests
 
 local M = {}
 
--- The tier this host builds first: `neon` on aarch64, `baseline` on x86-64.
--- Both lay the struct out and load its vectors alike, so the IR assertions
--- read the same on either.
-local function hostTier()
-    return assert(require("nupp.compiler.aot.target").buildTiers(nil, nil))[1].tier
-end
-
 local function write(path, text)
     local file = assert(io.open(path, "wb"))
     file:write(text)
@@ -185,11 +178,7 @@ function M.aStoredVectorFieldAgreesBetweenLuaAndNative()
             )
         end
     end
-    local tier = hostTier()
-    local llvm = assert(
-        read(dir .. "/build/native/aot/src/particles." .. tier .. ".ll"),
-        "the " .. tier .. " unit is emitted"
-    )
+    local llvm = assert(read(dir .. "/build/native/aot/src/particles.neon.ll"), "the NEON unit is emitted")
     assert(
         llvm:find("%struct.KsParticle = type { float, [12 x i8], [4 x float], [3 x float], [4 x i8] }", 1, true),
         "the struct is spelled with the model's padding:\n" .. llvm
