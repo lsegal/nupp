@@ -6,8 +6,12 @@ program is the other way round: its `main` is what the C runtime calls, and it
 reaches LuaJIT, or any other C library, through the `cdef function`
 declarations beside it. So the vocabulary is C's rather than the kernel IR's:
 calls to declared C functions, opaque pointers, C strings, pointer reads and
-writes, and Nupp functions handed to C as function pointers, such as a
-`lua_CFunction` registered with `lua_pushcclosure`.
+writes, `cdef struct` fields reached through a pointer, and Nupp functions
+handed to C as function pointers, such as a `lua_CFunction` registered with
+`lua_pushcclosure`. A struct's fields are laid out by `nupp.compiler.targetlayout`
+for the triple being compiled, the model the generated C headers share, and a
+struct that model does not place as C does, a union or one with a bitfield, is
+refused where its fields are read.
 
 The file's top level holds only `cdef function` declarations and functions, and
 every function is lowered as a C function. A function's parameters and result
@@ -30,6 +34,7 @@ local cst = require("nupp.compiler.syntax.cst")
 local lexer = require("nupp.compiler.syntax.lexer")
 local llvmText = require("nupp.compiler.aot.llvm.text")
 local lower = require("nupp.compiler.aot.lower")
+local targetLayout = require("nupp.compiler.targetlayout")
 
 local native = {}
 
@@ -41,11 +46,14 @@ record native.Problem
 end
 
 --- A C value as LLVM holds it: its type, whether integer conversions extend it
---- as signed, and, for a pointer that can be indexed, what it points at.
+--- as signed, and, for a pointer that can be indexed, what it points at. A
+--- `cdef struct` a pointer points at is a kind too, with `aggregate` its checked
+--- type, but only as a place whose fields are read: it is never a value.
 local record Kind
     llvm: string
     signed: boolean
     elem: Kind?
+    aggregate: any?
 end
 
 local VOID = Kind(llvm = "void", signed = false)
@@ -100,6 +108,21 @@ local function refuse(node: any, message: string): never
     error(Refusal(problem = native.Problem(line = line, column = column, message = message)), 0)
 end
 
+--- `t` with ownership, closed aliases and `const` taken off.
+local function bare(t: any): any
+    local raw = T.unwrapOwnership(t)
+    while raw.tag == "genericAlias" and #(raw.paramKinds or {}) == 0 or raw.tag == "const" do
+        raw = T.unwrapOwnership(raw.tag == "const" and raw.inner or raw.body)
+    end
+
+    return raw
+end
+
+--- Whether `t` is a type a `cdef struct` (or `cdef union`) declared.
+local function isAggregate(t: any): boolean
+    return t ~= nil and t.tag == "nominal" and t.declKind == "struct" and t.cdefName ~= nil
+end
+
 --- The C kind of a checked type, or nil when it has none.
 local function kindOf(t: any): Kind?
     if t == nil then
@@ -129,6 +152,10 @@ local function kindOf(t: any): Kind?
     elseif tag == "cstring" then
         return Kind(llvm = "ptr", signed = false, elem = INTEGERS.uint8)
     elseif tag == "ptr" then
+        local pointee = raw.elem ~= nil and bare(raw.elem) or nil
+        if isAggregate(pointee) then
+            return Kind(llvm = "ptr", signed = false, elem = Kind(llvm = "struct", signed = false, aggregate = pointee))
+        end
         local elem = kindOf(raw.elem)
         if elem == nil or (elem as Kind).llvm == "void" then
             return PTR
@@ -213,6 +240,15 @@ local record Program
 
     --- Top-level `const` literals, by name, lowered where they are read.
     constants: {[string]: any}
+
+    --- The target triple, which `cdef struct` fields are laid out for.
+    triple: string
+
+    --- The program's `cdef struct` declarations, by their checked identity.
+    aggregates: {[string]: cst.CdefStruct}
+
+    --- Each laid-out struct's size and field offsets, by its checked type.
+    layouts: {[any]: any}
 end
 
 local function lookup(scope: Scope?, name: string): Local?
@@ -270,8 +306,17 @@ local function convert(body: Body, v: Value, to: Kind, node: any, explicit: bool
         local op = from.signed and "sitofp" or "uitofp"
         return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
     elseif isInteger(to) and isFloat(from) then
-        local op = to.signed and "fptosi" or "fptoui"
-        return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
+        -- As LuaJIT converts a number to a C integer: through an `int32_t`
+        -- below 32 bits and for `int32_t`, through 64 bits for `uint32_t`, then
+        -- truncated, so a narrow field stored past its range wraps.
+        local width = WIDTHS[to.llvm] as integer
+        local through = (width < 32 or width == 32 and to.signed) and "i32" or width == 32 and "i64" or to.llvm
+        local op = (to.signed or through ~= to.llvm) and "fptosi" or "fptoui"
+        local whole = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, through))
+        if through == to.llvm then
+            return Value(text = whole, kind = to)
+        end
+        return Value(text = value(body, ("trunc %s %s to %s"):format(through, whole, to.llvm)), kind = to)
     elseif isFloat(to) and isFloat(from) then
         local op = to.llvm == "double" and "fpext" or "fptrunc"
         return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
@@ -639,21 +684,177 @@ local function unary(program: Program, body: Body, node: cst.Unop, want: Kind?):
     refuse(node, "a native program cannot apply " .. op .. " here")
 end
 
+--- The layout of the `cdef struct` `t` on the program's target: its size and
+--- each field's offset. What the target layout model would not place as C
+--- does is refused at `node`, the access that needed the layout, so a struct
+--- only ever passed by pointer needs none.
+local function layoutOf(program: Program, t: any, node: any): any
+    local cached = program.layouts[t]
+    if cached ~= nil then
+        return cached
+    end
+    -- Every struct a by-value field nests is placed by the same model, so each
+    -- is checked for what the model does not represent.
+    local pending: {any} = {t}
+    local seen: {[any]: boolean} = {}
+    while #pending > 0 do
+        local current = table.remove(pending)
+        if not seen[current] then
+            seen[current] = true
+            local name = tostring(current.cdefName)
+            local declared = program.aggregates[tostring(current.cdefIdentity)]
+            if declared == nil then
+                refuse(node, "cdef struct " .. name .. " is not declared by this native program")
+            end
+            if current.cdefKind == "union" then
+                refuse(node, name .. " is a cdef union, which a native program does not lay out")
+            end
+            for _, entry in ipairs((declared as cst.CdefStruct).entries) do
+                local field = entry as cst.FieldDecl
+                if entry.kind == "fieldDecl" and field.bitWidth ~= nil and field.name ~= nil then
+                    refuse(
+                        node,
+                        ("field %s of cdef struct %s is a bitfield, which a native program does not lay out"):format(
+                            (field.name as lexer.Token).text,
+                            name
+                        )
+                    )
+                end
+            end
+            for _, fieldName in ipairs(current.fieldOrder or {}) do
+                local fieldType = bare(current.byname[fieldName])
+                while fieldType.tag == "carray" do
+                    fieldType = bare(fieldType.elem)
+                end
+                if isAggregate(fieldType) then
+                    pending[#pending + 1] = fieldType
+                end
+            end
+        end
+    end
+    local layout, why = targetLayout.of(t, program.triple)
+    if layout == nil then
+        refuse(node, ("cdef struct %s has no layout on %s: %s"):format(tostring(t.cdefName), program.triple, tostring(why)))
+    end
+    program.layouts[t] = layout
+
+    return layout
+end
+
 --- The address of `p[i]`, and what is stored there.
 local function element(program: Program, body: Body, node: cst.BracketIndex): (string, Kind)
     local base = expression(program, body, node.obj, nil)
     if base.kind.llvm ~= "ptr" or base.kind.elem == nil then
-        refuse(node, "a native program indexes only pointers to C scalars and pointers")
+        refuse(node, "a native program indexes only pointers to C scalars, pointers and cdef structs")
     end
     local elem = base.kind.elem as Kind
+    -- A struct strides by its size on the target, padding included.
+    local stride = elem.aggregate ~= nil and ("[%d x i8]"):format(layoutOf(program, elem.aggregate, node).size)
+        or elem.llvm
     local index = expression(program, body, node.expr, I64)
     if not isInteger(index.kind) and not isFloat(index.kind) then
         refuse(node.expr, "a pointer index must be a number")
     end
     local wide = convert(body, index, I64, node.expr)
-    local address = value(body, ("getelementptr %s, ptr %s, i64 %s"):format(elem.llvm, base.text, wide.text))
+    local address = value(body, ("getelementptr %s, ptr %s, i64 %s"):format(stride, base.text, wide.text))
 
     return address, elem
+end
+
+--- How a field of type `t` is held: as it is stored, and as the program reads
+--- it. They differ where C's storage is not the value's kind: a `boolean` is a
+--- byte, and an `integer`, binary64 when read, is an `int32_t`.
+local function fieldKinds(t: any, field: string, owner: string, node: any): (Kind, Kind)
+    local raw = bare(t)
+    if isAggregate(raw) then
+        local nested = Kind(llvm = "struct", signed = false, aggregate = raw)
+        return nested, nested
+    elseif raw.tag == "carray" then
+        refuse(node, ("field %s of cdef struct %s is a C array, which a native program does not index"):format(field, owner))
+    elseif raw.tag == "boolean" then
+        return INTEGERS.uint8, BOOL
+    elseif raw.tag == "integer" then
+        return I32, F64
+    end
+    local kind = kindOf(t)
+    if kind == nil or (kind as Kind).llvm == "void" then
+        refuse(
+            node,
+            ("field %s of cdef struct %s has type %s, which a native program cannot read"):format(field, owner, T.tostring(t))
+        )
+    end
+
+    return kind as Kind, kind as Kind
+end
+
+--- Where the field or element `node` names lives: its address, the kind
+--- stored there, and the kind the program reads it as.
+local place: function(Program, Body, any): (string, Kind, Kind)
+
+--- The address of the struct `node` names, and its kind: a field or element
+--- holding one in place, or a pointer to one, which `.` reaches through as
+--- LuaJIT's does.
+local function aggregatePlace(program: Program, body: Body, node: any): (string, Kind)
+    local kind = node ~= nil and node.kind or nil
+    if kind == "paren" then
+        return aggregatePlace(program, body, (node as cst.Paren).expr)
+    elseif kind == "dotIndex" or kind == "bracketIndex" then
+        local address, stored = place(program, body, node)
+        if stored.aggregate ~= nil then
+            return address, stored
+        elseif stored.llvm == "ptr" and stored.elem ~= nil and (stored.elem as Kind).aggregate ~= nil then
+            return value(body, "load ptr, ptr " .. address), stored.elem as Kind
+        end
+    else
+        local base = expression(program, body, node, nil)
+        if base.kind.llvm == "ptr" and base.kind.elem ~= nil and (base.kind.elem as Kind).aggregate ~= nil then
+            return base.text, base.kind.elem as Kind
+        end
+    end
+    refuse(node, "a native program reads fields only of cdef structs, in place or through a pointer")
+end
+
+place = function(program: Program, body: Body, node: any): (string, Kind, Kind)
+    if node.kind == "bracketIndex" then
+        local address, elem = element(program, body, node as cst.BracketIndex)
+        return address, elem, elem
+    end
+    local index = node as cst.DotIndex
+    local base, owner = aggregatePlace(program, body, index.obj)
+    local t = owner.aggregate
+    local name = tostring(t.cdefName)
+    local field = (index.name as lexer.Token).text
+    local fieldType = t.byname ~= nil and t.byname[field] or nil
+    if fieldType == nil then
+        refuse(node, "cdef struct " .. name .. " has no field " .. field)
+    end
+    local stored, read = fieldKinds(fieldType, field, name, node)
+    local offset = layoutOf(program, t, node).offsets[field] as integer
+    local address = offset == 0 and base or value(body, ("getelementptr i8, ptr %s, i64 %d"):format(base, offset))
+
+    return address, stored, read
+end
+
+--- What is stored at `address`, read as `read`.
+local function readPlace(body: Body, address: string, stored: Kind, read: Kind, node: any): Value
+    if read.aggregate ~= nil then
+        refuse(node, "a native program reads a cdef struct's fields, not the whole struct")
+    end
+    local loaded = Value(text = value(body, ("load %s, ptr %s"):format(stored.llvm, address)), kind = stored)
+    if read.llvm == "i1" and stored.llvm ~= "i1" then
+        return Value(text = value(body, ("icmp ne %s %s, 0"):format(stored.llvm, loaded.text)), kind = BOOL)
+    end
+
+    return convert(body, loaded, read, node)
+end
+
+--- Stores `v` at `address` as the program writes `read` and C holds `stored`.
+local function writePlace(body: Body, address: string, stored: Kind, read: Kind, v: Value, node: any): nil
+    if read.aggregate ~= nil then
+        refuse(node, "a native program assigns a cdef struct's fields, not the whole struct")
+    end
+    local converted = convert(body, convert(body, v, read, node), stored, node)
+    builder.emit(body.f, ("store %s %s, ptr %s"):format(stored.llvm, converted.text, address))
 end
 
 --- `node` as a value. `want` is the kind its context takes, which a literal
@@ -703,9 +904,9 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
             return Value(text = inner.text, kind = to)
         end
         return convert(body, inner, to, node, true)
-    elseif kind == "bracketIndex" then
-        local address, elem = element(program, body, node as cst.BracketIndex)
-        return Value(text = value(body, ("load %s, ptr %s"):format(elem.llvm, address)), kind = elem)
+    elseif kind == "bracketIndex" or kind == "dotIndex" then
+        local address, stored, read = place(program, body, node)
+        return readPlace(body, address, stored, read, node)
     end
     refuse(node, "a native program cannot evaluate " .. tostring(kind) .. " expressions")
 end
@@ -776,10 +977,9 @@ local function assign(program: Program, body: Body, target: any, v: any): nil
         local entry = found as Local
         store(body, entry, expression(program, body, v, entry.kind), v)
         return
-    elseif target.kind == "bracketIndex" then
-        local address, elem = element(program, body, target as cst.BracketIndex)
-        local converted = convert(body, expression(program, body, v, elem), elem, v)
-        builder.emit(body.f, ("store %s %s, ptr %s"):format(elem.llvm, converted.text, address))
+    elseif target.kind == "bracketIndex" or target.kind == "dotIndex" then
+        local address, stored, read = place(program, body, target)
+        writePlace(body, address, stored, read, expression(program, body, v, read), v)
         return
     end
     refuse(target, "a native program cannot assign to this")
@@ -937,12 +1137,21 @@ local function statement(program: Program, body: Body, stat: any): nil
         local compound = stat as cst.CompoundAssign
         local op = ((compound.op as lexer.Token).text):sub(1, -2)
         local target = compound.target
+        local targetKind = target ~= nil and (target as any).kind or nil
+        if targetKind == "dotIndex" or targetKind == "bracketIndex" then
+            local address, stored, read = place(program, body, target)
+            local current = readPlace(body, address, stored, read, target)
+            local operand = expression(program, body, compound.value, current.kind)
+            local updated = binaryValues(program, body, stat, op, current, operand, target, compound.value)
+            writePlace(body, address, stored, read, updated, stat)
+            return
+        end
         local found = target ~= nil
             and (target as any).kind == "name"
             and lookup(body.scope, ((target as cst.NameExpr).token as lexer.Token).text)
             or nil
         if found == nil then
-            refuse(stat, "a native compound assignment updates a local")
+            refuse(stat, "a native compound assignment updates a local, a field or an element")
         end
         local current = expression(program, body, target, nil)
         local operand = expression(program, body, compound.value, current.kind)
@@ -1172,12 +1381,20 @@ local function lowerDefinition(program: Program, attributes: string, item: Defin
     end
 end
 
---- The program in `tree` as one LLVM IR module, or nil and what it does that
---- a native program cannot. `functionAttributes` are the target profile's.
+--- The program in `tree` as one LLVM IR module for `triple`, or nil and what it
+--- does that a native program cannot. `functionAttributes` are the target
+--- profile's.
 --- @raises string when lowering fails for a reason other than the program: a
 ---   defect here, which must not be reported as something the program did
-function native.module(tree: cst.Chunk, functionAttributes: string): (string?, native.Problem?)
-    local program = Program(module = builder.module(), callees = {}, constants = {})
+function native.module(tree: cst.Chunk, triple: string, functionAttributes: string): (string?, native.Problem?)
+    local program = Program(
+        module = builder.module(),
+        callees = {},
+        constants = {},
+        triple = triple,
+        aggregates = {},
+        layouts = {}
+    )
     local definitions: {Definition} = {}
     local ok, err = pcall(function(): nil
         local hasMain = false
@@ -1204,7 +1421,12 @@ function native.module(tree: cst.Chunk, functionAttributes: string): (string?, n
                     hasMain = hasMain or name == "main"
                 elseif kind == "localStmt" and (stat as cst.LocalStmt).isConst then
                     constant(program, stat as cst.LocalStmt)
-                elseif kind ~= "emptyStmt" and kind ~= "moduleStmt" and kind ~= "cdefStruct" then
+                elseif kind == "cdefStruct" then
+                    local identity = (stat as cst.CdefStruct).cdefIdentity
+                    if identity ~= nil then
+                        program.aggregates[identity as string] = stat as cst.CdefStruct
+                    end
+                elseif kind ~= "emptyStmt" and kind ~= "moduleStmt" then
                     refuse(stat, "a native program's top level holds only cdef declarations and functions")
                 end
             end
