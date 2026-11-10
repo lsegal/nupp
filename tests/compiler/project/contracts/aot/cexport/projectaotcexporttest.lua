@@ -92,17 +92,10 @@ local function library(linkage)
     )
     testAssert.eq(project.build(dir), 0)
     local nupp = require("helpers.paths").root .. "/bin/nupp"
-    local code, text = process.capture({
-        nupp,
-        "export-c",
-        "-o",
-        "game.h",
-        "src/main.nupp",
-        "main.add",
-        "main.scale",
-        "main.saxpy",
-        "main.bounds"
-    }, {cwd = dir})
+    local code, text = process.capture(
+        {nupp, "export-c", "-o", "game.h", "src/main.nupp", "main.add", "main.scale", "main.saxpy", "main.bounds"},
+        {cwd = dir}
+    )
     testAssert.eq(code, 0, text)
     assert(exists(dir .. "/game.h"), "export-c writes the header: " .. text)
 

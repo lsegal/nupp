@@ -757,6 +757,7 @@ local function scale(value: integer, by: float, enabled: boolean): number
 end
 @aot(export = "game_reset")
 local function reset(): nil
+   local zero = 0
 end
 game.add, game.scale, game.reset = add, scale, reset
 return game

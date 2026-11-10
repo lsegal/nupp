@@ -37,15 +37,7 @@ end
 -- crosses as whatever lowering made of it, which is what the entry takes.
 local ENTRY_VALUES: {
     [string]: string
-} = {
-    f64 = "number",
-    f32 = "float",
-    i32 = "int32",
-    u32 = "uint32",
-    i64 = "int64",
-    u64 = "uint64",
-    bool = "boolean",
-}
+} = {f64 = "number", f32 = "float", i32 = "int32", u32 = "uint32", i64 = "int64", u64 = "uint64", bool = "boolean",}
 
 -- The physical storage types a span element may name, which a span holds as
 -- written rather than as its value type.
@@ -108,6 +100,7 @@ local function exportedSignature(program: any): (any?, string?)
     local scalarIR = require("nupp.compiler.aot.scalar")
     local params: {any} = {}
     local taken: {[string]: boolean} = {}
+
     local function add(name: string, t: any): nil
         while taken[name] do
             name = name .. "_"
@@ -115,6 +108,7 @@ local function exportedSignature(program: any): (any?, string?)
         taken[name] = true
         params[#params + 1] = {name = name, type = t, mode = "plain"}
     end
+
     for _, param in ipairs(program.params) do
         taken[parameterName(param)] = true
     end
@@ -172,13 +166,9 @@ local function exportedSignature(program: any): (any?, string?)
         resultStruct = {tag = tag, fields = fields}
         add("result", {tag = "ptr", elem = {tag = "nominal", declKind = "struct", cdefKind = "struct", cdefName = tag}})
     end
-    local signature = require("nupp.compiler.cinterop.cabi").functionRecord(
-        tostring(program.exportName),
-        params,
-        result,
-        false,
-        "c"
-    )
+    local signature = require(
+        "nupp.compiler.cinterop.cabi"
+    ).functionRecord(tostring(program.exportName), params, result, false, "c")
     signature.resultStruct = resultStruct
 
     return signature, nil
@@ -186,11 +176,17 @@ end
 
 -- The C signature of every `@aot(export = ...)` entry of one checked file, by
 -- C name, or nil and why the file's entries could not be lowered.
-local function exportedSignatures(source: string, path: string, parsed: any): ({[string]: any}?, {[string]: string}?, string?)
+local function exportedSignatures(
+    source: string,
+    path: string,
+    parsed: any
+): ({[string]: any}?, {[string]: string}?, string?)
     local programs, problems = require("nupp.compiler.aot.compile").lower(source, path, parsed, nil)
     if #problems > 0 then
         local first = problems[1]
-        return nil, nil, ("lowering refused it (%s:%d:%d: %s)"):format(first.file, first.line, first.column, first.message)
+        return nil, nil, (
+            "lowering refused it (%s:%d:%d: %s)"
+        ):format(first.file, first.line, first.column, first.message)
     end
     local signatures: {[string]: any} = {}
     local refusals: {[string]: string} = {}
