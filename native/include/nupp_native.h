@@ -131,6 +131,16 @@ NUPP_NATIVE_EXPORT int32_t nuppNativePoll(uint64_t *generation);
 NUPP_NATIVE_EXPORT int32_t nuppNativeWait(
     uint64_t generation, uint64_t timeout_ms, uint64_t *output_generation);
 
+/* Present when NUPP_NATIVE_FEATURE_READINESS is set, for a caller that has to
+ * sleep on handles of its own as well as the generation. Open answers a
+ * waitable handle every advance of the generation signals: a manual-reset
+ * event HANDLE on Windows, and on POSIX the nonblocking read end of a pipe
+ * that receives a byte. Reset it (ResetEvent, or read the pipe dry), poll the
+ * generation, check, and then wait on it with the other handles. Close stops
+ * signalling the handle and closes it. */
+NUPP_NATIVE_EXPORT int32_t nuppNativeWakeOpen(uint64_t *handle);
+NUPP_NATIVE_EXPORT int32_t nuppNativeWakeClose(uint64_t handle);
+
 /* Present when NUPP_NATIVE_FEATURE_COMPRESSION is set. Input and output
  * ranges are borrowed only for one call. */
 #define NUPP_NATIVE_COMPRESSION_GZIP 1u

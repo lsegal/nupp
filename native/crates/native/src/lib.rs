@@ -362,6 +362,42 @@ pub unsafe extern "C" fn nuppNativeWait(
 }
 
 #[unsafe(no_mangle)]
+/// Opens a waitable handle every advance of the readiness generation signals,
+/// for a caller sleeping on handles of its own as well: a manual-reset event
+/// on Windows, the read end of a nonblocking pipe on POSIX.
+///
+/// # Safety
+///
+/// `handle` must be writable.
+pub unsafe extern "C" fn nuppNativeWakeOpen(handle: *mut u64) -> i32 {
+    boundary(|| {
+        if handle.is_null() {
+            return failed(Status::InvalidArgument, "wake handle output is null");
+        }
+        match nupp_native_runtime::activity::open_wake() {
+            Ok(raw) => {
+                // SAFETY: the output was checked above.
+                unsafe { handle.write(raw) };
+                Status::Ok.code()
+            }
+            Err(error) => failed(Status::Internal, &error.to_string()),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Stops signalling and closes a handle `nuppNativeWakeOpen` answered.
+pub extern "C" fn nuppNativeWakeClose(handle: u64) -> i32 {
+    boundary(|| {
+        if nupp_native_runtime::activity::close_wake(handle) {
+            Status::Ok.code()
+        } else {
+            failed(Status::InvalidArgument, "wake handle is not open")
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
 /// Writes the two-seed, lowercase XXH64 cache digest.
 ///
 /// # Safety
