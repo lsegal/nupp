@@ -632,6 +632,105 @@ end
     test.eq(ran, (describe(n, 2):gsub("%s+$", "")))
 end
 
+ffi.cdef([[
+typedef struct {
+    int64_t big;
+    uint64_t ubig;
+    uint16_t count;
+    int8_t small;
+    uint32_t id;
+} nuppNativeProgramWide;
+]])
+
+-- Numbers NaN, infinite, past 64 bits or negative where a C integer is unsigned,
+-- each converted as `lj_cconv_ct_ct` converts it.
+local CONVERSIONS = {
+    "0 / 0", "1 / 0", "-1 / 0", "1e300", "-1e300", "2 ^ 63", "-(2 ^ 63)", "2 ^ 64",
+    "2 ^ 64 + 2 ^ 63", "2 ^ 63 + 2 ^ 11", "-1", "-2.5", "4294967298", "3e9", "-3e9", "1e10",
+}
+
+-- Each number stored to an `int64` or `uint64` local, and to `cdef struct`
+-- fields of 64 bits and narrower, holds what the same store holds under this
+-- machine's LuaJIT, out of range and for NaN or an infinity included, where a
+-- plain `fptosi` or `fptoui` would be poison.
+function M.numbersConvertToCIntegersAsUnderLuaJIT()
+    requireCodegen()
+    local calls = {}
+    for _, expression in ipairs(CONVERSIONS) do
+        calls[#calls + 1] = ("    show(%s, wide)\n"):format(expression)
+    end
+    local executable, output = link([[
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+cdef function printf(borrows format: cstring, ...): int32
+
+cdef struct Wide
+    big: int64
+    ubig: uint64
+    count: uint16
+    small: int8
+    id: uint32
+end
+
+local function show(n: number, wide: Wide*): nil
+    local signed: int64 = n as int64
+    local unsigned: uint64 = n as uint64
+    @unsafe do
+        wide.big = n
+        wide.ubig = n
+        wide.count = n
+        wide.small = n
+        wide.id = n
+        printf(
+            "%lld %llu %lld %llu %g %g %.10g\n",
+            signed,
+            unsigned,
+            wide.big,
+            wide.ubig,
+            wide.count,
+            wide.small,
+            wide.id
+        )
+    end
+end
+
+local function main(): int32
+    local wide = calloc(1, 64) as Wide*
+]] .. table.concat(calls) .. [[
+    free(wide)
+    return 0
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+
+    local printed = {}
+    for line in ran:gmatch("[^\r\n]+") do
+        printed[#printed + 1] = line
+    end
+    local wide = ffi.new("nuppNativeProgramWide[1]")
+    for index, expression in ipairs(CONVERSIONS) do
+        local n = assert(load("return " .. expression))()
+        wide[0].big = n
+        wide[0].ubig = n
+        wide[0].count = n
+        wide[0].small = n
+        wide[0].id = n
+        local expected = ("%s %s %s %s %g %g %.10g"):format(
+            (tostring(ffi.new("int64_t", n)):gsub("LL$", "")),
+            (tostring(ffi.new("uint64_t", n)):gsub("ULL$", "")),
+            (tostring(wide[0].big):gsub("LL$", "")),
+            (tostring(wide[0].ubig):gsub("ULL$", "")),
+            wide[0].count,
+            wide[0].small,
+            wide[0].id
+        )
+        test.eq(printed[index], expected, expression)
+    end
+    test.eq(#printed, #CONVERSIONS, ran)
+end
+
 -- What lowering refuses is reported where it was written, before anything is
 -- compiled, so this needs no code generator.
 function M.aCdefUnionsFieldIsRefusedWhereItIsRead()
