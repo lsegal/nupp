@@ -16,7 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 nupp-native = { path = "../native", default-features = false, features = ["base"] }
-nupp-native-platform = { path = "../platform" }
 nupp-native-runtime = { path = "../runtime" }
 
 [target.'cfg(unix)'.dependencies]
@@ -26,9 +25,9 @@ libc = "0.2"
 default = []
 application-entry = []
 lpeg = []
-native-files = ["nupp-native/files"]
+native-files = []
 native-net = ["nupp-native/net"]
-native-process = ["nupp-native/process"]
+native-process = []
 native-tls = ["nupp-native/tls"]
 native-checksum = []
 native-compression = []

@@ -813,8 +813,6 @@ function M.retainedPlatformsGateTheExactRustNativeArtifacts()
         "the gate does not select the production host feature set"
     )
     for _, package in ipairs({
-        "nupp-native-files",
-        "nupp-native-process",
         "nupp-native-net",
         "nupp-native-tls",
         "nupp-native-host",

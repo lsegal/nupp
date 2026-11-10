@@ -5,7 +5,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 /* These records are read and written directly across the C/Rust boundary.
  * Keep the offsets explicit so every platform's smoke build checks the layout
@@ -33,14 +32,6 @@ _Static_assert(offsetof(NuppNativeHttpReady, transfer) == 0,
     "HTTP ready handle moved");
 _Static_assert(offsetof(NuppNativeHttpReady, tokens) == sizeof(uint64_t),
     "HTTP ready tokens have an unexpected offset");
-_Static_assert(offsetof(NuppNativeFilesSlice, length) == sizeof(void *),
-    "filesystem slice length has an unexpected offset");
-_Static_assert(offsetof(NuppNativeFilesInfo, read_only) == 4,
-    "filesystem info read-only flag has an unexpected offset");
-_Static_assert(offsetof(NuppNativeFilesInfo, size) == 8,
-    "filesystem info size has an unexpected offset");
-_Static_assert(offsetof(NuppNativeFilesInfo, modified) == 16,
-    "filesystem info modification time has an unexpected offset");
 _Static_assert(offsetof(NuppNativeTlsOptions, certificate)
         == sizeof(NuppNativeNetSlice),
     "TLS certificate slice has an unexpected offset");
@@ -50,28 +41,6 @@ _Static_assert(offsetof(NuppNativeTlsOptions, authority_present)
 _Static_assert(offsetof(NuppNativeTlsOptions, verify)
         == 5 * sizeof(NuppNativeNetSlice) + 2 * sizeof(int32_t),
     "TLS verify flag has an unexpected offset");
-_Static_assert(offsetof(NuppNativeProcessEnv, value)
-        == sizeof(NuppNativeProcessSlice),
-    "process environment value has an unexpected offset");
-_Static_assert(offsetof(NuppNativeProcessSpawn, env) == 2 * sizeof(void *),
-    "process spawn environment has an unexpected offset");
-_Static_assert(offsetof(NuppNativeProcessSpawn, cwd) == 4 * sizeof(void *),
-    "process spawn working directory has an unexpected offset");
-_Static_assert(offsetof(NuppNativeProcessSpawn, cwd_present)
-        == 4 * sizeof(void *) + sizeof(NuppNativeProcessSlice),
-    "process spawn cwd-present flag has an unexpected offset");
-_Static_assert(offsetof(NuppNativeProcessSpawn, stdin_mode)
-        == offsetof(NuppNativeProcessSpawn, cwd_present) + 2 * sizeof(int32_t),
-    "process spawn stdin mode has an unexpected offset");
-_Static_assert(offsetof(NuppNativeProcessSpawn, stderr_mode)
-        == offsetof(NuppNativeProcessSpawn, stdin_mode) + 2,
-    "process spawn stderr mode has an unexpected offset");
-_Static_assert(offsetof(NuppNativeProcessStarted, pid) == 4 * sizeof(uint64_t),
-    "process started pid has an unexpected offset");
-_Static_assert(sizeof(NuppNativeProcessStarted) == 5 * sizeof(uint64_t),
-    "process started record has an unexpected size");
-_Static_assert(offsetof(NuppNativeProcessExit, killed) == 2 * sizeof(int32_t),
-    "process exit killed flag has an unexpected offset");
 
 static int failed(const char *operation, int32_t status) {
     fprintf(stderr, "%s: status %d: %s\n", operation, status,
@@ -79,15 +48,11 @@ static int failed(const char *operation, int32_t status) {
     return 1;
 }
 
-/* A settled whole-file read advances the one process-wide readiness
- * generation, so a caller that polled it, found the transfer pending, and
- * waits from it is woken by the transfer rather than by the timeout. */
-static int readiness_generation_wakes_waiters(void) {
-    NuppNativeFilesSlice cargo = {
-        (const uint8_t *)"Cargo.toml", sizeof "Cargo.toml" - 1};
-    uint64_t generation = 0, found = 0, transfer = 0;
-    uint32_t state = NUPP_NATIVE_FILES_TRANSFER_PENDING;
-    int waits = 0;
+/* The readiness pair rejects a NULL output, and a wait that nothing wakes
+ * answers at its timeout with the generation it was given. The network smoke
+ * covers a wait that a socket wakes. */
+static int readiness_generation_answers_waiters(void) {
+    uint64_t generation = 0, found = 0;
     int32_t status;
     if (nuppNativePoll(NULL) != NUPP_NATIVE_INVALID_ARGUMENT
         || nuppNativeWait(0, 0, NULL) != NUPP_NATIVE_INVALID_ARGUMENT) {
@@ -98,25 +63,12 @@ static int readiness_generation_wakes_waiters(void) {
         fprintf(stderr, "the readiness feature bit is absent\n");
         return 1;
     }
-    status = nuppNativeFilesTransferSubmitRead(cargo, &transfer);
-    if (status != NUPP_NATIVE_OK) return failed("file transfer", status);
-    for (;;) {
-        status = nuppNativePoll(&generation);
-        if (status != NUPP_NATIVE_OK) return failed("readiness poll", status);
-        status = nuppNativeFilesTransferStatus(transfer, &state);
-        if (status != NUPP_NATIVE_OK) return failed("transfer status", status);
-        if (state != NUPP_NATIVE_FILES_TRANSFER_PENDING) break;
-        /* Ten seconds is the timeout's answer; the transfer's is far sooner. */
-        if (++waits > 3) {
-            fprintf(stderr, "a settled transfer did not wake the wait\n");
-            return 1;
-        }
-        status = nuppNativeWait(generation, 10000, &found);
-        if (status != NUPP_NATIVE_OK) return failed("readiness wait", status);
-    }
-    nuppNativeFilesTransferRelease(transfer);
-    if (state != NUPP_NATIVE_FILES_TRANSFER_READY) {
-        fprintf(stderr, "the whole-file read did not succeed\n");
+    status = nuppNativePoll(&generation);
+    if (status != NUPP_NATIVE_OK) return failed("readiness poll", status);
+    status = nuppNativeWait(generation, 10, &found);
+    if (status != NUPP_NATIVE_OK) return failed("readiness wait", status);
+    if (found != generation) {
+        fprintf(stderr, "an idle readiness wait moved the generation\n");
         return 1;
     }
     return 0;
@@ -124,18 +76,8 @@ static int readiness_generation_wakes_waiters(void) {
 
 int main(void) {
     size_t length = 0;
-    uint8_t uuid[37];
-    uint8_t digest[32];
     uint64_t uri = 0;
     uint64_t client = 0;
-    uint64_t file = 0;
-    int64_t file_size = 0;
-    uint32_t transfer_state = 0;
-    NuppNativeFilesInfo file_info = {0};
-    NuppNativeFilesSlice current = {
-        (const uint8_t *)".", sizeof "." - 1};
-    NuppNativeFilesSlice cargo = {
-        (const uint8_t *)"Cargo.toml", sizeof "Cargo.toml" - 1};
     NuppNativeHttpClientOptions http_options = {0};
     int32_t status;
 
@@ -144,28 +86,13 @@ int main(void) {
         return 1;
     }
     if ((nuppNativeFeatures() & (NUPP_NATIVE_FEATURE_BASE
-            | NUPP_NATIVE_FEATURE_UUID
             | NUPP_NATIVE_FEATURE_URI | NUPP_NATIVE_FEATURE_HTTP
-            | NUPP_NATIVE_FEATURE_PROCESS
-            | NUPP_NATIVE_FEATURE_FILESYSTEM
-            | NUPP_NATIVE_FEATURE_FILE_TRANSFER | NUPP_NATIVE_FEATURE_NET
-            | NUPP_NATIVE_FEATURE_TLS))
-        != (NUPP_NATIVE_FEATURE_BASE | NUPP_NATIVE_FEATURE_UUID
-            | NUPP_NATIVE_FEATURE_URI
-            | NUPP_NATIVE_FEATURE_HTTP | NUPP_NATIVE_FEATURE_PROCESS
-            | NUPP_NATIVE_FEATURE_FILESYSTEM
-            | NUPP_NATIVE_FEATURE_FILE_TRANSFER | NUPP_NATIVE_FEATURE_NET
-            | NUPP_NATIVE_FEATURE_TLS)) {
+            | NUPP_NATIVE_FEATURE_NET | NUPP_NATIVE_FEATURE_TLS))
+        != (NUPP_NATIVE_FEATURE_BASE
+            | NUPP_NATIVE_FEATURE_URI | NUPP_NATIVE_FEATURE_HTTP
+            | NUPP_NATIVE_FEATURE_NET | NUPP_NATIVE_FEATURE_TLS)) {
         fprintf(stderr, "a requested Rust-native feature bit is absent\n");
         return 1;
-    }
-    {
-        NuppNativeProcessExit process_exit = {0};
-        if (nuppNativeProcessPollExit(0, &process_exit)
-            != NUPP_NATIVE_STALE_HANDLE) {
-            fprintf(stderr, "invalid process handle was accepted\n");
-            return 1;
-        }
     }
     {
         int32_t connected = 0;
@@ -177,78 +104,7 @@ int main(void) {
             return 1;
         }
     }
-    {
-        uint64_t bytes = 0;
-        uint8_t one[1];
-        size_t bytes_length = 0;
-        status = nuppNativeFilesCurrentDirectory(&bytes);
-        if (status != NUPP_NATIVE_OK) {
-            return failed("current directory", status);
-        }
-        /* The pinned stage zero reads CAPACITY as its size-probe answer, so
-         * this copy keeps it where every other short output answers
-         * BUFFER_TOO_SMALL. */
-        status = nuppNativeBytesCopy(bytes, one, sizeof one, &bytes_length);
-        nuppNativeBytesRelease(bytes);
-        if (status != NUPP_NATIVE_CAPACITY || bytes_length <= sizeof one) {
-            fprintf(stderr, "a short byte copy did not answer CAPACITY\n");
-            return 1;
-        }
-    }
-    if (readiness_generation_wakes_waiters()) return 1;
-    status = nuppNativeFilesInfo(current, 1, &file_info);
-    if (status != NUPP_NATIVE_OK) return failed("filesystem info", status);
-    if (file_info.kind != NUPP_NATIVE_FILES_KIND_DIRECTORY) {
-        fprintf(stderr, "current directory is not a directory\n");
-        return 1;
-    }
-    status = nuppNativeFileOpen(cargo, NUPP_NATIVE_FILE_OPEN_READ, &file);
-    if (status != NUPP_NATIVE_OK) return failed("file open", status);
-    status = nuppNativeFileSize(file, &file_size);
-    if (status != NUPP_NATIVE_OK) return failed("file size", status);
-    if (file_size <= 0) {
-        fprintf(stderr, "Cargo.toml is unexpectedly empty\n");
-        return 1;
-    }
-    if (nuppNativeFilesTransferStatus(file, &transfer_state)
-        != NUPP_NATIVE_INVALID_ARGUMENT) {
-        fprintf(stderr, "open file was accepted as a transfer\n");
-        return 1;
-    }
-    status = nuppNativeFileRelease(file);
-    if (status != NUPP_NATIVE_OK) return failed("file release", status);
-    if (nuppNativeFileRelease(file) != NUPP_NATIVE_STALE_HANDLE) {
-        fprintf(stderr, "released file handle was revived\n");
-        return 1;
-    }
-    status = nuppNativeUuid4(uuid, sizeof uuid);
-    if (status != NUPP_NATIVE_OK) return failed("uuid4", status);
-    if (uuid[14] != '4' || uuid[36] != '\0') {
-        fprintf(stderr, "uuid4 is not canonical\n");
-        return 1;
-    }
-    status = nuppNativeUuid7(uuid, sizeof uuid);
-    if (status != NUPP_NATIVE_OK) return failed("uuid7", status);
-    if (uuid[14] != '7' || uuid[36] != '\0') {
-        fprintf(stderr, "uuid7 is not canonical\n");
-        return 1;
-    }
-    if (nuppNativeUuid4(uuid, sizeof uuid - 1)
-        != NUPP_NATIVE_BUFFER_TOO_SMALL) {
-        fprintf(stderr, "uuid4 accepted a short output\n");
-        return 1;
-    }
-    status = nuppNativeXxh64Digest(NULL, 0, digest, sizeof digest);
-    if (status != NUPP_NATIVE_OK) return failed("xxh64", status);
-    status = nuppNativeSleepMs(-1.0);
-    if (status != NUPP_NATIVE_INVALID_ARGUMENT) {
-        fprintf(stderr, "negative sleep duration was accepted\n");
-        return 1;
-    }
-    if (memcmp(digest, "ef46db3751d8e999", 16) != 0) {
-        fprintf(stderr, "XXH64 digest changed\n");
-        return 1;
-    }
+    if (readiness_generation_answers_waiters()) return 1;
     status = nuppNativeUriParse((const uint8_t *)"https://EXAMPLE.com",
         sizeof "https://EXAMPLE.com" - 1, &uri);
     if (status != NUPP_NATIVE_OK) return failed("URI parse", status);

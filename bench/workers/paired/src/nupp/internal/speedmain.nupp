@@ -2,10 +2,9 @@ module nupp.internal.speedmain
 
 const jobs = require("nupp.internal.speedjobs")
 const ffi = require("ffi")
-ffi.cdef("uint64_t nuppNativeMonotonicNs(void);")
 
 local function now(): number
-    return tonumber(ffi.C.nuppNativeMonotonicNs()) as number / 1000
+    return os.monotonic() * 1000
 end
 
 local function laneMode(enabled: boolean): nil
