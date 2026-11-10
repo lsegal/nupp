@@ -543,7 +543,6 @@ local function checkinsert(
             return
         elseif shape.op == OP_TYPE_STRUCT then
             length = shape.last - shape.first
-            element = words[shape.first + 1 + math.min(selection, length)]
         elseif shape.op == OP_TYPE_ARRAY then
             length = constants[words[shape.first + 2]]
             element = words[shape.first + 1]
@@ -568,7 +567,7 @@ local function checkinsert(
                 ):format(first - 1, selection, ty, length)
             )
         end
-        ty = element
+        ty = shape.op == OP_TYPE_STRUCT and words[shape.first + 1 + selection] or element
     end
 end
 
