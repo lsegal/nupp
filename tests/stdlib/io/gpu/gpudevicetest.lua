@@ -200,6 +200,242 @@ function M.arraysPastTheTypeSizeLimitAreRefused()
         layoutOf(moduleWithArrays(2, 5 * 65536 + 72, 3, 0, 35, 0x3ffffffc, 3 * 65536 + 30, 3, 1,
             4 * 65536 + 28, 4, 3, 2))
     end, "SPIR-V array type %4 is larger than")
+    -- naga reads an ArrayStride of 0 as the natural stride, here 4 bytes.
+    fails(function() layoutOf(moduleWithArrays(0x10000001, 4 * 65536 + 71, 3, 6, 0, 4 * 65536 + 28, 3, 1, 2)) end,
+        "SPIR-V array type %3 is larger than")
+end
+
+-- One SPIR-V instruction: its opcode, then its operand words.
+local function op(code, ...)
+    local operands = {...}
+    local result = {(#operands + 1) * 65536 + code}
+    for _, value in ipairs(operands) do
+        result[#result + 1] = value
+    end
+    return result
+end
+
+-- `instruction` grown to also span a hidden %60 = OpTypeInt 24 and a struct
+-- of it, which naga reads as instructions of their own.
+local function hiding(instruction)
+    local result = {instruction[1] + 7 * 65536, unpack(instruction, 2)}
+    for _, word in ipairs({4 * 65536 + 21, 60, 24, 0, 3 * 65536 + 30, 61, 60}) do
+        result[#result + 1] = word
+    end
+    return result
+end
+
+-- A compute module whose entry point %10 runs `parts.body` after its label
+-- %11. Ids: %1 void, %2 its function type, %3 int, %4 uint, %5 float, %6 bool,
+-- %7 int vec2, %8 uint vec4, %9 struct {int, float}, %20 int 7, %21 uint 0,
+-- %22 float 1.0, %23 uint 1, %24 true. `parts.modes`, `parts.annotations` and
+-- `parts.declarations` go in their sections.
+local function kernel(parts)
+    local sections = {
+        {op(17, 1), op(14, 0, 1), op(15, 5, 10, 0x6e69616d, 0), op(16, 10, 17, 1, 1, 1)},
+        parts.modes or {},
+        parts.annotations or {},
+        {
+            op(19, 1), op(33, 2, 1), op(21, 3, 32, 1), op(21, 4, 32, 0), op(22, 5, 32), op(20, 6),
+            op(23, 7, 3, 2), op(23, 8, 4, 4), op(30, 9, 3, 5), op(43, 3, 20, 7), op(43, 4, 21, 0),
+            op(43, 5, 22, 0x3f800000), op(43, 4, 23, 1), op(41, 6, 24),
+        },
+        parts.declarations or {},
+        {op(54, 1, 10, 0, 2), op(248, 11)},
+        parts.body or {},
+        {op(253), op(56)},
+    }
+    local module = {0x07230203, 0x00010300, 0, 200, 0}
+    for _, section in ipairs(sections) do
+        for _, instruction in ipairs(section) do
+            for _, word in ipairs(instruction) do
+                module[#module + 1] = word
+            end
+        end
+    end
+    return module
+end
+
+-- %36, a storage buffer in group 1 holding a runtime array %34 of `element`,
+-- with %37 a pointer to a uint in it.
+local function storage(element, stride)
+    return {
+        annotations = {
+            op(71, 34, 6, stride), op(72, 33, 0, 35, 0), op(71, 33, 2), op(71, 36, 34, 1), op(71, 36, 33, 0),
+        },
+        declarations = {op(29, 34, element), op(30, 33, 34), op(32, 35, 12, 33), op(59, 35, 36, 12), op(32, 37, 12, 4)},
+    }
+end
+
+local function withBody(parts, body)
+    return {annotations = parts.annotations, declarations = parts.declarations, body = body}
+end
+
+-- %32, a private int variable.
+local PRIVATE = {op(32, 31, 6, 3), op(59, 31, 32, 6)}
+
+-- Modules naga's front end panics on, each with the refusal that keeps it from
+-- wgpu-native.
+local PANICS = {
+    smodOfAStruct = {kernel({body = {op(139, 9, 30, 20, 20)}}),
+        "SPIR-V instruction 139 at word 77 needs a scalar, vector or matrix result"},
+    negationOfAStruct = {kernel({body = {op(126, 9, 30, 20)}}),
+        "SPIR-V instruction 126 at word 77 needs a scalar, vector or matrix result"},
+    bitfieldOffsetOfAPointer = {kernel({declarations = PRIVATE, body = {op(203, 3, 30, 20, 32, 20)}}),
+        "SPIR-V instruction 203 at word 85 needs a scalar, vector or matrix where %32 is not one"},
+    switchOnAnUndefinedSelector = {kernel({body = {op(247, 40, 0), op(251, 99, 40), op(248, 40)}}),
+        "SPIR-V OpSwitch at word 80 needs an integer selector of at most 32 bits defined before it"},
+    switchOnAFloat = {kernel({body = {op(247, 40, 0), op(251, 22, 40), op(248, 40)}}),
+        "SPIR-V OpSwitch at word 80 needs an integer selector of at most 32 bits defined before it"},
+    constructionOfNothing = {kernel({body = {op(80, 8, 30)}}),
+        "SPIR-V OpCompositeConstruct at word 77 has no constituents"},
+    insertionPastAVector = {kernel({body = {op(80, 7, 30, 20, 20), op(82, 7, 31, 20, 30, 5)}}),
+        "SPIR-V OpCompositeInsert at word 82 selects element 5 of %7, which has 2"},
+    phiOfAnUndefinedValue = {kernel({body = {op(249, 40), op(248, 40), op(245, 3, 30, 99, 11)}}),
+        "SPIR-V OpPhi at word 81 takes %99, which is no value of its function"},
+    phiFromAType = {kernel({body = {op(249, 40), op(248, 40), op(245, 3, 30, 20, 3)}}),
+        "SPIR-V OpPhi at word 81 names %3, which is no label of its function"},
+    phiFromALabelOnlyBranchedTo = {kernel({body = {
+        op(247, 42, 0), op(250, 24, 40, 41), op(248, 40), op(249, 42), op(248, 42), op(245, 3, 30, 20, 41),
+    }}), "SPIR-V branch at word 80 goes to %41, which is no label of its function"},
+    voidValueSpilledForAPhi = {kernel({body = {
+        op(247, 42, 0), op(250, 24, 40, 41), op(248, 40), op(128, 1, 30, 20, 20), op(249, 42), op(248, 41),
+        op(249, 42), op(248, 42), op(245, 3, 31, 30, 41),
+    }}), "SPIR-V instruction at word 86 has result type %1, which is not a value type"},
+    callOfNoFunction = {kernel({body = {op(57, 1, 30, 99)}}),
+        "SPIR-V call at word 77 names %99, which is no function"},
+    shortLocalSize = {kernel({modes = {op(16, 10, 17, 1)}}),
+        "SPIR-V instruction 16 at word 21 has a word count naga reads differently"},
+    atomicOnAVectorComponent = {kernel(withBody(storage(8, 16), {
+        op(65, 37, 30, 36, 21, 21, 21), op(234, 4, 31, 30, 23, 21, 23),
+    })), "SPIR-V atomic at word 122 indexes something other than a struct or an array"},
+    atomicOnAStruct = {kernel(withBody(storage(4, 4), {op(83, 37, 30, 36), op(234, 4, 31, 30, 23, 21, 23)})),
+        "SPIR-V atomic at word 119 does not reach an integer or a float"},
+    atomicThroughARelabelledPointer = {kernel({
+        annotations = {
+            op(72, 50, 0, 35, 0), op(71, 50, 2), op(72, 51, 0, 35, 0), op(72, 51, 1, 35, 4), op(72, 51, 2, 35, 8),
+            op(71, 51, 2), op(71, 54, 34, 1), op(71, 54, 33, 0),
+        },
+        declarations = {
+            op(43, 4, 25, 2), op(30, 50, 4), op(30, 51, 4, 4, 4), op(32, 52, 12, 50), op(32, 53, 12, 51),
+            op(59, 52, 54, 12), op(32, 55, 12, 4),
+        },
+        -- %54 holds a one-member struct; %30 calls it a three-member one.
+        body = {op(83, 53, 30, 54), op(65, 55, 31, 30, 25), op(234, 4, 32, 31, 23, 21, 23)},
+    }), "SPIR-V atomic at word 148 selects no member of struct %50"},
+    typeHiddenInADecoration = {kernel({annotations = {hiding(op(71, 9, 14))}}),
+        "SPIR-V instruction 71 at word 21 has a word count naga reads differently"},
+    typeHiddenInAString = {kernel({modes = {hiding(op(7, 70, 0x78))}}),
+        "SPIR-V instruction 7 at word 21 has a word count naga reads differently"},
+    typeHiddenInAConstant = {kernel({declarations = {hiding(op(43, 3, 71, 5))}}),
+        "SPIR-V instruction 43 at word 70 has a word count naga reads differently"},
+    quadSwapInAnUnknownDirection = {kernel({declarations = {op(43, 4, 26, 3)}, body = {op(366, 4, 30, 26, 21, 26)}}),
+        "SPIR-V instruction 366 at word 81 uses images, samplers or quads, which GPU kernels do not support"},
+    imageReadAtAPointer = {kernel({
+        declarations = {
+            op(25, 62, 5, 1, 0, 0, 0, 2, 1), op(32, 63, 0, 62), op(59, 63, 64, 0), op(23, 65, 5, 4),
+        },
+        body = {op(61, 62, 30, 64), op(98, 65, 31, 30, 64)},
+    }), "SPIR-V instruction 25 at word 70 uses images, samplers or quads, which GPU kernels do not support"},
+}
+
+-- Modules naga compiles, which the structural check must let through.
+local ACCEPTED = {
+    empty = kernel({}),
+    branchesAPhiAndASwitch = kernel({body = {
+        op(247, 42, 0), op(250, 24, 40, 41), op(248, 40), op(249, 42), op(248, 41), op(249, 42), op(248, 42),
+        op(245, 3, 30, 20, 40, 20, 41), op(247, 43, 0), op(251, 20, 43, 7, 44), op(248, 44), op(249, 43), op(248, 43),
+    }}),
+    atomicOnAStorageElement = kernel(withBody(storage(4, 4), {
+        op(65, 37, 30, 36, 21, 21), op(234, 4, 31, 30, 23, 21, 23),
+    })),
+}
+
+local function structureOf(module)
+    local spirv, count = device.spirvwords(words(module))
+    device.checkstructure(spirv, count)
+end
+
+function M.modulesNagaWouldPanicOnAreRefusedStructurally()
+    for name, case in pairs(PANICS) do
+        local ok, problem = pcall(structureOf, case[1])
+        assert(not ok, name .. " was accepted")
+        assert(problem.message == case[2], name .. ": " .. tostring(problem.message))
+    end
+    for name, module in pairs(ACCEPTED) do
+        local ok, problem = pcall(structureOf, module)
+        assert(ok, name .. ": " .. tostring(type(problem) == "table" and problem.message or problem))
+    end
+end
+
+function M.idsAndResultTypesAreOnesNagaRecords()
+    local function refuses(body, message)
+        fails(function() structureOf(kernel({body = body})) end, message)
+    end
+    refuses({op(124, 3, 0, 20)}, "SPIR-V id %0 at word 77 is outside the module's bound 200")
+    refuses({op(124, 3, 200, 20)}, "SPIR-V id %200 at word 77 is outside the module's bound 200")
+    refuses({op(124, 3, 20, 20)}, "SPIR-V id %20 is defined twice")
+    refuses({op(83, 2, 30, 20)}, "SPIR-V instruction at word 77 has result type %2, which is not a value type")
+    refuses({op(83, 99, 30, 20)}, "SPIR-V instruction at word 77 has result type %99, which is not a value type")
+end
+
+function M.instructionsSpanExactlyTheWordsNagaReads()
+    local function refuses(parts, message)
+        fails(function() structureOf(kernel(parts)) end, message)
+    end
+    -- Flag decorations and SpecId, and an extended instruction with no number.
+    refuses({annotations = {op(71, 9, 24, 0)}}, "instruction 71 at word 21 has a word count")
+    refuses({annotations = {op(72, 9, 0, 24, 0)}}, "instruction 72 at word 21 has a word count")
+    refuses({annotations = {op(71, 20, 1, 0, 0)}}, "instruction 71 at word 21 has a word count")
+    refuses({body = {op(12, 3, 30, 99)}}, "instruction 12 at word 77 has a word count")
+    -- A constant's words follow its type's width.
+    refuses({declarations = {op(43, 3, 30, 1, 0)}}, "instruction 43 at word 70 has a word count")
+    refuses({declarations = {op(21, 30, 64, 0), op(43, 30, 31, 1)}}, "instruction 43 at word 74 has a word count")
+    structureOf(kernel({declarations = {op(21, 30, 64, 0), op(43, 30, 31, 1, 0)}}))
+    -- A string ends in its last word.
+    refuses({modes = {op(7, 70, 0x78, 0)}}, "instruction 7 at word 21 has a word count")
+    refuses({modes = {op(4, 0x78787878)}}, "instruction 4 at word 21 has a word count")
+    structureOf(kernel({modes = {op(7, 70, 0x78787878, 0)}}))
+    -- An OpPhi's and an OpSwitch's operands come in pairs; a derivative has one.
+    refuses({body = {op(249, 40), op(248, 40), op(245, 3, 30, 20, 11, 0)}},
+        "instruction 245 at word 81 has a word count")
+    refuses({body = {op(247, 40, 0), op(251, 20, 40, 7), op(248, 40)}}, "instruction 251 at word 80 has a word count")
+    refuses({body = {op(207, 5, 30, 22, 0)}}, "instruction 207 at word 77 has a word count")
+end
+
+function M.switchSelectorsAreNarrowIntegersDefinedBeforeThem()
+    local function switchOn(declarations, selector)
+        structureOf(kernel({declarations = declarations, body = {op(247, 40, 0), op(251, selector, 40), op(248, 40)}}))
+    end
+    switchOn({}, 20)
+    fails(function() switchOn({op(21, 30, 64, 1), op(43, 30, 31, 1, 0)}, 31) end, "needs an integer selector")
+    fails(function() switchOn(PRIVATE, 32) end, "needs an integer selector")
+    fails(function() switchOn({}, 10) end, "needs an integer selector")
+end
+
+function M.compositeInsertionsStayInsideTheirTypes()
+    local function insert(declarations, body)
+        structureOf(kernel({declarations = declarations, body = body}))
+    end
+    insert({}, {op(80, 7, 30, 20, 20), op(82, 7, 31, 20, 30, 1)})
+    fails(function() insert({}, {op(80, 9, 30, 20, 22), op(82, 9, 31, 20, 30, 2)}) end,
+        "selects element 2 of %9, which has 2")
+    -- %31 = int[65537]; naga would build an expression for every element.
+    fails(function()
+        insert({op(43, 4, 30, 65537), op(28, 31, 3, 30), op(46, 31, 32)}, {op(82, 31, 33, 20, 32, 0)})
+    end, "indexes an array of 65537 elements; at most 65536 are supported")
+end
+
+function M.callsNameFunctions()
+    local callee = {op(54, 1, 40, 0, 2), op(248, 41), op(253), op(56)}
+    local module = kernel({body = {op(57, 1, 30, 40)}})
+    for _, instruction in ipairs(callee) do
+        for _, word in ipairs(instruction) do
+            module[#module + 1] = word
+        end
+    end
+    structureOf(module)
+    fails(function() structureOf(kernel({body = {op(57, 1, 30, 20)}})) end, "names %20, which is no function")
 end
 
 function M.closingAfterAWriteErrorPreservesTheErrorAndResetsTheSink()
@@ -327,6 +563,33 @@ function M.aModuleNagaWouldPanicOnFailsWithoutEndingTheProcessWhenAvailable()
     local buffer = check(device.createbuffer(other, 16))
     check(device.releasebuffer(other, buffer))
     check(device.close(other))
+    check(device.close(gpu))
+end
+
+function M.modulesNagaWouldPanicOnFailWithoutEndingTheProcessWhenAvailable()
+    local gpu = open()
+    for name, case in pairs(PANICS) do
+        local _, problem = device.createkernel(gpu, words(case[1]), "main", 0, 1, 0, {1, 1, 1})
+        assert(problem == "gpu: " .. case[2], name .. ": " .. tostring(problem))
+    end
+    for name, module in pairs(ACCEPTED) do
+        local kernel, problem = device.createkernel(gpu, words(module), "main", 0, 1, 0, {1, 1, 1})
+        assert(kernel, name .. ": " .. tostring(problem))
+        check(device.releasekernel(gpu, kernel))
+    end
+    check(device.close(gpu))
+end
+
+-- wgpu-native answers a module naga refuses with an empty one, and panics if a
+-- pipeline is created from that.
+function M.aModuleNagaRefusesFailsWithoutEndingTheProcessWhenAvailable()
+    local gpu = open()
+    -- An OpIAdd one operand short.
+    local module = words(kernel({body = {op(128, 3, 30, 20)}}))
+    local _, problem = device.createkernel(gpu, module, "main", 0, 1, 0, {1, 1, 1})
+    assert(problem and problem:find("^gpu: GPU validation: "), tostring(problem))
+    local buffer = check(device.createbuffer(gpu, 16))
+    check(device.releasebuffer(gpu, buffer))
     check(device.close(gpu))
 end
 
