@@ -34,7 +34,7 @@ fn status(result: Result<(), i32>) -> i32 {
 /// triple, cpu, features, opt (0-3), then `1` to return the assembly and `1`
 /// to return the optimized IR, separated by U+001F.
 fn compile_options(text: &str) -> Result<codegen::CompileOptions, i32> {
-    let fields: Vec<&str> = text.split('{1f}').collect();
+    let fields: Vec<&str> = text.split('\u{1f}').collect();
     let [triple, cpu, features, opt, assembly, optimized_ir] = fields[..] else {
         return Err(super::failed(Status::InvalidArgument, "codegen options need six fields"));
     };
