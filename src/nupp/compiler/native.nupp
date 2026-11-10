@@ -743,7 +743,9 @@ local FEATURES: {[string]: native.Feature} = {
         runtimeModule = "nupp.runtime.provider.nativeprocess",
         provider = "nupp_native",
         providerDriver = "native-rust",
-        providerFeature = "process",
+        -- Nupp spawns and reaps the child itself; all it takes from the provider
+        -- is the wake handle its readiness wait shares, which every build has.
+        providerFeature = "base",
         host = "native-process",
         library = "nupp_native",
         binary = true,
