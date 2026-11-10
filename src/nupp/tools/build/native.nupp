@@ -143,10 +143,8 @@ function stage.linkedProviders(effects: {[string]: any}?, platform: string, kit:
             local libraries: {string}? = nil
             if macos then
                 if kit ~= nil then
-                    libraries = require("nupp.tools.build.kits").providerLibraries(
-                        kit as string,
-                        tostring(feature.providerDriver)
-                    )
+                    local kits = require("nupp.tools.build.kits")
+                    libraries = kits.providerLibraries(kit as string, tostring(feature.providerDriver))
                 end
                 if libraries == nil then
                     return nil, (
