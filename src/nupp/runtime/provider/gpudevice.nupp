@@ -468,7 +468,7 @@ local function checkatomic(words: any, defs: {[integer]: any}, constants: {[inte
             if shape and shape.op == OP_TYPE_STRUCT then
                 local member = constants[words[index]]
                 if member == nil or member >= shape.last - shape.first then
-                    fail(("SPIR-V atomic at word %d selects no member of struct %%%d"):format(at, ty))
+                    fail(("SPIR-V atomic at word %d selects no member of struct %%%d"):format(at, ty as integer))
                 end
                 ty = words[shape.first + 1 + member]
             elseif shape and (shape.op == OP_TYPE_ARRAY or shape.op == OP_TYPE_RUNTIME_ARRAY) then
@@ -551,7 +551,7 @@ export function checkstructure(words: any, count: integer): nil
     local constants: {[integer]: number} = {}
     local imports: {[integer]: string} = {}
     local calls: {{integer}} = {}
-    local scope, functions = 0, 0
+    local scope: integer, functions: integer = 0, 0
     local labels: {[integer]: boolean} = {}
     local targets: {{integer}} = {}
     local phis: {{integer}} = {}
@@ -1200,6 +1200,16 @@ local function createKernel(context: any, descriptor: any): integer
     moduleDescriptor.nextInChain = ffi.cast("WGPUChainedStruct *", source)
     moduleDescriptor.label = wgpu.view(moduleLabel)
     local shader = library.wgpuDeviceCreateShaderModule(context.device, moduleDescriptor)
+    -- A module naga refuses comes back with no shader inside, and wgpu-native
+    -- panics creating a pipeline from one, so its error is read first.
+    local parsed, refusal = pcall(finishValidationScope, context)
+    if not parsed then
+        library.wgpuShaderModuleRelease(shader)
+        library.wgpuPipelineLayoutRelease(pipelineLayout)
+        releaseKernelEntry(context, entry)
+        error(refusal, 0)
+    end
+    library.wgpuDevicePushErrorScope(context.device, wgpu.ERROR_FILTER_VALIDATION)
     local pipelineLabel = "Nupp compute pipeline"
     local pipelineDescriptor: any = ffi.new("WGPUComputePipelineDescriptor")
     pipelineDescriptor.label = wgpu.view(pipelineLabel)
