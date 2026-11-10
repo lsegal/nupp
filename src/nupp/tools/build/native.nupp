@@ -126,6 +126,46 @@ function stage.hostStub(root: string, outDir: string, target: Target, effects: {
     return built
 end
 
+--- The link arguments for each prebuilt provider a standalone binary links in
+--- rather than stages: the platform's static library, read like any other
+--- archive, and the provider's entry points kept, because the provider finds
+--- them by name in the process and nothing in the link refers to them. Every
+--- kit's link exports what it keeps, which is where LuaJIT's `ffi.C` looks.
+function stage.linkedProviders(effects: {[string]: any}?, platform: string): ({string}?, string?)
+    local flags: {string} = {}
+    local compilerRoot = envMod.compilerRoot()
+    for _, feature in ipairs(native.features(effects)) do
+        local symbols = feature.linkedSymbols
+        if symbols then
+            -- A macOS kit stubs only the system libraries its own probe link
+            -- bound, so it has none of the frameworks wgpu-native calls into.
+            if platform:find("apple-darwin", 1, true) then
+                return nil, (
+                    "standalone binary for %s cannot link native feature %s; "
+                    .. "its link kit has no stubs for the system frameworks the provider needs"
+                ):format(platform, feature.name)
+            end
+            if not compilerRoot then
+                return nil, "native feature "
+                    .. feature.name
+                    .. " needs compiler source to link statically; use a source checkout to build this target"
+            end
+            local archive, problem = driven(compilerRoot as string, tostring(feature.providerDriver) .. "-static", {
+                platform
+            })
+            if not archive then
+                return nil, ("cannot build native facilities %s:\n%s"):format(feature.name, problem)
+            end
+            flags[#flags + 1] = archive as string
+            for _, symbol in ipairs(symbols as {string}) do
+                flags[#flags + 1] = "--undefined=" .. symbol
+            end
+        end
+    end
+
+    return flags, nil
+end
+
 --- Relinks the current-platform compiler host with an application's static
 --- native closure. The driver force-loads archives because FFI symbol lookups
 --- do not create ordinary undefined references for an archive linker to see.
@@ -162,11 +202,22 @@ function stage.linkHost(
             return driven(compilerRoot as string, "kit", featureNames)
         end
     end
+    local linkedFlags, linkedErr = stage.linkedProviders(effects, linked as string)
+    if linkedFlags == nil then
+        return nil, linkedErr
+    end
     local kit, kitErr = require("nupp.tools.build.kits").resolve(linked as string, featureNames, build)
     if kit == nil then
         return nil, kitErr
     end
-    local linkErr = aotllvm.linkStandalone(kit as string, output, archives, flags)
+    local allFlags: {string} = {}
+    for _, flag in ipairs(flags) do
+        allFlags[#allFlags + 1] = flag
+    end
+    for _, flag in ipairs(linkedFlags as {string}) do
+        allFlags[#allFlags + 1] = flag
+    end
+    local linkErr = aotllvm.linkStandalone(kit as string, output, archives, allFlags)
     if linkErr ~= nil then
         return nil, linkErr
     end
@@ -233,7 +284,7 @@ function stage.build(
     local providerKeys: {string} = {}
     for _, feature in ipairs(native.features(effects)) do
         if feature.provider then
-            if standalone and feature.host then
+            if standalone and (feature.host or feature.linkedSymbols) then
                 -- The relinked host contains this provider; no loadable sidecar
                 -- is part of a standalone binary's runtime closure.
                 goto continue

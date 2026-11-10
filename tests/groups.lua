@@ -434,6 +434,8 @@ scopes.nativeprogramtest = "integration"
 
 scopes.nativeprogramprojecttest = "integration"
 
+scopes.nativethreadstest = "integration"
+
 scopes.projectaottest = "integration"
 
 scopes.projectcrosstest = "integration"

@@ -221,10 +221,12 @@ Nested members use the same exact resolution. `serde.json.encodevalue(value)`
 selects JSON support, while an alias such as `local json = serde.json`
 followed by `json.encodevalue(value)` selects the same feature without also selecting
 UUID or UTF-8.
-Files and filesystem-backed path operations use the Rust-native
-provider; whole-file transfers and processes share its Tokio executor and use
-bounded queues. HTTP uses Reqwest over Tokio and Rustls, URI uses Rust's `url`
-parser, and UUID uses the Rust-native provider. Built-in message digests are
+Files and filesystem-backed path operations call the operating system through
+LuaJIT's FFI and stage no native artifact; whole-file transfers run in bounded
+steps on the calling Lua thread behind a bounded lane. Processes share the
+Rust-native provider's Tokio executor and use bounded queues. HTTP uses
+Reqwest over Tokio and Rustls, URI uses Rust's `url` parser, and UUID uses the
+Rust-native provider. Built-in message digests are
 written in Nupp and stage no native artifact. The build binds builtin services
 to the selected target implementation; package descriptors do not replace them.
 The Rust facilities share the versioned `build/lib/nupp_native` sidecar.
@@ -327,7 +329,11 @@ does not carry those libraries under `lib`.
 
 An explicitly shared C dependency is refused in this mode; use
 `linkage = "static"` or `"both"`. Native facilities which only have a sidecar
-implementation are refused for the same reason. A path-valued third-party
+implementation are refused for the same reason. The GPU provider is the
+exception: its pinned wgpu-native release also publishes a static library, which
+is linked into the host in place of `lib/wgpu_native` for Linux and Windows
+targets. A macOS standalone binary cannot carry it yet, because its link kit has
+no stubs for the system frameworks wgpu-native calls into. A path-valued third-party
 `stub` cannot be relinked and therefore cannot select `standalone`.
 
 ### Native programs
