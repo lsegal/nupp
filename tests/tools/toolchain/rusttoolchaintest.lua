@@ -956,4 +956,45 @@ function M.everyLockedRustDependencyHasACommittedNotice()
     )
 end
 
+-- wgpu-native's prebuilt library statically carries wgpu's own Cargo graph to
+-- every GPU program it is staged beside. Its lock file is only in the source
+-- archive of the pinned tag, so the committed notice names that tag, and a
+-- WGPU_VERSION bump fails here until the notice is regenerated from it.
+function M.wgpuNativeRustDependenciesHaveANoticeForThePinnedTag()
+    local pinned = assert(read(ROOT .. "/scripts/toolchain.pins"):match("\nWGPU_VERSION=([^\r\n]+)"))
+    local notice = read(ROOT .. "/host/notices/wgpu-native-Rust-dependencies.html")
+    local generated = assert(
+        notice:match('<meta name="wgpu%-native%-version" content="([^"]+)">'),
+        "the wgpu-native Rust notice does not name the release it was generated from"
+    )
+    assert(
+        generated == pinned,
+        ("the wgpu-native Rust notice covers %s but WGPU_VERSION is %s; run "
+            .. "scripts/rust-dependency-notices --write wgpu-native"):format(generated, pinned)
+    )
+
+    local seen = {}
+    local seenCount = 0
+    for marker in notice:gmatch('data%-crate="([^"]+)"') do
+        assert(marker:match("^[%w_%-]+@[%w%.%+%-]+$"), "malformed wgpu-native notice entry " .. marker)
+        assert(not seen[marker], "wgpu-native Rust notice repeats package " .. marker)
+        seen[marker] = true
+        seenCount = seenCount + 1
+    end
+    assert(seenCount > 0, "the wgpu-native Rust notice lists no packages")
+    for _, crate in ipairs({"wgpu-core", "wgpu-hal", "wgpu-types", "naga"}) do
+        assert(notice:find('data-crate="' .. crate .. "@", 1, true), "wgpu-native Rust notice omits " .. crate)
+    end
+
+    local row = assert(
+        read(ROOT .. "/host/NOTICE.md"):match("\n(| %[wgpu%-native%][^\n]*)"),
+        "the release notice has no wgpu-native row"
+    )
+    assert(row:find("`" .. pinned .. "`", 1, true), "the release notice's wgpu-native row does not name " .. pinned)
+    assert(
+        row:find("notices/wgpu-native-Rust-dependencies.html", 1, true),
+        "the release notice's wgpu-native row does not point readers to its Rust notice"
+    )
+end
+
 return M
