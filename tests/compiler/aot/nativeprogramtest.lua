@@ -321,7 +321,7 @@ function M.bitCompoundAssignmentsAgreeWithLuaJIT()
     local expected = assert(load("local x = 12 x = x & 10 x = x | 1 x = x << 2 x = x >> 1 x = x ~>> 33 return x"))()
     local executable, output = link([[
 local function main(): int32
-    local x = 12
+    local x: integer = 12
     x &= 10
     x |= 1
     x <<= 2
