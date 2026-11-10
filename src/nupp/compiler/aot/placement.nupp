@@ -5,9 +5,9 @@ A scalar field sits at the next offset its C alignment under the target
 divides, as C places it. A stored vector, `Fixed<N>` of a storage element, is
 laid out by the target layout model: padding before it brings it to the
 model's alignment, padding after it brings it to the size it occupies, and the
-struct takes the largest alignment of any field. The code generator spells its LLVM struct from this,
-and `export-c` declares and asserts the C struct a span of it crosses as, so
-the two cannot disagree about where a field is.
+struct takes the largest alignment of any field. The code generator spells
+its LLVM struct from this, and `export-c` declares and asserts the C struct a
+span of it crosses as, so the two cannot disagree about where a field is.
 ]]
 module nupp.compiler.aot.placement
 

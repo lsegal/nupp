@@ -838,20 +838,25 @@ return game
     os.execute("rm -rf '" .. dir .. "'")
 end
 
-function M.exportCRefusesAnAotExportOverASpanOfStructs()
+function M.exportCDeclaresAnAotExportOverASpanOfStructs()
+    -- The element struct is declared from the lowered layout, as the kernel
+    -- indexes it: a three-lane vector aligned and padded by the target layout
+    -- model, with its padding spelled and every offset asserted.
     local dir = exportProject(
         [[
 local span = require("bytes.span")
+local simd = require("simd")
 local game = {}
 local struct Pair
    x: float
-   n: int32
+   v: simd.Vector<float, simd.Fixed<3>>
+   n: int16
 end
 @aot(export = "game_first")
 local function first(borrows pairs: span.Span<Pair>): number
    local total = 0.0
    for index = 1, #pairs do
-      total = total + pairs[index].x
+      total = total + pairs[index].x + pairs[index].n
    end
    return total
 end
@@ -860,9 +865,32 @@ return game
 ]]
     )
     local output, code = captureStatusAt(dir, "export-c -o game.h src/game.nupp game.first")
-    assert(code ~= 0, "a span of structs has no C prototype yet: " .. output)
-    assert(output:find("NUPP2203", 1, true) and output:find('span parameter "pairs" does not hold', 1, true), output)
-    assert(not io.open(dir .. "/game.h", "rb"), "no header is written")
+    assert(code == 0, output)
+    local header = assert(io.open(dir .. "/game.h", "rb")):read("*a")
+    assert(
+        header:find(
+            "struct game_first_Pair {\n    float x;\n    uint8_t nupp_padding_1[12];\n"
+                .. "    GAME_H_ALIGNAS(16) float v[3];\n    uint8_t nupp_padding_2[4];\n    int16_t n;\n};",
+            1,
+            true
+        ),
+        header
+    )
+    for _, assertion in ipairs({
+        "sizeof(game_first_Pair) == 48",
+        "GAME_H_ALIGNOF(game_first_Pair) == 16",
+        "offsetof(game_first_Pair, x) == 0",
+        "offsetof(game_first_Pair, v) == 16",
+        "offsetof(game_first_Pair, n) == 32",
+    }) do
+        assert(header:find("GAME_H_STATIC_ASSERT(" .. assertion, 1, true), assertion .. "\n" .. header)
+    end
+    assert(header:find("double game_first%(const struct game_first_Pair %*pairs, size_t count[%w_]*%);"), header)
+    assert(not header:find("LAYOUT_FINGERPRINT", 1, true), header)
+    assert(
+        os.execute(("cd '%s' && cc -std=c11 -fsyntax-only game.h"):format(dir)) == 0,
+        "an independent C compiler accepts the struct and its layout assertions"
+    )
     os.execute("rm -rf '" .. dir .. "'")
 end
 
