@@ -4,9 +4,6 @@ const jobs = require("jobs")
 const ffi = require("ffi")
 const tasks = require("coroutine")
 
-ffi.cdef[[uint64_t nuppNativeMonotonicNs(void);]]
-const C = ffi.C
-
 -- The host clock is part of this benchmark fixture, not measured work.
 const SAMPLES = 9
 const LATENCY_TASKS = 1000
@@ -22,7 +19,7 @@ local type Row = {
 }
 
 local function now(): number
-    return tonumber(C.nuppNativeMonotonicNs()) as number / 1.0e6
+    return os.monotonic()
 end
 
 local function median(values: {number}): number

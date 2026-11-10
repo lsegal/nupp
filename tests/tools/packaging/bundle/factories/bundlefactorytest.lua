@@ -66,7 +66,7 @@ assert(table.concat(formats("mac"), ",") == "hmac-sha256")
             local result, ran = run(dir, "LUA_PATH='./build/?.lua;;' luajit build/app/main.lua")
             assert(ran and result == "catalogs carried\n", result)
         else
-            assert(readFile(dir .. "/build/nupp/runtime/browser/crc.lua"), "browser CRC backend is staged")
+            assert(readFile(dir .. "/build/nupp/checksum/internal/crc.lua"), "CRC implementation is staged")
         end
         os.execute("rm -rf '" .. dir .. "'")
     end

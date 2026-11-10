@@ -1,129 +1,47 @@
 @!internal
---[[Rust-native gzip, zlib, and raw DEFLATE provider for compression API 1.
+--[[Gzip, zlib, and raw DEFLATE provider for compression API 1.
 
-The fixed catalog forwards validated options and span bounds to the native ABI.
-Each encoder and decoder owns one native handle. Failed steps copy the native
-error into their reason, and closing surfaces a failed handle release.
+The fixed catalog adapts the Nupp DEFLATE codec in [](nupp.compression.deflate)
+and [](nupp.compression.inflate) to span-based steps. Each encoder and decoder
+owns its codec state; a malformed stream fails its step with the codec's reason,
+and the decoder keeps failing once it has.
 ]]
 module nupp.runtime.provider.nativecompression
 
 const contract = require("nupp.compression.contracts")
-const native = require("nupp.runtime.native")
+const deflate = require("nupp.compression.deflate")
+const inflate = require("nupp.compression.inflate")
 const span = require("bytes.span")
+const ffi = require("ffi")
 
-native.ffi.cdef[[
-int32_t nuppNativeCompressionEncoderCreate(uint32_t, uint32_t, uint64_t *);
-int32_t nuppNativeCompressionEncoderWrite(
-    uint64_t, const uint8_t *, size_t, uint8_t *, size_t,
-    size_t *, size_t *, uint32_t *);
-int32_t nuppNativeCompressionEncoderFlush(
-    uint64_t, uint8_t *, size_t, size_t *, uint32_t *);
-int32_t nuppNativeCompressionEncoderFinish(
-    uint64_t, uint8_t *, size_t, size_t *, uint32_t *);
-int32_t nuppNativeCompressionEncoderRelease(uint64_t);
-int32_t nuppNativeCompressionDecoderCreate(uint32_t, int32_t, uint64_t *);
-int32_t nuppNativeCompressionDecoderRead(
-    uint64_t, const uint8_t *, size_t, uint8_t *, size_t,
-    size_t *, size_t *, uint32_t *);
-int32_t nuppNativeCompressionDecoderFinishInput(
-    uint64_t, uint8_t *, size_t, size_t *, uint32_t *);
-int32_t nuppNativeCompressionDecoderRelease(uint64_t);
-]]
+-- The two copies across the span boundary, typed so a borrowed range is all
+-- that crosses: one call each way, and nothing retained.
+local ffiString: function(borrows source: const uint8[?], count: integer): string = ffi.string as any
+local copyInto: function(borrows destination: uint8[?], source: any, count: integer): nil = ffi.copy as any
 
-const C = native.C
-const COMPRESSION_FEATURE = 1024
-native.requireFeature(COMPRESSION_FEATURE, "compression")
+local function text(borrows input: span.Span<uint8>): string
+    local count = #input
+    if count == 0 then
+        return ""
+    end
 
-local function encoderWrite(
-    handle: uint64,
-    borrows input: const uint8[?],
-    inputLength: integer,
-    borrows output: uint8[?],
-    outputLength: integer,
-    consumed: any,
-    written: any,
-    status: any
-): integer
-    local call = C.nuppNativeCompressionEncoderWrite as function(
-        uint64,
-        borrows input: const uint8[?],
-        integer,
-        borrows output: uint8[?],
-        integer,
-        any,
-        any,
-        any
-    ): integer
-
-    return call(handle, input, inputLength, output, outputLength, consumed, written, status)
+    return ffiString(input:ref(), count)
 end
 
-local function encoderOutput(
-    operation: any,
-    handle: uint64,
-    borrows output: uint8[?],
-    outputLength: integer,
-    written: any,
-    status: any
-): integer
-    local call = operation as function(uint64, borrows output: uint8[?], integer, any, any): integer
-    return call(handle, output, outputLength, written, status)
-end
+--- Copies `chunk` to the start of `output`, answering how many bytes that was.
+local function publish(chunk: string, exclusive output: span.ByteWriteSpan): integer
+    local count = #chunk
+    if count > 0 then
+        copyInto(output:ref(), chunk, count)
+    end
 
-local function decoderRead(
-    handle: uint64,
-    borrows input: const uint8[?],
-    inputLength: integer,
-    borrows output: uint8[?],
-    outputLength: integer,
-    consumed: any,
-    written: any,
-    status: any
-): integer
-    local call = C.nuppNativeCompressionDecoderRead as function(
-        uint64,
-        borrows input: const uint8[?],
-        integer,
-        borrows output: uint8[?],
-        integer,
-        any,
-        any,
-        any
-    ): integer
-
-    return call(handle, input, inputLength, output, outputLength, consumed, written, status)
-end
-
-local function decoderFinishInput(
-    handle: uint64,
-    borrows output: uint8[?],
-    outputLength: integer,
-    written: any,
-    status: any
-): integer
-    local call = C.nuppNativeCompressionDecoderFinishInput as function(
-        uint64,
-        borrows output: uint8[?],
-        integer,
-        any,
-        any
-    ): integer
-
-    return call(handle, output, outputLength, written, status)
-end
-
-local function failure(prefix: string): string
-    return prefix .. ": " .. (native.ffi.string(C.nuppNativeLastError()) as string)
+    return count
 end
 
 local record Encoder is contract.Encoder
-    @private handle: uint64
-    @private consumed: any
-    @private written: any
-    @private status: any
+    @private state: deflate.Encoder
 
     function close(takes self): nil
-        native.succeeded(C.nuppNativeCompressionEncoderRelease(self.handle), 2)
     end
 
     function write(
@@ -131,66 +49,33 @@ local record Encoder is contract.Encoder
         borrows input: span.Span<uint8>,
         exclusive output: span.ByteWriteSpan
     ): (integer?, integer?, integer?, string?)
-        local code = encoderWrite(
-            self.handle,
-            input:ref(),
-            #input,
-            output:ref(),
-            #output,
-            self.consumed,
-            self.written,
-            self.status
-        )
-        if code ~= 0 then
-            return nil, nil, nil, failure("compression encode failed")
-        end
-
-        return tonumber(
-            self.consumed[0]
-        ) as integer, tonumber(self.written[0]) as integer, tonumber(self.status[0]) as integer
+        local consumed, chunk, status = deflate.write(self.state, text(input), #output)
+        return consumed as integer, publish(chunk, output), status as integer, nil
     end
 
     function flush(exclusive self, exclusive output: span.ByteWriteSpan): (integer?, integer?, string?)
-        local code = encoderOutput(
-            C.nuppNativeCompressionEncoderFlush,
-            self.handle,
-            output:ref(),
-            #output,
-            self.written,
-            self.status
-        )
-        if code ~= 0 then
-            return nil, nil, failure("compression flush failed")
-        end
-
-        return tonumber(self.written[0]) as integer, tonumber(self.status[0]) as integer
+        local chunk, status = deflate.flush(self.state, #output)
+        return publish(chunk, output), status as integer, nil
     end
 
     function finish(exclusive self, exclusive output: span.ByteWriteSpan): (integer?, integer?, string?)
-        local code = encoderOutput(
-            C.nuppNativeCompressionEncoderFinish,
-            self.handle,
-            output:ref(),
-            #output,
-            self.written,
-            self.status
-        )
-        if code ~= 0 then
-            return nil, nil, failure("compression finish failed")
-        end
-
-        return tonumber(self.written[0]) as integer, tonumber(self.status[0]) as integer
+        local chunk, status = deflate.finish(self.state, #output)
+        return publish(chunk, output), status as integer, nil
     end
 end
 
 local record Decoder is contract.Decoder
-    @private handle: uint64
-    @private consumed: any
-    @private written: any
-    @private status: any
+    @private state: inflate.Decoder
 
     function close(takes self): nil
-        native.succeeded(C.nuppNativeCompressionDecoderRelease(self.handle), 2)
+    end
+
+    --- Copies the codec's `count` decoded bytes to the start of `output`.
+    function publish(self, count: integer, exclusive output: span.ByteWriteSpan): integer
+        if count > 0 then
+            copyInto(output:ref(), self.state.output, count)
+        end
+        return count
     end
 
     function read(
@@ -198,32 +83,21 @@ local record Decoder is contract.Decoder
         borrows input: span.Span<uint8>,
         exclusive output: span.ByteWriteSpan
     ): (integer?, integer?, integer?, string?)
-        local code = decoderRead(
-            self.handle,
-            input:ref(),
-            #input,
-            output:ref(),
-            #output,
-            self.consumed,
-            self.written,
-            self.status
-        )
-        if code ~= 0 then
-            return nil, nil, nil, failure("compression decode failed")
+        local consumed, written, status, problem = inflate.read(self.state, text(input), #output)
+        if problem ~= nil then
+            return nil, nil, nil, "compression decode failed: " .. problem
         end
 
-        return tonumber(
-            self.consumed[0]
-        ) as integer, tonumber(self.written[0]) as integer, tonumber(self.status[0]) as integer
+        return consumed as integer, self:publish(written as integer, output), status as integer, nil
     end
 
     function finishinput(exclusive self, exclusive output: span.ByteWriteSpan): (integer?, integer?, string?)
-        local code = decoderFinishInput(self.handle, output:ref(), #output, self.written, self.status)
-        if code ~= 0 then
-            return nil, nil, failure("compression decode failed")
+        local written, status, problem = inflate.finishinput(self.state, #output)
+        if problem ~= nil then
+            return nil, nil, "compression decode failed: " .. problem
         end
 
-        return tonumber(self.written[0]) as integer, tonumber(self.status[0]) as integer
+        return self:publish(written as integer, output), status as integer, nil
     end
 end
 
@@ -233,27 +107,12 @@ local record Format is contract.Format
 
     function createencoder(self, options: contract.FormatOptions?): contract.Encoder
         local level = options ~= nil and options.level or 6
-        local handle = native.ffi.new("uint64_t[1]")
-        native.succeeded(C.nuppNativeCompressionEncoderCreate(self.id, level, handle), 2)
-        return Encoder(
-            handle = handle[0],
-            consumed = native.ffi.new("size_t[1]"),
-            written = native.ffi.new("size_t[1]"),
-            status = native.ffi.new("uint32_t[1]")
-        )
+        return Encoder(state = deflate.create(self.id, level))
     end
 
     function createdecoder(self, options: contract.FormatOptions?): contract.Decoder
         local concatenatedMembers = self.name == "gzip" and (options == nil or options.concatenatedmembers ~= false)
-        local handle = native.ffi.new("uint64_t[1]")
-        native.succeeded(C.nuppNativeCompressionDecoderCreate(self.id, concatenatedMembers and 1 or 0, handle), 2)
-
-        return Decoder(
-            handle = handle[0],
-            consumed = native.ffi.new("size_t[1]"),
-            written = native.ffi.new("size_t[1]"),
-            status = native.ffi.new("uint32_t[1]")
-        )
+        return Decoder(state = inflate.create(self.id, concatenatedMembers))
     end
 end
 
