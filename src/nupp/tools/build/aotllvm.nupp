@@ -615,7 +615,11 @@ local function link(kit: string, output: string, runtime: string, archives: {str
     end
     local named = (manifest as {[string]: any})[runtime]
     if type(named) ~= "string" then
-        return "the link kit at " .. kit .. " carries no " .. runtime .. " archive; rebuild it with scripts/toolchain kit"
+        return "the link kit at "
+            .. kit
+            .. " carries no "
+            .. runtime
+            .. " archive; rebuild it with scripts/toolchain kit"
     end
     local archive = kit .. "/" .. (named as string)
     local machine = (selected as llvmProfile.Profile).machine

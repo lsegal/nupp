@@ -294,8 +294,9 @@ local function number(node: cst.NumberLit, want: Kind?, negated: boolean?): Valu
     if digits ~= nil then
         local wide = (suffix as string):sub(1, 1):lower() == "u" and U64 or I64
         local decimal = (digits as string):match("^%d+$")
-        local text = decimal ~= nil and decimal or tonumber(digits as string) ~= nil
-            and llvmText.integer(tonumber(digits as string) as number) or nil
+        local text = decimal ~= nil and decimal
+            or tonumber(digits as string) ~= nil and llvmText.integer(tonumber(digits as string) as number)
+            or nil
         if text == nil then
             refuse(node, "a native program cannot represent the number " .. spelling)
         end
@@ -428,7 +429,9 @@ end
 --- The standard functions a native program calls, by canonical identity: the
 --- LLVM intrinsic each is, or for the establishing conversions, the kind it
 --- establishes.
-const INTRINSICS: {[string]: string} = {
+const INTRINSICS: {
+    [string]: string
+} = {
     ["math.floor"] = "floor",
     ["math.ceil"] = "ceil",
     ["math.abs"] = "fabs",
@@ -497,7 +500,9 @@ local function floatArithmetic(program: Program, body: Body, op: string, a: stri
     return value(body, ("fsub %s %s, %s"):format(t, a, product))
 end
 
-const ORDERS: {[string]: {string}} = {
+const ORDERS: {
+    [string]: {string}
+} = {
     ["=="] = {"eq", "eq", "oeq"},
     ["~="] = {"ne", "ne", "une"},
     ["<"] = {"slt", "ult", "olt"},
@@ -555,8 +560,12 @@ local function binaryValues(
             return Value(text = value(body, ("icmp %s i1 %s, %s"):format(order[1], left.text, right.text)), kind = BOOL)
         end
     end
-    local arithmetic = left.kind.llvm ~= "ptr" and left.kind.llvm ~= "i1" and left.kind.llvm ~= "void"
-        and right.kind.llvm ~= "ptr" and right.kind.llvm ~= "i1" and right.kind.llvm ~= "void"
+    local arithmetic = left.kind.llvm ~= "ptr"
+        and left.kind.llvm ~= "i1"
+        and left.kind.llvm ~= "void"
+        and right.kind.llvm ~= "ptr"
+        and right.kind.llvm ~= "i1"
+        and right.kind.llvm ~= "void"
     if not arithmetic then
         refuse(node, "the operands of " .. op .. " must be numbers in a native program")
     end
@@ -591,12 +600,14 @@ local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?
     if op == ".." then
         refuse(node, "a native program cannot concatenate strings")
     end
+
     -- A literal operand takes the other side's kind, so `n < 10` compares in
     -- `n`'s width rather than widening it. A literal has no effects, so reading
     -- the other side first changes nothing.
     local function operand(v: Value): Kind?
         return (v.kind.llvm ~= "ptr" and v.kind.llvm ~= "void") and v.kind or nil
     end
+
     if (node.lhs as any).kind == "number" and (node.rhs as any).kind ~= "number" then
         local right = expression(program, body, node.rhs, nil)
         local left = expression(program, body, node.lhs, operand(right))
@@ -878,8 +889,14 @@ local function fornumStmt(program: Program, body: Body, stat: cst.FornumStmt): n
     local up = float and value(body, ("fcmp oge %s %s, 0.0"):format(kind.llvm, stepValue.text))
         or kind.signed and value(body, ("icmp sge %s %s, 0"):format(kind.llvm, stepValue.text))
         or "true"
-    local within = value(body, ("%s %s %s %s, %s"):format(compare, float and "ole" or s .. "le", kind.llvm, current, stopValue.text))
-    local down = value(body, ("%s %s %s %s, %s"):format(compare, float and "oge" or s .. "ge", kind.llvm, current, stopValue.text))
+    local within = value(
+        body,
+        ("%s %s %s %s, %s"):format(compare, float and "ole" or s .. "le", kind.llvm, current, stopValue.text)
+    )
+    local down = value(
+        body,
+        ("%s %s %s %s, %s"):format(compare, float and "oge" or s .. "ge", kind.llvm, current, stopValue.text)
+    )
     local test = value(body, ("select i1 %s, i1 %s, i1 %s"):format(up, within, down))
     builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(test, loop, done))
     builder.start(body.f, loop)
@@ -922,8 +939,10 @@ local function statement(program: Program, body: Body, stat: any): nil
         local compound = stat as cst.CompoundAssign
         local op = ((compound.op as lexer.Token).text):sub(1, -2)
         local target = compound.target
-        local found = target ~= nil and (target as any).kind == "name"
-            and lookup(body.scope, ((target as cst.NameExpr).token as lexer.Token).text) or nil
+        local found = target ~= nil
+            and (target as any).kind == "name"
+            and lookup(body.scope, ((target as cst.NameExpr).token as lexer.Token).text)
+            or nil
         if found == nil then
             refuse(stat, "a native compound assignment updates a local")
         end
@@ -1033,7 +1052,10 @@ local function signature(name: string, stat: any, funcbody: cst.Funcbody): Defin
     if #rets == 1 then
         local kind = kindOf(checked.rets[1])
         if kind == nil then
-            refuse(rets[1], "the result of " .. name .. " has type " .. cst.textOf(rets[1]) .. ", which has no C representation")
+            refuse(
+                rets[1],
+                "the result of " .. name .. " has type " .. cst.textOf(rets[1]) .. ", which has no C representation"
+            )
         end
         result = kind as Kind
     end
@@ -1068,7 +1090,10 @@ local function foreign(stat: cst.CdefFunc): Callee
     for index, t in ipairs(physical.params) do
         local kind = kindOf(t)
         if kind == nil or (kind as Kind).llvm == "void" then
-            refuse(stat.params[index] or stat, "parameter " .. tostring(index) .. " of " .. name .. " has no C representation")
+            refuse(
+                stat.params[index] or stat,
+                "parameter " .. tostring(index) .. " of " .. name .. " has no C representation"
+            )
         end
         params[index] = kind as Kind
     end
@@ -1092,7 +1117,8 @@ local function literal(node: any): boolean
     if kind == "paren" then
         return literal((node as cst.Paren).expr)
     elseif kind == "unop" then
-        return ((node as cst.Unop).op as lexer.Token).text == "-" and ((node as cst.Unop).operand as any).kind == "number"
+        return ((node as cst.Unop).op as lexer.Token).text == "-"
+            and ((node as cst.Unop).operand as any).kind == "number"
     end
 
     return kind == "number" or kind == "string" or kind == "trueExpr" or kind == "falseExpr"
@@ -1119,7 +1145,9 @@ local function lowerDefinition(program: Program, attributes: string, item: Defin
         params = {"i32 %arg1", "ptr %arg2"}
     end
     local linkage = callee.symbol == "main" and "" or "internal "
-    local header = ("define %s%s @%s(%s) %s {"):format(
+    local header = (
+        "define %s%s @%s(%s) %s {"
+    ):format(
         linkage,
         callee.symbol == "main" and "i32" or callee.result.llvm,
         llvmText.name("", callee.symbol),
@@ -1198,21 +1226,15 @@ function native.module(tree: cst.Chunk, functionAttributes: string): (string?, n
                 builder.declare(
                     program.module,
                     "@" .. callee.symbol,
-                    ("declare %s%s @%s(%s)"):format(
-                        callee.result.llvm,
-                        extension(callee.result),
-                        callee.symbol,
-                        table.concat(params, ", ")
-                    )
+                    (
+                        "declare %s%s @%s(%s)"
+                    ):format(callee.result.llvm, extension(callee.result), callee.symbol, table.concat(params, ", "))
                 )
             end
         end
         -- Unwind tables, because a C function a Nupp callback calls may raise a
         -- Lua error that unwinds through it to the VM's protected call.
-        local attributes = builder.attributes(
-            program.module,
-            (("uwtable " .. functionAttributes):gsub("%s+$", ""))
-        )
+        local attributes = builder.attributes(program.module, (("uwtable " .. functionAttributes):gsub("%s+$", "")))
         for _, item in ipairs(definitions) do
             lowerDefinition(program, attributes, item)
         end

@@ -427,6 +427,8 @@ scopes.projectlayoutcachetest = "integration"
 
 scopes.projectaotlinktest = "integration"
 
+scopes.nativeprogramtest = "integration"
+
 scopes.projectaottest = "integration"
 
 scopes.projectcrosstest = "integration"

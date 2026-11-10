@@ -374,10 +374,16 @@ local function executable(
         "nupp.compiler.aot.llvm.native"
     ).module(tree.root, (profile as {functionAttributes: string}).functionAttributes)
     if ir == nil then
-        local at = problem as {line: integer, column: integer, message: string}
+        local at = problem as {
+            line: integer,
+            column: integer,
+            message: string
+        }
         return refuse(report.TOOL_FAILED, ("%s:%d:%d: native: %s"):format(path, at.line, at.column, at.message))
     end
-    local linked, linkErr = require("nupp.tools.build.native").linkProgram(target.triple, output as string, ir as string)
+    local linked, linkErr = require(
+        "nupp.tools.build.native"
+    ).linkProgram(target.triple, output as string, ir as string)
     if linked == nil then
         return refuse(report.TOOL_FAILED, tostring(linkErr))
     end

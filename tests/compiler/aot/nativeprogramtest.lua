@@ -68,17 +68,17 @@ end
 
 local LUA_API = [[
 cdef function luaL_newstate(): voidptr
-cdef function luaL_openlibs(L: voidptr): nil
-cdef function luaL_loadstring(L: voidptr, source: cstring): int32
-cdef function lua_pcall(L: voidptr, nargs: int32, nresults: int32, handler: int32): int32
-cdef function lua_pushcclosure(L: voidptr, fn: function(L: voidptr): int32, n: int32): nil
-cdef function lua_pushinteger(L: voidptr, n: int64): nil
-cdef function lua_pushstring(L: voidptr, s: cstring): nil
-cdef function lua_setfield(L: voidptr, index: int32, k: cstring): nil
-cdef function lua_tointeger(L: voidptr, index: int32): int64
-cdef function lua_tolstring(L: voidptr, index: int32, length: voidptr): cstring
-cdef function lua_close(L: voidptr): nil
-cdef function puts(s: cstring): int32
+cdef function luaL_openlibs(borrows L: voidptr)
+cdef function luaL_loadstring(borrows L: voidptr, source: cstring): int32
+cdef function lua_pcall(borrows L: voidptr, nargs: int32, nresults: int32, handler: int32): int32
+cdef function lua_pushcclosure(borrows L: voidptr, fn: function(L: voidptr): int32, n: int32)
+cdef function lua_pushnumber(borrows L: voidptr, n: number)
+cdef function lua_pushstring(borrows L: voidptr, s: cstring)
+cdef function lua_setfield(borrows L: voidptr, index: int32, k: cstring)
+cdef function lua_tonumber(borrows L: voidptr, index: int32): number
+cdef function lua_tolstring(borrows L: voidptr, index: int32, length: voidptr?): cstring
+cdef function lua_close(borrows L: voidptr)
+cdef function puts(borrows s: cstring): int32
 
 const GLOBALS = -10002
 ]]
@@ -88,13 +88,13 @@ const GLOBALS = -10002
 local HOST = LUA_API .. [[
 
 local function answer(L: voidptr): int32
-    lua_pushinteger(L, 42)
+    lua_pushnumber(L, 42)
     return 1
 end
 
 --- The sum of 1..n with every multiple of 3 skipped, by loop and branch.
-local function tally(n: int32): int32
-    local total: int32 = 0
+local function tally(n: int32): number
+    local total = 0
     for i = 1, n do
         if i % 3 ~= 0 then
             total += i
@@ -108,10 +108,12 @@ local function main(argc: int32, argv: cstring*): int32
     luaL_openlibs(L)
     lua_pushcclosure(L, answer, 0)
     lua_setfield(L, GLOBALS, "answer")
-    lua_pushinteger(L, tally(10))
+    lua_pushnumber(L, tally(10))
     lua_setfield(L, GLOBALS, "tally")
     if argc > 1 then
-        lua_pushstring(L, argv[1])
+        @unsafe do
+            lua_pushstring(L, argv[1])
+        end
         lua_setfield(L, GLOBALS, "name")
     end
     local chunk = "print('hello ' .. tostring(name) .. ' ' .. answer() .. ' ' .. tally) return answer() - 40"
@@ -122,9 +124,9 @@ local function main(argc: int32, argv: cstring*): int32
     if status ~= 0 then
         puts(lua_tolstring(L, -1, nil))
         lua_close(L)
-        return 100 + status
+        return math.i32.wrap(100 + status)
     end
-    local result = lua_tointeger(L, -1) as int32
+    local result = math.i32.wrap(math.floor(lua_tonumber(L, -1)))
     lua_close(L)
     return result
 end
@@ -139,14 +141,15 @@ function M.mainRunsALuaChunkAndExitsWithItsStatus()
     test.eq(ran, "hello world 42 37")
 end
 
+-- A Lua error raised inside a Nupp callback unwinds through its native frame
+-- to the VM's protected call, which needs the frame's unwind tables.
 function M.aNuppCallbackRaisingAnErrorReachesProtectedCall()
     requireCodegen()
     local executable, output = link(LUA_API .. [[
-
-cdef function luaL_error(L: voidptr, format: cstring, ...): int32
+cdef function luaL_error(borrows L: voidptr, format: cstring, ...): int32
 
 local function fail(L: voidptr): int32
-    return luaL_error(L, "failed with %d", 7)
+    return luaL_error(L, "failed with %g", 7)
 end
 
 local function main(): int32
@@ -169,10 +172,12 @@ end
     assert(ran:find("failed with 7", 1, true), ran)
 end
 
-function M.integerArithmeticFloorsAsTheLanguageDoes()
+-- `integer` and `number` are binary64, so `//` and `%` floor and `/` divides
+-- exactly; `int64` wraps; refinements enter through the establishing calls.
+function M.arithmeticKeepsTheLanguagesMeaning()
     requireCodegen()
     local executable, output = link([[
-local function check(ok: boolean, code: int32): int32
+local function check(ok: boolean, code: integer): integer
     if ok then
         return 0
     end
@@ -180,24 +185,24 @@ local function check(ok: boolean, code: int32): int32
 end
 
 local function main(): int32
-    local a: int32 = -7
-    local b: int32 = 2
+    local a = -7
+    local b = 2
     local failed = check(a // b == -4, 1) + check(a % b == 1, 2) + check(a / b == -3.5, 3)
-    local wide: int64 = 3000000000
-    failed += check(wide * 2 == 6000000000, 4)
-    local x: number = 7.5
+    local wide: int64 = 9223372036854775807LL
+    failed += check(wide + 1LL == -9223372036854775807LL - 1LL, 4)
+    local x = 7.5
     failed += check(x // 2 == 3, 5) + check(x % 2 == 1.5, 6)
-    local bits: uint32 = 0xF0
-    failed += check((bits >> 4) == 15 and (bits & 0x30) == 0x30, 7)
-    local count: int32 = 0
+    local narrow: int32 = math.i32.wrap(4294967297)
+    failed += check(narrow == 1, 7)
+    local count = 0
     while true do
         count += 1
         if count >= 5 then
             break
         end
     end
-    failed += check(count == 5, 8)
-    return failed
+    failed += check(count == 5 and math.floor(-0.5) == -1 and math.sqrt(16) == 4, 8)
+    return math.i32.wrap(failed)
 end
 ]])
     assert(executable ~= nil, output)
