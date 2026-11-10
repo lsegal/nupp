@@ -491,7 +491,11 @@ local function integerDivision(body: Body, op: string, a: string, b: string, kin
     local result = value(body, ("%s i64 %s, %s"):format(instruction, a, divisor))
 
     -- INT64_MIN % 1 is already the 0 that INT64_MIN % -1 gives.
-    local replaced = op == "%" and zero or special
+    local replaced = special
+    if op == "%" then
+        replaced = zero
+    end
+
     return value(body, ("select i1 %s, i64 %s, i64 %s"):format(replaced, INT64_MIN, result))
 end
 
