@@ -2295,4 +2295,54 @@ function M.windowsShellSurvivesLaterStandardIOLoad()
     test.eq(pipe:close(), true)
 end
 
+function M.windowsTemporaryNamesLeaveTheDriveRoot()
+    local source = read(ROOT .. "/tests/run.lua")
+    local first = assert(source:find("local rawTmpname, rawExit", 1, true))
+    local last = assert(source:find("local processSalt", first, true))
+    local setup = source:sub(first, last - 1) .. "\nreturn tempStem\n"
+
+    local function stem(separator, raw, env)
+        local environment = {
+            package = {config = separator .. "\n"},
+            os = {
+                tmpname = function()
+                    return raw
+                end,
+                remove = function()
+                end,
+                exit = os.exit,
+                getenv = function(name)
+                    return env[name]
+                end,
+            },
+        }
+        environment._G = environment
+
+        return assert(setfenv(assert(loadstring(setup, "@nupp:test-runner")), environment))()
+    end
+
+    local temp = [[C:\Users\me\AppData\Local\Temp]]
+    test.eq(stem("\\", [[\s1ako.]], {TEMP = temp}), temp .. [[\s1ako]])
+    test.eq(stem("\\", [[C:\s1ako.]], {TEMP = temp .. "\\"}), temp .. [[\s1ako]])
+    test.eq(stem("\\", "/s1ako.", {TMP = temp}), temp .. [[\s1ako]], "TMP stands in for TEMP")
+    test.eq(stem("\\", [[\.]], {TEMP = temp}), temp .. [[\tmp]])
+    test.eq(stem("\\", [[\s1ako.]], {}), [[\s1ako.]], "no temporary directory keeps the name")
+    test.eq(stem("\\", temp .. [[\s1ako]], {TEMP = temp}), temp .. [[\s1ako]])
+    test.eq(stem("/", "/tmp/lua_s1ako", {TEMP = temp}), "/tmp/lua_s1ako", "POSIX names are unchanged")
+end
+
+-- What `cheadertest` does with a scratch header: the shell makes a directory at
+-- a handed-out name and Lua writes into it.
+function M.temporaryNamesWorkFromBothLuaAndTheShell()
+    local name = os.tmpname()
+    os.remove(name)
+    test.eq(name:match("^[\\/][^\\/]+$"), nil, "not a drive-root name")
+    test.eq(os.execute(("mkdir -p '%s'"):format(name)), 0)
+    local file = assert(io.open(name .. "/flags.h", "wb"))
+    file:write("#define FLAGS 1\n")
+    file:close()
+    test.eq(read(name .. "/flags.h"), "#define FLAGS 1\n")
+    os.execute(("rm -rf '%s'"):format(name))
+end
+
 return M

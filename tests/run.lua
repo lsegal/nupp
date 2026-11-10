@@ -176,6 +176,21 @@ local workerHost = rawget(_G, "__NUPP_TEST_WORKER_HOST") == true
 local rawTmpname, rawExit = os.tmpname, os.exit
 local tempStem = rawTmpname()
 os.remove(tempStem)
+-- msvcrt's `tmpnam`, behind LuaJIT's `os.tmpname` on Windows, names a file at
+-- the root of the current drive: `\s1ako.`. An ordinary user cannot write `C:\`,
+-- and the runner's Git Bash reads `/s1ako.` as a path under its own root, so a
+-- case that made a directory there through the shell could not find it again
+-- from Lua. The name moves under the user's temporary directory, as
+-- `process.windowsTempName` moves the compiler's, and keeps its drive so both
+-- sides read it the same way.
+if package.config:sub(1, 1) == "\\" then
+    local base = tempStem:match("^[\\/]([^\\/]+)$") or tempStem:match("^%a:[\\/]([^\\/]+)$")
+    local tempDir = os.getenv("TEMP") or os.getenv("TMP")
+    if base and tempDir and tempDir ~= "" then
+        base = base:gsub("%.+$", "")
+        tempStem = (tempDir:gsub("[\\/]+$", "")) .. "\\" .. (base ~= "" and base or "tmp")
+    end
+end
 local processSalt
 -- This process, for a lock to name its holder by, and the question a waiter asks
 -- of that name. Both stay nil without FFI, where a lock is judged by age alone.
