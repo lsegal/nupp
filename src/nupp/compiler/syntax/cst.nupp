@@ -1118,7 +1118,7 @@ record cst.CompoundAssign is cst.Hints
     --- The right-hand side.
     value: cst.Node?
 
-    --- Set when a bit operator's result is a 64-bit integer, which LuaJIT boxes
+    --- Set when the operator's result is a 64-bit integer, which LuaJIT boxes
     --- in a fresh cdata object: an allocation a `@noalloc` region has to hear about.
     wideArithmetic: boolean?
 end

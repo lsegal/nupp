@@ -1545,12 +1545,24 @@ export function install(c: state.Checker): state.StatHandlers
                 or not shift and (valueT.tag == "int64" or valueT.tag == "uint64") and valueT
             )
             or nil
+        -- Arithmetic converts the other operand to the 64-bit box, and to unsigned
+        -- when either side is, as the binary operator does.
+        local wideArith = op ~= ".." and op ~= "??" and not bitop
+            and (
+                (targetT.tag == "uint64" or valueT.tag == "uint64") and T.uint64
+                or (targetT.tag == "int64" or valueT.tag == "int64") and T.int64
+            )
+            or nil
         if bitop then
             local wideCount = shift and (valueT.tag == "int64" or valueT.tag == "uint64")
             require("nupp.compiler.capabilities").require(c, (wideBits or wideCount) and "int64" or "bitops", opTok)
             if wideBits then
                 stat.wideArithmetic = true
             end
+        end
+        if wideArith then
+            require("nupp.compiler.capabilities").require(c, "int64", opTok)
+            stat.wideArithmetic = true
         end
         local operandsFit = true
         if op == "??" then
@@ -1590,6 +1602,8 @@ export function install(c: state.Checker): state.StatHandlers
             resultT = valueT
         elseif bitop then
             resultT = wideBits or T.integer
+        elseif wideArith then
+            resultT = wideArith
         elseif not fixedWidth.isValue(targetT)
             and not fixedWidth.isValue(valueT)
             and targetT ~= T.any
