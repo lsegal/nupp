@@ -1099,6 +1099,23 @@ function M.gpuIsAPinnedPrebuiltLibraryRatherThanAHostFeature()
     assert(driver:find("-e '^WGPU_'", 1, true), "a wgpu-native bump rebuilds the native toolchain")
 end
 
+-- The macOS host exports exactly host/include/nupp.exports, so a name left there
+-- after its definition moved to Nupp fails that link and only that link.
+function M.everyListedCodegenExportIsARustDefinition()
+    local list = read(ROOT .. "/host/include/nupp.exports")
+    local codegen = read(ROOT .. "/native/crates/native/src/codegen.rs")
+    local section = assert(list:match("%[native%-codegen%]\n(.-)\n%[") or list:match("%[native%-codegen%]\n(.*)$"),
+        "the export list has no native-codegen section")
+    local stale = {}
+    for line in section:gmatch("[^\n]+") do
+        local name = line:match("^%s*(nupp[%w_]+)%s*$")
+        if name and not codegen:find('extern "C" fn ' .. name .. "(", 1, true) then
+            stale[#stale + 1] = name
+        end
+    end
+    assert(#stale == 0, "the export list names codegen symbols nothing defines: " .. table.concat(stale, ", "))
+end
+
 function M.deletedCHostDoesNotContributeCacheInputs()
     local driver = read(ROOT .. "/scripts/toolchain")
     assert(not driver:find("host/c", 1, true), "the deleted C host still contributes toolchain cache inputs")

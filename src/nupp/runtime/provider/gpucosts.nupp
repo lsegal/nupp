@@ -58,8 +58,11 @@ local now: function(): number = do
     -- CLOCK_MONOTONIC, which macOS and the BSDs number differently from Linux.
     local clock = ffi.os == "OSX" and 6 or (ffi.os == "BSD" and 4 or 1)
     local time: any = ffi.new("NuppGpuCostTime")
+    -- nativeplatform declares clock_gettime over its own timespec, and the
+    -- first declaration LuaJIT loads wins, so pass the same layout untyped.
+    local timeArgument: any = ffi.cast("void *", time)
     yield function(): number
-        C.clock_gettime(clock, time)
+        C.clock_gettime(clock, timeArgument)
         return (tonumber(time.seconds) as number) * 1000 + (tonumber(time.nanoseconds) as number) / 1000000
     end
 end
