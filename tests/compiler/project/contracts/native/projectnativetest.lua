@@ -47,7 +47,7 @@ function M.nativeFacilitiesSharingAProviderBuildAsOneUnion()
     assert(copies[1][2]:find("out/lib/nupp_native", 1, true), "the Rust provider union keeps its stable sidecar name")
 end
 
-function M.gpuOverrideSelectsAHostWithTheProviderLinked()
+function M.gpuNeverChangesTheHost()
     local originalCapture = process.capture
     local originalCompilerRoot = compilerEnv.compilerRoot
     local calls = {}
@@ -70,7 +70,7 @@ function M.gpuOverrideSelectsAHostWithTheProviderLinked()
     assert(ok, problem)
     testAssert.eq(#calls, 2, "each feature union selects its own host")
     testAssert.eq(calls[1][#calls[1]], "", "GPU is absent when disabled")
-    testAssert.eq(calls[2][#calls[2]], "native-gpu", "forcing GPU changes the host build and cache key")
+    testAssert.eq(calls[2][#calls[2]], "", "the GPU is a staged library, which no host links")
 end
 
 function M.nativeFacilityCanSelectItsProviderDriver()
@@ -79,7 +79,7 @@ function M.nativeFacilityCanSelectItsProviderDriver()
     local calls, copies = {}, {}
     process.capture = function(argv)
         calls[#calls + 1] = argv
-        return 0, "/built/libnupp_native.dylib\n"
+        return 0, "/built/libwgpu_native.dylib\n"
     end
     fs.copyFile = function(source, destination)
         copies[#copies + 1] = {source, destination}
@@ -95,10 +95,46 @@ function M.nativeFacilityCanSelectItsProviderDriver()
     assert(outputs, problem)
     testAssert.eq(#calls, 1, "the facility selects one provider build")
     local command = "\n" .. table.concat(calls[1], "\n") .. "\n"
-    assert(command:find("\nnative%-rust\n"), "the feature's provider driver is passed to the toolchain")
-    assert(command:find("\ngpu\n", 1, true), "the selected driver receives the provider feature union")
-    testAssert.eq(copies[1][1], "/built/libnupp_native.dylib")
-    assert(copies[1][2]:find("out/lib/nupp_native", 1, true), "the Rust provider has an independent sidecar name")
+    assert(command:find("\nwgpu\n"), "the feature's provider driver is passed to the toolchain")
+    testAssert.eq(copies[1][1], "/built/libwgpu_native.dylib")
+    assert(copies[1][2]:find("out/lib/wgpu_native", 1, true), "wgpu-native has an independent sidecar name")
+end
+
+-- wgpu-native is prebuilt for every platform, so a binary for another one
+-- stages that platform's library, named the way its loader looks for it.
+function M.aForeignTargetStagesItsOwnGpuLibrary()
+    local originalCapture, originalCopy = process.capture, fs.copyFile
+    local originalCompilerRoot = compilerEnv.compilerRoot
+    local calls, copies = {}, {}
+    process.capture = function(argv)
+        calls[#calls + 1] = argv
+        return 0, "/built/wgpu_native\n"
+    end
+    fs.copyFile = function(source, destination)
+        copies[#copies + 1] = {source, destination}
+        return true
+    end
+    compilerEnv.compilerRoot = function()
+        return "."
+    end
+    local ok, problem = pcall(function()
+        for platform, name in pairs({
+            ["x86_64-pc-windows-msvc"] = "out/lib/wgpu_native.dll",
+            ["aarch64-apple-darwin"] = "out/lib/wgpu_native",
+        }) do
+            calls, copies = {}, {}
+            local outputs, err = nativeStage.build(".", "out", {["native.gpu"] = true}, platform)
+            assert(outputs, err)
+            local command = "\n" .. table.concat(calls[1], "\n") .. "\n"
+            assert(command:find("\nwgpu\n" .. platform .. "\n", 1, true), command)
+            assert(copies[1][2]:sub(-#name) == name, copies[1][2])
+        end
+        local outputs, err = nativeStage.build(".", "out", {["native.gpu"] = true}, nil, nil, true)
+        assert(outputs == nil and err:find("standalone binary needs sidecar-only native feature gpu", 1, true), err)
+    end)
+    process.capture, fs.copyFile = originalCapture, originalCopy
+    compilerEnv.compilerRoot = originalCompilerRoot
+    assert(ok, problem)
 end
 
 function M.aTargetKeepsTheRuntimeModuleItAlreadyBuilt()

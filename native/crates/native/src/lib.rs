@@ -15,8 +15,6 @@ mod codegen;
 mod compression;
 #[cfg(any(feature = "files", feature = "filesystem"))]
 mod files;
-#[cfg(feature = "gpu")]
-mod gpu;
 #[cfg(feature = "http")]
 mod http;
 #[cfg(feature = "net")]
@@ -54,7 +52,8 @@ pub extern "C" fn nuppCrcLastError() -> *const c_char {
 
 const FEATURE_BASE: u64 = 1 << 0;
 const FEATURE_UUID: u64 = 1 << 1;
-const FEATURE_GPU: u64 = 1 << 2;
+// Bit 2 was the GPU provider, which is Nupp over wgpu-native now. It stays
+// unassigned, so an old caller asking for it reads its absence.
 const FEATURE_URI: u64 = 1 << 3;
 const FEATURE_HTTP: u64 = 1 << 4;
 const FEATURE_PROCESS: u64 = 1 << 5;
@@ -119,11 +118,6 @@ pub extern "C" fn nuppNativeFeatures() -> u64 {
             | FEATURE_READINESS
             | if cfg!(feature = "uuid") {
                 FEATURE_UUID
-            } else {
-                0
-            }
-            | if cfg!(feature = "gpu") {
-                FEATURE_GPU
             } else {
                 0
             }
@@ -490,7 +484,6 @@ mod tests {
         for (name, value) in [
             ("BASE", FEATURE_BASE),
             ("UUID", FEATURE_UUID),
-            ("GPU", FEATURE_GPU),
             ("URI", FEATURE_URI),
             ("HTTP", FEATURE_HTTP),
             ("PROCESS", FEATURE_PROCESS),

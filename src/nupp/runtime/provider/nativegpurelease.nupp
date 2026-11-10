@@ -4,16 +4,17 @@ Non-suspending teardown for native GPU context state.
 
 This helper releases the native device context used by
 [](nupp.runtime.provider.nativegpu). It marks the state closed and clears its
-handle before calling the native release operation, making repeated cleanup a
-no-op. It implements the provider's destruction callback behind the canonical
-[](nupp.gpu.api) cleanup identity; it is not a separately selectable service.
+handle before releasing the device through [](nupp.runtime.provider.gpudevice),
+making repeated cleanup a no-op. It implements the provider's destruction
+callback behind the canonical [](nupp.gpu.api) cleanup identity; it is not a
+separately selectable service.
 
 The callback accepts only state created by the native GPU implementation and
 must not be used with browser contexts or arbitrary public context values.
 ]]
 module nupp.runtime.provider.nativegpurelease
 
-local native = require("nupp.runtime.native")
+local device = require("nupp.runtime.provider.gpudevice")
 export function destroy(state: any): nil
     if state._closed then
         return
@@ -21,6 +22,7 @@ export function destroy(state: any): nil
     state._closed = true
     local handle = state._handle
     state._handle = nil
-    local destroy = native.C.nuppNativeGpuContextRelease as @nosuspend function(any): integer
-    destroy(handle)
+    -- Closing settles nothing that can suspend: it only waits on the device.
+    local close = device.close as @nosuspend function(any): (any, string?)
+    close(handle)
 end

@@ -1,0 +1,1676 @@
+@!internal
+--[[
+Safe, handle-based native compute over wgpu-native.
+
+wgpu-native owns command and device-resource lifetimes. This module adds the
+language-facing invariants it does not provide: resource kind checks,
+stale-handle rejection, byte-range validation, an explicit synchronization
+boundary, and one queued readback per buffer. It is what
+[](nupp.runtime.provider.nativegpu) drives, through
+[](nupp.runtime.provider.wgpu)'s FFI binding.
+
+Every exported operation answers its result, or nil and a message beginning
+`gpu: `; a context is only ever used from the Lua state that opened it, so no
+handle can cross threads.
+]]
+module nupp.runtime.provider.gpudevice
+
+-- A wgpu-native call may run a callback before it returns, and a compiled trace
+-- cannot call back into Lua, so nothing in this module is compiled.
+jit.off(true, true)
+
+local ffi = require("ffi")
+local wgpu = require("nupp.runtime.provider.wgpu")
+local costs = require("nupp.runtime.provider.gpucosts")
+
+if ffi.os == "Windows" then
+    ffi.cdef("void Sleep(uint32_t milliseconds);")
+else
+    ffi.cdef("int usleep(uint32_t microseconds);")
+end
+
+--- Sleeps the calling thread for `milliseconds`, the slice a synchronize waits
+--- between polls of a device that reports completion only when asked.
+export function pause(milliseconds: integer): nil
+    if milliseconds <= 0 then
+        return
+    end
+    if ffi.os == "Windows" then
+        ffi.C.Sleep(milliseconds)
+    else
+        ffi.C.usleep(milliseconds * 1000)
+    end
+end
+
+const NULL = costs.NULL
+const COPY_ALIGNMENT = 4
+const CALLBACK_MODE = 2
+const SPIRV_MAGIC = 0x07230203
+const OP_ENTRY_POINT = 15
+const OP_EXECUTION_MODE = 16
+const EXECUTION_MODEL_GL_COMPUTE = 5
+const EXECUTION_MODE_LOCAL_SIZE = 17
+
+local function array(values: {any}): {any}
+    return require("serde.json").asarray(values)
+end
+
+--- The marker a failure raised inside this module carries.
+local FailureMT = {}
+
+local function fail(message: string): never
+    error(setmetatable({message = message}, FailureMT), 0)
+end
+
+local function triple(values: {integer}): string
+    return ("[%d, %d, %d]"):format(values[1], values[2], values[3])
+end
+
+local function outOfBounds(operation: string, offset: integer, size: integer, capacity: integer): never
+    fail(("%s range %d..%d exceeds buffer size %d"):format(operation, offset, offset + size, capacity))
+end
+
+-- Public handles never repeat within a process, so a handle from one context is
+-- stale in every other rather than naming some unrelated resource there.
+local nextHandle = 0
+
+local function freshHandle(): integer
+    nextHandle += 1
+
+    return nextHandle as integer
+end
+
+local function lib(): any
+    local ok, value = pcall(wgpu.library)
+    if not ok then
+        fail("no suitable compute adapter is available: " .. tostring(value))
+    end
+
+    return value
+end
+
+-- --- ranges ------------------------------------------------------------------
+
+--- Refuses a range that overflows or runs past `capacity`.
+export function checkedrange(operation: string, offset: integer, size: integer, capacity: integer): nil
+    if offset + size > capacity or offset + size < offset then
+        outOfBounds(operation, offset, size, capacity)
+    end
+end
+
+local function requireCopyAlignment(name: string, value: integer): nil
+    if value % COPY_ALIGNMENT ~= 0 then
+        fail(("GPU %s %d is not aligned to %d bytes"):format(name, value, COPY_ALIGNMENT))
+    end
+end
+
+local function alignUp(value: integer, alignment: integer): integer
+    return (value + alignment - 1) // alignment * alignment
+end
+
+--- How many bytes a copy or binding of `length` at `offset` moves. Both are
+--- whole words; a range whose length is not one may still end the buffer, and
+--- then takes the padding after its last byte along with it.
+export function copyextent(name: string, offset: integer, length: integer, size: integer): integer
+    if offset % COPY_ALIGNMENT ~= 0 then
+        fail(("GPU %s offset %d is not aligned to %d bytes"):format(name, offset, COPY_ALIGNMENT))
+    end
+    if length % COPY_ALIGNMENT == 0 then
+        return length
+    end
+    if offset + length ~= size then
+        fail(
+            (
+                "GPU %s size %d is not a multiple of %d bytes and does not end the buffer"
+            ):format(name, length, COPY_ALIGNMENT)
+        )
+    end
+
+    return alignUp(length, COPY_ALIGNMENT)
+end
+
+--- Whether any of `slots` names `buffer`. The device tracks usage per
+--- allocation, so one allocation bound to a read slot and a write slot of the
+--- same dispatch is refused however far apart the ranges are.
+export function binds(slots: {any}, buffer: integer): boolean
+    for _, slot in ipairs(slots) do
+        if slot and slot.buffer == buffer then
+            return true
+        end
+    end
+
+    return false
+end
+
+--- A device interval in milliseconds, or why the counters do not give one.
+export function timestampmilliseconds(first: any, last: any, period: number): (number?, string?)
+    if first == last then
+        return nil, "equal-timestamps"
+    end
+    if last < first then
+        return nil, "reversed-timestamps"
+    end
+    if period ~= period or period <= 0 or period == math.huge then
+        return nil, "invalid-timestamp-period"
+    end
+
+    return (tonumber(last - first) as number) * period / 1000000, nil
+end
+
+-- --- SPIR-V ------------------------------------------------------------------
+
+--- The words of a SPIR-V module, refusing a partial word or the wrong byte order.
+export function spirvwords(bytes: string): (any, integer)
+    if #bytes == 0 or #bytes % 4 ~= 0 then
+        fail("SPIR-V must be a non-empty sequence of complete 32-bit words")
+    end
+    local count = #bytes // 4
+    local words: any = ffi.new("uint32_t[?]", count)
+    ffi.copy(words, bytes, #bytes)
+    if words[0] ~= SPIRV_MAGIC then
+        fail("SPIR-V has an invalid magic word or byte order")
+    end
+
+    return words, count
+end
+
+-- The words of a SPIR-V literal string, NUL-terminated and padded to a word.
+local function spirvString(words: any, first: integer, last: integer): string
+    local bytes: {string} = {}
+    for index = first, last do
+        local word = words[index]
+        for shift = 0, 24, 8 do
+            local byte = (word >> shift) & 0xff
+            if byte == 0 then
+                return table.concat(bytes)
+            end
+            bytes[#bytes + 1] = string.char(byte)
+        end
+    end
+
+    return table.concat(bytes)
+end
+
+--- Refuses a declared workgroup size that is not the one the entry point's
+--- `LocalSize` execution mode compiles in. Dispatch geometry is computed from
+--- the declared size, so a wrong one silently covers the wrong elements.
+export function checkworkgroupsize(words: any, count: integer, entryPoint: string, declared: {integer}): nil
+    -- The instructions after the five-word header, as opcode and operand span.
+    local instructions: {{integer}} = {}
+    local at = math.min(5, count)
+    while at < count do
+        local length = words[at] >> 16
+        if length == 0 or at + length > count then
+            fail(("SPIR-V instruction at word %d has an invalid length"):format(at))
+        end
+        instructions[#instructions + 1] = {words[at] & 0xffff, at + 1, at + length - 1}
+        at += length
+    end
+    local entry: integer? = nil
+    for _, instruction in ipairs(instructions) do
+        local first, last = instruction[2], instruction[3]
+        if instruction[1] == OP_ENTRY_POINT
+            and last - first + 1 >= 3
+            and words[first] == EXECUTION_MODEL_GL_COMPUTE
+            and spirvString(words, first + 2, last) == entryPoint
+        then
+            entry = words[first + 1]
+            break
+        end
+    end
+    if entry == nil then
+        return
+    end
+    for _, instruction in ipairs(instructions) do
+        local first, last = instruction[2], instruction[3]
+        if instruction[1] == OP_EXECUTION_MODE
+            and last - first + 1 == 5
+            and words[first] == entry
+            and words[first + 1] == EXECUTION_MODE_LOCAL_SIZE
+        then
+            local compiled = {words[first + 2], words[first + 3], words[first + 4]}
+            if compiled[1] ~= declared[1] or compiled[2] ~= declared[2] or compiled[3] ~= declared[3] then
+                fail(
+                    (
+                        "GPU kernel declares workgroup size %s, but %s is compiled for %s"
+                    ):format(triple(declared), entryPoint, triple(compiled))
+                )
+            end
+            return
+        end
+    end
+end
+
+-- --- resource tables ---------------------------------------------------------
+
+--- A context's public handles, each naming a kind and its entry.
+export function resources(): {[integer]: any}
+    return {}
+end
+
+--- Registers `entry` under a fresh public handle.
+export function insert(table: {[integer]: any}, kind: string, entry: any): integer
+    local handle = freshHandle()
+    table[handle] = {kind = kind, entry = entry}
+
+    return handle
+end
+
+--- The entry `handle` names, refusing a stale handle or one of another kind.
+export function lookup(table: {[integer]: any}, handle: any, expected: string): any
+    local key = (tonumber(handle) or -1) as integer
+    local reference = table[key]
+    if reference == nil then
+        fail(("unknown or released GPU handle %s"):format(tostring(key)))
+    end
+    if reference.kind ~= expected then
+        fail(("GPU handle %d is a %s, not a %s"):format(key, reference.kind, expected))
+    end
+
+    return reference.entry
+end
+
+--- Removes the entry `handle` names, with the same refusals as `lookup`.
+export function remove(table: {[integer]: any}, handle: any, expected: string): any
+    local entry = lookup(table, handle, expected)
+    table[tonumber(handle) as integer] = nil
+
+    return entry
+end
+
+-- --- the device --------------------------------------------------------------
+
+local function settle(context: any): nil
+    local library = context.lib
+    library.wgpuDevicePoll(context.device, true, nil)
+    library.wgpuInstanceProcessEvents(context.instance)
+end
+
+local function callbackInfo(callback: any, userdata: any, mode: integer?): any
+    local info: any = ffi.new("WGPUCallbackInfo")
+    info.mode = mode or CALLBACK_MODE
+    info.callback = callback
+    info.userdata1 = userdata
+
+    return info
+end
+
+local function limitsOf(limits: any): {[string]: integer}
+    return {
+        maxBufferSize = tonumber(limits.maxBufferSize) as integer,
+        maxBindGroups = limits.maxBindGroups,
+        maxBindingsPerBindGroup = limits.maxBindingsPerBindGroup,
+        maxStorageBuffersPerShaderStage = limits.maxStorageBuffersPerShaderStage,
+        maxUniformBufferBindingSize = tonumber(limits.maxUniformBufferBindingSize) as integer,
+        maxStorageBufferBindingSize = tonumber(limits.maxStorageBufferBindingSize) as integer,
+        minStorageBufferOffsetAlignment = limits.minStorageBufferOffsetAlignment,
+        maxComputeInvocationsPerWorkgroup = limits.maxComputeInvocationsPerWorkgroup,
+        maxComputeWorkgroupSizeX = limits.maxComputeWorkgroupSizeX,
+        maxComputeWorkgroupSizeY = limits.maxComputeWorkgroupSizeY,
+        maxComputeWorkgroupSizeZ = limits.maxComputeWorkgroupSizeZ,
+        maxComputeWorkgroupsPerDimension = limits.maxComputeWorkgroupsPerDimension,
+    }
+end
+
+local function releaseAll(context: any): nil
+    local library = context.lib
+    if context.queue ~= nil then
+        library.wgpuQueueRelease(context.queue)
+        context.queue = nil
+    end
+    if context.device ~= nil then
+        library.wgpuDeviceRelease(context.device)
+        context.device = nil
+    end
+    if context.adapter ~= nil then
+        library.wgpuAdapterRelease(context.adapter)
+        context.adapter = nil
+    end
+    if context.instance ~= nil then
+        library.wgpuInstanceRelease(context.instance)
+        context.instance = nil
+    end
+    if context.faultKey ~= nil then
+        wgpu.dropfaults(context.faultKey)
+        context.faultKey = nil
+    end
+end
+
+local function costRecord(context: any, operation: string, values: {[string]: any}): nil
+    if costs.enabled() then
+        costs.record(context.costId, operation, values)
+    end
+end
+
+local function checkCosts(): nil
+    local problem = costs.check()
+    if problem ~= nil then
+        fail(problem)
+    end
+end
+
+local function createContext(): any
+    local library = lib()
+    local callbacks = wgpu.callbacks()
+    local costId = freshHandle()
+    local setupStart = costs.clock()
+    local context: any = {
+        lib = library,
+        costId = costId,
+        timestampSupported = false,
+        pendingTimestamps = {},
+        dispatchSequence = 0,
+        resources = {},
+        pendingDownloads = {},
+    }
+    local backendsOk, backends = pcall(wgpu.requestedbackends)
+    if not backendsOk then
+        fail("no suitable compute adapter is available: " .. tostring(backends))
+    end
+    local extras: any = nil
+    local descriptor: any = nil
+    if backends ~= 0 then
+        extras = ffi.new("WGPUInstanceExtras") as any
+        extras.chain.sType = wgpu.STYPE_INSTANCE_EXTRAS
+        extras.backends = backends
+        descriptor = ffi.new("WGPUInstanceDescriptor") as any
+        descriptor.nextInChain = ffi.cast("WGPUChainedStruct *", extras)
+    end
+    context.instance = library.wgpuCreateInstance(descriptor)
+    if context.instance == nil then
+        fail("no suitable compute adapter is available: wgpu-native created no instance")
+    end
+    local options: any = ffi.new("WGPURequestAdapterOptions")
+    options.featureLevel = wgpu.FEATURE_LEVEL_CORE
+    options.powerPreference = wgpu.POWER_HIGH_PERFORMANCE
+    local userdata, key = wgpu.token()
+    library.wgpuInstanceRequestAdapter(context.instance, options, callbackInfo(callbacks.adapter, userdata))
+    library.wgpuInstanceProcessEvents(context.instance)
+    local adapter = wgpu.take(key)
+    if not adapter or adapter.status ~= wgpu.STATUS_SUCCESS or adapter.value == nil then
+        releaseAll(context)
+        fail("no suitable compute adapter is available: " .. (adapter and adapter.message or "no adapter answered"))
+    end
+    context.adapter = adapter.value
+    local adapterTime = costs.elapsed(setupStart)
+    local info: any = ffi.new("WGPUAdapterInfo")
+    if library.wgpuAdapterGetInfo(context.adapter, info) == wgpu.STATUS_SUCCESS then
+        context.adapterName = ffi.string(info.device.data, info.device.length)
+        context.backend = wgpu.backendname(info.backendType)
+        library.wgpuAdapterInfoFreeMembers(info)
+    else
+        context.adapterName = ""
+        context.backend = "empty"
+    end
+    context.timestampSupported = costs.enabled()
+        and library.wgpuAdapterHasFeature(context.adapter, wgpu.FEATURE_TIMESTAMP_QUERY) ~= 0
+    local deviceStart = costs.clock()
+    local adapterLimits: any = ffi.new("WGPULimits")
+    library.wgpuAdapterGetLimits(context.adapter, adapterLimits)
+    local features: any = ffi.new("uint32_t[1]", wgpu.FEATURE_TIMESTAMP_QUERY)
+    local label = "Nupp native compute device"
+    local faultUserdata, faultKey = wgpu.faultsink()
+    context.faultKey = faultKey
+    local request: any = ffi.new("WGPUDeviceDescriptor")
+    request.label = wgpu.view(label)
+    request.requiredFeatureCount = context.timestampSupported and 1 or 0
+    request.requiredFeatures = features
+    request.requiredLimits = adapterLimits
+    request.deviceLostCallbackInfo.mode = wgpu.CALLBACK_SPONTANEOUS
+    request.deviceLostCallbackInfo.callback = callbacks.lost
+    request.deviceLostCallbackInfo.userdata1 = faultUserdata
+    request.uncapturedErrorCallbackInfo.callback = callbacks.error
+    request.uncapturedErrorCallbackInfo.userdata1 = faultUserdata
+    userdata, key = wgpu.token()
+    library.wgpuAdapterRequestDevice(context.adapter, request, callbackInfo(callbacks.device, userdata))
+    library.wgpuInstanceProcessEvents(context.instance)
+    local device = wgpu.take(key)
+    if not device or device.status ~= wgpu.STATUS_SUCCESS or device.value == nil then
+        releaseAll(context)
+        fail("request GPU device: " .. (device and device.message or "no device answered"))
+    end
+    context.device = device.value
+    context.queue = library.wgpuDeviceGetQueue(context.device)
+    local deviceLimits: any = ffi.new("WGPULimits")
+    library.wgpuDeviceGetLimits(context.device, deviceLimits)
+    context.limits = limitsOf(deviceLimits)
+    costRecord(context, "adapterDevice", {
+        phase = "setup",
+        adapter = context.adapterName,
+        backend = context.backend,
+        adapterMs = adapterTime,
+        deviceMs = costs.elapsed(deviceStart),
+        gpuTiming = context.timestampSupported and "timestamp-query" or "unavailable",
+    })
+    local problem = costs.check()
+    if problem ~= nil then
+        releaseAll(context)
+        fail(problem)
+    end
+
+    return context
+end
+
+local function finishValidationScope(context: any): nil
+    local userdata, key = wgpu.token()
+    context.lib.wgpuDevicePopErrorScope(context.device, callbackInfo(wgpu.callbacks().scope, userdata))
+    settle(context)
+    local scope = wgpu.take(key)
+    if not scope then
+        fail("poll GPU device: the validation scope never settled")
+    end
+    if scope.status == wgpu.STATUS_SUCCESS and scope.kind ~= wgpu.ERROR_TYPE_NO_ERROR then
+        local text = scope.message ~= "" and scope.message or wgpu.errortype(scope.kind)
+        fail("GPU validation: " .. text)
+    end
+end
+
+-- --- buffers -----------------------------------------------------------------
+
+local function createBuffer(context: any, size: integer): integer
+    if size == 0 then
+        fail("GPU buffer size must be greater than zero")
+    end
+    if size > context.limits.maxBufferSize then
+        fail(("GPU buffer size %d exceeds the device limit %d"):format(size, context.limits.maxBufferSize))
+    end
+    -- Copies and storage bindings move whole words, so a buffer of narrow
+    -- elements whose bytes end partway through one gets the rest of that word
+    -- as padding nobody can address.
+    local allocated = alignUp(size, COPY_ALIGNMENT)
+    local start = costs.clock()
+    local label = "Nupp resident compute buffer"
+    local descriptor: any = ffi.new("WGPUBufferDescriptor")
+    descriptor.label = wgpu.view(label)
+    descriptor.size = allocated
+    descriptor.usage = wgpu.BUFFER_USAGE_STORAGE | wgpu.BUFFER_USAGE_COPY_SRC | wgpu.BUFFER_USAGE_COPY_DST
+    local buffer = context.lib.wgpuDeviceCreateBuffer(context.device, descriptor)
+    local handle = insert(context.resources, "buffer", {
+        buffer = buffer,
+        size = size,
+        download = nil,
+        version = 0,
+        completedVersion = nil,
+        completedLayout = NULL,
+        metadata = NULL,
+    })
+    costRecord(context, "bufferAllocate", {
+        buffer = handle,
+        version = 0,
+        bytes = size,
+        reused = false,
+        hostMs = costs.elapsed(start),
+    })
+
+    return handle
+end
+
+local function releaseBuffer(context: any, handle: any): boolean
+    local entry = lookup(context.resources, handle, "buffer")
+    if entry.download ~= nil and entry.download.pending then
+        fail(("buffer %d already has a queued download"):format(tonumber(handle) as integer))
+    end
+    local start = costs.clock()
+    remove(context.resources, handle, "buffer")
+    context.lib.wgpuBufferRelease(entry.buffer)
+    costRecord(context, "bufferRelease", {buffer = tonumber(handle), hostMs = costs.elapsed(start)})
+
+    return true
+end
+
+-- The caller's bytes cross into C through these typed views of the C functions,
+-- so a span's borrow is never erased into a dynamic value on the way.
+local function writeTyped<T>(context: any, buffer: any, offset: integer, borrows data: const T[?], length: integer): nil
+    local write = context.lib.wgpuQueueWriteBuffer as function(
+        any,
+        any,
+        integer,
+        borrows data: const T[?],
+        integer
+    ): nil
+    write(context.queue, buffer, offset, data, length)
+end
+
+local function copyFrom<T>(destination: any, borrows source: const T[?], length: integer): nil
+    local copy = ffi.copy as function(any, borrows source: const T[?], integer): nil
+    copy(destination, source, length)
+end
+
+local function copyInto<T>(borrows destination: T[?], source: string, length: integer): nil
+    local copy = ffi.copy as function(borrows destination: T[?], string, integer): nil
+    copy(destination, source, length)
+end
+
+-- Checks an upload, answering its buffer entry and how many bytes it moves.
+local function prepareUpload(context: any, handle: any, offset: integer, length: integer): any
+    local entry = lookup(context.resources, handle, "buffer")
+    checkedrange("upload", offset, length, entry.size)
+
+    return {entry = entry, copied = copyextent("upload", offset, length, entry.size)}
+end
+
+local function finishUpload(
+    context: any,
+    handle: any,
+    offset: integer,
+    length: integer,
+    entry: any,
+    start: number?
+): boolean
+    if length > 0 then
+        entry.version += 1
+    end
+    costRecord(context, "upload", {
+        buffer = tonumber(handle),
+        version = entry.version,
+        offset = offset,
+        bytes = length,
+        layout = entry.metadata,
+        hostMs = costs.elapsed(start),
+        gpuMs = NULL,
+        gpuTiming = "unavailable",
+        hostCopies = 1,
+    })
+
+    return true
+end
+
+-- --- kernels -----------------------------------------------------------------
+
+local function validateKernelDescriptor(context: any, descriptor: any): nil
+    local limits = context.limits
+    if descriptor.entryPoint == "" or descriptor.entryPoint:find("\0", 1, true) then
+        fail("GPU entry point must be non-empty text without NUL bytes")
+    end
+    spirvwords(descriptor.spirv)
+    if descriptor.uniformSize % COPY_ALIGNMENT ~= 0 then
+        fail(("GPU uniform size must be aligned to %d bytes"):format(COPY_ALIGNMENT))
+    end
+    if descriptor.uniformSize > limits.maxUniformBufferBindingSize then
+        fail(
+            (
+                "GPU uniform size %d exceeds the device limit %d"
+            ):format(descriptor.uniformSize, limits.maxUniformBufferBindingSize)
+        )
+    end
+    local size = descriptor.workgroupSize
+    if size[1] == 0 or size[2] == 0 or size[3] == 0 then
+        fail("GPU workgroup dimensions must be nonzero")
+    end
+    if size[1] > limits.maxComputeWorkgroupSizeX
+        or size[2] > limits.maxComputeWorkgroupSizeY
+        or size[3] > limits.maxComputeWorkgroupSizeZ
+        or size[1] * size[2] * size[3] > limits.maxComputeInvocationsPerWorkgroup
+    then
+        fail(("GPU workgroup size %s exceeds device limits"):format(triple(size)))
+    end
+    local readonly, writable = descriptor.readonlyBindings, descriptor.writableBindings
+    local storage = limits.maxStorageBuffersPerShaderStage
+    if readonly > storage
+        or writable > storage
+        or readonly > limits.maxBindingsPerBindGroup
+        or writable > limits.maxBindingsPerBindGroup
+        or readonly + writable > storage
+    then
+        fail("GPU storage binding count exceeds the device limit")
+    end
+    local required = descriptor.uniformSize ~= 0 and 3 or (writable ~= 0 and 2 or (readonly ~= 0 and 1 or 0))
+    if required > limits.maxBindGroups then
+        fail(("GPU kernel requires %d bind groups, but the device supports %d"):format(required, limits.maxBindGroups))
+    end
+end
+
+local function bindGroupLayout(context: any, label: string, count: integer, kind: integer, minimum: integer): any
+    local entries: any = ffi.new("WGPUBindGroupLayoutEntry[?]", math.max(count, 1))
+    for binding = 0, count - 1 do
+        entries[binding].binding = binding
+        entries[binding].visibility = wgpu.SHADER_STAGE_COMPUTE
+        entries[binding].buffer.type = kind
+        entries[binding].buffer.minBindingSize = minimum
+    end
+    local descriptor: any = ffi.new("WGPUBindGroupLayoutDescriptor")
+    descriptor.label = wgpu.view(label)
+    descriptor.entryCount = count
+    descriptor.entries = entries
+
+    return context.lib.wgpuDeviceCreateBindGroupLayout(context.device, descriptor)
+end
+
+local function emptyGroup(context: any, layout: any): any
+    local descriptor: any = ffi.new("WGPUBindGroupDescriptor")
+    local label = "Nupp empty bind group"
+    descriptor.label = wgpu.view(label)
+    descriptor.layout = layout
+
+    return context.lib.wgpuDeviceCreateBindGroup(context.device, descriptor)
+end
+
+-- The groups the generated shaders use: read-only storage at 0, writable
+-- storage at 1, uniforms at 2. A pipeline layout has no holes, so a group a
+-- kernel leaves out below one it uses gets an empty layout, and a dispatch
+-- sets the empty group that matches it.
+local function releaseKernelEntry(context: any, entry: any): nil
+    local library = context.lib
+    for index = 0, 2 do
+        local group = entry.emptyGroups[index]
+        if group ~= nil then
+            library.wgpuBindGroupRelease(group)
+        end
+        local layout = entry.groupLayouts[index]
+        if layout ~= nil then
+            library.wgpuBindGroupLayoutRelease(layout)
+        end
+    end
+    if entry.pipeline ~= nil then
+        library.wgpuComputePipelineRelease(entry.pipeline)
+    end
+end
+
+local function createKernel(context: any, descriptor: any): integer
+    local start = costs.clock()
+    validateKernelDescriptor(context, descriptor)
+    local words, count = spirvwords(descriptor.spirv)
+    checkworkgroupsize(words, count, descriptor.entryPoint, descriptor.workgroupSize)
+    local library = context.lib
+    library.wgpuDevicePushErrorScope(context.device, wgpu.ERROR_FILTER_VALIDATION)
+    local entry: any = {
+        groupLayouts = {},
+        emptyGroups = {},
+        readonlyBindings = descriptor.readonlyBindings,
+        writableBindings = descriptor.writableBindings,
+        uniformSize = descriptor.uniformSize,
+        workgroupSize = descriptor.workgroupSize,
+        metadata = NULL,
+        dispatches = 0,
+    }
+    local used = {
+        [0] = descriptor.readonlyBindings ~= 0,
+        [1] = descriptor.writableBindings ~= 0,
+        [2] = descriptor.uniformSize ~= 0,
+    }
+    local groups = used[2] and 3 or (used[1] and 2 or (used[0] and 1 or 0))
+    if used[0] then
+        entry.groupLayouts[
+            0
+        ] = bindGroupLayout(
+            context,
+            "Nupp read-only storage layout",
+            descriptor.readonlyBindings,
+            wgpu.BUFFER_BINDING_READ_ONLY_STORAGE,
+            0
+        )
+    end
+    if used[1] then
+        entry.groupLayouts[
+            1
+        ] = bindGroupLayout(
+            context,
+            "Nupp writable storage layout",
+            descriptor.writableBindings,
+            wgpu.BUFFER_BINDING_STORAGE,
+            0
+        )
+    end
+    if used[2] then
+        entry.groupLayouts[
+            2
+        ] = bindGroupLayout(context, "Nupp uniform layout", 1, wgpu.BUFFER_BINDING_UNIFORM, descriptor.uniformSize)
+    end
+    local layouts: any = ffi.new("WGPUBindGroupLayout[3]")
+    for index = 0, groups - 1 do
+        if not used[index] then
+            entry.groupLayouts[index] = bindGroupLayout(context, "Nupp empty layout", 0, 0, 0)
+            entry.emptyGroups[index] = emptyGroup(context, entry.groupLayouts[index])
+        end
+        layouts[index] = entry.groupLayouts[index]
+    end
+    entry.used = used
+    local layoutLabel = "Nupp compute pipeline layout"
+    local layoutDescriptor: any = ffi.new("WGPUPipelineLayoutDescriptor")
+    layoutDescriptor.label = wgpu.view(layoutLabel)
+    layoutDescriptor.bindGroupLayoutCount = groups
+    layoutDescriptor.bindGroupLayouts = layouts
+    local pipelineLayout = library.wgpuDeviceCreatePipelineLayout(context.device, layoutDescriptor)
+    local source: any = ffi.new("WGPUShaderSourceSPIRV")
+    source.chain.sType = wgpu.STYPE_SHADER_SOURCE_SPIRV
+    source.codeSize = count
+    source.code = words
+    local moduleLabel = "Nupp SPIR-V compute module"
+    local moduleDescriptor: any = ffi.new("WGPUShaderModuleDescriptor")
+    moduleDescriptor.nextInChain = ffi.cast("WGPUChainedStruct *", source)
+    moduleDescriptor.label = wgpu.view(moduleLabel)
+    local shader = library.wgpuDeviceCreateShaderModule(context.device, moduleDescriptor)
+    local pipelineLabel = "Nupp compute pipeline"
+    local pipelineDescriptor: any = ffi.new("WGPUComputePipelineDescriptor")
+    pipelineDescriptor.label = wgpu.view(pipelineLabel)
+    pipelineDescriptor.layout = pipelineLayout
+    pipelineDescriptor.compute.module = shader
+    pipelineDescriptor.compute.entryPoint = wgpu.view(descriptor.entryPoint)
+    entry.pipeline = library.wgpuDeviceCreateComputePipeline(context.device, pipelineDescriptor)
+    library.wgpuShaderModuleRelease(shader)
+    library.wgpuPipelineLayoutRelease(pipelineLayout)
+    local ok, problem = pcall(finishValidationScope, context)
+    if not ok then
+        releaseKernelEntry(context, entry)
+        error(problem, 0)
+    end
+    local handle = insert(context.resources, "kernel", entry)
+    costRecord(context, "pipelineCreate", {
+        kernel = handle,
+        phase = "setup",
+        bytes = #descriptor.spirv,
+        entrypoint = descriptor.entryPoint,
+        workgroup = descriptor.workgroupSize,
+        reused = false,
+        hostMs = costs.elapsed(start),
+    })
+
+    return handle
+end
+
+-- A kernel compiled from WGSL with a layout the device derives, which is how
+-- the tests exercise a device without generated SPIR-V. Its one writable
+-- binding is group 1, binding 0, as a generated kernel's would be.
+local function createWgslKernel(context: any, shader: string, workgroupSize: {integer}): integer
+    local library = context.lib
+    library.wgpuDevicePushErrorScope(context.device, wgpu.ERROR_FILTER_VALIDATION)
+    local source: any = ffi.new("WGPUShaderSourceWGSL")
+    source.chain.sType = wgpu.STYPE_SHADER_SOURCE_WGSL
+    source.code = wgpu.view(shader)
+    local label = "Nupp GPU round-trip test"
+    local moduleDescriptor: any = ffi.new("WGPUShaderModuleDescriptor")
+    moduleDescriptor.nextInChain = ffi.cast("WGPUChainedStruct *", source)
+    moduleDescriptor.label = wgpu.view(label)
+    local module = library.wgpuDeviceCreateShaderModule(context.device, moduleDescriptor)
+    local entryPoint = "main"
+    local pipelineDescriptor: any = ffi.new("WGPUComputePipelineDescriptor")
+    pipelineDescriptor.label = wgpu.view(label)
+    pipelineDescriptor.compute.module = module
+    pipelineDescriptor.compute.entryPoint = wgpu.view(entryPoint)
+    local entry: any = {
+        groupLayouts = {},
+        emptyGroups = {},
+        used = {[0] = false, [1] = true, [2] = false},
+        readonlyBindings = 0,
+        writableBindings = 1,
+        uniformSize = 0,
+        workgroupSize = workgroupSize,
+        metadata = NULL,
+        dispatches = 0,
+    }
+    entry.pipeline = library.wgpuDeviceCreateComputePipeline(context.device, pipelineDescriptor)
+    library.wgpuShaderModuleRelease(module)
+    local ok, problem = pcall(finishValidationScope, context)
+    if not ok then
+        releaseKernelEntry(context, entry)
+        error(problem, 0)
+    end
+    entry.groupLayouts[0] = library.wgpuComputePipelineGetBindGroupLayout(entry.pipeline, 0)
+    entry.emptyGroups[0] = emptyGroup(context, entry.groupLayouts[0])
+    entry.groupLayouts[1] = library.wgpuComputePipelineGetBindGroupLayout(entry.pipeline, 1)
+
+    return insert(context.resources, "kernel", entry)
+end
+
+local function setMetadata(context: any, handle: any, kernel: boolean, value: any): boolean
+    if type(value) ~= "table" then
+        fail("GPU cost metadata must be an object")
+    end
+    if kernel then
+        lookup(context.resources, handle, "kernel").metadata = value
+    else
+        -- Replaced rather than updated, so a binding or download that captured
+        -- the earlier layout keeps it.
+        local entry = lookup(context.resources, handle, "buffer")
+        local merged: {[string]: any} = {}
+        if type(entry.metadata) == "table" and entry.metadata ~= NULL then
+            for key, field in pairs(entry.metadata) do
+                merged[key] = field
+            end
+        end
+        for key, field in pairs(value) do
+            merged[key] = field
+        end
+        entry.metadata = merged
+    end
+    costRecord(context, kernel and "kernelIdentity" or "bufferIdentity", {handle = tonumber(handle), metadata = value})
+
+    return true
+end
+
+local function releaseKernel(context: any, handle: any): boolean
+    local start = costs.clock()
+    local entry = remove(context.resources, handle, "kernel")
+    releaseKernelEntry(context, entry)
+    costRecord(context, "kernelRelease", {kernel = tonumber(handle), hostMs = costs.elapsed(start)})
+
+    return true
+end
+
+-- --- bindings ----------------------------------------------------------------
+
+local function slots(count: integer): {any}
+    local values: {any} = {}
+    for index = 1, count do
+        values[index] = false
+    end
+
+    return values
+end
+
+local function releaseGroup(context: any, binding: any, index: integer): nil
+    local group = binding.groups[index]
+    if group ~= nil then
+        context.lib.wgpuBindGroupRelease(group)
+        binding.groups[index] = nil
+    end
+end
+
+local function createBindings(context: any, kernelHandle: any): integer
+    local start = costs.clock()
+    local kernel = lookup(context.resources, kernelHandle, "kernel")
+    local uniform: any = nil
+    if kernel.uniformSize ~= 0 then
+        local label = "Nupp dispatch uniforms"
+        local descriptor: any = ffi.new("WGPUBufferDescriptor")
+        descriptor.label = wgpu.view(label)
+        descriptor.size = alignUp(kernel.uniformSize, 16)
+        descriptor.usage = wgpu.BUFFER_USAGE_UNIFORM | wgpu.BUFFER_USAGE_COPY_DST
+        uniform = context.lib.wgpuDeviceCreateBuffer(context.device, descriptor)
+    end
+    local handle = insert(context.resources, "binding", {
+        kernel = tonumber(kernelHandle),
+        readonly = slots(kernel.readonlyBindings),
+        writable = slots(kernel.writableBindings),
+        uniform = uniform,
+        groups = {},
+    })
+    costRecord(context, "bindingCreate", {
+        binding = handle,
+        kernel = tonumber(kernelHandle),
+        uniformBytes = kernel.uniformSize,
+        reused = false,
+        hostMs = costs.elapsed(start),
+    })
+
+    return handle
+end
+
+local function releaseBindings(context: any, handle: any): boolean
+    local start = costs.clock()
+    local binding = remove(context.resources, handle, "binding")
+    for index = 0, 2 do
+        releaseGroup(context, binding, index)
+    end
+    if binding.uniform ~= nil then
+        context.lib.wgpuBufferRelease(binding.uniform)
+    end
+    costRecord(context, "bindingRelease", {binding = tonumber(handle), hostMs = costs.elapsed(start)})
+
+    return true
+end
+
+local function setBuffer(
+    context: any,
+    bindings: any,
+    writable: boolean,
+    slot: integer,
+    bufferHandle: any,
+    offset: integer,
+    size: integer
+): boolean
+    local buffer = lookup(context.resources, bufferHandle, "buffer")
+    checkedrange("binding", offset, size, buffer.size)
+    if size == 0 then
+        fail("GPU binding range must not be empty")
+    end
+    size = copyextent("storage binding", offset, size, buffer.size)
+    local alignment = context.limits.minStorageBufferOffsetAlignment
+    if offset % alignment ~= 0 then
+        fail(("GPU storage binding offset %d is not aligned to %d bytes"):format(offset, alignment))
+    end
+    if size > context.limits.maxStorageBufferBindingSize then
+        fail(
+            (
+                "GPU storage binding size %d exceeds the device limit %d"
+            ):format(size, context.limits.maxStorageBufferBindingSize)
+        )
+    end
+    local binding = lookup(context.resources, bindings, "binding")
+    local key = tonumber(bufferHandle) as integer
+    if binds(writable and binding.readonly or binding.writable, key) then
+        fail("a GPU buffer cannot be bound for both reading and writing in one dispatch")
+    end
+    local targets = writable and binding.writable or binding.readonly
+    if slot < 0 or slot >= #targets then
+        fail(
+            (
+                "GPU %s binding slot %d is outside the compiled kernel"
+            ):format(writable and "writable" or "read-only", slot)
+        )
+    end
+    targets[slot + 1] = {buffer = key, offset = offset, size = size, layout = buffer.metadata}
+    releaseGroup(context, binding, writable and 1 or 0)
+    costRecord(context, "bindBuffer", {
+        binding = tonumber(bindings),
+        kernel = binding.kernel,
+        buffer = key,
+        writable = writable,
+        slot = slot,
+        offset = offset,
+        bytes = size,
+    })
+
+    return true
+end
+
+local function validateStorageSlots(context: any, values: {any}, writable: boolean): nil
+    for index, value in ipairs(values) do
+        if not value then
+            fail(("missing %s buffer binding at slot %d"):format(writable and "writable" or "read-only", index - 1))
+        end
+        lookup(context.resources, value.buffer, "buffer")
+    end
+end
+
+local function storageGroup(context: any, layout: any, values: {any}, writable: boolean): any
+    local entries: any = ffi.new("WGPUBindGroupEntry[?]", math.max(#values, 1))
+    for index, value in ipairs(values) do
+        local buffer = lookup(context.resources, value.buffer, "buffer")
+        entries[index - 1].binding = index - 1
+        entries[index - 1].buffer = buffer.buffer
+        entries[index - 1].offset = value.offset
+        entries[index - 1].size = value.size
+    end
+    local label = writable and "Nupp writable storage bind group" or "Nupp read-only storage bind group"
+    local descriptor: any = ffi.new("WGPUBindGroupDescriptor")
+    descriptor.label = wgpu.view(label)
+    descriptor.layout = layout
+    descriptor.entryCount = #values
+    descriptor.entries = entries
+
+    return context.lib.wgpuDeviceCreateBindGroup(context.device, descriptor)
+end
+
+local function uniformGroup(context: any, layout: any, buffer: any, size: integer): any
+    local entries: any = ffi.new("WGPUBindGroupEntry[1]")
+    entries[0].binding = 0
+    entries[0].buffer = buffer
+    entries[0].offset = 0
+    entries[0].size = size
+    local label = "Nupp uniform bind group"
+    local descriptor: any = ffi.new("WGPUBindGroupDescriptor")
+    descriptor.label = wgpu.view(label)
+    descriptor.layout = layout
+    descriptor.entryCount = 1
+    descriptor.entries = entries
+
+    return context.lib.wgpuDeviceCreateBindGroup(context.device, descriptor)
+end
+
+local function describeSlots(context: any, values: {any}): {any}
+    local described: {any} = {}
+    for index, value in ipairs(values) do
+        if value then
+            local buffer = lookup(context.resources, value.buffer, "buffer")
+            described[
+                #described + 1
+            ] = {
+                slot = index - 1,
+                buffer = value.buffer,
+                version = buffer.version,
+                offset = value.offset,
+                bytes = value.size,
+                layout = value.layout,
+            }
+        end
+    end
+
+    return array(described)
+end
+
+-- Validates a dispatch and builds the bind groups it lacks, answering what the
+-- rest of it needs. The uniforms are written between this and `submitDispatch`.
+local function prepareDispatch(context: any, bindings: any, uniformLength: integer): any
+    local binding = lookup(context.resources, bindings, "binding")
+    local kernelHandle = binding.kernel
+    local kernel = lookup(context.resources, kernelHandle, "kernel")
+    local needReadonly = binding.groups[0] == nil
+    local needWritable = binding.groups[1] == nil
+    local needUniform = binding.groups[2] == nil
+    if uniformLength ~= kernel.uniformSize then
+        fail(
+            (
+                "GPU dispatch supplied %d uniform bytes, but the kernel requires %d"
+            ):format(uniformLength, kernel.uniformSize)
+        )
+    end
+    requireCopyAlignment("uniform size", uniformLength)
+    validateStorageSlots(context, binding.readonly, false)
+    validateStorageSlots(context, binding.writable, true)
+    local used = kernel.used
+    if used[0] and needReadonly then
+        binding.groups[0] = storageGroup(context, kernel.groupLayouts[0], binding.readonly, false)
+    end
+    if used[1] and needWritable then
+        binding.groups[1] = storageGroup(context, kernel.groupLayouts[1], binding.writable, true)
+    end
+    if (kernel.groupLayouts[2] ~= nil and used[2]) ~= (binding.uniform ~= nil) then
+        fail("GPU internal invariant: GPU kernel uniform layout and binding disagree")
+    end
+    if used[2] and needUniform then
+        binding.groups[2] = uniformGroup(context, kernel.groupLayouts[2], binding.uniform, kernel.uniformSize)
+    end
+
+    return {
+        binding = binding,
+        kernel = kernel,
+        kernelHandle = kernelHandle,
+        needReadonly = needReadonly,
+        needWritable = needWritable,
+        needUniform = needUniform,
+    }
+end
+
+local function submitDispatch(
+    context: any,
+    bindings: any,
+    workItems: {integer},
+    uniformLength: integer,
+    prepared: any,
+    start: number?
+): boolean
+    local binding, kernel, kernelHandle = prepared.binding, prepared.kernel, prepared.kernelHandle
+    local needReadonly, needWritable, needUniform = prepared.needReadonly, prepared.needWritable, prepared.needUniform
+    local used = kernel.used
+    local library = context.lib
+    if workItems[1] == 0 or workItems[2] == 0 or workItems[3] == 0 then
+        return true
+    end
+    local size = kernel.workgroupSize
+    local groups = {
+        (workItems[1] + size[1] - 1) // size[1],
+        (workItems[2] + size[2] - 1) // size[2],
+        (workItems[3] + size[3] - 1) // size[3],
+    }
+    local limit = context.limits.maxComputeWorkgroupsPerDimension
+    if groups[1] > limit or groups[2] > limit or groups[3] > limit then
+        fail(
+            ("GPU dispatch workgroup count %s exceeds the per-dimension limit %d"):format(triple(groups as any), limit)
+        )
+    end
+    local encoderLabel = "Nupp compute dispatch"
+    local encoderDescriptor: any = ffi.new("WGPUCommandEncoderDescriptor")
+    encoderDescriptor.label = wgpu.view(encoderLabel)
+    local encoder = library.wgpuDeviceCreateCommandEncoder(context.device, encoderDescriptor)
+    local query: any = nil
+    local passLabel = "Nupp compute pass"
+    local passDescriptor: any = ffi.new("WGPUComputePassDescriptor")
+    passDescriptor.label = wgpu.view(passLabel)
+    local writes: any = nil
+    if context.timestampSupported and costs.enabled() then
+        local queryLabel = "Nupp cost timestamps"
+        local queryDescriptor: any = ffi.new("WGPUQuerySetDescriptor")
+        queryDescriptor.label = wgpu.view(queryLabel)
+        queryDescriptor.type = wgpu.QUERY_TYPE_TIMESTAMP
+        queryDescriptor.count = 2
+        query = library.wgpuDeviceCreateQuerySet(context.device, queryDescriptor)
+        writes = ffi.new("WGPUPassTimestampWrites")
+        writes.querySet = query
+        writes.beginningOfPassWriteIndex = 0
+        writes.endOfPassWriteIndex = 1
+        passDescriptor.timestampWrites = writes
+    end
+    local pass = library.wgpuCommandEncoderBeginComputePass(encoder, passDescriptor)
+    library.wgpuComputePassEncoderSetPipeline(pass, kernel.pipeline)
+    for index = 0, 2 do
+        local group = used[index] and binding.groups[index] or kernel.emptyGroups[index]
+        if group ~= nil then
+            library.wgpuComputePassEncoderSetBindGroup(pass, index, group, 0, nil)
+        end
+    end
+    library.wgpuComputePassEncoderDispatchWorkgroups(pass, groups[1], groups[2], groups[3])
+    library.wgpuComputePassEncoderEnd(pass)
+    library.wgpuComputePassEncoderRelease(pass)
+    context.dispatchSequence += 1
+    local operation = context.dispatchSequence
+    if query ~= nil then
+        context.pendingTimestamps[
+            #context.pendingTimestamps + 1
+        ] = {query = query, operation = operation, kernel = kernelHandle,}
+    end
+    local commands: any = ffi.new("WGPUCommandBuffer[1]")
+    commands[0] = library.wgpuCommandEncoderFinish(encoder, nil)
+    library.wgpuQueueSubmit(context.queue, 1, commands)
+    library.wgpuCommandBufferRelease(commands[0])
+    library.wgpuCommandEncoderRelease(encoder)
+    local reads = costs.enabled() and describeSlots(context, binding.readonly) or array({})
+    -- One logical version per dispatch even when disjoint writable slots alias.
+    local changed: {[integer]: boolean} = {}
+    for _, value in ipairs(binding.writable) do
+        if value and not changed[value.buffer] then
+            changed[value.buffer] = true
+            local buffer = lookup(context.resources, value.buffer, "buffer")
+            buffer.version += 1
+        end
+    end
+    kernel.dispatches += 1
+    if costs.enabled() then
+        costs.record(context.costId, "dispatch", {
+            dispatch = operation,
+            kernel = kernelHandle,
+            binding = tonumber(bindings),
+            metadata = kernel.metadata,
+            phase = kernel.dispatches == 1 and "first-use" or "steady-state",
+            workItems = workItems,
+            workgroup = size,
+            uniformBytes = uniformLength,
+            read = reads,
+            write = describeSlots(context, binding.writable),
+            bindingsReused = (not used[0] or not needReadonly)
+            and (not used[1] or not needWritable)
+            and (not used[2] or not needUniform),
+            hostMs = costs.elapsed(start),
+            gpuMs = NULL,
+            gpuTiming = context.timestampSupported and "pending" or "unavailable",
+        })
+    end
+
+    return true
+end
+
+-- --- downloads and synchronization -------------------------------------------
+
+local function stagingBuffer(context: any, label: string, size: integer, usage: integer): any
+    local descriptor: any = ffi.new("WGPUBufferDescriptor")
+    descriptor.label = wgpu.view(label)
+    descriptor.size = size
+    descriptor.usage = usage
+
+    return context.lib.wgpuDeviceCreateBuffer(context.device, descriptor)
+end
+
+local function submitCopy(context: any, label: string, record: function(encoder: any): nil): nil
+    local library = context.lib
+    local descriptor: any = ffi.new("WGPUCommandEncoderDescriptor")
+    descriptor.label = wgpu.view(label)
+    local encoder = library.wgpuDeviceCreateCommandEncoder(context.device, descriptor)
+    record(encoder)
+    local commands: any = ffi.new("WGPUCommandBuffer[1]")
+    commands[0] = library.wgpuCommandEncoderFinish(encoder, nil)
+    library.wgpuQueueSubmit(context.queue, 1, commands)
+    library.wgpuCommandBufferRelease(commands[0])
+    library.wgpuCommandEncoderRelease(encoder)
+end
+
+local function queueDownload(context: any, handle: any, offset: integer, size: integer): boolean
+    local start = costs.clock()
+    local entry = lookup(context.resources, handle, "buffer")
+    checkedrange("download", offset, size, entry.size)
+    if size == 0 then
+        fail("GPU download range must not be empty")
+    end
+    local length = size
+    size = copyextent("download", offset, size, entry.size)
+    local key = tonumber(handle) as integer
+    if entry.download ~= nil then
+        if entry.download.pending then
+            fail(("buffer %d already has a queued download"):format(key))
+        end
+        fail(("buffer %d has a synchronized download that has not been read yet"):format(key))
+    end
+    local staging = stagingBuffer(
+        context,
+        "Nupp GPU readback",
+        size,
+        wgpu.BUFFER_USAGE_MAP_READ | wgpu.BUFFER_USAGE_COPY_DST
+    )
+    submitCopy(context, "Nupp GPU download", function(encoder: any): nil
+        context.lib.wgpuCommandEncoderCopyBufferToBuffer(encoder, entry.buffer, offset, staging, 0, size)
+    end)
+    costRecord(context, "downloadQueue", {
+        buffer = key,
+        version = entry.version,
+        offset = offset,
+        bytes = size,
+        layout = entry.metadata,
+        stagingReused = false,
+        stagingBytes = size,
+        hostMs = costs.elapsed(start),
+        gpuMs = NULL,
+        gpuTiming = "unavailable",
+    })
+    entry.download = {
+        pending = true,
+        staging = staging,
+        stagingSize = size,
+        offset = offset,
+        length = length,
+        version = entry.version,
+        layout = entry.metadata,
+    }
+    context.pendingDownloads[#context.pendingDownloads + 1] = key
+
+    return true
+end
+
+-- Maps one staging buffer, waits for the device, and copies it out.
+local function mapDownload(context: any, staging: any, size: integer): string
+    local library = context.lib
+    local userdata, key = wgpu.token()
+    library.wgpuBufferMapAsync(staging, wgpu.MAP_MODE_READ, 0, size, callbackInfo(wgpu.callbacks().map, userdata))
+    settle(context)
+    local mapped = wgpu.take(key)
+    if not mapped then
+        fail("map GPU download: the map request never settled")
+    end
+    if mapped.status ~= wgpu.STATUS_SUCCESS then
+        fail("map GPU download: " .. mapped.message)
+    end
+    local range = library.wgpuBufferGetConstMappedRange(staging, 0, size)
+    if range == nil then
+        library.wgpuBufferUnmap(staging)
+        fail("map GPU download: the mapped range is unavailable")
+    end
+    local bytes = ffi.string(range, size)
+    library.wgpuBufferUnmap(staging)
+
+    return bytes
+end
+
+local function settleTimestamps(context: any): nil
+    local library = context.lib
+    while #context.pendingTimestamps > 0 do
+        local pending = table.remove(context.pendingTimestamps)
+        local start = costs.clock()
+        -- Metal can resolve pass-boundary counters from the preceding submission
+        -- when resolution shares the compute command buffer. The wait before this
+        -- completes every measured dispatch first; only now submit its resolve and
+        -- copy, preserving current-work identity.
+        local resolve = stagingBuffer(
+            context,
+            "Nupp timestamp resolve",
+            256,
+            wgpu.BUFFER_USAGE_QUERY_RESOLVE | wgpu.BUFFER_USAGE_COPY_SRC
+        )
+        local staging = stagingBuffer(
+            context,
+            "Nupp timestamp readback",
+            16,
+            wgpu.BUFFER_USAGE_COPY_DST | wgpu.BUFFER_USAGE_MAP_READ
+        )
+        submitCopy(context, "Nupp timestamp readback", function(encoder: any): nil
+            library.wgpuCommandEncoderResolveQuerySet(encoder, pending.query, 0, 2, resolve, 0)
+            library.wgpuCommandEncoderCopyBufferToBuffer(encoder, resolve, 0, staging, 0, 16)
+        end)
+        local ok, bytes = pcall(mapDownload, context, staging, 16)
+        library.wgpuQuerySetRelease(pending.query)
+        library.wgpuBufferRelease(resolve)
+        library.wgpuBufferRelease(staging)
+        if not ok then
+            error(bytes, 0)
+        end
+        local ticks: any = ffi.new("uint64_t[2]")
+        ffi.copy(ticks, bytes, 16)
+        local first, last = ticks[0], ticks[1]
+        local period = library.wgpuQueueGetTimestampPeriod(context.queue)
+        local measured, reason = timestampmilliseconds(first, last, period)
+        costRecord(context, "kernelExecution", {
+            dispatch = pending.operation,
+            kernel = pending.kernel,
+            gpuMs = measured ?? NULL,
+            gpuTiming = measured ~= nil and "timestamp-query" or "unavailable",
+            gpuTimingReason = reason ?? NULL,
+            gpuTicksBegin = (tostring(first):gsub("ULL$", "")),
+            gpuTicksEnd = (tostring(last):gsub("ULL$", "")),
+            gpuTickPeriodNs = period,
+            instrumentationHostMs = costs.elapsed(start),
+        })
+    end
+end
+
+local function synchronizeWork(context: any): boolean
+    local start = costs.clock()
+    settle(context)
+    costRecord(context, "synchronizeWait", {
+        hostMs = costs.elapsed(start),
+        pendingDownloads = #context.pendingDownloads,
+        pendingTimestamps = #context.pendingTimestamps,
+    })
+    while #context.pendingDownloads > 0 do
+        local handle = context.pendingDownloads[1]
+        local entry = lookup(context.resources, handle, "buffer")
+        local download = entry.download
+        if download == nil or not download.pending then
+            fail("GPU internal invariant: pending download queue disagrees with buffer")
+        end
+        local mapStart = costs.clock()
+        local ok, bytes = pcall(mapDownload, context, download.staging, download.stagingSize)
+        costRecord(context, "downloadMapCopy", {
+            buffer = handle,
+            version = download.version,
+            offset = download.offset,
+            bytes = download.stagingSize,
+            layout = download.layout,
+            hostMs = costs.elapsed(mapStart),
+            hostCopies = 1,
+            success = ok,
+        })
+        -- The download is settled either way. A failed map must not stay
+        -- pending: a retry would fail again, and a pending download refuses to
+        -- release its buffer.
+        table.remove(context.pendingDownloads, 1)
+        context.lib.wgpuBufferRelease(download.staging)
+        if not ok then
+            entry.download = nil
+            error(bytes, 0)
+        end
+        entry.download = {
+            pending = false,
+            offset = download.offset,
+            bytes = (bytes as string):sub(1, download.length),
+            version = download.version,
+            layout = download.layout,
+        }
+    end
+    settleTimestamps(context)
+    checkCosts()
+    local recorded = wgpu.takefaults(context.faultKey)
+    if #recorded > 0 then
+        fail("GPU device error: " .. table.concat(recorded, "; "))
+    end
+
+    return true
+end
+
+-- Takes a synchronized download, answering its bytes for the caller to copy.
+local function takeDownload(context: any, handle: any, offset: integer, size: integer): string
+    local entry = lookup(context.resources, handle, "buffer")
+    local key = tonumber(handle) as integer
+    local download = entry.download
+    if download == nil or download.pending then
+        fail(("buffer %d has no synchronized download"):format(key))
+    end
+    if download.offset ~= offset or #download.bytes ~= size then
+        fail(
+            (
+                "downloaded range %d..%d does not match requested range %d..%d"
+            ):format(download.offset, download.offset + #download.bytes, offset, offset + size)
+        )
+    end
+    entry.download = nil
+    entry.completedVersion = download.version
+    entry.completedLayout = download.layout
+
+    return download.bytes
+end
+
+local function recordHostCopy(context: any, handle: any, offset: integer, size: integer, start: number?): boolean
+    local entry = lookup(context.resources, handle, "buffer")
+    local key = tonumber(handle) as integer
+    -- The bytes are already the caller's. A cost output that failed to record
+    -- the copy is reported by the next call that can still fail cleanly, not by
+    -- this one after the download is gone.
+    costRecord(context, "downloadHostCopy", {
+        buffer = key,
+        version = entry.completedVersion ?? NULL,
+        offset = offset,
+        bytes = size,
+        layout = entry.completedLayout,
+        hostCopies = 1,
+        hostMs = costs.elapsed(start),
+    })
+
+    return true
+end
+
+local function release(context: any): boolean
+    if context.device == nil then
+        return true
+    end
+    local cleanupStart: number? = nil
+    if costs.enabled() then
+        synchronizeWork(context)
+        cleanupStart = costs.clock()
+    end
+    local library = context.lib
+    for _, reference in pairs(context.resources) do
+        local entry = reference.entry
+        if reference.kind == "buffer" then
+            library.wgpuBufferRelease(entry.buffer)
+            if entry.download ~= nil and entry.download.staging ~= nil then
+                library.wgpuBufferRelease(entry.download.staging)
+            end
+        elseif reference.kind == "kernel" then
+            releaseKernelEntry(context, entry)
+        else
+            for index = 0, 2 do
+                releaseGroup(context, entry, index)
+            end
+            if entry.uniform ~= nil then
+                library.wgpuBufferRelease(entry.uniform)
+            end
+        end
+    end
+    context.resources = {}
+    for _, pending in ipairs(context.pendingTimestamps) do
+        library.wgpuQuerySetRelease(pending.query)
+    end
+    context.pendingTimestamps = {}
+    -- Released before its device, so the loss its release reports goes nowhere.
+    wgpu.dropfaults(context.faultKey)
+    context.faultKey = nil
+    releaseAll(context)
+    if cleanupStart ~= nil then
+        costs.record(context.costId, "contextCleanup", costs.cleanup(cleanupStart))
+    end
+
+    return true
+end
+
+-- --- the boundary ------------------------------------------------------------
+
+-- Runs one operation, answering its result or nil and the failure it raised.
+-- Anything that is not a failure of this module is a defect and propagates.
+local function guard(body: any, ...: any): (any, string?)
+    local ok, value = pcall(body, ...)
+    if ok then
+        return value, nil
+    end
+    if type(value) == "table" and getmetatable(value) == FailureMT then
+        return nil, "gpu: " .. value.message
+    end
+    error(value, 0)
+end
+
+--- Opens a device context on the preferred compute adapter.
+export function open(): (any, string?)
+    return guard(createContext)
+end
+
+--- Releases a context and everything it holds, settling its work first while
+--- costs are recorded.
+export function close(context: any): (any, string?)
+    return guard(release, context)
+end
+
+--- The context's backend and adapter name, as `backend: adapter`.
+export function description(context: any): string
+    return context.backend .. ": " .. context.adapterName
+end
+
+--- The identity cost records carry for this context.
+export function costid(context: any): integer
+    return context.costId
+end
+
+--- Whether timestamp queries are measured, and lets a test turn them off.
+export function timestamps(context: any, enabled: boolean?): boolean
+    if enabled ~= nil then
+        context.timestampSupported = enabled
+    end
+
+    return context.timestampSupported
+end
+
+--- How many timestamp queries await synchronization, for tests.
+export function pendingtimestamps(context: any): integer
+    return #context.pendingTimestamps
+end
+
+--- How many dispatches the context has submitted, for tests.
+export function dispatches(context: any): integer
+    return context.dispatchSequence
+end
+
+--- Allocates one resident byte buffer.
+export function createbuffer(context: any, size: integer): (any, string?)
+    return guard(createBuffer, context, size)
+end
+
+export function releasebuffer(context: any, handle: any): (any, string?)
+    return guard(releaseBuffer, context, handle)
+end
+
+--- Uploads `length` bytes from `data` at `offset`.
+export function upload<T>(
+    context: any,
+    handle: any,
+    offset: integer,
+    borrows data: const T[?],
+    length: integer
+): (any, string?)
+    local start = costs.clock()
+    local prepared, problem = guard(prepareUpload, context, handle, offset, length)
+    if problem ~= nil then
+        return nil, problem
+    end
+    local entry, copied = prepared.entry, prepared.copied
+    if length > 0 then
+        if copied == length then
+            writeTyped(context, entry.buffer, offset, data, length)
+        else
+            -- A range that ends the buffer partway through a word is padded to it.
+            local padded: any = ffi.new("uint8_t[?]", copied)
+            copyFrom(padded, data, length)
+            context.lib.wgpuQueueWriteBuffer(context.queue, entry.buffer, offset, padded, copied)
+        end
+    end
+
+    return guard(finishUpload, context, handle, offset, length, entry, start)
+end
+
+--- Compiles canonical SPIR-V with its explicit binding shape.
+export function createkernel(
+    context: any,
+    spirv: string,
+    entryPoint: string,
+    readonlyBindings: integer,
+    writableBindings: integer,
+    uniformSize: integer,
+    workgroupSize: {integer}
+): (any, string?)
+    return guard(createKernel, context, {
+        spirv = spirv,
+        entryPoint = entryPoint,
+        readonlyBindings = readonlyBindings,
+        writableBindings = writableBindings,
+        uniformSize = uniformSize,
+        workgroupSize = workgroupSize,
+    })
+end
+
+--- Compiles a WGSL test kernel with one writable binding at group 1.
+export function createwgslkernel(context: any, shader: string, workgroupSize: {integer}): (any, string?)
+    return guard(createWgslKernel, context, shader, workgroupSize)
+end
+
+--- Associates an authored kernel or typed buffer with its native identity.
+export function metadata(context: any, handle: any, kernel: boolean, value: any): (any, string?)
+    return guard(setMetadata, context, handle, kernel, value)
+end
+
+export function releasekernel(context: any, handle: any): (any, string?)
+    return guard(releaseKernel, context, handle)
+end
+
+--- Creates an empty binding set for one kernel.
+export function createbindings(context: any, kernel: any): (any, string?)
+    return guard(createBindings, context, kernel)
+end
+
+export function releasebindings(context: any, handle: any): (any, string?)
+    return guard(releaseBindings, context, handle)
+end
+
+--- Binds `size` bytes of a buffer at `offset` to one read or write slot.
+export function setbuffer(
+    context: any,
+    bindings: any,
+    writable: boolean,
+    slot: integer,
+    buffer: any,
+    offset: integer,
+    size: integer
+): (any, string?)
+    return guard(setBuffer, context, bindings, writable, slot, buffer, offset, size)
+end
+
+--- Enqueues one logical dispatch of `workItems` invocations.
+export function dispatch(
+    context: any,
+    bindings: any,
+    workItems: {integer},
+    borrows uniforms: const uint8[?],
+    length: integer
+): (any, string?)
+    local start = costs.clock()
+    local prepared, problem = guard(prepareDispatch, context, bindings, length)
+    if problem ~= nil then
+        return nil, problem
+    end
+    local uniform = prepared.binding.uniform
+    if uniform ~= nil and length > 0 then
+        writeTyped(context, uniform, 0, uniforms, length)
+    end
+
+    return guard(submitDispatch, context, bindings, workItems, length, prepared, start)
+end
+
+--- Queues one readback of a buffer range.
+export function queuedownload(context: any, handle: any, offset: integer, size: integer): (any, string?)
+    return guard(queueDownload, context, handle, offset, size)
+end
+
+--- Whether the submitted work has finished, so that `synchronize` would not
+--- wait for it. Never blocks.
+export function workdone(context: any): (any, string?)
+    return guard(function(): boolean
+        return context.lib.wgpuDevicePoll(context.device, false, nil) == true
+    end)
+end
+
+--- Waits for the submitted work, then settles its downloads and timestamps.
+export function synchronize(context: any): (any, string?)
+    return guard(synchronizeWork, context)
+end
+
+--- Copies one synchronized download into `destination`.
+export function readdownload<T>(
+    context: any,
+    handle: any,
+    offset: integer,
+    size: integer,
+    borrows destination: T[?]
+): (any, string?)
+    local bytes, problem = guard(takeDownload, context, handle, offset, size)
+    if problem ~= nil then
+        return nil, problem
+    end
+    local start = costs.clock()
+    if size > 0 then
+        copyInto(destination, bytes as string, size)
+    end
+
+    return guard(recordHostCopy, context, handle, offset, size, start)
+end
