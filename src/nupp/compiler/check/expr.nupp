@@ -1533,7 +1533,8 @@ function expr.install(c: state.Checker): nil
             local source = c.infer(cast)
             local target = c.resolveType(node.type)
             -- Recorded as an annotation's is, for the backends that lower casts.
-            node.type.resolvedType = target
+            local written: any = node.type
+            written.resolvedType = target
             c.fixedWidth.storageOnly(node.type, target, "a cast result")
             -- `as` is erased, so it can say a value is one of these but cannot make it
             -- one. A constrained type is exactly the claim that has to be established,

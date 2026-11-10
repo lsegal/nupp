@@ -143,28 +143,12 @@ local function run(command)
     return status, (output:gsub("\r?\n__status__:%d+%s*$", ""))
 end
 
---- What a program needs from its platform to start, join and lock: `spawn`
---- starts `work` on a thread whose handle goes in a slot, `join` waits for it,
---- and `lock` and `unlock` hold a zeroed mutex.
-local POSIX = [[
-cdef function pthread_create(thread: voidptr, attributes: voidptr, start: function(arg: voidptr): voidptr, arg: voidptr): int32
-cdef function pthread_join(thread: uint64, result: voidptr): int32
-cdef function pthread_mutex_init(mutex: voidptr, attributes: voidptr): int32
-cdef function pthread_mutex_lock(mutex: voidptr): int32
-cdef function pthread_mutex_unlock(mutex: voidptr): int32
-
-local function entry(context: voidptr): voidptr
-    work(context as voidptr*)
-    return nil
-end
-
-local function spawn(slot: voidptr, context: voidptr): boolean
-    return pthread_create(slot, nil, entry, context) == 0
-end
-
-local function join(slot: voidptr): boolean
-    return pthread_join((slot as uint64*)[0], nil) == 0
-end
+--- What a program needs from its platform. The locks come before the work that
+--- takes them: `prepare` readies a zeroed mutex, which `lock` and `unlock` hold.
+local POSIX_LOCKS = [[
+cdef function pthread_mutex_init(borrows mutex: voidptr, attributes: voidptr?): int32
+cdef function pthread_mutex_lock(borrows mutex: voidptr): int32
+cdef function pthread_mutex_unlock(borrows mutex: voidptr): int32
 
 local function prepare(mutex: voidptr): nil
     pthread_mutex_init(mutex, nil)
@@ -179,30 +163,9 @@ local function unlock(mutex: voidptr): nil
 end
 ]]
 
-local WINDOWS = [[
-cdef function CreateThread(attributes: voidptr, stack: uint64, start: function(arg: voidptr): uint32, arg: voidptr, flags: uint32, id: voidptr): voidptr
-cdef function WaitForSingleObject(handle: voidptr, milliseconds: uint32): uint32
-cdef function CloseHandle(handle: voidptr): int32
-cdef function AcquireSRWLockExclusive(lock: voidptr)
-cdef function ReleaseSRWLockExclusive(lock: voidptr)
-
-local function entry(context: voidptr): uint32
-    work(context as voidptr*)
-    return 0
-end
-
-local function spawn(slot: voidptr, context: voidptr): boolean
-    local cell = slot as voidptr*
-    cell[0] = CreateThread(nil, 0, entry, context, 0, nil)
-    return cell[0] ~= nil
-end
-
-local function join(slot: voidptr): boolean
-    local handle = (slot as voidptr*)[0]
-    local waited = WaitForSingleObject(handle, 4294967295) == 0
-    CloseHandle(handle)
-    return waited
-end
+local WINDOWS_LOCKS = [[
+cdef function AcquireSRWLockExclusive(borrows lock: voidptr)
+cdef function ReleaseSRWLockExclusive(borrows lock: voidptr)
 
 local function prepare(mutex: voidptr): nil
 end
@@ -216,73 +179,152 @@ local function unlock(mutex: voidptr): nil
 end
 ]]
 
--- Four threads each add to three counters 20000 times: one with an atomic add,
--- one with a compare-exchange loop, and a plain one under a mutex. The exit
--- status says which counter, if any, lost an update.
-local THREADS = ATOMICS .. [[
-cdef function calloc(count: uint64, size: uint64): voidptr
-cdef function free(p: voidptr)
+--- The threads come after the work they run: `spawn` starts `work` on a thread
+--- whose handle goes in a slot, and `join` waits for it.
+local POSIX_THREADS = [[
+cdef function pthread_create(borrows thread: voidptr, attributes: voidptr?, start: function(arg: voidptr): voidptr, borrows arg: voidptr): int32
+cdef function pthread_join(thread: uint64, result: voidptr?): int32
 
-local function work(context: voidptr*): nil
-    local added = context[0] as int64*
-    local swapped = context[1] as int64*
-    local guarded = context[2] as int64*
-    local mutex = context[3]
-    local expected = calloc(1, 8) as int64*
-    for _ = 1, 20000 do
-        __atomic_fetch_add_8(added, 1, 0)
-        expected[0] = __atomic_load_8(swapped, 0)
-        while not __atomic_compare_exchange_8(swapped, expected, expected[0] + 1, 4, 0) do
-        end
-        lock(mutex)
-        guarded[0] = guarded[0] + 1
-        unlock(mutex)
+local function entry(context: voidptr): voidptr
+    work(context as voidptr*)
+    return nil
+end
+
+local function spawn(slot: voidptr, context: voidptr): boolean
+    return pthread_create(slot, nil, entry, context) == 0
+end
+
+local function join(slot: voidptr): boolean
+    local thread: uint64 = 0
+    @unsafe do
+        thread = (slot as uint64*)[0]
     end
-    free(expected)
+    return pthread_join(thread, nil) == 0
 end
 ]]
 
-local THREADS_MAIN = [[
+local WINDOWS_THREADS = [[
+cdef function CreateThread(attributes: voidptr?, stack: uint64, start: function(arg: voidptr): uint32, borrows arg: voidptr, flags: uint32, id: voidptr?): voidptr?
+cdef function WaitForSingleObject(borrows handle: voidptr, milliseconds: uint32): uint32
+cdef function CloseHandle(borrows handle: voidptr): int32
+
+local function entry(context: voidptr): uint32
+    work(context as voidptr*)
+    return 0
+end
+
+local function spawn(slot: voidptr, context: voidptr): boolean
+    local handle = CreateThread(nil, 0, entry, context, 0, nil)
+    if handle == nil then
+        return false
+    end
+    local cell = slot as voidptr*
+    @unsafe do
+        cell[0] = handle
+    end
+    return true
+end
+
+local function join(slot: voidptr): boolean
+    local handle: voidptr? = nil
+    @unsafe do
+        handle = (slot as voidptr*)[0]
+    end
+    if handle == nil then
+        return false
+    end
+    local waited = WaitForSingleObject(handle, 4294967295) == 0
+    CloseHandle(handle)
+    return waited
+end
+]]
+
+-- Four threads each add to three counters 20000 times: one with an atomic add,
+-- one with a compare-exchange loop, and a plain one under a mutex. The exit
+-- status says which counter, if any, lost an update.
+local MEMORY = [[
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+]]
+
+local WORK = [[
+
+local function work(context: voidptr*): nil
+    @unsafe do
+        local added = context[0] as int64*
+        local swapped = context[1] as int64*
+        local guarded = context[2] as int64*
+        local mutex = context[3]
+        local expected = calloc(1, 8) as int64*
+        for _ = 1, 20000 do
+            __atomic_fetch_add_8(added, 1, 0)
+            expected[0] = __atomic_load_8(swapped, 0)
+            while not __atomic_compare_exchange_8(swapped, expected, expected[0] + 1, 4, 0) do
+            end
+            lock(mutex)
+            guarded[0] = guarded[0] + 1
+            unlock(mutex)
+        end
+        free(expected as voidptr)
+    end
+end
+]]
+
+local MAIN = [[
 
 local function main(argc: int32, argv: cstring*): int32
-    local context = calloc(4, 8) as voidptr*
-    context[0] = calloc(1, 8)
-    context[1] = calloc(1, 8)
-    context[2] = calloc(1, 8)
-    context[3] = calloc(1, 64)
-    prepare(context[3])
-    __atomic_store_8(context[0] as int64*, 0, 3)
-    local slots = calloc(4, 8) as voidptr*
-    for i = 0, 3 do
-        slots[i] = calloc(1, 16)
-        if not spawn(slots[i], context as voidptr) then
-            return 10
+    @unsafe do
+        local context = calloc(4, 8) as voidptr*
+        context[0] = calloc(1, 8)
+        context[1] = calloc(1, 8)
+        context[2] = calloc(1, 8)
+        context[3] = calloc(1, 64)
+        prepare(context[3])
+        __atomic_store_8(context[0] as int64*, 0, 3)
+        local slots = calloc(4, 8) as voidptr*
+        for i = 0, 3 do
+            slots[i] = calloc(1, 16)
+            if not spawn(slots[i], context as voidptr) then
+                return 10
+            end
         end
-    end
-    for i = 0, 3 do
-        if not join(slots[i]) then
-            return 11
+        for i = 0, 3 do
+            if not join(slots[i]) then
+                return 11
+            end
         end
-    end
-    if __atomic_load_8(context[0] as int64*, 2) ~= 80000 then
-        return 1
-    end
-    if __atomic_load_8(context[1] as int64*, 5) ~= 80000 then
-        return 2
-    end
-    if (context[2] as int64*)[0] ~= 80000 then
-        return 3
+        if __atomic_load_8(context[0] as int64*, 2) ~= 80000 then
+            return 1
+        end
+        if __atomic_load_8(context[1] as int64*, 5) ~= 80000 then
+            return 2
+        end
+        if (context[2] as int64*)[0] ~= 80000 then
+            return 3
+        end
     end
     return 0
 end
 ]]
+
+--- The program for the platform this test runs on.
+local function threadsProgram()
+    local windows = jit.os == "Windows"
+    return table.concat({
+        ATOMICS,
+        MEMORY,
+        windows and WINDOWS_LOCKS or POSIX_LOCKS,
+        WORK,
+        windows and WINDOWS_THREADS or POSIX_THREADS,
+        MAIN,
+    }, "\n")
+end
 
 function M.threadsShareAtomicAndGuardedCounters()
     local available, why = require("nupp.tools.build.aotllvm").selected()
     if available ~= true then
         test.suite.skip("this nupp has no code generator: " .. tostring(why))
     end
-    local platform = jit.os == "Windows" and WINDOWS or POSIX
     local dir = os.tmpname()
     os.remove(dir)
     assert(os.execute("mkdir -p " .. quote(dir)) == 0)
@@ -290,7 +332,7 @@ function M.threadsShareAtomicAndGuardedCounters()
     manifest:write('return {include = {"."}}\n')
     manifest:close()
     local handle = assert(io.open(dir .. "/host.nupp", "wb"))
-    handle:write(THREADS .. "\n" .. platform .. THREADS_MAIN)
+    handle:write(threadsProgram())
     handle:close()
     local executable = dir .. "/host" .. (jit.os == "Windows" and ".exe" or "")
     local status, output = run(

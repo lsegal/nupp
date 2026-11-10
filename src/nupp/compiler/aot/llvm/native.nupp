@@ -418,7 +418,7 @@ local function atomicCallee(stat: any, name: string, callee: Callee): Callee
     end
     local operation = ATOMIC_OPERATIONS[spelled as string]
     local width = (tonumber(bytes as string) as integer) * 8
-    if operation == nil or WIDTHS["i" .. tostring(width)] == nil or width == 1 then
+    if operation == nil or WIDTHS["i" .. tostring(width)] == nil then
         refuse(stat, name .. " is not a libatomic operation a native program can lower")
     end
     local params, result = atomicShape(operation as string, width)
@@ -450,7 +450,7 @@ local function memoryOrder(program: Program, body: Body, node: any, allowed: {[i
     end
     local order = tonumber(((inner as cst.NumberLit).token as lexer.Token).text)
     if order == nil or not allowed[order as integer] then
-        refuse(node, "memory order " .. cst.textOf(node as cst.Child) .. " is not valid for this atomic operation")
+        refuse(node, "memory order " .. tostring(order) .. " is not valid for this atomic operation")
     end
 
     return ATOMIC_ORDERS[(order as integer) + 1]
