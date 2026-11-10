@@ -264,17 +264,22 @@ export function checkworkgroupsize(words: any, count: integer, entryPoint: strin
     end
 end
 
+-- `alignUp` over sizes taken from SPIR-V words, which may pass 2^32.
+local function roundUp(value: number, alignment: number): number
+    return math.ceil(value / alignment) * alignment
+end
+
 --- Refuses a type naga cannot lay out. wgpu-native compiles SPIR-V with naga,
 --- whose front end lays out every type read so far each time it reaches an
 --- array or a struct, and panics, aborting the process, on a scalar that is
 --- not a power-of-two number of bytes or an array larger than 1 GiB. Sizes and
 --- alignments follow naga's layouter.
 export function checklayout(words: any, count: integer): nil
-    local strides: {[integer]: integer} = {}
-    local offsets: {[integer]: {[integer]: integer}} = {}
-    local constants: {[integer]: integer} = {}
+    local strides: {[integer]: number} = {}
+    local offsets: {[integer]: {[integer]: number}} = {}
+    local constants: {[integer]: number} = {}
     -- Each type's size and alignment. A type naga refuses on its own has none.
-    local layouts: {[integer]: {integer}} = {}
+    local layouts: {[integer]: {number}} = {}
     for _, instruction in ipairs(spirvInstructions(words, count)) do
         local op, first, last = instruction[1], instruction[2], instruction[3]
         local operands = last - first + 1
@@ -286,7 +291,7 @@ export function checklayout(words: any, count: integer): nil
             members[words[first + 1]] = words[first + 3]
             offsets[id] = members
         elseif (op == OP_CONSTANT or op == OP_SPEC_CONSTANT) and operands >= 3 then
-            local value: integer = words[first + 2]
+            local value: number = words[first + 2]
             if operands >= 4 then
                 value += words[first + 3] * 0x100000000
             end
@@ -298,7 +303,7 @@ export function checklayout(words: any, count: integer): nil
             if bits ~= 8 and bits ~= 16 and bits ~= 32 and bits ~= 64 then
                 fail(("SPIR-V type %%%d has an unsupported %d-bit width"):format(id, bits))
             end
-            layouts[id] = {bits // 8, bits // 8}
+            layouts[id] = {bits / 8, bits / 8}
         elseif op == OP_TYPE_VECTOR and operands >= 3 then
             local component, size = layouts[words[first + 1]], words[first + 2]
             if component and size >= 2 and size <= 4 then
@@ -317,26 +322,22 @@ export function checklayout(words: any, count: integer): nil
             local element = layouts[words[first + 1]]
             if element then
                 local length = op == OP_TYPE_ARRAY and (constants[words[first + 2]] or 0) or 1
-                local stride = strides[id] or alignUp(element[1], element[2])
+                local stride = strides[id] or roundUp(element[1], element[2])
                 if length > MAX_TYPE_BYTES or length * stride > MAX_TYPE_BYTES then
-                    fail(
-                        (
-                            "SPIR-V array type %%%d is larger than the %d-byte type limit"
-                        ):format(id, MAX_TYPE_BYTES)
-                    )
+                    fail(("SPIR-V array type %%%d is larger than the %d-byte type limit"):format(id, MAX_TYPE_BYTES))
                 end
                 layouts[id] = {length * stride, element[2]}
             end
         elseif op == OP_TYPE_STRUCT and operands >= 1 then
             local placed = offsets[id] or {}
-            local span, alignment = 0, 1
+            local span: number, alignment: number = 0, 1
             for index = first + 1, last do
                 local member = layouts[words[index]] or {0, 1}
-                span = placed[index - first - 1] or alignUp(span, member[2])
+                span = placed[index - first - 1] or roundUp(span, member[2])
                 span += member[1]
                 alignment = math.max(alignment, member[2])
             end
-            layouts[id] = {alignUp(span, alignment), alignment}
+            layouts[id] = {roundUp(span, alignment), alignment}
         end
     end
 end
