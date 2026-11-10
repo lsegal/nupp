@@ -551,14 +551,10 @@ local FEATURES: {[string]: native.Feature} = {
         -- The public module records the facility at the call site; its internal
         -- provider records it when the module graph is followed directly.
         modules = {"nupp.runtime.provider.nativepath"},
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "filesystem",
         host = "native-files",
-        library = "nupp_native",
         binary = true,
         runtimeModule = "nupp.runtime.provider.nativepath",
-        requires = {"runtime.path", "runtime.native"},
+        requires = {"runtime.path"},
     },
     [
         "runtime.path"
@@ -663,23 +659,12 @@ local FEATURES: {[string]: native.Feature} = {
     ["native.files"] = {
         name = "files",
         modules = {"nupp.runtime.provider.nativefiles"},
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "files",
         host = "native-files",
-        library = "nupp_native",
         binary = true,
         runtimeModule = "nupp.runtime.provider.nativefiles",
         -- A file operation that waits performs `suspend`, so the runtime that
         -- answers it has to be in the target beside the program.
-        requires = {
-            "runtime.files",
-            "native.path",
-            "stdlib.io",
-            "runtime.spanview",
-            "runtime.suspension",
-            "runtime.native",
-        },
+        requires = {"runtime.files", "native.path", "stdlib.io", "runtime.spanview", "runtime.suspension",},
     },
     ["runtime.suspension"] = {
         -- Not a native library: a compiler-provided Nupp module a target needs its

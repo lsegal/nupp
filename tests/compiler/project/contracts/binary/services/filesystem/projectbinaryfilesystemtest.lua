@@ -16,7 +16,7 @@ local setEnvironment = fixture.setEnvironment
 
 local M = {}
 
-function M.standaloneBinaryLinksRustFilesystemIntoItsOwnHost()
+function M.standaloneBinaryReachesTheFilesystemThroughItsOwnFfi()
     local dir = tempProject({
         [
             "nupp.lua"
@@ -30,19 +30,19 @@ assert(os.stat("Cargo.toml") == "file")
 local file = assert(io.open("Cargo.toml", "rb"))
 local contents = assert(file:read("*a"))
 assert(contents:find("[workspace]", 1, true))
-print("rust-files-ok")
+print("native-files-ok")
 ]],
     })
     testAssert.eq(project.build(dir), 0)
     local output = executableName(dir .. "/out/app")
     assert(exists(output), "the standalone filesystem executable is emitted")
-    assert(not exists(dir .. "/out/lib/nupp_native"), "the standalone filesystem build retains no Rust sidecar")
+    assert(not exists(dir .. "/out/lib/nupp_native"), "the standalone filesystem build needs no Rust sidecar")
     local code, text = process.capture({output})
     testAssert.eq(code, 0, text)
     testAssert.eq(
         text:match("[^\r\n]+"),
-        "rust-files-ok",
-        "the executable resolves Rust filesystem FFI from its own symbols"
+        "native-files-ok",
+        "the executable calls the operating system through its own FFI"
     )
     remove(dir)
 end

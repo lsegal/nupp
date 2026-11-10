@@ -279,13 +279,14 @@ end
 
 function M.pathStagesOnlyTheGenericFilesystemSlice()
     local feature = assert(native.feature("native.path"))
-    test.eq(feature.providerFeature, "filesystem")
-    test.eq(feature.providerDriver, "native-rust")
-    test.eq(feature.provider, "nupp_native")
+    -- The provider asks the operating system itself, so it stages no Rust library.
+    test.eq(feature.providerFeature, nil)
+    test.eq(feature.providerDriver, nil)
+    test.eq(feature.provider, nil)
     test.eq(feature.host, "native-files")
-    test.eq(feature.library, "nupp_native")
+    test.eq(feature.library, nil)
     test.eq(feature.runtimeModule, "nupp.runtime.provider.nativepath")
-    test.eq(table.concat(feature.requires or {}, ","), "runtime.path,runtime.native")
+    test.eq(table.concat(feature.requires or {}, ","), "runtime.path")
     local runtime = assert(native.feature("runtime.path"))
     test.eq(runtime.runtimeModule, "io.internal.path")
     test.eq(runtime.portableRuntime, true)
@@ -301,10 +302,10 @@ function M.pathStagesOnlyTheGenericFilesystemSlice()
     local provider = assert(io.open("src/nupp/runtime/provider/nativepath.nupp", "rb"))
     local providerText = provider:read("*a")
     provider:close()
-    assert(providerText:find("nupp.runtime.native", 1, true), "the native path provider loads the native ABI provider")
+    assert(not providerText:find("nupp.runtime.native", 1, true), "the native path provider needs no Rust provider")
     assert(
-        providerText:find("nuppNativeFiles", 1, true),
-        "the native path provider declares the Rust filesystem ABI it calls"
+        not providerText:find("nuppNativeFiles", 1, true),
+        "the native path provider asks the operating system itself"
     )
 end
 
