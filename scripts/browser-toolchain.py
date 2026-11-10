@@ -28,7 +28,7 @@ def pins():
     for line in (ROOT / 'scripts/toolchain.pins').read_text().splitlines():
         if line and not line.startswith('#') and '=' in line:
             key, value = line.split('=', 1)
-            values[key] = Template(shlex.split(value)[0]).substitute(values)
+            values[key] = Template(shlex.split(value)[0]).safe_substitute(values)
     return values
 
 
