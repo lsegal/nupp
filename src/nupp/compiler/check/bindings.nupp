@@ -1535,8 +1535,22 @@ export function install(c: state.Checker): state.StatHandlers
             end
         end
         local op = opTok.kind:sub(1, -2) -- drop the '='
-        if op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>" or op == "~>>" then
-            require("nupp.compiler.capabilities").require(c, "bitops", opTok)
+        local bitop = op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>" or op == "~>>"
+        -- The binary operator's widths: a shift takes its width from the target
+        -- alone, the other bit operators widen when either side is 64-bit.
+        local shift = op == "<<" or op == ">>" or op == "~>>"
+        local wideBits = bitop
+            and (
+                (targetT.tag == "int64" or targetT.tag == "uint64") and targetT
+                or not shift and (valueT.tag == "int64" or valueT.tag == "uint64") and valueT
+            )
+            or nil
+        if bitop then
+            local wideCount = shift and (valueT.tag == "int64" or valueT.tag == "uint64")
+            require("nupp.compiler.capabilities").require(c, (wideBits or wideCount) and "int64" or "bitops", opTok)
+            if wideBits then
+                stat.wideArithmetic = true
+            end
         end
         local operandsFit = true
         if op == "??" then
@@ -1574,8 +1588,8 @@ export function install(c: state.Checker): state.StatHandlers
             resultT = T.string
         elseif op == "??" then
             resultT = valueT
-        elseif op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>" or op == "~>>" then
-            resultT = T.integer
+        elseif bitop then
+            resultT = wideBits or T.integer
         elseif not fixedWidth.isValue(targetT)
             and not fixedWidth.isValue(valueT)
             and targetT ~= T.any
