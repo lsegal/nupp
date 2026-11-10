@@ -1,0 +1,172 @@
+--[[
+`kind = "program"` targets: a native program whose `main` is written in Nupp.
+
+The same lowering and link `nupp aot --emit executable` does -- the checked
+entry module through `nupp.compiler.aot.llvm.native`, then
+`nupp.tools.build.native`'s `linkProgram` against the static LuaJIT of the
+target triple's link kit -- with the output placed by the target and kept
+across builds that would link the same thing.
+]]
+module nupp.tools.build.program
+
+const {type Config} = require("nupp.tools.build.manifest")
+const {type Target} = require("nupp.tools.build.manifest")
+
+local fs = require("nupp.compiler.fs")
+local hash = require("nupp.compiler.hash")
+
+local program = {}
+
+--- What a program build did, for the caller to report.
+record program.Outcome
+    --- The executable, or nil when the build only checked.
+    output: string?
+
+    --- Whether the executable was linked here rather than kept from the last
+    --- build that linked the same IR with the same code generator and kit.
+    linked: boolean
+end
+
+--- The LLVM IR of the checked `tree` as a native program for `triple`, or nil
+--- and why not: a triple with no link profile, or a source position lowering
+--- refused and its message.
+function program.lower(tree: any, triple: string): (string?, string?, {line: integer, column: integer}?)
+    local profile = require("nupp.compiler.aot.llvm.profile").of(triple)
+    if profile == nil then
+        return nil, "a native program cannot be built for " .. triple, nil
+    end
+    local ir, problem = require(
+        "nupp.compiler.aot.llvm.native"
+    ).module(tree.root, (profile as {functionAttributes: string}).functionAttributes)
+    if ir == nil then
+        local at = problem as {
+            line: integer,
+            column: integer,
+            message: string
+        }
+
+        return nil, at.message, {line = at.line, column = at.column}
+    end
+
+    return ir as string, nil, nil
+end
+
+--- Where a program target writes its executable: `output` when the target
+--- names one, otherwise the target's name under its `outDir`, with the
+--- triple's executable suffix. `--out-dir` keeps the file name and moves it.
+local function outputPath(root: string, target: Target, name: string, triple: string, outDir: string?): string
+    local platform = require("nupp.tools.build.platform")
+    local suffix = platform.has(triple) and platform.executableSuffix(triple)
+        or (triple:find("windows", 1, true) and ".exe" or "")
+    local file = target.output or (name .. suffix)
+    if outDir ~= nil then
+        return fs.join(root, fs.join(outDir as string, fs.basename(file)))
+    end
+    if target.output ~= nil then
+        return fs.join(root, target.output as string)
+    end
+
+    return fs.join(root, fs.join(target.outDir or "build", file))
+end
+
+--- Checks the target's entry module and, unless `checkOnly`, links it.
+---
+--- @return what was built, or nil, a NUPP code and a message; nil with no
+---   code is a source the checker refused, whose diagnostics are reported
+function program.build(
+    root: string,
+    config: Config,
+    target: Target,
+    name: string,
+    opts: {outDir: string?, checkOnly: boolean?, diagnostics: {any}?}
+): (program.Outcome?, string?, string?)
+    local selected, targetErr = require("nupp.compiler.aot.target").select(target.aotTarget, nil)
+    if selected == nil then
+        return nil, "NUPP0002", tostring(targetErr)
+    end
+    local triple = (selected as {triple: string}).triple
+    local entry = (target.entries as {string})[1]
+
+    -- The entry is checked the way `nupp aot` checks it, which is how a
+    -- native program has always been built: as an inspection of AOT code,
+    -- whatever the target's own policy.
+    local checking: {[string]: any} = {}
+    for key, value in pairs(target as {[string]: any}) do
+        checking[key] = value
+    end
+    checking.aot = "inspect"
+    config._target = checking
+    local envMod = require("nupp.compiler.project.env")
+    local environment = envMod.new(root, {config = config})
+    local path = envMod.findModulePath(environment, entry)
+    if path == nil then
+        return nil, "NUPP0003", "program target " .. name .. " names entry " .. entry .. ", which no include root has"
+    end
+    local tree = require("nupp.tools.cli.compile").check(
+        path as string,
+        environment as {[string]: any},
+        {},
+        opts.diagnostics
+    )
+    if tree == nil then
+        return nil, nil, nil
+    end
+    if opts.checkOnly then
+        return program.Outcome(output = nil, linked = false), nil, nil
+    end
+
+    local ir, lowerErr, at = program.lower(tree, triple)
+    if ir == nil then
+        if at == nil then
+            return nil, "NUPP0004", tostring(lowerErr)
+        end
+        local position = at as {line: integer, column: integer}
+
+        return nil, "NUPP0004", ("%s:%d:%d: native: %s"):format(path, position.line, position.column, lowerErr)
+    end
+    local aotllvm = require("nupp.tools.build.aotllvm")
+    local available, availableErr = aotllvm.selected()
+    if available ~= true then
+        return nil, "NUPP0004", tostring(availableErr)
+    end
+    local native = require("nupp.tools.build.native")
+    local kit, kitErr = native.programKit(triple)
+    if kit == nil then
+        return nil, "NUPP0004", tostring(kitErr)
+    end
+
+    -- Keyed like every other LLVM artifact: the IR, the code generator that
+    -- compiles it and the kit it links against. The executable's own digest
+    -- is recorded beside the key, so one replaced or damaged since is linked
+    -- again.
+    local output = outputPath(root, target, name, triple, opts.outDir)
+    local key = hash.digest(
+        table.concat(
+            {ir as string, aotllvm.version(), triple, require("nupp.tools.build.kits").identity(kit as string)},
+            "\0"
+        )
+    )
+    local stamp = fs.join(root, fs.join(opts.outDir or target.outDir or "build", "cache/program-" .. name .. ".link"))
+    local recorded = fs.readFile(stamp)
+    local existing = fs.readFile(output)
+    if recorded ~= nil and existing ~= nil and recorded == key .. " " .. hash.digest(existing as string) .. "\n" then
+        return program.Outcome(output = output, linked = false), nil, nil
+    end
+    os.remove(stamp)
+    local linkErr = aotllvm.program(ir as string, triple, kit as string, output)
+    if linkErr ~= nil then
+        return nil, "NUPP0004", tostring(linkErr)
+    end
+    local linked = fs.readFile(output)
+    if linked == nil then
+        return nil, "NUPP0004", "the linker wrote no " .. output
+    end
+    local wrote, writeErr = fs.writeFile(stamp, key .. " " .. hash.digest(linked as string) .. "\n")
+    if not wrote then
+        return nil, "NUPP0001", tostring(writeErr)
+    end
+
+    return program.Outcome(output = output, linked = true), nil, nil
+end
+
+export = program

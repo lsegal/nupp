@@ -647,8 +647,14 @@ local function validateTarget(target, label, dependencies)
         return nil, label .. " must be a table"
     end
     local kind = target.kind or "modules"
-    if kind ~= "modules" and kind ~= "docs" and kind ~= "bundle" and kind ~= "binary" and kind ~= "component" then
-        return nil, label .. ".kind must be \"modules\", \"bundle\", \"binary\", \"component\", or \"docs\""
+    if kind ~= "modules"
+        and kind ~= "docs"
+        and kind ~= "bundle"
+        and kind ~= "binary"
+        and kind ~= "component"
+        and kind ~= "program"
+    then
+        return nil, label .. ".kind must be \"modules\", \"bundle\", \"binary\", \"component\", \"program\", or \"docs\""
     end
     if kind ~= "docs" then
         local valid, err = validateKeys(target, TARGET_KEYS, label)
@@ -923,10 +929,15 @@ local function validateTarget(target, label, dependencies)
         target.entries,
         label .. ".entries",
         "string",
-        kind == "bundle" or kind == "binary" or kind == "component"
+        kind == "bundle" or kind == "binary" or kind == "component" or kind == "program"
     )
     if not valid then
         return nil, err
+    end
+    -- A native program is one file whose `main` is the executable's own; a
+    -- second entry would be a second `main`.
+    if kind == "program" and #target.entries ~= 1 then
+        return nil, label .. ".entries names the one module a program target links; it has " .. #target.entries
     end
     if target.output ~= nil then
         valid, err = validateString(target.output, label .. ".output")

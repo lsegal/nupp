@@ -64,6 +64,20 @@ function kits.target(directory: string): string?
     return value.target as string
 end
 
+--- What a program linked from the kit at `directory` depends on: its manifest
+--- and the LuaJIT archive that manifest names, so a kit rebuilt or replaced in
+--- place relinks what was linked from the old one.
+function kits.identity(directory: string): string
+    local text = fs.readFile(fs.join(directory, "kit.json")) or ""
+    local value = manifest(directory)
+    local archive: string? = nil
+    if value ~= nil and type(value.luajit) == "string" then
+        archive = fs.readFile(fs.join(directory, value.luajit as string))
+    end
+
+    return hash.digest(directory .. "\0" .. text .. "\0" .. hash.digest(archive or ""))
+end
+
 --- The features a kit's runtime carries.
 local function features(directory: string): {[string]: boolean}
     local carried: {[string]: boolean} = {}

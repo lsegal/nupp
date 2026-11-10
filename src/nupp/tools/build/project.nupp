@@ -465,6 +465,29 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
             checkOnly = opts.checkOnly,
             output = opts.outDir,
         }))
+    elseif target.kind == "program" then
+        local targetKey = target.name or opts.target or "default"
+        report:step("linking " .. targetKey)
+        local built, code, message = require("nupp.tools.build.program").build(root, config, target, targetKey, {
+            outDir = opts.outDir,
+            checkOnly = opts.checkOnly,
+            diagnostics = opts.diagnostics,
+        })
+        if built == nil then
+            if code ~= nil then
+                say(opts, code as string, "nupp: " .. tostring(message) .. "\n")
+            end
+            return 1
+        end
+        local outcome = built as {output: string?, linked: boolean}
+        report:finish(opts.checkOnly and "checked" or outcome.linked and "built" or "reused", targetKey)
+        if opts.produced then
+            opts.produced.target = targetKey
+            opts.produced.artifact = outcome.output
+            opts.produced.outputs = cache.jsonArray(outcome.output ~= nil and {outcome.output as string} or {})
+            opts.produced.timing = report:timing()
+        end
+        return 0
     elseif target.kind
         and target.kind ~= "modules"
         and target.kind ~= "bundle"
