@@ -175,7 +175,12 @@ function M.aStandaloneLinkKeepsTheGpuProvidersEntryPoints()
         assert(flags == nil and err:find("cannot link native feature gpu", 1, true), err)
         testAssert.eq(#calls, 0, "a refused platform fetches nothing")
 
-        flags, err = nativeStage.linkedProviders(nativeStage.resolve({["native.path"] = true}), "x86_64-unknown-linux-gnu")
+        flags, err = nativeStage.linkedProviders(
+            nativeStage.resolve({
+                ["native.path"] = true
+            }),
+            "x86_64-unknown-linux-gnu"
+        )
         assert(flags, err)
         testAssert.eq(#flags, 0, "a provider with a host implementation adds nothing")
     end)

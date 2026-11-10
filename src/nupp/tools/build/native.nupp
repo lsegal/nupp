@@ -150,11 +150,9 @@ function stage.linkedProviders(effects: {[string]: any}?, platform: string): ({s
                     .. feature.name
                     .. " needs compiler source to link statically; use a source checkout to build this target"
             end
-            local archive, problem = driven(
-                compilerRoot as string,
-                tostring(feature.providerDriver) .. "-static",
-                {platform}
-            )
+            local archive, problem = driven(compilerRoot as string, tostring(feature.providerDriver) .. "-static", {
+                platform
+            })
             if not archive then
                 return nil, ("cannot build native facilities %s:\n%s"):format(feature.name, problem)
             end
