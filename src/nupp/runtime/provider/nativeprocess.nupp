@@ -1206,7 +1206,7 @@ else
     end
 
     local function nonblocking(descriptor: integer): nil
-        local flags = C.fcntl(descriptor, F_GETFL)
+        local flags = C.fcntl(descriptor, F_GETFL, ffi.new("int", 0))
         C.fcntl(descriptor, F_SETFL, ffi.new("int", flags | O_NONBLOCK))
     end
 
@@ -1399,7 +1399,9 @@ else
 
         local function null(): integer
             if nullDescriptor < 0 then
-                nullDescriptor = tonumber(C.open("/dev/null", O_RDWR | O_CLOEXEC)) as integer
+                -- An unused mode as well: LuaJIT keeps the first declaration of a
+                -- name, and another one may have declared three fixed arguments.
+                nullDescriptor = tonumber(C.open("/dev/null", O_RDWR | O_CLOEXEC, ffi.new("int", 0))) as integer
                 if nullDescriptor < 0 then
                     problem = ffi.errno()
                 else
