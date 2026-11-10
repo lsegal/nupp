@@ -252,9 +252,36 @@ function process.run(argv: {string}, opts: process.Options?): integer
     return exitCode(os.execute(process.command(argv, opts)))
 end
 
+--- Where a Windows `os.tmpname` name is put. msvcrt's `tmpnam`, which LuaJIT's
+--- `os.tmpname` calls there, names a file at the root of the current drive, and
+--- an ordinary user cannot write `C:\`: cmd answers `Access is denied.` and the
+--- capture comes back empty. A name at a drive root moves under `tempDir`; any
+--- other name, or no `tempDir`, is left as it was. msvcrt's trailing dot is
+--- dropped because Windows drops it from the file it makes.
+function process.windowsTempName(name: string, tempDir: string?): string
+    local base = name:match("^[\\/]([^\\/]+)$") or name:match("^%a:[\\/]([^\\/]+)$")
+    if not base or not tempDir or tempDir == "" then
+        return name
+    end
+    base = base:gsub("%.+$", "")
+
+    return (tempDir:gsub("[\\/]+$", "")) .. "\\" .. (base ~= "" and base or "tmp")
+end
+
+--- A temporary name the compiler can write, under the user's temporary
+--- directory on Windows rather than the drive root.
+function process.tmpname(): string
+    local name = os.tmpname()
+    if not windows then
+        return name
+    end
+
+    return process.windowsTempName(name, os.getenv("TEMP") or os.getenv("TMP"))
+end
+
 function process.capture(argv: {string}, opts: process.Options?): integer, string
     opts = (opts or {}) as process.Options
-    local tmp = nativePath(os.tmpname())
+    local tmp = nativePath(process.tmpname())
     local command = process.command(argv, opts) .. " >" .. quote(tmp) .. " 2>&1"
     local code = exitCode(os.execute(command))
     local f = io.open(tmp, "rb")
