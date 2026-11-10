@@ -361,9 +361,37 @@ end
 -- What `checkstructure` knows about the instructions naga's front end parses,
 -- from the SPIR-V grammar.
 local RESULT_TYPED = opcodes({
-    {1}, {12}, {41, 44}, {46}, {48, 51}, {54, 55}, {57}, {59}, {61}, {65, 66}, {68}, {77, 84}, {86, 98}, {100},
-    {103, 104}, {106, 107}, {109, 115}, {124}, {126, 148}, {154, 159}, {164, 191}, {194, 205}, {207, 215},
-    {227}, {229, 230}, {232, 242}, {245}, {334, 335}, {337, 339}, {345, 366}, {6035},
+    {1},
+    {12},
+    {41, 44},
+    {46},
+    {48, 51},
+    {54, 55},
+    {57},
+    {59},
+    {61},
+    {65, 66},
+    {68},
+    {77, 84},
+    {86, 98},
+    {100},
+    {103, 104},
+    {106, 107},
+    {109, 115},
+    {124},
+    {126, 148},
+    {154, 159},
+    {164, 191},
+    {194, 205},
+    {207, 215},
+    {227},
+    {229, 230},
+    {232, 242},
+    {245},
+    {334, 335},
+    {337, 339},
+    {345, 366},
+    {6035},
 })
 local RESULT_ONLY = opcodes({{7}, {11}, {19, 30}, {32, 33}, {248}})
 local TYPES = opcodes({{19, 24}, {28, 30}, {32, 33}})
@@ -429,7 +457,13 @@ local function wordCount(op: integer, at: integer): never
 end
 
 -- Whether naga keeps `def` as a value the function `scope` can name.
-local function namedValue(words: any, defs: {[integer]: any}, imports: {[integer]: string}, def: any, scope: integer): boolean
+local function namedValue(
+    words: any,
+    defs: {[integer]: any},
+    imports: {[integer]: string},
+    def: any,
+    scope: integer
+): boolean
     if def == nil or def.type == nil or def.op == OP_FUNCTION or defs[def.type].op == OP_TYPE_VOID then
         return false
     end
@@ -444,7 +478,13 @@ end
 -- Refuses an atomic whose pointer, walked from the global variable at its
 -- root, steps through anything but structs and arrays or ends anywhere but an
 -- integer or float. naga's atomic upgrade expects nothing else.
-local function checkatomic(words: any, defs: {[integer]: any}, constants: {[integer]: number}, pointer: integer, at: integer): nil
+local function checkatomic(
+    words: any,
+    defs: {[integer]: any},
+    constants: {[integer]: number},
+    pointer: integer,
+    at: integer
+): nil
     local steps: {{integer}} = {}
     local def = defs[pointer]
     local before = at
@@ -486,7 +526,13 @@ end
 
 -- Refuses an `OpCompositeInsert` whose indices leave its composite type, or
 -- that indexes an array naga would build too many expressions for.
-local function checkinsert(words: any, defs: {[integer]: any}, constants: {[integer]: number}, first: integer, last: integer): nil
+local function checkinsert(
+    words: any,
+    defs: {[integer]: any},
+    constants: {[integer]: number},
+    first: integer,
+    last: integer
+): nil
     local ty: integer = words[first]
     for index = first + 4, last do
         local shape = defs[ty]
@@ -502,7 +548,11 @@ local function checkinsert(words: any, defs: {[integer]: any}, constants: {[inte
             length = constants[words[shape.first + 2]]
             element = words[shape.first + 1]
             if length ~= nil and length > MAX_INSERT_ELEMENTS then
-                fail(("SPIR-V OpCompositeInsert at word %d indexes an array of %d elements; at most %d are supported"):format(first - 1, length, MAX_INSERT_ELEMENTS))
+                fail(
+                    (
+                        "SPIR-V OpCompositeInsert at word %d indexes an array of %d elements; at most %d are supported"
+                    ):format(first - 1, length, MAX_INSERT_ELEMENTS)
+                )
             end
         elseif shape.op == OP_TYPE_VECTOR or shape.op == OP_TYPE_MATRIX then
             length = words[shape.first + 2]
@@ -512,7 +562,11 @@ local function checkinsert(words: any, defs: {[integer]: any}, constants: {[inte
             return
         end
         if selection >= length then
-            fail(("SPIR-V OpCompositeInsert at word %d selects element %d of %%%d, which has %d"):format(first - 1, selection, ty, length))
+            fail(
+                (
+                    "SPIR-V OpCompositeInsert at word %d selects element %d of %%%d, which has %d"
+                ):format(first - 1, selection, ty, length)
+            )
         end
         ty = element
     end
@@ -560,7 +614,11 @@ export function checkstructure(words: any, count: integer): nil
         local operands = last - first + 1
         local at = first - 1
         if UNBOUND[op] then
-            fail(("SPIR-V instruction %d at word %d uses images, samplers or quads, which GPU kernels do not support"):format(op, at))
+            fail(
+                (
+                    "SPIR-V instruction %d at word %d uses images, samplers or quads, which GPU kernels do not support"
+                ):format(op, at)
+            )
         end
         local resultType: integer? = nil
         local result: integer? = nil
@@ -571,10 +629,16 @@ export function checkstructure(words: any, count: integer): nil
         end
         if resultType ~= nil then
             local declared = defs[resultType]
-            if declared == nil or not TYPES[declared.op] or declared.op == OP_TYPE_FUNCTION
+            if declared == nil
+                or not TYPES[declared.op]
+                or declared.op == OP_TYPE_FUNCTION
                 or (declared.op == OP_TYPE_VOID and op ~= OP_FUNCTION and op ~= OP_FUNCTION_CALL and op ~= OP_EXT_INST)
             then
-                fail(("SPIR-V instruction at word %d has result type %%%d, which is not a value type"):format(at, resultType))
+                fail(
+                    (
+                        "SPIR-V instruction at word %d has result type %%%d, which is not a value type"
+                    ):format(at, resultType)
+                )
             end
         end
         if result ~= nil then
@@ -614,7 +678,9 @@ export function checkstructure(words: any, count: integer): nil
                     wordCount(op, at)
                 end
                 if shape.op == OP_TYPE_INT then
-                    constants[words[first + 1]] = words[first + 2] + (operands == 4 and words[first + 3] * 0x100000000 or 0)
+                    constants[
+                        words[first + 1]
+                    ] = words[first + 2] + (operands == 4 and words[first + 3] * 0x100000000 or 0)
                 end
             end
         elseif DERIVATIVES[op] and operands ~= 3 then
@@ -624,7 +690,11 @@ export function checkstructure(words: any, count: integer): nil
                 local operand = defs[words[index]]
                 local ty = operand and operand.type and defs[operand.type]
                 if ty and not NUMERIC_TYPES[ty.op] then
-                    fail(("SPIR-V instruction %d at word %d needs a scalar, vector or matrix where %%%d is not one"):format(op, at, words[index]))
+                    fail(
+                        (
+                            "SPIR-V instruction %d at word %d needs a scalar, vector or matrix where %%%d is not one"
+                        ):format(op, at, words[index])
+                    )
                 end
             end
             if not NUMERIC_TYPES[defs[words[first]].op] and (op < 149 or op > 152) then
@@ -655,8 +725,15 @@ export function checkstructure(words: any, count: integer): nil
             end
             local selector = defs[words[first]]
             local shape = selector and selector.type and defs[selector.type]
-            if not namedValue(words, defs, imports, selector, scope) or shape.op ~= OP_TYPE_INT or words[shape.first + 1] > 32 then
-                fail(("SPIR-V OpSwitch at word %d needs an integer selector of at most 32 bits defined before it"):format(at))
+            if not namedValue(words, defs, imports, selector, scope)
+                or shape.op ~= OP_TYPE_INT
+                or words[shape.first + 1] > 32
+            then
+                fail(
+                    (
+                        "SPIR-V OpSwitch at word %d needs an integer selector of at most 32 bits defined before it"
+                    ):format(at)
+                )
             end
             targets[#targets + 1] = {words[first + 1], at}
             for index = first + 3, last, 2 do
@@ -673,16 +750,28 @@ export function checkstructure(words: any, count: integer): nil
         elseif op == OP_FUNCTION_END then
             for _, target in ipairs(targets) do
                 if not labels[target[1]] then
-                    fail(("SPIR-V branch at word %d goes to %%%d, which is no label of its function"):format(target[2], target[1]))
+                    fail(
+                        (
+                            "SPIR-V branch at word %d goes to %%%d, which is no label of its function"
+                        ):format(target[2], target[1])
+                    )
                 end
             end
             for _, phi in ipairs(phis) do
                 for index = phi[2] + 2, phi[3], 2 do
                     if not namedValue(words, defs, imports, defs[words[index]], scope) then
-                        fail(("SPIR-V OpPhi at word %d takes %%%d, which is no value of its function"):format(phi[1], words[index]))
+                        fail(
+                            (
+                                "SPIR-V OpPhi at word %d takes %%%d, which is no value of its function"
+                            ):format(phi[1], words[index])
+                        )
                     end
                     if not labels[words[index + 1]] then
-                        fail(("SPIR-V OpPhi at word %d names %%%d, which is no label of its function"):format(phi[1], words[index + 1]))
+                        fail(
+                            (
+                                "SPIR-V OpPhi at word %d names %%%d, which is no label of its function"
+                            ):format(phi[1], words[index + 1])
+                        )
                     end
                 end
             end
