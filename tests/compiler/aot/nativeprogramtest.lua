@@ -308,6 +308,37 @@ end
     assert(executable ~= nil, output)
     local status, ran = run(quote(executable))
     test.eq(status, expected, ran)
+
+    -- On `int64` and `uint64` locals the same operators keep all 64 bits.
+    local w, u = assert(load([[
+local w = -3LL w = w << 40 w = w & -4096LL w = w | 5 w = w ~>> 3 w = w >> 1
+local u = 0ULL - 3ULL u = u << 4 u = u & (0ULL - 65536ULL) u = u | 7 u = u >> 2 u = u ~>> 1
+return w, u
+]]))()
+    executable, output = link([[
+cdef function printf(borrows format: cstring, ...): int32
+
+local function main(): int32
+    local w: int64 = -3LL
+    w <<= 40
+    w &= -4096LL
+    w |= 5
+    w ~>>= 3
+    w >>= 1
+    local u: uint64 = 0ULL - 3ULL
+    u <<= 4
+    u &= 0ULL - 65536ULL
+    u |= 7
+    u >>= 2
+    u ~>>= 1
+    printf("%lld %llu\n", w, u)
+    return 0
+end
+]])
+    assert(executable ~= nil, output)
+    status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+    test.eq(ran, tostring(w):match("^-?%d+") .. " " .. tostring(u):match("^%d+"))
 end
 
 local INT64_MIN = "(-9223372036854775807LL - 1LL)"

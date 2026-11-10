@@ -1540,10 +1540,10 @@ export function install(c: state.Checker): state.StatHandlers
         -- alone, the other bit operators widen when either side is 64-bit.
         local shift = op == "<<" or op == ">>" or op == "~>>"
         local wideBits = bitop
-                and (
-                    (targetT.tag == "int64" or targetT.tag == "uint64") and targetT
-                    or not shift and (valueT.tag == "int64" or valueT.tag == "uint64") and valueT
-                )
+            and (
+                (targetT.tag == "int64" or targetT.tag == "uint64") and targetT
+                or not shift and (valueT.tag == "int64" or valueT.tag == "uint64") and valueT
+            )
             or nil
         if bitop then
             local wideCount = shift and (valueT.tag == "int64" or valueT.tag == "uint64")
