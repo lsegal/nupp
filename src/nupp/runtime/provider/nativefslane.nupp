@@ -307,8 +307,7 @@ local function writePart(transfer: Transfer, appending: boolean): (boolean, stri
         local wrote, reason = system.fileWrite(transfer.output, base + done, wanted, (not appending) and done or nil)
         if wrote == nil then
             return false, reason
-        end
-        if wrote == 0 then
+        elseif wrote == 0 then
             return false, "failed to write whole buffer"
         end
         transfer.done = done + (wrote as integer)
@@ -489,8 +488,7 @@ local function copyStep(transfer: Transfer): nil
             if wrote == nil then
                 settle(transfer, failure, nil)
                 return
-            end
-            if wrote == 0 then
+            elseif wrote == 0 then
                 settle(transfer, "failed to write whole buffer", nil)
                 return
             end

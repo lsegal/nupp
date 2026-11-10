@@ -130,64 +130,81 @@ end
 -- append, or a seek past the end, means what it does on every platform. Positions
 -- stay inside the exact integer range, where a cursor is still a number.
 
-local function readAt(state: any, into: any, count: integer): (integer?, string?)
-    local position = state._position as integer
+-- Reads up to `count` bytes at `position`.
+local function readAt(handle: any, position: integer, into: any, count: integer): (integer?, string?)
     local remaining = MAX_EXACT_INTEGER - position
     if remaining == 0 then
-        local size = system.fileSize(state._handle)
+        local size = system.fileSize(handle)
         if size ~= nil and (size as integer) > position then
             return nil, EXACT_RANGE
         end
     end
-    local got, reason = system.fileRead(state._handle, into, math.min(count, remaining), position)
+    local got, reason = system.fileRead(handle, into, math.min(count, remaining), position)
     if got == nil then
         return nil, reason
     end
-    state._position = position + (got as integer)
 
     return got as integer, nil
 end
 
-local function writeAt(state: any, from: any, count: integer): (integer?, string?)
-    local appending = state._appending as boolean
-    local start: integer
+-- Writes every byte at `position`, or at the end when appending, and answers how
+-- many moved and where the cursor lands.
+local function writeAt(
+    handle: any,
+    appending: boolean,
+    position: integer,
+    from: any,
+    count: integer
+): (integer?, integer?, string?)
+    local start = position
     if appending then
-        local size, reason = system.fileSize(state._handle)
+        local size, reason = system.fileSize(handle)
         if size == nil then
-            return nil, reason
+            return nil, nil, reason
         end
         start = size as integer
-    else
-        start = state._position as integer
     end
     if start + count > MAX_EXACT_INTEGER then
-        return nil, "the file cursor would exceed Nupp's exact integer range"
+        return nil, nil, "the file cursor would exceed Nupp's exact integer range"
     end
-    local written = 0
+    local written: integer = 0
     while written < count do
-        local wrote, reason = system.fileWrite(state._handle, from + written, count - written, (not appending) and (start + written) or nil)
+        local wrote, reason = system.fileWrite(handle, from + written, count - written, (not appending) and (start + written) or nil)
         if wrote == nil then
-            return nil, reason
-        end
-        if wrote == 0 then
-            return nil, "failed to write the complete file buffer"
+            return nil, nil, reason
+        elseif wrote == 0 then
+            return nil, nil, "failed to write the complete file buffer"
         end
         written = written + (wrote as integer)
     end
     if appending then
         -- Append mode writes at the then-current end whatever the cursor said, so the
         -- cursor moves to where the write landed.
-        local size, reason = system.fileSize(state._handle)
+        local size, reason = system.fileSize(handle)
         if size == nil then
-            return nil, reason
+            return nil, nil, reason
         end
-        state._position = size
-    else
-        state._position = start + written
+        return written, size as integer, nil
     end
 
-    return written, nil
+    return written, start + written, nil
 end
+
+-- The same two calls for a checked span's storage, which may only be lent to a
+-- callee that says it borrows it.
+local readBorrowed: function(
+    handle: any,
+    position: integer,
+    borrows destination: uint8[?],
+    count: integer
+): (integer?, string?) = readAt as any
+local writeBorrowed: function(
+    handle: any,
+    appending: boolean,
+    position: integer,
+    borrows source: const uint8[?],
+    count: integer
+): (integer?, integer?, string?) = writeAt as any
 
 ----------------------------------------------------------------------------
 -- Open files
@@ -227,10 +244,11 @@ export record File is io.Reader, io.Writer
         end
         local wanted = positive(count, "File:read count", 2)
         local into = scratch(self, wanted)
-        local got, reason = readAt(self, into, wanted)
+        local got, reason = readAt(self._handle, self._position, into, wanted)
         if got == nil then
             return nil, reason
         end
+        self._position = self._position + (got as integer)
         if got == 0 then
             return "", nil
         end
@@ -248,9 +266,13 @@ export record File is io.Reader, io.Writer
             return nil, "the file is closed"
         end
         local wanted = positive(#destination, "File:readspan destination length", 2)
-        local pointer: any = destination:ref()
+        local got, reason = readBorrowed(self._handle, self._position, destination:ref(), wanted)
+        if got == nil then
+            return nil, reason
+        end
+        self._position = self._position + (got as integer)
 
-        return readAt(self, pointer, wanted)
+        return got, nil
     end
 
     --- Writes bytes at the cursor.
@@ -270,10 +292,11 @@ export record File is io.Reader, io.Writer
             return true, nil
         end
         local from: any = ffi.cast("const uint8_t *", bytes)
-        local wrote, reason = writeAt(self, from, #bytes)
+        local wrote, landed, reason = writeAt(self._handle, self._appending, self._position, from, #bytes)
         if wrote == nil then
             return false, reason
         end
+        self._position = landed as integer
 
         return true, nil
     end
@@ -291,9 +314,13 @@ export record File is io.Reader, io.Writer
         if count == 0 then
             return 0, nil
         end
-        local pointer: any = source:ref()
+        local wrote, landed, reason = writeBorrowed(self._handle, self._appending, self._position, source:ref(), count)
+        if wrote == nil then
+            return nil, reason
+        end
+        self._position = landed as integer
 
-        return writeAt(self, pointer, count)
+        return wrote, nil
     end
 
     --- Returns the file's byte length without moving the cursor.
@@ -1165,9 +1192,9 @@ export function applicationBase(
     environment: (function(string): string?)?
 ): (string?, string?)
     local chosen = platform or (windows and "windows" or (darwin and "apple" or "xdg"))
-    local read = environment or os.getenv
+    local lookup = environment or os.getenv
     local function setting(name: string): string?
-        local value = read(name)
+        local value = lookup(name)
         if value == nil or value == "" then
             return nil
         end
@@ -1183,6 +1210,9 @@ export function applicationBase(
     if which ~= 0 and which ~= 1 and which ~= 2 then
         return nil, "unknown application base"
     end
+    local folders = {[0] = "Library/Preferences", [1] = "Library/Application Support", [2] = "Library/Caches",}
+    local variables = {[0] = "XDG_CONFIG_HOME", [1] = "XDG_DATA_HOME", [2] = "XDG_CACHE_HOME",}
+    local fallbacks = {[0] = ".config", [1] = ".local/share", [2] = ".cache",}
     if chosen == "windows" then
         -- Roaming carries settings between machines, local does not, which is the
         -- same split configuration and data already mean.
@@ -1202,27 +1232,23 @@ export function applicationBase(
             return base:gsub("/$", "") .. "/Temp", nil
         end
         return base, nil
-    end
-    if chosen == "apple" then
+    elseif chosen == "apple" then
         local base, reason = homeDirectory()
         if base == nil then
             return nil, reason
         end
-        local folders = {[0] = "Library/Preferences", [1] = "Library/Application Support", [2] = "Library/Caches",}
         return (base as string):gsub("/$", "") .. "/" .. folders[which], nil
+    else
+        local value = setting(variables[which])
+        if value ~= nil and value:sub(1, 1) == "/" then
+            return value, nil
+        end
+        local base, reason = homeDirectory()
+        if base == nil then
+            return nil, reason
+        end
+        return (base as string):gsub("/$", "") .. "/" .. fallbacks[which], nil
     end
-    local variables = {[0] = "XDG_CONFIG_HOME", [1] = "XDG_DATA_HOME", [2] = "XDG_CACHE_HOME",}
-    local fallbacks = {[0] = ".config", [1] = ".local/share", [2] = ".cache",}
-    local value = setting(variables[which])
-    if value ~= nil and value:sub(1, 1) == "/" then
-        return value, nil
-    end
-    local base, reason = homeDirectory()
-    if base == nil then
-        return nil, reason
-    end
-
-    return (base as string):gsub("/$", "") .. "/" .. fallbacks[which], nil
 end
 
 local APP_BASES = {configuration = 0, data = 1, cache = 2,}

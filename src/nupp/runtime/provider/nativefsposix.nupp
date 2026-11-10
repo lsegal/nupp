@@ -123,10 +123,10 @@ void nupp_fs_free(void *) __asm__("free");
 char *nupp_fs_strerror(int) __asm__("strerror");
 int nupp_fs_getentropy(void *, size_t) __asm__("getentropy");
 int nupp_fs_executable(char *, uint32_t *) __asm__("_NSGetExecutablePath");
-]]):gsub("MODE", MODE):gsub("FSTATAT", label("fstatat", "$INODE64")):gsub("FSTAT\"", label("fstat", "$INODE64") .. "\""):gsub(
-    "OPENDIR",
-    label("opendir", "$INODE64")
-):gsub("FDOPENDIR", label("fdopendir", "$INODE64")):gsub("READDIR", label("readdir", "$INODE64")):gsub(
+]]):gsub("MODE", MODE):gsub("FDOPENDIR", label("fdopendir", "$INODE64")):gsub("OPENDIR", label("opendir", "$INODE64")):gsub(
+    "READDIR",
+    label("readdir", "$INODE64")
+):gsub("FSTATAT", label("fstatat", "$INODE64")):gsub("FSTAT\"", label("fstat", "$INODE64") .. "\""):gsub(
     "REALPATH",
     label("realpath", "$DARWIN_EXTSN")
 ))
