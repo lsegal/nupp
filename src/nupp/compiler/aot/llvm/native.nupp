@@ -15,16 +15,21 @@ must have C types, written out. `main` takes nothing or `(argc, argv)` and
 returns its exit status. Everything outside that subset is refused where it was
 written rather than approximated, because there is no Lua state to fall back to.
 
-Arithmetic keeps the language's meaning where C's would differ: `/` is binary64
-division, and `//` and `%` floor. Integers wrap at their width.
+Arithmetic keeps the language's meaning rather than C's. `number` and `integer`
+are binary64, and so is arithmetic over `int32`, `uint32` and `float`: those are
+refinements a value enters through an establishing conversion such as
+`math.i32.wrap`, not types whose operators wrap. `//` and `%` floor. Only `int64`
+and `uint64` arithmetic is fixed-width, wrapping as LuaJIT's does.
 ]]
 module nupp.compiler.aot.llvm.native
 
 local T = require("nupp.compiler.types")
+local apiidentity = require("nupp.compiler.apiidentity")
 local builder = require("nupp.compiler.aot.llvm.builder")
 local cst = require("nupp.compiler.syntax.cst")
 local lexer = require("nupp.compiler.syntax.lexer")
 local llvmText = require("nupp.compiler.aot.llvm.text")
+local lower = require("nupp.compiler.aot.lower")
 
 local native = {}
 
@@ -48,20 +53,22 @@ local BOOL = Kind(llvm = "i1", signed = false)
 local F64 = Kind(llvm = "double", signed = true)
 local F32 = Kind(llvm = "float", signed = true)
 local I32 = Kind(llvm = "i32", signed = true)
+local U32 = Kind(llvm = "i32", signed = false)
+local I64 = Kind(llvm = "i64", signed = true)
+local U64 = Kind(llvm = "i64", signed = false)
 local PTR = Kind(llvm = "ptr", signed = false)
 
 local INTEGERS: {
     [string]: Kind
 } = {
-    integer = I32,
     int8 = Kind(llvm = "i8", signed = true),
     uint8 = Kind(llvm = "i8", signed = false),
     int16 = Kind(llvm = "i16", signed = true),
     uint16 = Kind(llvm = "i16", signed = false),
     int32 = I32,
-    uint32 = Kind(llvm = "i32", signed = false),
-    int64 = Kind(llvm = "i64", signed = true),
-    uint64 = Kind(llvm = "i64", signed = false),
+    uint32 = U32,
+    int64 = I64,
+    uint64 = U64,
 }
 
 const WIDTHS: {[string]: integer} = {i1 = 1, i8 = 8, i16 = 16, i32 = 32, i64 = 64}
@@ -109,7 +116,7 @@ local function kindOf(t: any): Kind?
         return kindOf(raw.inner)
     elseif tag == "boolean" then
         return BOOL
-    elseif tag == "number" then
+    elseif tag == "number" or tag == "integer" then
         return F64
     elseif tag == "float" then
         return F32
@@ -278,27 +285,33 @@ end
 local expression: function(Program, Body, any, Kind?): Value
 
 --- A numeric literal, in the kind it is wanted in when there is one, negated
---- when it is the operand of a unary minus.
+--- when it is the operand of a unary minus. An `LL` or `ULL` literal is an
+--- `int64` or `uint64` whatever it is wanted as; any other is binary64 unless a
+--- C integer is wanted, where the checker has already said it is exact.
 local function number(node: cst.NumberLit, want: Kind?, negated: boolean?): Value
     local spelling = (node.token as lexer.Token).text
-    local parsed = tonumber(spelling)
-    if parsed ~= nil and negated then
-        parsed = -(parsed as number)
+    local digits, suffix = spelling:match("^(.-)([uU]?[lL][lL])$")
+    if digits ~= nil then
+        local wide = (suffix as string):sub(1, 1):lower() == "u" and U64 or I64
+        local decimal = (digits as string):match("^%d+$")
+        local text = decimal ~= nil and decimal or tonumber(digits as string) ~= nil
+            and llvmText.integer(tonumber(digits as string) as number) or nil
+        if text == nil then
+            refuse(node, "a native program cannot represent the number " .. spelling)
+        end
+        return Value(text = negated and "-" .. (text as string) or text as string, kind = wide)
     end
+    local parsed = tonumber(spelling)
     if parsed == nil then
         refuse(node, "a native program cannot represent the number " .. spelling)
     end
-    local amount = parsed as number
-    local integral = amount == math.floor(amount) and math.abs(amount) < 2 ^ 63
-    local kind = want
-    if kind == nil or not isInteger(kind as Kind) and not isFloat(kind as Kind) then
-        local written = spelling:find("[%.eEpP]") == nil or spelling:match("^0[xX]") ~= nil
-            and spelling:find("[pP%.]") == nil
-        kind = integral and written and amount >= -2 ^ 31 and amount < 2 ^ 31 and I32 or F64
+    local amount = negated and -(parsed as number) or parsed as number
+    local selected = F64
+    if want ~= nil and (isInteger(want as Kind) or isFloat(want as Kind)) then
+        selected = want as Kind
     end
-    local selected = kind as Kind
     if isInteger(selected) then
-        if not integral then
+        if amount ~= math.floor(amount) or math.abs(amount) >= 2 ^ 63 then
             refuse(node, spelling .. " is not an integer")
         end
         return Value(text = llvmText.integer(amount), kind = selected)
@@ -335,9 +348,16 @@ local function calleeOf(program: Program, body: Body, node: any): Callee?
     return program.callees[name]
 end
 
+--- A standard-library call lowered in place, by its resolved identity, or nil.
+local intrinsic: function(Program, Body, cst.Call): Value?
+
 local function call(program: Program, body: Body, node: cst.Call): Value
     local callee = calleeOf(program, body, node.obj)
     if callee == nil then
+        local inlined = intrinsic(program, body, node)
+        if inlined ~= nil then
+            return inlined as Value
+        end
         refuse(node, "a native program calls only the functions it defines and the C functions it declares")
     end
     local target = callee as Callee
@@ -384,15 +404,17 @@ local function call(program: Program, body: Body, node: cst.Call): Value
     return Value(text = value(body, text), kind = target.result)
 end
 
---- The kind two operands of an arithmetic operator meet in.
+--- The kind two operands of an arithmetic operator meet in: a 64-bit integer
+--- when either is one, as a LuaJIT `int64` absorbs a number, and binary64
+--- otherwise. A `uint64` on either side makes the result unsigned.
 local function common(left: Kind, right: Kind): Kind
-    if isFloat(left) or isFloat(right) then
-        return (left.llvm == "float" and right.llvm == "float") and F32 or F64
-    end
-    local wide = math.max(WIDTHS[left.llvm] as integer, WIDTHS[right.llvm] as integer, 32)
-    local signed = left.signed or right.signed
+    if left.llvm == "i64" or right.llvm == "i64" then
+        local unsigned = left.llvm == "i64" and not left.signed or right.llvm == "i64" and not right.signed
 
-    return Kind(llvm = "i" .. tostring(wide), signed = signed)
+        return unsigned and U64 or I64
+    end
+
+    return F64
 end
 
 local function libm(program: Program, name: string, kind: Kind): string
@@ -403,43 +425,53 @@ local function libm(program: Program, name: string, kind: Kind): string
     return "@" .. intrinsic
 end
 
---- `left op right` for integers, flooring `//` and `%` as the language does.
-local function integerArithmetic(body: Body, op: string, a: string, b: string, kind: Kind): string
-    local t = kind.llvm
-    if op == "+" then
-        return value(body, ("add %s %s, %s"):format(t, a, b))
-    elseif op == "-" then
-        return value(body, ("sub %s %s, %s"):format(t, a, b))
-    elseif op == "*" then
-        return value(body, ("mul %s %s, %s"):format(t, a, b))
-    elseif op == "&" then
-        return value(body, ("and %s %s, %s"):format(t, a, b))
-    elseif op == "|" then
-        return value(body, ("or %s %s, %s"):format(t, a, b))
-    elseif op == "~" then
-        return value(body, ("xor %s %s, %s"):format(t, a, b))
-    elseif op == "<<" then
-        return value(body, ("shl %s %s, %s"):format(t, a, b))
-    elseif op == ">>" then
-        return value(body, ("%s %s %s, %s"):format(kind.signed and "ashr" or "lshr", t, a, b))
-    end
-    if not kind.signed then
-        return value(body, ("%s %s %s, %s"):format(op == "//" and "udiv" or "urem", t, a, b))
-    end
-    -- A remainder whose sign differs from the divisor's moves one step down.
-    local quotient = value(body, ("sdiv %s %s, %s"):format(t, a, b))
-    local remainder = value(body, ("srem %s %s, %s"):format(t, a, b))
-    local nonzero = value(body, ("icmp ne %s %s, 0"):format(t, remainder))
-    local signs = value(body, ("xor %s %s, %s"):format(t, remainder, b))
-    local negative = value(body, ("icmp slt %s %s, 0"):format(t, signs))
-    local adjust = value(body, "and i1 " .. nonzero .. ", " .. negative)
-    if op == "//" then
-        local step = value(body, ("zext i1 %s to %s"):format(adjust, t))
-        return value(body, ("sub %s %s, %s"):format(t, quotient, step))
-    end
-    local shifted = value(body, ("add %s %s, %s"):format(t, remainder, b))
+--- The standard functions a native program calls, by canonical identity: the
+--- LLVM intrinsic each is, or for the establishing conversions, the kind it
+--- establishes.
+const INTRINSICS: {[string]: string} = {
+    ["math.floor"] = "floor",
+    ["math.ceil"] = "ceil",
+    ["math.abs"] = "fabs",
+    ["math.sqrt"] = "sqrt",
+    ["math.i32.wrap"] = "i32",
+    ["math.u32.wrap"] = "u32",
+    ["math.f32.narrow"] = "f32",
+}
 
-    return value(body, ("select i1 %s, %s %s, %s %s"):format(adjust, t, shifted, t, remainder))
+intrinsic = function(program: Program, body: Body, node: cst.Call): Value?
+    local identity = lower.callIdentity(node.obj)
+    local operation: string? = nil
+    for name, selected in pairs(INTRINSICS) do
+        if identity ~= nil and identity == apiidentity.canonical(name) then
+            operation = selected
+        end
+    end
+    if operation == nil then
+        return nil
+    end
+    local written = node.args ~= nil and ((node.args as cst.Args).exprs or {}) or {}
+    if #written ~= 1 then
+        refuse(node, tostring(identity) .. " takes one argument")
+    end
+    local argument = convert(body, expression(program, body, written[1], F64), F64, written[1])
+    if operation == "i32" or operation == "u32" then
+        -- Modulo 2^32, as the checker's integer argument is whole.
+        local whole = value(body, "fptosi double " .. argument.text .. " to i64")
+        local kind = operation == "i32" and I32 or U32
+        return Value(text = value(body, "trunc i64 " .. whole .. " to i32"), kind = kind)
+    elseif operation == "f32" then
+        return Value(text = value(body, "fptrunc double " .. argument.text .. " to float"), kind = F32)
+    end
+    local name = libm(program, operation as string, F64)
+
+    return Value(text = value(body, ("call double %s(double %s)"):format(name, argument.text)), kind = F64)
+end
+
+--- `left op right` over 64-bit integers, which wrap as LuaJIT's do.
+local function integerArithmetic(body: Body, op: string, a: string, b: string, kind: Kind): string
+    local instruction = op == "+" and "add" or op == "-" and "sub" or "mul"
+
+    return value(body, ("%s %s %s, %s"):format(instruction, kind.llvm, a, b))
 end
 
 local function floatArithmetic(program: Program, body: Body, op: string, a: string, b: string, kind: Kind): string
@@ -528,11 +560,12 @@ local function binaryValues(
     if not arithmetic then
         refuse(node, "the operands of " .. op .. " must be numbers in a native program")
     end
+    if op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>" then
+        refuse(node, "a native program does not lower bitwise operators")
+    end
     local meet = common(left.kind, right.kind)
-    if op == "/" or op == "^" then
-        meet = isFloat(meet) and meet or F64
-    elseif (op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>") and isFloat(meet) then
-        refuse(node, "bitwise operators take integers in a native program")
+    if order == nil and meet.llvm == "i64" and op ~= "+" and op ~= "-" and op ~= "*" then
+        refuse(node, "a native program does not lower " .. op .. " over 64-bit integers")
     end
     local a = convert(body, left, meet, lhs).text
     local b = convert(body, right, meet, rhs).text
@@ -584,16 +617,12 @@ local function unary(program: Program, body: Body, node: cst.Unop, want: Kind?):
         if (node.operand as any).kind == "number" then
             return number(node.operand as cst.NumberLit, want, true)
         end
-        local operand = expression(program, body, node.operand, want)
-        if isFloat(operand.kind) then
-            return Value(text = value(body, ("fneg %s %s"):format(operand.kind.llvm, operand.text)), kind = operand.kind)
-        elseif isInteger(operand.kind) then
-            return Value(text = value(body, ("sub %s 0, %s"):format(operand.kind.llvm, operand.text)), kind = operand.kind)
-        end
-    elseif op == "~" then
-        local operand = expression(program, body, node.operand, want)
-        if isInteger(operand.kind) then
-            return Value(text = value(body, ("xor %s %s, -1"):format(operand.kind.llvm, operand.text)), kind = operand.kind)
+        local operand = expression(program, body, node.operand, nil)
+        if operand.kind.llvm == "i64" then
+            return Value(text = value(body, "sub i64 0, " .. operand.text), kind = operand.kind)
+        elseif isInteger(operand.kind) or isFloat(operand.kind) then
+            local wide = convert(body, operand, F64, node.operand)
+            return Value(text = value(body, "fneg double " .. wide.text), kind = F64)
         end
     end
     refuse(node, "a native program cannot apply " .. op .. " here")
@@ -924,6 +953,13 @@ local function statement(program: Program, body: Body, stat: any): nil
         fornumStmt(program, body, stat as cst.FornumStmt)
     elseif kind == "doStmt" then
         block(program, body, (stat as cst.DoStmt).body)
+    elseif kind == "pragmaStmt" then
+        -- `@unsafe` is a promise to the checker, and changes nothing that runs.
+        local pragma = stat as cst.PragmaStmt
+        if pragma.name == nil or (pragma.name as lexer.Token).text ~= "unsafe" then
+            refuse(stat, "a native program cannot apply this annotation")
+        end
+        block(program, body, pragma.stat)
     elseif kind == "breakStmt" then
         local exit = body.exits[#body.exits]
         if exit == nil then
@@ -985,10 +1021,22 @@ local function signature(name: string, stat: any, funcbody: cst.Funcbody): Defin
         end
     end
     local rets = funcbody.rets or {}
-    if #rets > 1 or funcbody.returnPack ~= nil then
+    local pack = funcbody.returnPack as any
+    if #rets > 1 or pack ~= nil and (pack.kind ~= "tpack" or pack.tail ~= nil) then
         refuse(stat, "a native function returns at most one value")
     end
-    local result = #rets == 1 and annotated(rets[1], "the result of " .. name) or VOID
+    local checked = (funcbody as any).signatureType
+    if checked == nil or checked.tag ~= "func" then
+        refuse(stat, "the checker did not resolve the signature of " .. name)
+    end
+    local result = VOID
+    if #rets == 1 then
+        local kind = kindOf(checked.rets[1])
+        if kind == nil then
+            refuse(rets[1], "the result of " .. name .. " has type " .. cst.textOf(rets[1]) .. ", which has no C representation")
+        end
+        result = kind as Kind
+    end
     local symbol = "nupp." .. name
     if name == "main" then
         symbol = "main"
