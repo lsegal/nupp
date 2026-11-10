@@ -9,8 +9,9 @@ declarations follow the headers of the release `scripts/toolchain.pins` names;
 bumping that pin means checking these layouts against the new headers.
 
 The library is found through `NUPP_WGPU_LIBRARY`, then as `lib/wgpu_native`
-beside the program (with its `.dll` suffix on Windows), then by the platform
-loader's own search. `nupp` itself names the toolchain's copy in the variable.
+beside the program (with its `.dll` suffix on Windows), then in the process
+itself, where a standalone binary links it, then by the platform loader's own
+search. `nupp` itself names the toolchain's copy in the variable.
 ]]
 module nupp.runtime.provider.wgpu
 
@@ -483,6 +484,13 @@ local function open(): any
         if found then
             return value
         end
+    end
+    -- A standalone binary links wgpu-native in and exports its entry points.
+    local linked, entry = pcall(function(): any
+        return ffi.C.wgpuCreateInstance
+    end)
+    if linked and entry ~= nil then
+        return ffi.C
     end
 
     return ffi.load("wgpu_native")
