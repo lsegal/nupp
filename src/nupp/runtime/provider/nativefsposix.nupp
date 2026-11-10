@@ -132,45 +132,45 @@ int nupp_fs_executable(char *, uint32_t *) __asm__("_NSGetExecutablePath");
 ))
 
 -- Each constant the two families number differently.
-local AT_FDCWD = darwin and -2 or -100
-local AT_SYMLINK_NOFOLLOW = darwin and 0x20 or 0x100
-local AT_REMOVEDIR = darwin and 0x80 or 0x200
-local O_RDONLY = 0
-local O_WRONLY = 1
-local O_RDWR = 2
-local O_CREAT = darwin and 0x200 or 0x40
-local O_EXCL = darwin and 0x800 or 0x80
-local O_TRUNC = darwin and 0x400 or 0x200
-local O_APPEND = darwin and 0x8 or 0x400
-local O_NONBLOCK = darwin and 0x4 or 0x800
-local O_CLOEXEC = darwin and 0x1000000 or 0x80000
-local O_DIRECTORY = darwin and 0x100000 or (arch == "x64" and 0x10000 or 0x4000)
-local O_NOFOLLOW = darwin and 0x100 or (arch == "x64" and 0x20000 or 0x8000)
-local SEEK_CUR = 1
-local EINTR = 4
-local ENOENT = 2
-local EEXIST = 17
-local ENOTDIR = 20
-local ERANGE = 34
-local EAGAIN = darwin and 35 or 11
-local ELOOP = darwin and 62 or 40
-local S_IFMT = 0xF000
-local S_IFDIR = 0x4000
-local S_IFREG = 0x8000
-local S_IFLNK = 0xA000
-local DT_UNKNOWN = 0
-local DT_DIR = 4
-local DT_REG = 8
-local DT_LNK = 10
+local AT_FDCWD: integer = darwin and -2 or -100
+local AT_SYMLINK_NOFOLLOW: integer = darwin and 0x20 or 0x100
+local AT_REMOVEDIR: integer = darwin and 0x80 or 0x200
+local O_RDONLY: integer = 0
+local O_WRONLY: integer = 1
+local O_RDWR: integer = 2
+local O_CREAT: integer = darwin and 0x200 or 0x40
+local O_EXCL: integer = darwin and 0x800 or 0x80
+local O_TRUNC: integer = darwin and 0x400 or 0x200
+local O_APPEND: integer = darwin and 0x8 or 0x400
+local O_NONBLOCK: integer = darwin and 0x4 or 0x800
+local O_CLOEXEC: integer = darwin and 0x1000000 or 0x80000
+local O_DIRECTORY: integer = darwin and 0x100000 or (arch == "x64" and 0x10000 or 0x4000)
+local O_NOFOLLOW: integer = darwin and 0x100 or (arch == "x64" and 0x20000 or 0x8000)
+local SEEK_CUR: integer = 1
+local EINTR: integer = 4
+local ENOENT: integer = 2
+local EEXIST: integer = 17
+local ENOTDIR: integer = 20
+local ERANGE: integer = 34
+local EAGAIN: integer = darwin and 35 or 11
+local ELOOP: integer = darwin and 62 or 40
+local S_IFMT: integer = 0xF000
+local S_IFDIR: integer = 0x4000
+local S_IFREG: integer = 0x8000
+local S_IFLNK: integer = 0xA000
+local DT_UNKNOWN: integer = 0
+local DT_DIR: integer = 4
+local DT_REG: integer = 8
+local DT_LNK: integer = 10
 
 -- The kinds the provider numbers: a file, a directory, something else, a link.
-local FILE = 1
-local DIRECTORY = 2
-local OTHER = 3
-local SYMLINK = 4
+local FILE: integer = 1
+local DIRECTORY: integer = 2
+local OTHER: integer = 3
+local SYMLINK: integer = 4
 
 -- What a recursive remove and a glob refuse to descend past.
-local MAX_WALK_DEPTH = 512
+local MAX_WALK_DEPTH: integer = 512
 
 --- The platform's words for an `errno`, in the spelling Rust's `io::Error` used.
 local function described(code: integer): string
@@ -199,13 +199,16 @@ local mode: function(value: integer): any = function(value: integer): any
     return ffi.cast(MODE, value)
 end
 
-local statBuffer: any = ffi.new("nupp_fs_stat")
+-- Named through a variable: the structure is declared for the running system
+-- above, out of the checker's sight.
+local STAT_TYPE = "nupp_fs_stat"
+local statBuffer: any = ffi.new(STAT_TYPE)
 
 -- glibc before 2.33 exports only the versioned `__fxstat*` entry points.
 local direct = pcall(function(): any
     return C.nupp_fs_fstatat
 end)
-local STAT_VERSION = arch == "x64" and 1 or 0
+local STAT_VERSION: integer = arch == "x64" and 1 or 0
 
 local function statAt(directory: integer, path: string, follow: boolean, into: any): integer
     local flags = follow and 0 or AT_SYMLINK_NOFOLLOW
@@ -285,7 +288,7 @@ export function readLink(path: string): (string?, string?)
     if refused ~= nil then
         return nil, refused
     end
-    local size = 256
+    local size: integer = 256
     while true do
         local buffer = ffi.new("char[?]", size)
         local count = tonumber(C.nupp_fs_readlink(path, buffer, size)) as integer
@@ -840,7 +843,7 @@ end
 
 --- The working directory.
 export function currentDirectory(): (string?, string?)
-    local size = 512
+    local size: integer = 512
     while true do
         local buffer = ffi.new("char[?]", size)
         if C.nupp_fs_getcwd(buffer, size) ~= nil then

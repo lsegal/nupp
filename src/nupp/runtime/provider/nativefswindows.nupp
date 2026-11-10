@@ -80,64 +80,64 @@ uint32_t nupp_fs_temp_path(uint32_t, uint16_t *) __asm__("GetTempPathW");
 int32_t nupp_fs_random(void *, uint8_t *, uint32_t, uint32_t) __asm__("BCryptGenRandom");
 ]]
 
-local CP_UTF8 = 65001
-local MB_ERR_INVALID_CHARS = 0x8
-local WC_ERR_INVALID_CHARS = 0x80
-local FORMAT_MESSAGE_FROM_SYSTEM = 0x1000
-local FORMAT_MESSAGE_IGNORE_INSERTS = 0x200
-local INVALID_ATTRIBUTES = 0xFFFFFFFF
-local FILE_ATTRIBUTE_READONLY = 0x1
-local FILE_ATTRIBUTE_DIRECTORY = 0x10
-local FILE_ATTRIBUTE_NORMAL = 0x80
-local FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-local GENERIC_READ = 0x80000000
-local GENERIC_WRITE = 0x40000000
-local FILE_READ_ATTRIBUTES = 0x80
+local CP_UTF8: integer = 65001
+local MB_ERR_INVALID_CHARS: integer = 0x8
+local WC_ERR_INVALID_CHARS: integer = 0x80
+local FORMAT_MESSAGE_FROM_SYSTEM: integer = 0x1000
+local FORMAT_MESSAGE_IGNORE_INSERTS: integer = 0x200
+local INVALID_ATTRIBUTES: integer = 0xFFFFFFFF
+local FILE_ATTRIBUTE_READONLY: integer = 0x1
+local FILE_ATTRIBUTE_DIRECTORY: integer = 0x10
+local FILE_ATTRIBUTE_NORMAL: integer = 0x80
+local FILE_ATTRIBUTE_REPARSE_POINT: integer = 0x400
+local GENERIC_READ: integer = 0x80000000
+local GENERIC_WRITE: integer = 0x40000000
+local FILE_READ_ATTRIBUTES: integer = 0x80
 -- What append mode asks for: the right to add at the end, without the right to
 -- write anywhere else.
-local FILE_APPEND_ACCESS = 0x120116
-local FILE_SHARE_ALL = 0x7
-local CREATE_NEW = 1
-local CREATE_ALWAYS = 2
-local OPEN_EXISTING = 3
-local OPEN_ALWAYS = 4
-local FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-local FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
-local FSCTL_GET_REPARSE_POINT = 0x000900A8
-local IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
-local IO_REPARSE_TAG_SYMLINK = 0xA000000C
-local SYMLINK_FLAG_RELATIVE = 1
-local MOVEFILE_REPLACE_EXISTING = 0x1
-local MOVEFILE_WRITE_THROUGH = 0x8
-local SYMBOLIC_LINK_FLAG_DIRECTORY = 0x1
-local SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2
-local FIND_EX_INFO_BASIC = 1
-local FIND_FIRST_EX_LARGE_FETCH = 2
-local FILE_BEGIN = 0
-local FILE_CURRENT = 1
-local ERROR_FILE_NOT_FOUND = 2
-local ERROR_PATH_NOT_FOUND = 3
-local ERROR_ACCESS_DENIED = 5
-local ERROR_INVALID_DRIVE = 15
-local ERROR_NO_MORE_FILES = 18
-local ERROR_SHARING_VIOLATION = 32
-local ERROR_BAD_NETPATH = 53
-local ERROR_BAD_NET_NAME = 67
-local ERROR_FILE_EXISTS = 80
-local ERROR_INVALID_PARAMETER = 87
-local ERROR_ALREADY_EXISTS = 183
-local ERROR_DIRECTORY = 267
-local BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2
+local FILE_APPEND_ACCESS: integer = 0x120116
+local FILE_SHARE_ALL: integer = 0x7
+local CREATE_NEW: integer = 1
+local CREATE_ALWAYS: integer = 2
+local OPEN_EXISTING: integer = 3
+local OPEN_ALWAYS: integer = 4
+local FILE_FLAG_BACKUP_SEMANTICS: integer = 0x02000000
+local FILE_FLAG_OPEN_REPARSE_POINT: integer = 0x00200000
+local FSCTL_GET_REPARSE_POINT: integer = 0x000900A8
+local IO_REPARSE_TAG_MOUNT_POINT: integer = 0xA0000003
+local IO_REPARSE_TAG_SYMLINK: integer = 0xA000000C
+local SYMLINK_FLAG_RELATIVE: integer = 1
+local MOVEFILE_REPLACE_EXISTING: integer = 0x1
+local MOVEFILE_WRITE_THROUGH: integer = 0x8
+local SYMBOLIC_LINK_FLAG_DIRECTORY: integer = 0x1
+local SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE: integer = 0x2
+local FIND_EX_INFO_BASIC: integer = 1
+local FIND_FIRST_EX_LARGE_FETCH: integer = 2
+local FILE_BEGIN: integer = 0
+local FILE_CURRENT: integer = 1
+local ERROR_FILE_NOT_FOUND: integer = 2
+local ERROR_PATH_NOT_FOUND: integer = 3
+local ERROR_ACCESS_DENIED: integer = 5
+local ERROR_INVALID_DRIVE: integer = 15
+local ERROR_NO_MORE_FILES: integer = 18
+local ERROR_SHARING_VIOLATION: integer = 32
+local ERROR_BAD_NETPATH: integer = 53
+local ERROR_BAD_NET_NAME: integer = 67
+local ERROR_FILE_EXISTS: integer = 80
+local ERROR_INVALID_PARAMETER: integer = 87
+local ERROR_ALREADY_EXISTS: integer = 183
+local ERROR_DIRECTORY: integer = 267
+local BCRYPT_USE_SYSTEM_PREFERRED_RNG: integer = 2
 -- 100-nanosecond intervals between 1601-01-01 and 1970-01-01.
-local EPOCH_OFFSET = 11644473600
+local EPOCH_OFFSET: integer = 11644473600
 
-local FILE = 1
-local DIRECTORY = 2
-local SYMLINK = 4
+local FILE: integer = 1
+local DIRECTORY: integer = 2
+local SYMLINK: integer = 4
 
 local INVALID_HANDLE: any = ffi.cast("void *", -1)
 
-local MAX_WALK_DEPTH = 512
+local MAX_WALK_DEPTH: integer = 512
 
 ----------------------------------------------------------------------------
 -- Text and failures
@@ -212,7 +212,7 @@ local function narrow(units: any, count: integer): string?
 end
 
 local function unitsLength(units: any, limit: integer): integer
-    local count = 0
+    local count: integer = 0
     while count < limit and units[count] ~= 0 do
         count = count + 1
     end
@@ -290,7 +290,7 @@ export function info(path: string, follow: boolean): (integer?, integer?, number
     local attributes = tonumber(attributeBuffer.attributes) as integer
     local reparse = bit.band(attributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0
     if not reparse or not follow then
-        local kind = bit.band(attributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0 and DIRECTORY or FILE
+        local kind: integer = bit.band(attributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0 and DIRECTORY or FILE
         if reparse then
             local tag = reparseTag(name)
             if tag ~= nil and nameSurrogate(tag) then
@@ -298,8 +298,8 @@ export function info(path: string, follow: boolean): (integer?, integer?, number
             end
         end
         local written: integer = tonumber(attributeBuffer.written) as integer
-        local size = (tonumber(attributeBuffer.sizeHigh) as integer) * 4294967296
-            + (tonumber(attributeBuffer.sizeLow) as integer)
+        local size = ((tonumber(attributeBuffer.sizeHigh) as integer) * 4294967296
+            + (tonumber(attributeBuffer.sizeLow) as integer)) as integer
 
         return kind, size, written / 1e7 - EPOCH_OFFSET, bit.band(attributes, FILE_ATTRIBUTE_READONLY) ~= 0, nil
     end
@@ -317,8 +317,11 @@ export function info(path: string, follow: boolean): (integer?, integer?, number
     end
     local target = tonumber(handleBuffer.attributes) as integer
 
-    return bit.band(target, FILE_ATTRIBUTE_DIRECTORY) ~= 0 and DIRECTORY or FILE,
-        (tonumber(handleBuffer.sizeHigh) as integer) * 4294967296 + (tonumber(handleBuffer.sizeLow) as integer),
+    local kind: integer = bit.band(target, FILE_ATTRIBUTE_DIRECTORY) ~= 0 and DIRECTORY or FILE
+    local size = ((tonumber(handleBuffer.sizeHigh) as integer) * 4294967296 + (tonumber(handleBuffer.sizeLow) as integer)) as integer
+
+    return kind,
+        size,
         seconds(tonumber(handleBuffer.writtenLow) as integer, tonumber(handleBuffer.writtenHigh) as integer),
         bit.band(target, FILE_ATTRIBUTE_READONLY) ~= 0,
         nil
@@ -385,7 +388,8 @@ export function readLink(path: string): (string?, string?)
     local pathBuffer: any
     local relative = false
     if tag == IO_REPARSE_TAG_SYMLINK then
-        relative = bit.band(tonumber(ffi.cast("uint32_t *", buffer + 16)[0]) as integer, SYMLINK_FLAG_RELATIVE) ~= 0
+        local flags: any = ffi.cast("uint32_t *", buffer + 16)
+        relative = bit.band(tonumber(flags[0]) as integer, SYMLINK_FLAG_RELATIVE) ~= 0
         pathBuffer = buffer + 20
     elseif tag == IO_REPARSE_TAG_MOUNT_POINT then
         pathBuffer = buffer + 16
@@ -806,7 +810,7 @@ end
 local transferred: any = ffi.new("uint32_t[1]")
 local position: any = ffi.new("int64_t[1]")
 -- One call moves at most this much, below the 32-bit count the API takes.
-local MAX_CALL = 1073741824
+local MAX_CALL: integer = 1073741824
 
 local function seekTo(file: any, offset: integer): boolean
     return C.nupp_fs_seek(file[0], offset, nil, FILE_BEGIN) ~= 0
@@ -907,7 +911,7 @@ end
 ----------------------------------------------------------------------------
 
 local function fetched(fill: function(size: integer, buffer: any): integer): (string?, string?)
-    local size = 512
+    local size: integer = 512
     while true do
         local buffer = ffi.new("uint16_t[?]", size)
         local count = fill(size, buffer)
@@ -955,7 +959,7 @@ end
 
 --- The running executable's path.
 export function executablePath(): (string?, string?)
-    local size = 512
+    local size: integer = 512
     while true do
         local buffer = ffi.new("uint16_t[?]", size)
         local count = C.nupp_fs_module_path(nil, buffer, size) as integer

@@ -15,7 +15,7 @@ module nupp.runtime.provider.nativefsglob
 --- may have.
 export const MAX_WALK_DEPTH = 512
 
-local DIRECTORY = 2
+local DIRECTORY: integer = 2
 
 --- The directory operations a walk needs, as the platform modules provide them.
 export type System = {
@@ -89,10 +89,10 @@ end
 
 --- Whether one name matches one pattern component.
 export function matchesName(pattern: string, name: string): boolean
-    local patternAt = 1
-    local nameAt = 1
+    local patternAt: integer = 1
+    local nameAt: integer = 1
     local starAt: integer? = nil
-    local starName = 1
+    local starName: integer = 1
     local patternLength = #pattern
     local nameLength = #name
 
@@ -144,7 +144,7 @@ end
 
 local function checkComponent(component: string): string?
     local length = #component
-    local at = 1
+    local at: integer = 1
     while at <= length do
         local current = component:byte(at)
         if current == BRACKET then
@@ -222,7 +222,7 @@ end
 -- A walk's state: the pattern, what it found, and which recursive wildcards it has
 -- already expanded from which directory. Two recursive wildcards reach one directory
 -- at one pattern position by many routes, and walking it again finds nothing new.
-type Walk = {
+local type Walk = {
     system: System,
     components: {string},
     matches: {[string]: boolean},

@@ -32,8 +32,8 @@ export const MAX_REQUEST_BYTES = 268435456
 
 --- The most I/O one step of one transfer performs.
 export const STEP_BYTES = 1048576
-local READ_CHUNK = 65536
-local TEMPORARY_ATTEMPTS = 64
+local READ_CHUNK: integer = 65536
+local TEMPORARY_ATTEMPTS: integer = 64
 
 --- A transfer that is still moving.
 export const PENDING = 0
@@ -263,7 +263,7 @@ local function readStep(transfer: Transfer): nil
         if got == maxRequestBytes then
             wanted = 1
         end
-        local refused = grow(transfer, math.min(got + wanted, maxRequestBytes))
+        local refused = grow(transfer, math.min(got + wanted, maxRequestBytes) as integer)
         if refused ~= nil then
             settle(transfer, refused, nil)
             return
