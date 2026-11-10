@@ -235,12 +235,16 @@ local BIT_EXPRESSIONS = {
     "w & 255", "w | 1", "w ~ -1", "~w", "w << 63", "w << 64", "w << -1",
     "w >> 1", "w ~>> 1", "w >> 65", "w & a", "a & w", "w & f", "w << b",
     "u & -1", "u & a", "u | w", "w ~ u", "u ~>> 4", "u >> 4", "~u", "u & huge", "w << u",
+    "-2.5 | 0", "1e300 | 0", "w & 2.5", "w << 64.7", "9007199254740993 & w",
+    "w & 1e300", "w | (0/0)", "w | (1/0)", "u & -1e30", "u | (0/0)", "u & (2^64 + 2^63)",
 }
 
 -- Each bit operator lowered natively gives what the same expression gives under
 -- LuaJIT: numbers meet as 32-bit words, shift counts outside 0..31 or 0..63 are
 -- masked, a fraction rounds, and an `int64` or `uint64` operand makes the
--- operation 64-bit. The program exits with the first case that disagrees.
+-- operation 64-bit, truncating a number beside it. A number out of 64-bit range,
+-- NaN or an infinity converts as this machine's LuaJIT converts it. The program
+-- exits with the first case that disagrees.
 function M.bitOperatorsAgreeWithLuaJIT()
     requireCodegen()
     local lines = {}
@@ -269,6 +273,26 @@ end
 ]])
     test.eq(executable, nil)
     assert(output:find("host.nupp:3:21: native: LuaJIT shifts a number by a 64-bit count", 1, true), output)
+end
+
+-- A compound bit assignment stores what the operator gives, as LuaJIT does.
+function M.bitCompoundAssignmentsAgreeWithLuaJIT()
+    requireCodegen()
+    local expected = assert(load("local x = 12 x = x & 10 x = x | 1 x = x << 2 x = x >> 1 x = x ~>> 33 return x"))()
+    local executable, output = link([[
+local function main(): int32
+    local x = 12
+    x &= 10
+    x |= 1
+    x <<= 2
+    x >>= 1
+    x ~>>= 33
+    return math.i32.wrap(x)
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, expected, ran)
 end
 
 local ffi = require("ffi")
