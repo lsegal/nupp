@@ -172,12 +172,14 @@ local function kindOf(t: any): Kind?
     return nil
 end
 
---- The C kind a written type annotation names.
-local function annotated(node: any, what: string): Kind
+--- The C kind a written type annotation names. `checked` is the type the
+--- checker gave what it annotates, for an annotation it does not publish a
+--- type on itself, as on a cast.
+local function annotated(node: any, what: string, checked: any?): Kind
     if node == nil then
         refuse(node, what .. " needs a written C type in a native program")
     end
-    local kind = kindOf((node as any).resolvedType)
+    local kind = kindOf((node as any).resolvedType or checked)
     if kind == nil then
         refuse(node, what .. " has type " .. cst.textOf(node as cst.Child) .. ", which has no C representation")
     end
@@ -905,7 +907,7 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
         return unary(program, body, node as cst.Unop, want)
     elseif kind == "castExpr" then
         local cast = node as cst.CastExpr
-        local to = annotated(cast.type, "a cast")
+        local to = annotated(cast.type, "a cast", (node as any).inferredType)
         local inner = expression(program, body, cast.expr, nil)
         if to.llvm == "ptr" and inner.kind.llvm == "ptr" then
             return Value(text = inner.text, kind = to)

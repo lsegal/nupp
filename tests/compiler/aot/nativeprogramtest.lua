@@ -259,7 +259,7 @@ end
 --- program below prints them.
 local function describe(n, count)
     local big = tostring(n[0].big):gsub("LL$", "")
-    local fields = ("%d %g %g %g %g %s %g %g %.17g %d %g %g\n"):format(
+    local fields = ("%d %g %g %g %.10g %s %g %g %.17g %d %.10g %g\n"):format(
         n[0].flag and 1 or 0,
         n[0].small,
         n[0].count,
@@ -316,7 +316,7 @@ local function main(): int32
         nodes[1].flag = other.id == 5 and not nodes[1].flag
         nodes.next = nil
         printf(
-            "%%d %%g %%g %%g %%g %%lld %%g %%g %%.17g %%d %%g %%g\n",
+            "%%d %%g %%g %%g %%.10g %%lld %%g %%g %%.17g %%d %%.10g %%g\n",
             nodes.flag,
             nodes.small,
             nodes.count,
@@ -366,7 +366,7 @@ end
     ffi.cast("nuppNativeProgramNode *", n[0].next).id = 5
     n[1].flag = other[0].id == 5 and not n[1].flag
     n[0].next = nil
-    test.eq(ran .. "\n", describe(n, 2))
+    test.eq(ran, (describe(n, 2):gsub("%s+$", "")))
 end
 
 -- What lowering refuses is reported where it was written, before anything is
