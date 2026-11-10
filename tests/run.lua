@@ -176,6 +176,21 @@ local workerHost = rawget(_G, "__NUPP_TEST_WORKER_HOST") == true
 local rawTmpname, rawExit = os.tmpname, os.exit
 local tempStem = rawTmpname()
 os.remove(tempStem)
+-- msvcrt's `tmpnam`, behind LuaJIT's `os.tmpname` on Windows, names a file at
+-- the root of the current drive: `\s1ako.`. An ordinary user cannot write `C:\`,
+-- and the runner's Git Bash reads `/s1ako.` as a path under its own root, so a
+-- case that made a directory there through the shell could not find it again
+-- from Lua. The name moves under the user's temporary directory, as
+-- `process.windowsTempName` moves the compiler's, and keeps its drive so both
+-- sides read it the same way.
+if package.config:sub(1, 1) == "\\" then
+    local base = tempStem:match("^[\\/]([^\\/]+)$") or tempStem:match("^%a:[\\/]([^\\/]+)$")
+    local tempDir = os.getenv("TEMP") or os.getenv("TMP")
+    if base and tempDir and tempDir ~= "" then
+        base = base:gsub("%.+$", "")
+        tempStem = (tempDir:gsub("[\\/]+$", "")) .. "\\" .. (base ~= "" and base or "tmp")
+    end
+end
 local processSalt
 -- This process, for a lock to name its holder by, and the question a waiter asks
 -- of that name. Both stay nil without FFI, where a lock is judged by age alone.
@@ -296,6 +311,15 @@ end
 -- launched by Git Bash. Keep one shell dialect for the tests, and keep native
 -- paths for the Windows programs those commands start.
 if package.config:sub(1, 1) == "\\" then
+    -- Loading the runtime's I/O module assigns its own `io.popen` over the one
+    -- installed below. A process worker reaches its first suite before anything
+    -- has loaded it, so the first compiler module a suite required replaced the
+    -- Bash route and later pipes went to cmd.exe. Load it now, so the route
+    -- wraps it instead. A shared worker lane refuses pipes anyway: leave its
+    -- refusal in place rather than loading a working popen over it.
+    if not package.loaded["nupp.runtime.standardio"] and not rawget(_G, "__NUPP_TEST_EMBEDDED") then
+        pcall(require, "nupp.runtime.standardio")
+    end
     local rawExecute, rawPopen = os.execute, io.popen
     local standardIO = package.loaded["nupp.runtime.standardio"]
     local nativePopen = standardIO and rawPopen == standardIO.popen

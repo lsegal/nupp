@@ -366,20 +366,19 @@ local function executable(
     if output == nil then
         return usageError("--emit executable needs --output PATH")
     end
-    local profile = require("nupp.compiler.aot.llvm.profile").of(target.triple)
-    if profile == nil then
-        return refuse(report.UNKNOWN_NAME, "a native program cannot be built for " .. target.triple)
-    end
-    local ir, problem = require(
-        "nupp.compiler.aot.llvm.native"
-    ).module(tree.root, target.triple, (profile as {functionAttributes: string}).functionAttributes)
+    local ir, problem, at = require("nupp.tools.build.program").lower(tree, target.triple)
     if ir == nil then
-        local at = problem as {
+        if at == nil then
+            return refuse(report.UNKNOWN_NAME, tostring(problem))
+        end
+        local position = at as {
             line: integer,
-            column: integer,
-            message: string
+            column: integer
         }
-        return refuse(report.TOOL_FAILED, ("%s:%d:%d: native: %s"):format(path, at.line, at.column, at.message))
+        return refuse(
+            report.TOOL_FAILED,
+            ("%s:%d:%d: native: %s"):format(path, position.line, position.column, tostring(problem))
+        )
     end
     local linked, linkErr = require(
         "nupp.tools.build.native"

@@ -16,7 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 nupp-native = { path = "../native", default-features = false, features = ["base"] }
-nupp-native-platform = { path = "../platform" }
 nupp-native-runtime = { path = "../runtime" }
 
 [target.'cfg(unix)'.dependencies]
@@ -26,12 +25,12 @@ libc = "0.2"
 default = []
 application-entry = []
 lpeg = []
-native-files = ["nupp-native/files"]
+native-files = []
 native-net = ["nupp-native/net"]
-native-process = ["nupp-native/process"]
+native-process = []
 native-tls = ["nupp-native/tls"]
 native-checksum = []
-native-compression = ["nupp-native/compression"]
+native-compression = []
 native-codegen = ["nupp-native/codegen"]
 # The provider's test-only panic probe; no release build selects it.
 native-panic-probe = ["nupp-native/panic-probe"]

@@ -34,17 +34,17 @@ function M.nativeFacilitiesSharingAProviderBuildAsOneUnion()
     compilerEnv.compilerRoot = function()
         return "."
     end
-    local ok, outputs, problem = pcall(nativeStage.build, ".", "out", {["native.path"] = true, ["native.uuid"] = true,})
+    local ok, outputs, problem = pcall(nativeStage.build, ".", "out", {["native.path"] = true, ["native.uri"] = true,})
     process.capture, fs.copyFile = originalCapture, originalCopy
     compilerEnv.compilerRoot = originalCompilerRoot
     assert(ok, outputs)
     assert(outputs, problem)
     testAssert.eq(#calls, 1, "one provider union is built once")
-    testAssert.eq(#copies, 2, "the shared library and path runtime are staged")
+    testAssert.eq(#copies, 3, "the shared library and the path and URI runtimes are staged")
     local command = "\n" .. table.concat(calls[1], "\n") .. "\n"
-    -- The path provider asks the operating system itself, so only UUID reaches
+    -- The path provider asks the operating system itself, so only URI reaches
     -- the Rust union.
-    assert(command:find("\nnative%-rust\nuuid\n"), "path and UUID select one Rust feature union")
+    assert(command:find("\nnative%-rust\nuri\n"), "path and URI select one Rust feature union")
     testAssert.eq(copies[1][1], "/built/libnupp_native.dylib", "the Rust provider union has one source artifact")
     assert(copies[1][2]:find("out/lib/nupp_native", 1, true), "the Rust provider union keeps its stable sidecar name")
 end
@@ -172,10 +172,35 @@ function M.aStandaloneLinkKeepsTheGpuProvidersEntryPoints()
         end
         assert(kept.wgpuCreateInstance and kept.wgpuQueueSubmit, "the provider's entry points are kept")
 
+        -- A macOS kit stubs the provider's frameworks apart from its own
+        -- libraries; one built before it did is refused.
         calls = {}
         flags, err = nativeStage.linkedProviders(effects, "aarch64-apple-darwin")
         assert(flags == nil and err:find("cannot link native feature gpu", 1, true), err)
+        local kit = tempProject({
+            ["old/kit.json"] = [[{"schemaVersion": 1, "platform": "macos", "libraries": ["-lSystem"]}]],
+            ["kit.json"] = [[{"schemaVersion": 1, "platform": "macos", "libraries": ["-lSystem"],
+  "providers": {"wgpu": ["-framework", "Metal", "-lobjc"]}}]],
+        })
+        flags, err = nativeStage.linkedProviders(effects, "aarch64-apple-darwin", kit .. "/old")
+        assert(flags == nil and err:find("no stubs for the system frameworks", 1, true), err)
         testAssert.eq(#calls, 0, "a refused platform fetches nothing")
+
+        flags, err = nativeStage.linkedProviders(effects, "aarch64-apple-darwin", kit)
+        remove(kit)
+        assert(flags, err)
+        testAssert.eq(#calls, 1, "one static library is built")
+        command = "\n" .. table.concat(calls[1], "\n") .. "\n"
+        assert(command:find("\nwgpu-static\naarch64-apple-darwin\n", 1, true), command)
+        testAssert.eq(flags[1], "/built/libwgpu_native.a")
+        kept = {}
+        local index = 2
+        while flags[index] == "-u" do
+            kept[assert(flags[index + 1]:match("^_(wgpu%w+)$"), flags[index + 1])] = true
+            index = index + 2
+        end
+        assert(kept.wgpuCreateInstance and kept.wgpuQueueSubmit, "the provider's entry points are kept")
+        testAssert.eq(table.concat(flags, " ", index), "-framework Metal -lobjc", "the kit's frameworks follow")
 
         flags, err = nativeStage.linkedProviders(
             nativeStage.resolve({

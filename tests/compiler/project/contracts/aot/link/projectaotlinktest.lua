@@ -52,9 +52,6 @@ end
 --- program opens a device, or reports that the machine has none, with no
 --- library named in its environment.
 function M.standaloneBinaryLinksTheGpuProviderIntoItsOwnHost()
-    if jit.os == "OSX" then
-        return
-    end
     local dir = tempProject({
         [
             "src/main.nupp"

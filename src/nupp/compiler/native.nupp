@@ -702,18 +702,7 @@ local FEATURES: {[string]: native.Feature} = {
         requires = {"runtime.uri_whatwg"}
     },
     ["runtime.uri_whatwg"] = {name = "uri_whatwg", runtimeModule = "nupp.io.uri.whatwg", portableRuntime = true},
-    [
-        "native.uuid"
-    ] = {
-        name = "uuid",
-        modules = {"nupp.runtime.provider.nativeuuid"},
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "uuid",
-        library = "nupp_native",
-        binary = true,
-        requires = {"runtime.native"},
-    },
+    ["native.uuid"] = {name = "uuid", modules = {"nupp.runtime.provider.nativeuuid"},},
     ["native.files"] = {
         name = "files",
         modules = {"nupp.runtime.provider.nativefiles"},
@@ -755,20 +744,6 @@ local FEATURES: {[string]: native.Feature} = {
         requires = {"runtime.suspension"},
         portableRuntime = true,
     },
-    [
-        "native.crc"
-    ] = {
-        name = "crc",
-        module = "nupp.runtime.provider.nativecrc",
-        runtimeModule = "nupp.runtime.provider.nativecrc",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "base",
-        host = "native-checksum",
-        library = "nupp_native",
-        binary = true,
-        requires = {"runtime.native"},
-    },
     ["runtime.native"] = {name = "native_runtime", runtimeModule = "nupp.runtime.native",},
     [
         "native.time"
@@ -777,12 +752,7 @@ local FEATURES: {[string]: native.Feature} = {
         host = "native-time",
         module = "nupp.runtime.provider.nativetime",
         runtimeModule = "nupp.runtime.provider.nativetime",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "base",
-        library = "nupp_native",
-        binary = true,
-        requires = {"runtime.suspension", "runtime.native"},
+        requires = {"runtime.suspension"},
     },
     ["native.net"] = {
         name = "net",
@@ -831,7 +801,9 @@ local FEATURES: {[string]: native.Feature} = {
         runtimeModule = "nupp.runtime.provider.nativeprocess",
         provider = "nupp_native",
         providerDriver = "native-rust",
-        providerFeature = "process",
+        -- Nupp spawns and reaps the child itself; all it takes from the provider
+        -- is the wake handle its readiness wait shares, which every build has.
+        providerFeature = "base",
         host = "native-process",
         library = "nupp_native",
         binary = true,
@@ -916,13 +888,8 @@ local FEATURES: {[string]: native.Feature} = {
         exports = {"bytes.compress"},
         modules = {"nupp.runtime.provider.nativecompression"},
         runtimeModule = "nupp.runtime.provider.nativecompression",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "compression",
         host = "native-compression",
-        library = "nupp_native",
-        binary = true,
-        requires = {"runtime.native", "runtime.spanview", "stdlib.io"},
+        requires = {"runtime.spanview", "stdlib.io"},
     },
     [
         "native.sha256"
@@ -962,9 +929,7 @@ local FEATURES: {[string]: native.Feature} = {
         requires = {"runtime.suspension"},
     },
     ["native.host"] = {name = "host", module = "nupp.runtime.provider.nativehost", requires = {"runtime.suspension"}},
-    [
-        "native.crypto"
-    ] = {name = "crypto", module = "nupp.runtime.provider.nativecrypto", requires = {"runtime.native"},},
+    ["native.crypto"] = {name = "crypto", module = "nupp.runtime.provider.nativecrypto"},
 }
 
 local byGlobal: {[string]: string} = {}

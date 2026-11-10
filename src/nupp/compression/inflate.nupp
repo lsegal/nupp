@@ -1,0 +1,734 @@
+@!internal
+
+--[[Streaming DEFLATE decoding (RFC 1951) with gzip (RFC 1952) and zlib
+(RFC 1950) wrappers, written in Nupp.
+
+The decoder is a resumable state machine. Input arrives in arbitrary chunks and
+output leaves through a caller-sized span, so decoding advances one item at a
+time -- a block header, a code-length table, one literal or match, a run of
+stored bytes, a wrapper header or trailer -- and checkpoints the bit reader
+before each. An item that runs out of input is rolled back to its checkpoint and
+the bytes it would have needed are carried into the next call. Bytes are pulled
+from the input only as bits are needed, so a stream that ends mid-chunk leaves
+the rest of that chunk unconsumed.
+
+Codes are decoded canonically from per-length counts, as zlib's `puff` does.
+]]
+module nupp.compression.inflate
+
+const ffi = require("ffi")
+const crc = require("nupp.checksum.internal.crc")
+
+export const GZIP = 1
+export const ZLIB = 2
+export const RAW = 3
+
+export const NEED_INPUT = 1
+export const NEED_OUTPUT = 2
+export const FINISHED = 3
+
+local WINDOW = 32768
+local WINDOW_MASK = WINDOW - 1
+
+local LENGTH_BASE: any = {
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    13,
+    15,
+    17,
+    19,
+    23,
+    27,
+    31,
+    35,
+    43,
+    51,
+    59,
+    67,
+    83,
+    99,
+    115,
+    131,
+    163,
+    195,
+    227,
+    258
+}
+local LENGTH_EXTRA: any = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
+local DISTANCE_BASE: any = {
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    9,
+    13,
+    17,
+    25,
+    33,
+    49,
+    65,
+    97,
+    129,
+    193,
+    257,
+    385,
+    513,
+    769,
+    1025,
+    1537,
+    2049,
+    3073,
+    4097,
+    6145,
+    8193,
+    12289,
+    16385,
+    24577
+}
+local DISTANCE_EXTRA: any = {
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13
+}
+local CODE_LENGTH_ORDER: any = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
+
+--- A canonical Huffman code: how many codes each length has, and the symbols
+--- in code order.
+export record Code
+    counts: any
+    symbols: any
+end
+
+--- Raised inside an item when the input runs out; the item is retried later.
+local UNDERFLOW = {}
+
+local record Failure
+    reason: string
+end
+
+local function fail(reason: string): nil
+    error(Failure(reason = reason), 0)
+end
+
+--- Builds a code from symbol lengths, refusing an over-subscribed set and, unless
+--- `incompleteAllowed`, an incomplete one with more than a single code.
+local function build(lengths: any, count: number, incompleteAllowed: boolean, label: string): Code
+    local counts: any = {}
+    for length = 0, 15 do
+        counts[length] = 0
+    end
+    for symbol = 0, count - 1 do
+        local length = lengths[symbol] or 0
+        counts[length] = counts[length] + 1
+    end
+    local codes = 0
+    local left = 1
+    for length = 1, 15 do
+        left = left * 2 - counts[length]
+        if left < 0 then
+            fail("invalid " .. label .. " code lengths")
+        end
+        codes = codes + counts[length]
+    end
+    if left > 0 and not incompleteAllowed and codes ~= 1 then
+        fail("invalid " .. label .. " code lengths")
+    end
+    local offsets: any = {}
+    offsets[1] = 0
+    for length = 1, 14 do
+        offsets[length + 1] = offsets[length] + counts[length]
+    end
+    local symbols: any = {}
+    for symbol = 0, count - 1 do
+        local length = lengths[symbol] or 0
+        if length ~= 0 then
+            symbols[offsets[length]] = symbol
+            offsets[length] = offsets[length] + 1
+        end
+    end
+    counts[0] = 0
+
+    return Code(counts = counts, symbols = symbols)
+end
+
+local fixedLiterals: Code? = nil
+local fixedDistances: Code? = nil
+
+local function fixedCodes(): (Code, Code)
+    if fixedLiterals == nil then
+        local lengths: any = {}
+        for symbol = 0, 287 do
+            lengths[symbol] = symbol < 144 and 8 or symbol < 256 and 9 or symbol < 280 and 7 or 8
+        end
+        fixedLiterals = build(lengths, 288, true, "fixed literal")
+        local distances: any = {}
+        for symbol = 0, 29 do
+            distances[symbol] = 5
+        end
+        fixedDistances = build(distances, 30, true, "fixed distance")
+    end
+
+    return fixedLiterals as Code, fixedDistances as Code
+end
+
+--- Decoder state. `phase` names the item the next step decodes.
+export record Decoder
+    format: integer
+    concatenated: boolean
+    phase: string
+    -- The bit reader: the bytes of this step, where it has read to, and the
+    -- bits pulled from them but not yet used.
+    data: string
+    position: integer
+    bits: number
+    count: number
+    -- Where the current item began, to roll back to on underflow.
+    markPosition: integer
+    markBits: number
+    markCount: number
+    -- The block being decoded.
+    last: boolean
+    literals: Code?
+    distances: Code?
+    storedLeft: number
+    copyLength: number
+    copyDistance: number
+    -- History for back-references, and how much of it is filled.
+    window: any
+    windowAt: number
+    produced: number
+    -- Integrity: the running checksum of the member's output.
+    checksum: uint64
+    adlerLow: number
+    adlerHigh: number
+    memberSize: number
+    completedMember: boolean
+    finished: boolean
+    failed: string?
+    -- The step in progress: its output, how far into it this step has written,
+    -- and how much of that the checksum has seen.
+    output: any
+    capacity: number
+    at: number
+    accounted: number
+end
+
+local crc32 = crc.lookup(1) as crc.Algorithm
+
+local function startMember(self: Decoder): nil
+    self.phase = self.format == RAW and "header" or "wrapper"
+    self.last = false
+    self.literals = nil
+    self.distances = nil
+    self.storedLeft = 0
+    self.copyLength = 0
+    self.copyDistance = 0
+    self.produced = 0
+    self.windowAt = 0
+    self.checksum = crc.initial(crc32)
+    self.adlerLow = 1
+    self.adlerHigh = 0
+    self.memberSize = 0
+    self.accounted = self.at
+end
+
+--- A fresh decoder for `format`; gzip may decode `concatenated` members.
+export function create(format: integer, concatenated: boolean): Decoder
+    local decoder = Decoder(
+        format = format,
+        concatenated = format == GZIP and concatenated,
+        phase = "wrapper",
+        data = "",
+        position = 1,
+        bits = 0,
+        count = 0,
+        markPosition = 1,
+        markBits = 0,
+        markCount = 0,
+        last = false,
+        literals = nil,
+        distances = nil,
+        storedLeft = 0,
+        copyLength = 0,
+        copyDistance = 0,
+        window = ffi.new("uint8_t[?]", WINDOW),
+        windowAt = 0,
+        produced = 0,
+        checksum = 0ULL,
+        adlerLow = 1,
+        adlerHigh = 0,
+        memberSize = 0,
+        completedMember = false,
+        finished = false,
+        failed = nil,
+        output = ffi.new("uint8_t[?]", 1),
+        capacity = 1,
+        at = 0,
+        accounted = 0
+    )
+    startMember(decoder)
+
+    return decoder
+end
+
+local function mark(self: Decoder): nil
+    self.markPosition = self.position
+    self.markBits = self.bits
+    self.markCount = self.count
+end
+
+local function rewind(self: Decoder): nil
+    self.position = self.markPosition
+    self.bits = self.markBits
+    self.count = self.markCount
+end
+
+local function need(self: Decoder, wanted: number): nil
+    while self.count < wanted do
+        local byte = self.data:byte(self.position)
+        if byte == nil then
+            error(UNDERFLOW, 0)
+        end
+        self.position = self.position + 1
+        self.bits = bit.bor(self.bits, bit.lshift(byte, self.count))
+        self.count = self.count + 8
+    end
+end
+
+local function take(self: Decoder, wanted: number): number
+    if wanted == 0 then
+        return 0
+    end
+    -- Sixteen bits at most are ever asked for, so a 32-bit bit buffer holding
+    -- under eight leftover bits never overflows.
+    need(self, wanted)
+    local value = bit.band(self.bits, bit.lshift(1, wanted) - 1)
+    self.bits = bit.rshift(self.bits, wanted)
+    self.count = self.count - wanted
+
+    return value
+end
+
+local function align(self: Decoder): nil
+    local spare = self.count % 8
+    self.bits = bit.rshift(self.bits, spare)
+    self.count = self.count - spare
+end
+
+local function byteAligned(self: Decoder): number
+    return take(self, 8)
+end
+
+local function decode(self: Decoder, code: Code): number
+    local value = 0
+    local first = 0
+    local index = 0
+    local counts = code.counts
+    for length = 1, 15 do
+        value = bit.bor(value, take(self, 1))
+        local count = counts[length]
+        if value - count < first then
+            return code.symbols[index + value - first]
+        end
+        index = index + count
+        first = (first + count) * 2
+        value = value * 2
+    end
+    fail("invalid Huffman code")
+
+    return 0
+end
+
+local function emit(self: Decoder, byte: number): nil
+    self.output[self.at] = byte
+    self.at = self.at + 1
+    self.window[self.windowAt] = byte
+    self.windowAt = bit.band(self.windowAt + 1, WINDOW_MASK)
+    self.produced = self.produced + 1
+end
+
+local function dynamicTables(self: Decoder): nil
+    local literalCount = take(self, 5) + 257
+    local distanceCount = take(self, 5) + 1
+    local lengthCount = take(self, 4) + 4
+    if literalCount > 286 or distanceCount > 30 then
+        fail("invalid dynamic block code counts")
+    end
+    local lengths: any = {}
+    for index = 0, 18 do
+        lengths[index] = 0
+    end
+    for index = 1, lengthCount do
+        lengths[CODE_LENGTH_ORDER[index]] = take(self, 3)
+    end
+    local lengthCode = build(lengths, 19, false, "code length")
+    local all: any = {}
+    local index = 0
+    local total = literalCount + distanceCount
+    while index < total do
+        local symbol = decode(self, lengthCode)
+        if symbol < 16 then
+            all[index] = symbol
+            index = index + 1
+        else
+            local repeated = 0
+            local times: number
+            if symbol == 16 then
+                if index == 0 then
+                    fail("code length repeat with no previous length")
+                end
+                repeated = all[index - 1]
+                times = 3 + take(self, 2)
+            elseif symbol == 17 then
+                times = 3 + take(self, 3)
+            else
+                times = 11 + take(self, 7)
+            end
+            if index + times > total then
+                fail("code length repeat overruns the table")
+            end
+            for _ = 1, times do
+                all[index] = repeated
+                index = index + 1
+            end
+        end
+    end
+    if (all[256] or 0) == 0 then
+        fail("dynamic block has no end-of-block code")
+    end
+    local literalLengths: any = {}
+    for symbol = 0, literalCount - 1 do
+        literalLengths[symbol] = all[symbol]
+    end
+    local distanceLengths: any = {}
+    for symbol = 0, distanceCount - 1 do
+        distanceLengths[symbol] = all[literalCount + symbol]
+    end
+    self.literals = build(literalLengths, literalCount, false, "literal/length")
+    self.distances = build(distanceLengths, distanceCount, true, "distance")
+end
+
+local function gzipHeader(self: Decoder): nil
+    if byteAligned(self) ~= 0x1f or byteAligned(self) ~= 0x8b then
+        fail("incorrect gzip header")
+    end
+    if byteAligned(self) ~= 8 then
+        fail("unknown gzip compression method")
+    end
+    local flags = byteAligned(self)
+    if bit.band(flags, 0xe0) ~= 0 then
+        fail("reserved gzip header flags are set")
+    end
+    for _ = 1, 6 do
+        byteAligned(self)
+    end
+    if bit.band(flags, 4) ~= 0 then
+        local length = byteAligned(self) + byteAligned(self) * 256
+        for _ = 1, length do
+            byteAligned(self)
+        end
+    end
+    for _, flag in ipairs({8, 16}) do
+        if bit.band(flags, flag) ~= 0 then
+            while byteAligned(self) ~= 0 do
+            end
+        end
+    end
+    if bit.band(flags, 2) ~= 0 then
+        byteAligned(self)
+        byteAligned(self)
+    end
+end
+
+local function zlibHeader(self: Decoder): nil
+    local method = byteAligned(self)
+    local flags = byteAligned(self)
+    if bit.band(method, 0x0f) ~= 8 or bit.rshift(method, 4) > 7 then
+        fail("unknown zlib compression method")
+    end
+    if (method * 256 + flags) % 31 ~= 0 then
+        fail("incorrect zlib header check")
+    end
+    if bit.band(flags, 0x20) ~= 0 then
+        fail("zlib streams with a preset dictionary are not supported")
+    end
+end
+
+--- Folds the bytes written since the last call into the member's checksum.
+local function account(self: Decoder): nil
+    local from = self.accounted
+    local count = self.at - from
+    self.accounted = self.at
+    if count <= 0 then
+        return
+    end
+    self.memberSize = self.memberSize + count
+    local output = self.output
+    if self.format == GZIP then
+        self.checksum = crc.updatebytes(crc32, self.checksum, output + from, count)
+    elseif self.format == ZLIB then
+        local low = self.adlerLow
+        local high = self.adlerHigh
+        for index = from, self.at - 1 do
+            low = low + output[index]
+            high = high + low
+            if high >= 0x7fffffff then
+                low = low % 65521
+                high = high % 65521
+            end
+        end
+        self.adlerLow = low % 65521
+        self.adlerHigh = high % 65521
+    end
+end
+
+local function trailer(self: Decoder): nil
+    account(self)
+    align(self)
+    if self.format == GZIP then
+        local expected = 0ULL
+        for shift = 0, 24, 8 do
+            expected = expected + (0ULL + byteAligned(self)) * (1ULL << shift)
+        end
+        local size = 0
+        for shift = 0, 3 do
+            size = size + byteAligned(self) * 2 ^ (shift * 8)
+        end
+        if crc.finish(crc32, self.checksum) ~= expected then
+            fail("incorrect gzip data check")
+        end
+        if size ~= self.memberSize % 4294967296 then
+            fail("incorrect gzip length check")
+        end
+    elseif self.format == ZLIB then
+        local expected = 0
+        for _ = 1, 4 do
+            expected = expected * 256 + byteAligned(self)
+        end
+        if expected ~= self.adlerHigh * 65536 + self.adlerLow then
+            fail("incorrect zlib data check")
+        end
+    end
+end
+
+--- Advances as far as the input and `room` output bytes allow.
+--- @raises Failure when the stream is malformed; ending mid-item also unwinds, to the
+---     rollback in `step`
+local function run(self: Decoder, room: number): nil
+    while not self.finished do
+        mark(self)
+        local phase = self.phase
+        if phase == "wrapper" then
+            if self.format == GZIP then
+                gzipHeader(self)
+            else
+                zlibHeader(self)
+            end
+            self.phase = "header"
+        elseif phase == "header" then
+            self.last = take(self, 1) == 1
+            local kind = take(self, 2)
+            if kind == 0 then
+                align(self)
+                local length = byteAligned(self) + byteAligned(self) * 256
+                local complement = byteAligned(self) + byteAligned(self) * 256
+                if bit.bxor(length, complement) ~= 0xffff then
+                    fail("invalid stored block lengths")
+                end
+                self.storedLeft = length
+                self.phase = "stored"
+            elseif kind == 1 then
+                self.literals, self.distances = fixedCodes()
+                self.phase = "codes"
+            elseif kind == 2 then
+                dynamicTables(self)
+                self.phase = "codes"
+            else
+                fail("invalid block type")
+            end
+        elseif phase == "stored" then
+            while self.storedLeft > 0 do
+                if self.at >= room then
+                    return
+                end
+                mark(self)
+                emit(self, byteAligned(self))
+                self.storedLeft = self.storedLeft - 1
+            end
+            self.phase = self.last and "trailer" or "header"
+        elseif phase == "copy" then
+            local window = self.window
+            while self.copyLength > 0 do
+                if self.at >= room then
+                    return
+                end
+                emit(self, window[bit.band(self.windowAt - self.copyDistance, WINDOW_MASK)])
+                self.copyLength = self.copyLength - 1
+            end
+            self.phase = "codes"
+        elseif phase == "codes" then
+            if self.at >= room then
+                return
+            end
+            local symbol = decode(self, self.literals as Code)
+            if symbol < 256 then
+                emit(self, symbol)
+            elseif symbol == 256 then
+                self.phase = self.last and "trailer" or "header"
+            else
+                local lengthIndex = symbol - 256
+                if lengthIndex > 29 then
+                    fail("invalid literal/length code")
+                end
+                local length = LENGTH_BASE[lengthIndex] + take(self, LENGTH_EXTRA[lengthIndex])
+                local distanceSymbol = decode(self, self.distances as Code)
+                if distanceSymbol > 29 then
+                    fail("invalid distance code")
+                end
+                local distance = DISTANCE_BASE[distanceSymbol + 1] + take(self, DISTANCE_EXTRA[distanceSymbol + 1])
+                if distance > self.produced then
+                    fail("invalid distance too far back")
+                end
+                self.copyLength = length
+                self.copyDistance = distance
+                self.phase = "copy"
+            end
+        elseif phase == "trailer" then
+            trailer(self)
+            self.completedMember = true
+            if self.concatenated then
+                self.phase = "between"
+            else
+                self.finished = true
+            end
+        elseif phase == "between" then
+            -- Another member begins only if a byte follows, and looking must not
+            -- consume one.
+            if self.position > #self.data then
+                error(UNDERFLOW, 0)
+            end
+            startMember(self)
+        end
+    end
+end
+
+--- Runs one step, converting an underflow into a rollback to the interrupted
+--- item. Answers false and a reason when the stream is malformed.
+local function step(self: Decoder, room: number): (boolean, string?)
+    if room > self.capacity then
+        self.output = ffi.new("uint8_t[?]", room)
+        self.capacity = room
+    end
+    self.at = 0
+    self.accounted = 0
+    local ok, problem = pcall(run, self, room)
+    if not ok and problem ~= UNDERFLOW then
+        local failure = problem as any
+        self.failed = type(failure) == "table" and failure.reason or tostring(problem)
+        return false, self.failed
+    end
+    if not ok then
+        rewind(self)
+    end
+    account(self)
+
+    return true, nil
+end
+
+--- One decoding step over `input`, producing at most `room` bytes into
+--- `self.output`. Answers bytes consumed, bytes written and a status, or nil
+--- and a reason.
+export function read(self: Decoder, input: string, room: number): (number?, number?, number?, string?)
+    if self.failed ~= nil then
+        return nil, nil, nil, self.failed
+    end
+    if self.finished then
+        return 0, 0, FINISHED, nil
+    end
+    self.data = self.data:sub(self.position) .. input
+    self.position = 1
+    local ok, problem = step(self, room)
+    if not ok then
+        return nil, nil, nil, problem
+    end
+    local written = self.at
+    local consumed = #input
+    if self.finished then
+        -- Whatever follows the end of the stream was never read.
+        consumed = math.max(0, #input - (#self.data - self.position + 1))
+        self.data = ""
+        self.position = 1
+        return consumed, written, FINISHED, nil
+    end
+
+    return consumed, written, (written == room and room > 0) and NEED_OUTPUT or NEED_INPUT, nil
+end
+
+--- Reports the end of the input. A stream that has not ended is truncated or,
+--- after a complete gzip member, followed by bytes that are not one.
+export function finishinput(self: Decoder, room: number): (number?, number?, string?)
+    if self.failed ~= nil then
+        return nil, nil, self.failed
+    end
+    if self.finished or self.phase == "between" and self.position > #self.data then
+        self.finished = true
+        return 0, FINISHED, nil
+    end
+    local ok, problem = step(self, room)
+    if not ok then
+        return nil, nil, problem
+    end
+    local written = self.at
+    if self.phase == "between" and self.position > #self.data then
+        -- The last member ended and nothing follows it.
+        self.finished = true
+    end
+    if self.finished then
+        return written, FINISHED, nil
+    end
+    if written == room and room > 0 then
+        return written, NEED_OUTPUT, nil
+    end
+    if self.completedMember and written == 0 then
+        self.failed = "compressed stream has trailing bytes that are not a complete member"
+        return nil, nil, self.failed
+    end
+
+    return written, NEED_INPUT, nil
+end

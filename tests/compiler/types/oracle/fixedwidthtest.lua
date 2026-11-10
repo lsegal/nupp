@@ -873,6 +873,38 @@ function M.boxedSixtyFourBitTypesStandApartFromLuaNumbers()
     )
 end
 
+function M.aShiftTakesItsWidthFromItsLeftOperand()
+    -- LuaJIT reads a 64-bit count beside a number as a 32-bit word, so the
+    -- shift is a number; a 64-bit left side keeps the shift 64-bit
+    testAssert.eq(
+        errorCodes(
+            table.concat(
+                {
+                    "local count: int64 = 3LL",
+                    "local ucount: uint64 = 3ULL",
+                    "local narrow: int32 = 1",
+                    "local a: number = 1 << count",
+                    "local b: number = 256 >> ucount",
+                    "local c: integer = -256 ~>> count",
+                    "local d: number = narrow << count",
+                    "local e: int64 = 1LL << 3",
+                    "local f: uint64 = 1ULL >> narrow",
+                    "local g: int64 = 1LL ~>> count",
+                    "local h: uint64 = 1ULL << count",
+                    "return a, b, c, d, e, f, g, h",
+                },
+                "\n"
+            )
+        ),
+        ""
+    )
+    testAssert.eq(errorCodes("local count: int64 = 3LL\nlocal s: int64 = 1 << count"), "NUPP2001")
+    testAssert.eq(errorCodes("local s: number = 1LL << 3"), "NUPP2001")
+    -- the other bit operators still widen when either side is 64-bit
+    testAssert.eq(errorCodes("local count: int64 = 3LL\nlocal s: int64 = 1 & count"), "")
+    testAssert.eq(errorCodes("local count: int64 = 3LL\nlocal s: number = 1 | count"), "NUPP2001")
+end
+
 function M.physicalStoresRefuseLiteralsTheSlotCannotHold()
     -- a real C store converts to the slot's width, so a literal outside it lands
     -- as a different value: 300 in a byte is 44, 1.9 in an int32 is 1

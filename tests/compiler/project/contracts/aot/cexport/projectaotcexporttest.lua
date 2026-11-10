@@ -12,6 +12,7 @@ local M = {}
 
 local SOURCE = [[
 local span = require("bytes.span")
+local simd = require("simd")
 
 @aot(export = "game_add")
 local function add(a: int32, b: int32): int32
@@ -53,7 +54,25 @@ local function bounds(borrows values: span.Span<number>, borrows weights: span.S
    return low, high, #weights == #values
 end
 
-return {add = add, scale = scale, saxpy = saxpy, bounds = bounds}
+-- A span of structs: the element crosses as the struct its lowered layout
+-- places, the vector aligned and padded by the target layout model.
+local struct Pair
+   x: float
+   v: simd.Vector<float, simd.Fixed<3>>
+   w: number
+end
+
+@aot(export = "game_weigh")
+local function weigh(borrows pairs: span.Span<Pair>): number
+   local total = 0.0
+   for i = 1, #pairs do
+      local p = pairs[i]
+      total = total + p.x * p.w + simd.horizontal.orderedsum(p.v)
+   end
+   return total
+end
+
+return {add = add, scale = scale, saxpy = saxpy, bounds = bounds, weigh = weigh}
 ]]
 
 local PROGRAM = [[
@@ -65,11 +84,16 @@ int main(void) {
     double out[3] = {0.0, 0.0, 0.0};
     float weights[2] = {1.0f, 2.0f};
     game_bounds_result bounds;
+    game_weigh_Pair pairs[2] = {
+        {.x = 1.0f, .v = {1.0f, 2.0f, 3.0f}, .w = 2.0},
+        {.x = 0.5f, .v = {0.5f, 0.5f, 1.0f}, .w = 4.0},
+    };
     game_saxpy(out, xs, 2.0, 3);
     game_bounds(xs, weights, 3, 2, &bounds);
     printf("%d %.1f %.1f\n", (int)game_add(2, 3), game_scale(5, 1.5f, true), game_scale(5, 1.5f, false));
     printf("%.1f %.1f %.1f\n", out[0], out[1], out[2]);
     printf("%.1f %.1f %d\n", bounds.r1, bounds.r2, (int)bounds.r3);
+    printf("%.1f\n", game_weigh(pairs, 2));
     return 0;
 }
 ]]
@@ -93,7 +117,18 @@ local function library(linkage)
     testAssert.eq(project.build(dir), 0)
     local nupp = require("helpers.paths").root .. "/bin/nupp"
     local code, text = process.capture(
-        {nupp, "export-c", "-o", "game.h", "src/main.nupp", "main.add", "main.scale", "main.saxpy", "main.bounds"},
+        {
+            nupp,
+            "export-c",
+            "-o",
+            "game.h",
+            "src/main.nupp",
+            "main.add",
+            "main.scale",
+            "main.saxpy",
+            "main.bounds",
+            "main.weigh",
+        },
         {cwd = dir}
     )
     testAssert.eq(code, 0, text)
@@ -112,6 +147,7 @@ local function run(dir, program)
     testAssert.eq(lines[1], "5 7.5 5.0", "C reaches every scalar export through the header")
     testAssert.eq(lines[2], "2.0 6.0 4.0", "C passes arrays to a span export and their shared count")
     testAssert.eq(lines[3], "1.0 3.0 0", "C reads several results through the declared struct")
+    testAssert.eq(lines[4], "12.0", "C passes an array of structs laid out as the kernel indexes them")
     remove(dir)
 end
 
@@ -167,10 +203,14 @@ end
 --- its entry point or its stack probe.
 local function publishesOnlyItsCNamesAndWrapperSymbols(shared)
     local names, text = exported(shared)
-    assert(names.game_add and names.game_scale, "the C names are published:\n" .. text)
+    local cNames = {}
+    for _, name in ipairs({"game_add", "game_scale", "game_saxpy", "game_bounds", "game_weigh"}) do
+        assert(names[name], name .. " is published:\n" .. text)
+        cNames[name] = true
+    end
     for name in pairs(names) do
         assert(
-            name == "game_add" or name == "game_scale" or name:sub(1, 3) == "ks_",
+            cNames[name] or name:sub(1, 3) == "ks_",
             name .. " is published, which neither C nor a Lua wrapper resolves:\n" .. text
         )
     end

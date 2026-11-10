@@ -377,6 +377,15 @@ function cabi.header(aggregates: {any}, functions: {any}, guard: string?): strin
     end
 
     guard = macroName(guard or "NUPP_EXPORTED_C_H")
+    -- A field C would otherwise align by its element, such as a stored
+    -- vector's array, states its alignment through a macro declared only in a
+    -- header that has one.
+    local aligned = false
+    for _, description in ipairs(descriptions) do
+        for _, field in ipairs(description.fields) do
+            aligned = aligned or field.alignas ~= nil
+        end
+    end
     local out = {
         "#ifndef " .. guard,
         "#define " .. guard,
@@ -388,13 +397,19 @@ function cabi.header(aggregates: {any}, functions: {any}, guard: string?): strin
         "#if defined(__cplusplus)",
         "#define " .. guard .. "_ALIGNOF alignof",
         "#define " .. guard .. "_STATIC_ASSERT static_assert",
-        "extern \"C\" {",
-        "#else",
-        "#define " .. guard .. "_ALIGNOF _Alignof",
-        "#define " .. guard .. "_STATIC_ASSERT _Static_assert",
-        "#endif",
-        "",
     }
+    if aligned then
+        out[#out + 1] = "#define " .. guard .. "_ALIGNAS alignas"
+    end
+    out[#out + 1] = "extern \"C\" {"
+    out[#out + 1] = "#else"
+    out[#out + 1] = "#define " .. guard .. "_ALIGNOF _Alignof"
+    out[#out + 1] = "#define " .. guard .. "_STATIC_ASSERT _Static_assert"
+    if aligned then
+        out[#out + 1] = "#define " .. guard .. "_ALIGNAS _Alignas"
+    end
+    out[#out + 1] = "#endif"
+    out[#out + 1] = ""
     for _, description in ipairs(descriptions) do
         out[#out + 1] = "typedef struct " .. description.tag .. " " .. description.typedef .. ";"
     end
@@ -404,11 +419,15 @@ function cabi.header(aggregates: {any}, functions: {any}, guard: string?): strin
     for _, description in ipairs(descriptions) do
         out[#out + 1] = "struct " .. description.tag .. " {"
         for _, field in ipairs(description.fields) do
-            out[#out + 1] = "    " .. field.cType .. ";"
+            local alignas = field.alignas and ("%s_ALIGNAS(%d) "):format(guard, field.alignas) or ""
+            out[#out + 1] = "    " .. alignas .. field.cType .. ";"
         end
         out[#out + 1] = "};"
-        local prefix = macroName(description.typedef)
-        out[#out + 1] = "#define " .. prefix .. "_LAYOUT_FINGERPRINT \"" .. description.layoutFingerprint .. "\""
+        -- Only a struct with a Nupp identity has a layout fingerprint to publish.
+        if description.layoutFingerprint then
+            local prefix = macroName(description.typedef)
+            out[#out + 1] = "#define " .. prefix .. "_LAYOUT_FINGERPRINT \"" .. description.layoutFingerprint .. "\""
+        end
         out[
             #out + 1
         ] = (
@@ -460,6 +479,9 @@ function cabi.header(aggregates: {any}, functions: {any}, guard: string?): strin
     out[#out + 1] = "#endif"
     out[#out + 1] = "#undef " .. guard .. "_STATIC_ASSERT"
     out[#out + 1] = "#undef " .. guard .. "_ALIGNOF"
+    if aligned then
+        out[#out + 1] = "#undef " .. guard .. "_ALIGNAS"
+    end
     out[#out + 1] = ""
     out[#out + 1] = "#endif"
     out[#out + 1] = ""

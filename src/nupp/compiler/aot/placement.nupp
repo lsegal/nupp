@@ -1,0 +1,147 @@
+--[[
+Where each field of a reified struct lies in the memory a span holds.
+
+A scalar field sits at the next offset its C alignment under the target
+divides, as C places it. A stored vector, `Fixed<N>` of a storage element, is
+laid out by the target layout model: padding before it brings it to the
+model's alignment, padding after it brings it to the size it occupies, and the
+struct takes the largest alignment of any field. The code generator spells
+its LLVM struct from this, and `export-c` declares and asserts the C struct a
+span of it crosses as, so the two cannot disagree about where a field is.
+]]
+module nupp.compiler.aot.placement
+
+local scalarIR = require("nupp.compiler.aot.scalar")
+local shape = require("nupp.compiler.aot.simdshape")
+local targetLayout = require("nupp.compiler.targetlayout")
+local types = require("nupp.compiler.aot.llvm.types")
+
+local placement = {}
+
+--- One run of bytes in a placed struct: a field, or padding when `field` is
+--- absent.
+record placement.Slot
+    field: scalarIR.Field?
+    offset: integer
+    bytes: integer
+
+    --- A stored vector's lane count and IR element, `f32`, `u8`, ...
+    lanes: integer?
+
+    element: string?
+end
+
+record placement.Placement
+    --- The slots in memory order, padding included, up to the last field's end.
+    slots: {placement.Slot}
+
+    --- Each field's offset and alignment, by name.
+    offset: {[string]: integer}
+
+    fieldAlignment: {[string]: integer}
+
+    --- Where the last slot ends.
+    extent: integer
+
+    --- The struct's size and alignment.
+    size: integer
+
+    alignment: integer
+
+    --- The largest element width of any field, which is the alignment a
+    --- struct of the same members has with no vector alignment of its own.
+    natural: integer
+end
+
+local function roundUp(value: integer, alignment: integer): integer
+    return math.floor((value + alignment - 1) / alignment) * alignment
+end
+
+--- The placement of a span element layout under the target layout `key`,
+--- which only a stored vector field requires.
+--- @raises string when a vector field is not a fixed-width vector of a
+--- storage element, or its layout is not modeled for the target
+function placement.of(layout: scalarIR.Layout, key: string?): placement.Placement
+    local placed = placement.Placement(
+        slots = {},
+        offset = {},
+        fieldAlignment = {},
+        extent = 0,
+        size = 0,
+        alignment = 1,
+        natural = 1
+    )
+    local cursor: integer = 0
+
+    local function pad(bytes: integer): nil
+        if bytes > 0 then
+            placed.slots[#placed.slots + 1] = placement.Slot(offset = cursor, bytes = bytes)
+            cursor = cursor + bytes
+        end
+    end
+
+    -- A scalar placed with no target named, as a Lua-builder entry places one,
+    -- is aligned by its size, as every 64-bit model aligns it.
+    local function aligned(bytes: integer): integer
+        if key == nil then
+            return bytes
+        end
+        local alignment, why = targetLayout.scalarAlignment(key as string, bytes)
+        if alignment == nil then
+            error(tostring(why), 0)
+        end
+
+        return alignment as integer
+    end
+
+    for _, field in ipairs(layout.fields) do
+        if scalarIR.storedVectorField(field) then
+            local _, element, shapeName = shape.parts(tostring(field.type))
+            local bits = shape.bits(element)
+            local lanes = element ~= nil and shapeName ~= nil and shape.lanes(0, element as string, shapeName as string)
+                or nil
+            if bits == nil or lanes == nil or shapeName ~= "fixed" .. tostring(lanes) then
+                error("stored vector field " .. field.name .. " is not a fixed-width vector", 0)
+            end
+            local elementBytes = math.floor((bits as integer) / 8) as integer
+            local elementAlignment = aligned(elementBytes)
+            local laid, why = targetLayout.vector(tostring(key), elementBytes, lanes as integer)
+            if laid == nil then
+                error("stored vector field " .. field.name .. ": " .. tostring(why), 0)
+            end
+            local vector = laid as targetLayout.Vector
+            pad(roundUp(cursor, vector.alignment) - cursor)
+            placed.offset[field.name] = cursor
+            placed.fieldAlignment[field.name] = vector.alignment
+            placed.slots[
+                #placed.slots + 1
+            ] = placement.Slot(
+                field = field,
+                offset = cursor,
+                bytes = vector.payload,
+                lanes = lanes as integer,
+                element = element as string
+            )
+            cursor = cursor + vector.payload
+            pad(vector.padding)
+            placed.alignment = math.max(placed.alignment, vector.alignment) as integer
+            placed.natural = math.max(placed.natural, elementAlignment) as integer
+        else
+            local bytes = types.storageBytes(field.type, field.sourceType)
+            local alignment = aligned(bytes)
+            cursor = roundUp(cursor, alignment)
+            placed.offset[field.name] = cursor
+            placed.fieldAlignment[field.name] = alignment
+            placed.slots[#placed.slots + 1] = placement.Slot(field = field, offset = cursor, bytes = bytes)
+            cursor = cursor + bytes
+            placed.alignment = math.max(placed.alignment, alignment) as integer
+            placed.natural = math.max(placed.natural, alignment) as integer
+        end
+    end
+    placed.extent = cursor
+    placed.size = roundUp(cursor, placed.alignment)
+
+    return placed
+end
+
+export = placement

@@ -9,6 +9,7 @@
 mod channels;
 #[doc(hidden)]
 pub mod cli;
+mod clock;
 mod embed;
 mod host_channel;
 mod lua;
@@ -17,6 +18,7 @@ mod payload;
 mod sharedbytes;
 mod worker_adapter;
 mod workers;
+mod xxh64;
 
 pub use payload::{Error as PayloadError, Payload, read as read_payload};
 pub use sharedbytes::{BuilderError as SharedBytesBuilderError, SharedBytes, SharedBytesBuilder};

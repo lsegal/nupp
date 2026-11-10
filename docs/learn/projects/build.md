@@ -331,10 +331,38 @@ An explicitly shared C dependency is refused in this mode; use
 `linkage = "static"` or `"both"`. Native facilities which only have a sidecar
 implementation are refused for the same reason. The GPU provider is the
 exception: its pinned wgpu-native release also publishes a static library, which
-is linked into the host in place of `lib/wgpu_native` for Linux and Windows
-targets. A macOS standalone binary cannot carry it yet, because its link kit has
-no stubs for the system frameworks wgpu-native calls into. A path-valued third-party
+is linked into the host in place of `lib/wgpu_native`. On macOS the link also
+names the system frameworks wgpu-native calls into (Metal, QuartzCore,
+Foundation and libobjc), whose stubs the link kit carries apart from its own
+libraries, so a program that does not use the GPU never loads them. A link kit
+built before it carried those stubs refuses the GPU provider. A path-valued third-party
 `stub` cannot be relinked and therefore cannot select `standalone`.
+
+### Native programs
+
+A `program` target links one file as a native program, the way
+`nupp aot --emit executable` does: its `main` is the executable's own, and it
+reaches LuaJIT and other C libraries through its `cdef function` declarations.
+
+```lua
+build = {
+   targets = {
+      host = {
+         kind = "program",
+         entries = { "host" },
+         outDir = "build",
+      }
+   }
+}
+```
+
+`nupp build --target host` writes `build/host`, with `.exe` on Windows; `output`
+names the file instead. `entries` names exactly one module or `.nupp` path.
+`aotTarget` selects the triple the program is compiled and linked for, and
+with it the link kit whose static LuaJIT it carries; the default is this
+machine. The link is keyed on the program's LLVM IR, the code generator and
+the kit, so a rebuild that would link the same program keeps the one already
+there.
 
 ### Static AOT components
 

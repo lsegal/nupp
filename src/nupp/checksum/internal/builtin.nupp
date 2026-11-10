@@ -1,34 +1,14 @@
 @!internal
---[[Built-in Adler-32 and crc-fast algorithm descriptors.
+--[[Built-in Adler-32 and CRC algorithm descriptors.
 
-Each descriptor creates independent state. CRC updates borrow byte spans through
-crc-fast without retaining them; value reads the saved non-consuming snapshot.
+Each descriptor creates independent state. CRC updates borrow byte spans without
+retaining them; value finishes a copy of the register and leaves it resumable.
 ]]
 module nupp.checksum.internal.builtin
 
 const provider = require("nupp.digest.internal.checksumprovider")
+const crc = require("nupp.checksum.internal.crc")
 const span = require("bytes.span")
-const target = require("nupp.runtime.target")
-const ffi = require("ffi")
-
-ffi.cdef[[
-int32_t nuppCrcUpdate(uint32_t, int32_t, uint64_t *, const uint8_t *, size_t);
-const char *nuppCrcLastError(void);
-]]
-
-local C: any = do
-    if target.host == "native" then
-        yield _G.require("nupp.runtime.provider.nativecrc")
-    end
-    yield _G.require("nupp.runtime.browser.crc")
-end
-
-local function crcUpdate(id: integer, reset: integer, words: any, borrows bytes: const uint8[?], count: integer): nil
-    local update = C.nuppCrcUpdate as function(integer, integer, any, borrows input: const uint8[?], integer): integer
-    if update(id, reset, words, bytes, count) ~= 0 then
-        error("nupp: " .. ffi.string(C.nuppCrcLastError()), 2)
-    end
-end
 
 local record AdlerState is provider.State
     @private high: integer
@@ -50,15 +30,15 @@ local record AdlerState is provider.State
 end
 
 local record CrcState is provider.State
-    @private id: integer
-    @private words: any
+    @private algorithm: crc.Algorithm
+    @private register: uint64
 
     function update(exclusive self, borrows bytes: span.Span<uint8>): nil
-        crcUpdate(self.id, 0, self.words, bytes:ref(), #bytes)
+        self.register = crc.update(self.algorithm, self.register, bytes)
     end
 
     function value(self): uint64
-        return self.words[1] as uint64
+        return crc.finish(self.algorithm, self.register)
     end
 
     function close(takes self): nil
@@ -74,12 +54,9 @@ local record Algorithm is provider.Algorithm
         if self.id == 0 then
             return AdlerState(high = 0, low = 1)
         end
-        local words = ffi.new("uint64_t[2]")
-        const empty = ""
-        local bytes = span.fromstring(empty)
-        crcUpdate(self.id, 1, words, bytes:ref(), 0)
+        local algorithm = crc.lookup(self.id) as crc.Algorithm
 
-        return CrcState(id = self.id, words = words)
+        return CrcState(algorithm = algorithm, register = crc.initial(algorithm))
     end
 end
 

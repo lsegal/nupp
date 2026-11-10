@@ -78,11 +78,8 @@ return function(jobs, tasks)
     failure, failedScope = nil, nil
     print("correctness passed " .. expected)
 
-    local ffi = require("ffi")
-    ffi.cdef("uint64_t nuppNativeMonotonicNs(void);")
-
     local function now()
-        return assert(tonumber(ffi.C.nuppNativeMonotonicNs())) / 1e6
+        return os.monotonic()
     end
 
     local count = tonumber(os.getenv("HANDLE_CHILDREN")) or 50000

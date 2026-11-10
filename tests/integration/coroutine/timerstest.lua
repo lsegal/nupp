@@ -217,15 +217,14 @@ function M.aSleepInsideAHandlerParksRatherThanBlocking()
     assert(os.monotonic() - started >= 25, "the parked sleep returned early")
 end
 
-function M.timeSelectsTheRustBaseProvider()
+function M.timeNeedsNoNativeProvider()
     local feature = assert(native.feature("native.time"))
-    testAssert.eq(feature.provider, "nupp_native", "time provider")
-    testAssert.eq(feature.providerDriver, "native-rust", "time provider driver")
-    testAssert.eq(feature.providerFeature, "base", "time provider feature")
+    testAssert.eq(feature.provider, nil, "time reads the clock through FFI, not a provider library")
+    testAssert.eq(feature.binary, nil, "time needs no sidecar artifact")
     testAssert.eq(feature.host, "native-time", "time is linked into every native host")
     testAssert.deepeq(native.requiredHostFeatureNames({["native.time"] = true}), {"native-time"})
     local expanded = native.expand({["native.time"] = true})
-    assert(expanded["runtime.native"], "time omitted the Rust ABI runtime")
+    assert(not expanded["runtime.native"], "time pulled in the Rust ABI runtime")
 end
 
 return M

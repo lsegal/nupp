@@ -1,0 +1,986 @@
+@!internal
+
+--[[Streaming DEFLATE encoding (RFC 1951) with gzip (RFC 1952) and zlib
+(RFC 1950) wrappers, written in Nupp.
+
+Input is gathered into blocks of up to 64 KiB. Each block is matched against
+itself and the 32 KiB of input before it with hash chains -- greedily at levels
+one to three and with one step of lazy evaluation above -- then written as
+whichever of a dynamic Huffman, fixed Huffman or stored block is smallest.
+Level zero stores. The chain, lazy and nice-match limits follow zlib's table for
+each level, so a higher level searches harder.
+
+Encoded bytes wait in a queue the caller drains through spans of any size. A
+flush ends the current block and appends an empty stored block, as zlib's sync
+flush does, so everything written so far can be decoded.
+]]
+module nupp.compression.deflate
+
+const ffi = require("ffi")
+const crc = require("nupp.checksum.internal.crc")
+
+export const GZIP = 1
+export const ZLIB = 2
+export const RAW = 3
+
+export const NEED_INPUT = 1
+export const NEED_OUTPUT = 2
+export const FINISHED = 3
+
+local WINDOW = 32768
+local BLOCK = 65536
+local MIN_MATCH = 3
+local MAX_MATCH = 258
+local HASH_SIZE = 32768
+local MAX_STORED = 65535
+
+--- zlib's per-level search configuration: a match this long cuts the chain to a
+--- quarter, a match this long is not lazily improved, a match this long ends the
+--- search, and the most chain links followed.
+export record Tuning
+    good: integer
+    lazy: integer
+    nice: integer
+    chain: integer
+end
+
+local TUNING: any = {
+    Tuning(good = 4, lazy = 0, nice = 8, chain = 4),
+    Tuning(good = 4, lazy = 0, nice = 16, chain = 8),
+    Tuning(good = 4, lazy = 0, nice = 32, chain = 32),
+    Tuning(good = 4, lazy = 4, nice = 16, chain = 16),
+    Tuning(good = 8, lazy = 16, nice = 32, chain = 32),
+    Tuning(good = 8, lazy = 16, nice = 128, chain = 128),
+    Tuning(good = 8, lazy = 32, nice = 128, chain = 256),
+    Tuning(good = 32, lazy = 128, nice = 258, chain = 1024),
+    Tuning(good = 32, lazy = 258, nice = 258, chain = 4096),
+}
+
+local LENGTH_BASE: any = {
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    13,
+    15,
+    17,
+    19,
+    23,
+    27,
+    31,
+    35,
+    43,
+    51,
+    59,
+    67,
+    83,
+    99,
+    115,
+    131,
+    163,
+    195,
+    227,
+    258
+}
+local LENGTH_EXTRA: any = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
+local DISTANCE_BASE: any = {
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    9,
+    13,
+    17,
+    25,
+    33,
+    49,
+    65,
+    97,
+    129,
+    193,
+    257,
+    385,
+    513,
+    769,
+    1025,
+    1537,
+    2049,
+    3073,
+    4097,
+    6145,
+    8193,
+    12289,
+    16385,
+    24577
+}
+local DISTANCE_EXTRA: any = {
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13
+}
+local CODE_LENGTH_ORDER: any = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}
+
+-- Symbol lookups by length (3..258) and distance (1..32768), zero-based codes.
+local LENGTH_CODE: any = {}
+for index = 1, 29 do
+    local top = index < 29 and LENGTH_BASE[index + 1] - 1 or 258
+    for length = LENGTH_BASE[index], top do
+        LENGTH_CODE[length] = index - 1
+    end
+end
+LENGTH_CODE[258] = 28
+
+local function distanceCode(distance: number): number
+    local low = 1
+    local high = 30
+    while low < high do
+        local middle = bit.rshift(low + high + 1, 1)
+        if DISTANCE_BASE[middle] <= distance then
+            low = middle
+        else
+            high = middle - 1
+        end
+    end
+
+    return low - 1
+end
+
+--- Writes bits least significant first into a byte list.
+export record Bits
+    bytes: any
+    value: number
+    count: number
+end
+
+local function newBits(): Bits
+    return Bits(bytes = {}, value = 0, count = 0)
+end
+
+local function put(writer: Bits, value: number, count: number): nil
+    writer.value = bit.bor(writer.value, bit.lshift(value, writer.count))
+    writer.count = writer.count + count
+    while writer.count >= 8 do
+        local bytes = writer.bytes
+        bytes[#bytes + 1] = bit.band(writer.value, 0xff)
+        writer.value = bit.rshift(writer.value, 8)
+        writer.count = writer.count - 8
+    end
+end
+
+local function alignBits(writer: Bits): nil
+    if writer.count > 0 then
+        put(writer, 0, 8 - writer.count)
+    end
+end
+
+local function drainBits(writer: Bits): string
+    local bytes = writer.bytes
+    local parts: {string} = {}
+    local index = 1
+    while index <= #bytes do
+        local last = math.min(#bytes, index + 4095)
+        parts[#parts + 1] = string.char(unpack(bytes, index, last))
+        index = last + 1
+    end
+    writer.bytes = {}
+
+    return table.concat(parts)
+end
+
+local function reverse(code: number, length: number): number
+    local result = 0
+    for _ = 1, length do
+        result = bit.bor(bit.lshift(result, 1), bit.band(code, 1))
+        code = bit.rshift(code, 1)
+    end
+
+    return result
+end
+
+--- Canonical codes for `lengths` (symbols 0..count-1), bit-reversed for writing.
+local function canonical(lengths: any, count: number): any
+    local perLength: any = {}
+    for length = 0, 15 do
+        perLength[length] = 0
+    end
+    for symbol = 0, count - 1 do
+        local length = lengths[symbol]
+        if length > 0 then
+            perLength[length] = perLength[length] + 1
+        end
+    end
+    local nextCode: any = {}
+    local code = 0
+    for length = 1, 15 do
+        code = (code + perLength[length - 1]) * 2
+        nextCode[length] = code
+    end
+    perLength[0] = 0
+    local codes: any = {}
+    for symbol = 0, count - 1 do
+        local length = lengths[symbol]
+        if length > 0 then
+            codes[symbol] = reverse(nextCode[length], length)
+            nextCode[length] = nextCode[length] + 1
+        else
+            codes[symbol] = 0
+        end
+    end
+
+    return codes
+end
+
+--- Huffman code lengths for `frequencies` (symbols 0..count-1), none longer
+--- than `limit`. Unused symbols get zero; a lone used symbol gets one bit.
+local function lengthsFor(frequencies: any, count: number, limit: number): any
+    local lengths: any = {}
+    local used: any = {}
+    for symbol = 0, count - 1 do
+        lengths[symbol] = 0
+        if frequencies[symbol] > 0 then
+            used[#used + 1] = symbol
+        end
+    end
+    if #used == 0 then
+        return lengths
+    end
+    if #used == 1 then
+        lengths[used[1]] = 1
+        return lengths
+    end
+    -- Nodes are leaves 1..#used and internal nodes after them; a binary heap of
+    -- node indices ordered by weight builds the tree bottom up.
+    local weight: any = {}
+    local parent: any = {}
+    for index, symbol in ipairs(used) do
+        weight[index] = frequencies[symbol]
+    end
+    local heap: any = {}
+
+    local function less(a: number, b: number): boolean
+        return weight[a] < weight[b] or weight[a] == weight[b] and a < b
+    end
+
+    local function push(node: number): nil
+        heap[#heap + 1] = node
+        local at = #heap
+        while at > 1 do
+            local up = bit.rshift(at, 1)
+            if less(heap[at], heap[up]) then
+                heap[at], heap[up] = heap[up], heap[at]
+                at = up
+            else
+                break
+            end
+        end
+    end
+
+    local function pop(): number
+        local top = heap[1]
+        local last = heap[#heap]
+        heap[#heap] = nil
+        if #heap > 0 then
+            heap[1] = last
+            local at = 1
+            while true do
+                local left = at * 2
+                local right = left + 1
+                local smallest = at
+                if left <= #heap and less(heap[left], heap[smallest]) then
+                    smallest = left
+                end
+                if right <= #heap and less(heap[right], heap[smallest]) then
+                    smallest = right
+                end
+                if smallest == at then
+                    break
+                end
+                heap[at], heap[smallest] = heap[smallest], heap[at]
+                at = smallest
+            end
+        end
+
+        return top
+    end
+
+    for index = 1, #used do
+        push(index)
+    end
+    local nodes = #used
+    while #heap > 1 do
+        local a = pop()
+        local b = pop()
+        nodes = nodes + 1
+        weight[nodes] = weight[a] + weight[b]
+        parent[a] = nodes
+        parent[b] = nodes
+        push(nodes)
+    end
+    local depth: any = {}
+    depth[nodes] = 0
+    for node = nodes - 1, 1, -1 do
+        depth[node] = depth[parent[node]] + 1
+    end
+    local overflow = false
+    for index, symbol in ipairs(used) do
+        local length = depth[index]
+        if length > limit then
+            length = limit
+            overflow = true
+        end
+        lengths[symbol] = length
+    end
+    if overflow then
+        -- Clamping over-long codes over-subscribes the Kraft sum; lengthen the
+        -- longest codes still under the limit until it fits again, starting
+        -- with the least frequent so the cost stays small.
+        local capacity = bit.lshift(1, limit)
+        local total = 0
+        for _, symbol in ipairs(used) do
+            total = total + bit.lshift(1, limit - lengths[symbol])
+        end
+        table.sort(used, function(a: number, b: number): boolean
+            return frequencies[a] < frequencies[b] or frequencies[a] == frequencies[b] and a < b
+        end)
+        while total > capacity do
+            local best = -1
+            for _, symbol in ipairs(used) do
+                local length = lengths[symbol]
+                if length < limit and (best < 0 or length > lengths[best]) then
+                    best = symbol
+                end
+            end
+            total = total - bit.lshift(1, limit - lengths[best] - 1)
+            lengths[best] = lengths[best] + 1
+        end
+    end
+
+    return lengths
+end
+
+--- Encoder state.
+export record Encoder
+    format: integer
+    level: integer
+    tuning: Tuning?
+    -- Up to a window of input already encoded, then input waiting for a block.
+    history: string
+    waiting: {string}
+    waitingBytes: integer
+    writer: Bits
+    -- Encoded bytes not yet handed out, and how many of the first were.
+    queue: {string}
+    queueAt: number
+    flushing: boolean
+    finishing: boolean
+    finished: boolean
+    -- Integrity of all input.
+    checksum: uint64
+    adlerLow: number
+    adlerHigh: number
+    size: number
+end
+
+local crc32 = crc.lookup(1) as crc.Algorithm
+
+local function enqueue(self: Encoder, bytes: string): nil
+    if #bytes > 0 then
+        self.queue[#self.queue + 1] = bytes
+    end
+end
+
+--- A fresh encoder for `format` at compression `level` (0..9).
+export function create(format: integer, level: integer): Encoder
+    local encoder = Encoder(
+        format = format,
+        level = level,
+        tuning = TUNING[level],
+        history = "",
+        waiting = {},
+        waitingBytes = 0,
+        writer = newBits(),
+        queue = {},
+        queueAt = 1,
+        flushing = false,
+        finishing = false,
+        finished = false,
+        checksum = crc.initial(crc32),
+        adlerLow = 1,
+        adlerHigh = 0,
+        size = 0
+    )
+    if format == GZIP then
+        local extra = level == 9 and 2 or level == 1 and 4 or 0
+        enqueue(encoder, string.char(0x1f, 0x8b, 8, 0, 0, 0, 0, 0, extra, 255))
+    elseif format == ZLIB then
+        local flevel = level < 2 and 0 or level < 6 and 1 or level == 6 and 2 or 3
+        local flags = flevel * 64
+        flags = flags + 31 - (0x78 * 256 + flags) % 31
+        enqueue(encoder, string.char(0x78, flags))
+    end
+
+    return encoder
+end
+
+local function track(self: Encoder, input: string): nil
+    self.size = self.size + #input
+    if self.format == GZIP then
+        self.checksum = crc.updatebytes(crc32, self.checksum, ffi.cast("const uint8_t *", input), #input)
+    elseif self.format == ZLIB then
+        local low = self.adlerLow
+        local high = self.adlerHigh
+        for index = 1, #input do
+            low = low + input:byte(index)
+            high = high + low
+            if high >= 0x7fffffff then
+                low = low % 65521
+                high = high % 65521
+            end
+        end
+        self.adlerLow = low % 65521
+        self.adlerHigh = high % 65521
+    end
+end
+
+--- Matches `data` from `start` (1-based) to its end against itself, the bytes
+--- before `start` serving as history. Answers parallel lists: each entry is a
+--- literal byte with distance zero, or a match length and its distance.
+local function match(self: Encoder, data: string, start: number): (any, any)
+    local tuning = self.tuning as Tuning
+    local bytes: any = ffi.cast("const uint8_t *", data)
+    local size = #data
+    local head: any = {}
+    local previous: any = {}
+
+    local function hash(at: number): number
+        -- `at` is zero-based here.
+        return bit.band(bit.bxor(bit.lshift(bytes[at], 10), bit.lshift(bytes[at + 1], 5), bytes[at + 2]), HASH_SIZE - 1)
+    end
+
+    local function insert(at: number): nil
+        if at + 2 < size then
+            local key = hash(at)
+            previous[at] = head[key] or -1
+            head[key] = at
+        end
+    end
+
+    local function longest(at: number, atLeast: number): (number, number)
+        local bestLength = atLeast
+        local bestDistance = 0
+        if at + 2 >= size then
+            return 0, 0
+        end
+        local candidate = head[hash(at)] or -1
+        local chain = tuning.chain
+        if atLeast >= tuning.good then
+            chain = bit.rshift(chain, 2)
+        end
+        local limit = math.min(MAX_MATCH, size - at)
+        local floor = at - WINDOW
+        while candidate >= 0 and candidate > floor and chain > 0 do
+            if bytes[candidate + bestLength] == bytes[at + bestLength] or bestLength == 0 then
+                local length = 0
+                while length < limit and bytes[candidate + length] == bytes[at + length] do
+                    length = length + 1
+                end
+                if length > bestLength and length >= MIN_MATCH then
+                    bestLength = length
+                    bestDistance = at - candidate
+                    if length >= tuning.nice then
+                        break
+                    end
+                end
+            end
+            candidate = previous[candidate] or -1
+            chain = chain - 1
+        end
+        if bestDistance == 0 then
+            return 0, 0
+        end
+
+        return bestLength, bestDistance
+    end
+
+    for at = math.max(0, start - 1 - WINDOW), start - 2 do
+        insert(at)
+    end
+    local symbols: any = {}
+    local distances: any = {}
+
+    local function literal(at: number): nil
+        symbols[#symbols + 1] = bytes[at]
+        distances[#distances + 1] = 0
+    end
+
+    local at = start - 1
+    local lazy = tuning.lazy
+    while at < size do
+        local length, distance = longest(at, 0)
+        if length >= MIN_MATCH and lazy > 0 and length < lazy and at + 1 < size then
+            insert(at)
+            local nextLength, nextDistance = longest(at + 1, length)
+            if nextLength > length then
+                literal(at)
+                at = at + 1
+                length = nextLength
+                distance = nextDistance
+            else
+                -- `at` is already in the chains.
+                symbols[#symbols + 1] = length
+                distances[#distances + 1] = distance
+                for offset = 1, length - 1 do
+                    insert(at + offset)
+                end
+                at = at + length
+                goto continue
+            end
+        end
+        if length >= MIN_MATCH then
+            symbols[#symbols + 1] = length
+            distances[#distances + 1] = distance
+            for offset = 0, length - 1 do
+                insert(at + offset)
+            end
+            at = at + length
+        else
+            literal(at)
+            insert(at)
+            at = at + 1
+        end
+        ::continue::
+    end
+
+    return symbols, distances
+end
+
+local fixedLiteralLengths: any = {}
+for symbol = 0, 287 do
+    fixedLiteralLengths[symbol] = symbol < 144 and 8 or symbol < 256 and 9 or symbol < 280 and 7 or 8
+end
+local fixedDistanceLengths: any = {}
+for symbol = 0, 29 do
+    fixedDistanceLengths[symbol] = 5
+end
+local fixedLiteralCodes = canonical(fixedLiteralLengths, 288)
+local fixedDistanceCodes = canonical(fixedDistanceLengths, 30)
+
+--- Bits the symbols take under the given code lengths, extra bits included.
+local function cost(symbols: any, distances: any, literalLengths: any, distanceLengths: any): number
+    local total = literalLengths[256]
+    for index = 1, #symbols do
+        local distance = distances[index]
+        if distance == 0 then
+            total = total + literalLengths[symbols[index]]
+        else
+            local code = LENGTH_CODE[symbols[index]]
+            local distanceSymbol = distanceCode(distance)
+            total = total + literalLengths[
+                257 + code
+            ] + LENGTH_EXTRA[code + 1] + distanceLengths[distanceSymbol] + DISTANCE_EXTRA[distanceSymbol + 1]
+        end
+    end
+
+    return total
+end
+
+local function writeSymbols(
+    writer: Bits,
+    symbols: any,
+    distances: any,
+    literalCodes: any,
+    literalLengths: any,
+    distanceCodes: any,
+    distanceLengths: any
+): nil
+    for index = 1, #symbols do
+        local distance = distances[index]
+        local symbol = symbols[index]
+        if distance == 0 then
+            put(writer, literalCodes[symbol], literalLengths[symbol])
+        else
+            local code = LENGTH_CODE[symbol]
+            put(writer, literalCodes[257 + code], literalLengths[257 + code])
+            local extra = LENGTH_EXTRA[code + 1]
+            if extra > 0 then
+                put(writer, symbol - LENGTH_BASE[code + 1], extra)
+            end
+            local distanceSymbol = distanceCode(distance)
+            put(writer, distanceCodes[distanceSymbol], distanceLengths[distanceSymbol])
+            local distanceExtra = DISTANCE_EXTRA[distanceSymbol + 1]
+            if distanceExtra > 0 then
+                put(writer, distance - DISTANCE_BASE[distanceSymbol + 1], distanceExtra)
+            end
+        end
+    end
+    put(writer, literalCodes[256], literalLengths[256])
+end
+
+--- The run-length encoding of the concatenated code lengths, as code-length
+--- symbols and their extra-bit values.
+local function runLengths(lengths: any, count: number): (any, any)
+    local symbols: any = {}
+    local extras: any = {}
+    local index = 0
+    while index < count do
+        local length = lengths[index]
+        local run = 1
+        while index + run < count and lengths[index + run] == length do
+            run = run + 1
+        end
+        local left = run
+        if length == 0 then
+            while left >= 11 do
+                local taken = math.min(left, 138)
+                symbols[#symbols + 1] = 18
+                extras[#extras + 1] = taken - 11
+                left = left - taken
+            end
+            if left >= 3 then
+                symbols[#symbols + 1] = 17
+                extras[#extras + 1] = left - 3
+                left = 0
+            end
+        else
+            symbols[#symbols + 1] = length
+            extras[#extras + 1] = 0
+            left = left - 1
+            while left >= 3 do
+                local taken = math.min(left, 6)
+                symbols[#symbols + 1] = 16
+                extras[#extras + 1] = taken - 3
+                left = left - taken
+            end
+        end
+        for _ = 1, left do
+            symbols[#symbols + 1] = length
+            extras[#extras + 1] = 0
+        end
+        index = index + run
+    end
+
+    return symbols, extras
+end
+
+local CODE_LENGTH_EXTRA: any = {[16] = 2, [17] = 3, [18] = 7}
+
+--- Writes `raw` (the block's input) as stored blocks, the last one final when
+--- `last` is set.
+local function writeStored(writer: Bits, raw: string, last: boolean): nil
+    local at = 1
+    repeat
+        local piece = raw:sub(at, at + MAX_STORED - 1)
+        at = at + #piece
+        local final = last and at > #raw
+        put(writer, final and 1 or 0, 1)
+        put(writer, 0, 2)
+        alignBits(writer)
+        put(writer, bit.band(#piece, 0xff), 8)
+        put(writer, bit.rshift(#piece, 8), 8)
+        put(writer, bit.band(bit.bnot(#piece), 0xff), 8)
+        put(writer, bit.band(bit.rshift(bit.bnot(#piece), 8), 0xff), 8)
+        local bytes = writer.bytes
+        for index = 1, #piece do
+            bytes[#bytes + 1] = piece:byte(index)
+        end
+    until at > #raw
+end
+
+--- Encodes `raw` as one block (or several stored ones), the last when `last`.
+local function writeBlock(self: Encoder, raw: string, last: boolean): nil
+    local writer = self.writer
+    if self.level == 0 then
+        writeStored(writer, raw, last)
+        return
+    end
+    local data = self.history .. raw
+    local symbols, distances = match(self, data, #self.history + 1)
+
+    local literalFrequencies: any = {}
+    for symbol = 0, 285 do
+        literalFrequencies[symbol] = 0
+    end
+    local distanceFrequencies: any = {}
+    for symbol = 0, 29 do
+        distanceFrequencies[symbol] = 0
+    end
+    literalFrequencies[256] = 1
+    for index = 1, #symbols do
+        local distance = distances[index]
+        if distance == 0 then
+            literalFrequencies[symbols[index]] = literalFrequencies[symbols[index]] + 1
+        else
+            local code = 257 + LENGTH_CODE[symbols[index]]
+            literalFrequencies[code] = literalFrequencies[code] + 1
+            local distanceSymbol = distanceCode(distance)
+            distanceFrequencies[distanceSymbol] = distanceFrequencies[distanceSymbol] + 1
+        end
+    end
+    local literalLengths = lengthsFor(literalFrequencies, 286, 15)
+    local distanceLengths = lengthsFor(distanceFrequencies, 30, 15)
+    local literalCount = 286
+    while literalCount > 257 and literalLengths[literalCount - 1] == 0 do
+        literalCount = literalCount - 1
+    end
+    local distanceCount = 30
+    while distanceCount > 1 and distanceLengths[distanceCount - 1] == 0 do
+        distanceCount = distanceCount - 1
+    end
+    -- A block without matches still names one distance code, as zlib does.
+    if distanceLengths[0] == 0 and distanceCount == 1 then
+        distanceLengths[0] = 1
+    end
+    local all: any = {}
+    for symbol = 0, literalCount - 1 do
+        all[symbol] = literalLengths[symbol]
+    end
+    for symbol = 0, distanceCount - 1 do
+        all[literalCount + symbol] = distanceLengths[symbol]
+    end
+    local runSymbols, runExtras = runLengths(all, literalCount + distanceCount)
+    local runFrequencies: any = {}
+    for symbol = 0, 18 do
+        runFrequencies[symbol] = 0
+    end
+    for _, symbol in ipairs(runSymbols) do
+        runFrequencies[symbol] = runFrequencies[symbol] + 1
+    end
+    local runLengthsTable = lengthsFor(runFrequencies, 19, 7)
+    local lengthCount = 19
+    while lengthCount > 4 and runLengthsTable[CODE_LENGTH_ORDER[lengthCount]] == 0 do
+        lengthCount = lengthCount - 1
+    end
+
+    local dynamicBits = 3 + 14 + lengthCount * 3 + cost(symbols, distances, literalLengths, distanceLengths)
+    for _, symbol in ipairs(runSymbols) do
+        dynamicBits = dynamicBits + runLengthsTable[symbol] + (CODE_LENGTH_EXTRA[symbol] or 0)
+    end
+    local fixedBits = 3 + cost(symbols, distances, fixedLiteralLengths, fixedDistanceLengths)
+    local pieces = math.max(1, math.ceil(#raw / MAX_STORED))
+    local storedBits = pieces * 40 + #raw * 8 + 8
+
+    if storedBits <= fixedBits and storedBits <= dynamicBits then
+        writeStored(writer, raw, last)
+    elseif fixedBits <= dynamicBits then
+        put(writer, last and 1 or 0, 1)
+        put(writer, 1, 2)
+        writeSymbols(
+            writer,
+            symbols,
+            distances,
+            fixedLiteralCodes,
+            fixedLiteralLengths,
+            fixedDistanceCodes,
+            fixedDistanceLengths
+        )
+    else
+        put(writer, last and 1 or 0, 1)
+        put(writer, 2, 2)
+        put(writer, literalCount - 257, 5)
+        put(writer, distanceCount - 1, 5)
+        put(writer, lengthCount - 4, 4)
+        for index = 1, lengthCount do
+            put(writer, runLengthsTable[CODE_LENGTH_ORDER[index]], 3)
+        end
+        local runCodes = canonical(runLengthsTable, 19)
+        for index, symbol in ipairs(runSymbols) do
+            put(writer, runCodes[symbol], runLengthsTable[symbol])
+            local extra = CODE_LENGTH_EXTRA[symbol]
+            if extra ~= nil then
+                put(writer, runExtras[index], extra)
+            end
+        end
+        writeSymbols(
+            writer,
+            symbols,
+            distances,
+            canonical(literalLengths, literalCount),
+            literalLengths,
+            canonical(distanceLengths, distanceCount),
+            distanceLengths
+        )
+    end
+    if #data > WINDOW then
+        self.history = data:sub(#data - WINDOW + 1)
+    else
+        self.history = data
+    end
+end
+
+--- Encodes every waiting byte, in blocks of at most BLOCK bytes, leaving any
+--- final partial block waiting unless `all` is set.
+local function encodeWaiting(self: Encoder, all: boolean, last: boolean): nil
+    local waiting = table.concat(self.waiting)
+    local at = 1
+    while #waiting - at + 1 >= BLOCK or all and at <= #waiting do
+        local raw = waiting:sub(at, at + BLOCK - 1)
+        at = at + #raw
+        writeBlock(self, raw, last and at > #waiting)
+    end
+    local rest = waiting:sub(at)
+    self.waiting = #rest > 0 and {rest} or {}
+    self.waitingBytes = #rest
+    enqueue(self, drainBits(self.writer))
+end
+
+--- Takes up to `room` queued bytes.
+local function deliver(self: Encoder, room: number): string
+    local parts: {string} = {}
+    local taken = 0
+    local queue = self.queue
+    while taken < room and #queue > 0 do
+        local first = queue[1]
+        local available = #first - self.queueAt + 1
+        local count = math.min(available, room - taken)
+        parts[#parts + 1] = first:sub(self.queueAt, self.queueAt + count - 1)
+        taken = taken + count
+        if count == available then
+            table.remove(queue, 1)
+            self.queueAt = 1
+        else
+            self.queueAt = self.queueAt + count
+        end
+    end
+
+    return table.concat(parts)
+end
+
+local function pending(self: Encoder): boolean
+    return #self.queue > 0
+end
+
+--- Consumes `input` and answers bytes consumed, at most `room` encoded bytes,
+--- and a status.
+export function write(self: Encoder, input: string, room: number): (number, string, number)
+    if self.finished then
+        return 0, "", FINISHED
+    end
+    local first = deliver(self, room)
+    if pending(self) then
+        return 0, first, NEED_OUTPUT
+    end
+    self.flushing = false
+    if #input > 0 then
+        track(self, input)
+        self.waiting[#self.waiting + 1] = input
+        self.waitingBytes = self.waitingBytes + #input
+        if self.waitingBytes >= BLOCK then
+            encodeWaiting(self, false, false)
+        end
+    end
+    local chunk = first .. deliver(self, room - #first)
+    local status = (#chunk == room and room > 0) and NEED_OUTPUT or NEED_INPUT
+
+    return #input, chunk, status
+end
+
+--- Ends the current block so everything written so far can be decoded, and
+--- answers at most `room` encoded bytes and a status.
+export function flush(self: Encoder, room: number): (string, number)
+    if self.finished then
+        return "", FINISHED
+    end
+    local first = ""
+    if not self.flushing then
+        -- Bytes from earlier writes come out first.
+        first = deliver(self, room)
+        if pending(self) then
+            return first, NEED_OUTPUT
+        end
+        self.flushing = true
+        encodeWaiting(self, true, false)
+        local writer = self.writer
+        put(writer, 0, 3)
+        alignBits(writer)
+        put(writer, 0, 16)
+        put(writer, 0xffff, 16)
+        enqueue(self, drainBits(writer))
+    end
+    local chunk = first .. deliver(self, room - #first)
+    if pending(self) then
+        return chunk, NEED_OUTPUT
+    end
+    self.flushing = false
+
+    return chunk, NEED_INPUT
+end
+
+--- Writes the final block and the wrapper trailer, answering at most `room`
+--- encoded bytes and a status, FINISHED once the last byte is out.
+export function finish(self: Encoder, room: number): (string, number)
+    if self.finished then
+        return "", FINISHED
+    end
+    if not self.finishing then
+        self.finishing = true
+        if self.waitingBytes > 0 then
+            encodeWaiting(self, true, true)
+        else
+            -- An empty final block: a fixed-code end-of-block.
+            put(self.writer, 1, 1)
+            put(self.writer, 1, 2)
+            put(self.writer, fixedLiteralCodes[256], fixedLiteralLengths[256])
+        end
+        local writer = self.writer
+        alignBits(writer)
+        if self.format == GZIP then
+            local value = crc.finish(crc32, self.checksum)
+            for _ = 1, 4 do
+                put(writer, tonumber(value & 0xffULL) as number, 8)
+                value = value >> 8
+            end
+            local size = self.size % 4294967296
+            for _ = 1, 4 do
+                put(writer, size % 256, 8)
+                size = math.floor(size / 256)
+            end
+        elseif self.format == ZLIB then
+            local value = self.adlerHigh * 65536 + self.adlerLow
+            for shift = 24, 0, -8 do
+                put(writer, math.floor(value / 2 ^ shift) % 256, 8)
+            end
+        end
+        enqueue(self, drainBits(writer))
+    end
+    local chunk = deliver(self, room)
+    if pending(self) then
+        return chunk, NEED_OUTPUT
+    end
+    self.finished = true
+
+    return chunk, FINISHED
+end

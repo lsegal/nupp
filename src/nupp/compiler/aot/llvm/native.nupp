@@ -29,7 +29,10 @@ Arithmetic keeps the language's meaning rather than C's. `number` and `integer`
 are binary64, and so is arithmetic over `int32`, `uint32` and `float`: those are
 refinements a value enters through an establishing conversion such as
 `math.i32.wrap`, not types whose operators wrap. `//` and `%` floor. Only `int64`
-and `uint64` arithmetic is fixed-width, wrapping as LuaJIT's does.
+and `uint64` arithmetic is fixed-width, as LuaJIT's is: it wraps, `/` and `%`
+truncate, and `//` floors as the Lua backend's helper does. Bit operators are
+the patched LuaJIT's: numbers meet as 32-bit words and give the signed word
+back, and an `int64` or `uint64` operand makes them 64-bit.
 ]]
 module nupp.compiler.aot.llvm.native
 
@@ -229,16 +232,6 @@ local record Scope
     parent: Scope?
 end
 
---- The function being filled.
-local record Body
-    f: builder.Function
-    scope: Scope
-    result: Kind
-
-    --- The labels a `break` leaves through, innermost last.
-    exits: {string}
-end
-
 --- A lowered value.
 local record Value
     text: string
@@ -261,6 +254,19 @@ local record Program
 
     --- Each laid-out struct's size and field offsets, by its checked type.
     layouts: {[any]: any}
+end
+
+--- The function being filled.
+local record Body
+    f: builder.Function
+    scope: Scope
+    result: Kind
+
+    --- The labels a `break` leaves through, innermost last.
+    exits: {string}
+
+    --- The program the function belongs to.
+    program: Program
 end
 
 local function lookup(scope: Scope?, name: string): Local?
@@ -296,6 +302,53 @@ local function value(body: Body, instruction: string): string
     return builder.value(body.f, instruction)
 end
 
+--- A saturating conversion of the binary64 `wide`, which LLVM defines for every
+--- input: out of range it clamps, and NaN gives 0.
+local function saturate(body: Body, wide: string, signed: boolean): string
+    local intrinsic = signed and "llvm.fptosi.sat.i64.f64" or "llvm.fptoui.sat.i64.f64"
+    builder.declare(body.program.module, "@" .. intrinsic, ("declare i64 @%s(double)"):format(intrinsic))
+
+    return value(body, ("call i64 @%s(double %s)"):format(intrinsic, wide))
+end
+
+--- `wide` truncated toward zero as x86's `cvttsd2si` does it: out of range, and
+--- for NaN, it gives the "integer indefinite" value, -2^63.
+local function indefinite(body: Body, wide: string): string
+    local clamped = saturate(body, wide, true)
+    local fits = value(body, ("fcmp olt double %s, %s"):format(wide, llvmText.double(2 ^ 63)))
+
+    return value(body, ("select i1 %s, i64 %s, i64 -9223372036854775808"):format(fits, clamped))
+end
+
+--- The binary64 `wide` truncated toward zero to 64 bits, as `lj_num2i64` does,
+--- or, when `unsigned`, as `lj_num2u64` does. Their result out of range, and
+--- for NaN or an infinity, is what the target's instructions give, so it is
+--- reproduced per target: arm64's `fcvtzs` and `fcvtzu` saturate, and x86's
+--- `cvttsd2si` gives -2^63, which `lj_num2u64` retries 2^64 lower. LLVM's own
+--- `fptosi` and `fptoui` would give poison there instead.
+local function integer64(body: Body, wide: string, unsigned: boolean): string
+    local triple = body.program.triple
+    if triple:match("^aarch64") ~= nil or triple:match("^arm64") ~= nil then
+        local signed = saturate(body, wide, true)
+        if not unsigned then
+            return signed
+        end
+        local saturated = saturate(body, wide, false)
+        local overflowed = value(body, "icmp eq i64 " .. signed .. ", 9223372036854775807")
+
+        return value(body, ("select i1 %s, i64 %s, i64 %s"):format(overflowed, saturated, signed))
+    end
+    local first = indefinite(body, wide)
+    if not unsigned then
+        return first
+    end
+    local lowered = value(body, ("fsub double %s, %s"):format(wide, llvmText.double(2 ^ 64)))
+    local retried = indefinite(body, lowered)
+    local overflowed = value(body, "icmp eq i64 " .. first .. ", -9223372036854775808")
+
+    return value(body, ("select i1 %s, i64 %s, i64 %s"):format(overflowed, retried, first))
+end
+
 --- `v` as `to`. `explicit` admits what only an `as` cast may do: pointers to
 --- and from integers.
 local function convert(body: Body, v: Value, to: Kind, node: any, explicit: boolean?): Value
@@ -318,17 +371,16 @@ local function convert(body: Body, v: Value, to: Kind, node: any, explicit: bool
         local op = from.signed and "sitofp" or "uitofp"
         return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
     elseif isInteger(to) and isFloat(from) then
-        -- As LuaJIT converts a number to a C integer: through an `int32_t`
-        -- below 32 bits and for `int32_t`, through 64 bits for `uint32_t`, then
-        -- truncated, so a narrow field stored past its range wraps.
-        local width = WIDTHS[to.llvm] as integer
-        local through = (width < 32 or width == 32 and to.signed) and "i32" or width == 32 and "i64" or to.llvm
-        local op = (to.signed or through ~= to.llvm) and "fptosi" or "fptoui"
-        local whole = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, through))
-        if through == to.llvm then
+        -- As LuaJIT's `lj_cconv_ct_ct` converts a number to a C integer:
+        -- through binary64, then `lj_num2u64` for a `uint64_t` and `lj_num2i64`
+        -- for every other, truncated, so a narrow field stored past its range
+        -- wraps.
+        local wide = from.llvm == "double" and v.text or value(body, "fpext float " .. v.text .. " to double")
+        local whole = integer64(body, wide, to.llvm == "i64" and not to.signed)
+        if to.llvm == "i64" then
             return Value(text = whole, kind = to)
         end
-        return Value(text = value(body, ("trunc %s %s to %s"):format(through, whole, to.llvm)), kind = to)
+        return Value(text = value(body, ("trunc i64 %s to %s"):format(whole, to.llvm)), kind = to)
     elseif isFloat(to) and isFloat(from) then
         local op = to.llvm == "double" and "fpext" or "fptrunc"
         return Value(text = value(body, ("%s %s %s to %s"):format(op, from.llvm, v.text, to.llvm)), kind = to)
@@ -344,21 +396,19 @@ local expression: function(Program, Body, any, Kind?): Value
 
 --- A numeric literal, in the kind it is wanted in when there is one, negated
 --- when it is the operand of a unary minus. An `LL` or `ULL` literal is an
---- `int64` or `uint64` whatever it is wanted as; any other is binary64 unless a
---- C integer is wanted, where the checker has already said it is exact.
+--- `int64` or `uint64` whatever it is wanted as, its value exact and wrapped to
+--- 64 bits as LuaJIT reads it; any other is binary64 unless a C integer is
+--- wanted, where the checker has already said it is exact.
 local function number(node: cst.NumberLit, want: Kind?, negated: boolean?): Value
     local spelling = (node.token as lexer.Token).text
     local digits, suffix = spelling:match("^(.-)([uU]?[lL][lL])$")
     if digits ~= nil then
         local wide = (suffix as string):sub(1, 1):lower() == "u" and U64 or I64
-        local decimal = (digits as string):match("^%d+$")
-        local text = decimal ~= nil and decimal
-            or tonumber(digits as string) ~= nil and llvmText.integer(tonumber(digits as string) as number)
-            or nil
+        local text = llvmText.wideInteger(digits as string, wide == U64, negated)
         if text == nil then
             refuse(node, "a native program cannot represent the number " .. spelling)
         end
-        return Value(text = negated and "-" .. (text as string) or text as string, kind = wide)
+        return Value(text = text as string, kind = wide)
     end
     local parsed = tonumber(spelling)
     if parsed == nil then
@@ -679,8 +729,75 @@ intrinsic = function(program: Program, body: Body, node: cst.Call): Value?
     return Value(text = value(body, ("call double %s(double %s)"):format(name, argument.text)), kind = F64)
 end
 
+const INT64_MIN = "-9223372036854775808"
+
+--- `a / b` or `a % b` over 64-bit integers, as LuaJIT's `lj_carith_divi64` and
+--- its kin compute them: C's truncating division, except that dividing by zero
+--- gives INT64_MIN, and so does INT64_MIN / -1, whose remainder is 0. Those
+--- cases divide by 1 instead, so the instruction itself is always defined.
+local function integerDivision(body: Body, op: string, a: string, b: string, kind: Kind): string
+    local zero = value(body, ("icmp eq i64 %s, 0"):format(b))
+    local special = zero
+    if kind.signed then
+        local minusOne = value(body, ("icmp eq i64 %s, -1"):format(b))
+        local least = value(body, ("icmp eq i64 %s, %s"):format(a, INT64_MIN))
+        local overflow = value(body, ("and i1 %s, %s"):format(minusOne, least))
+        special = value(body, ("or i1 %s, %s"):format(zero, overflow))
+    end
+    local divisor = value(body, ("select i1 %s, i64 1, i64 %s"):format(special, b))
+    local instruction = (kind.signed and "s" or "u") .. (op == "%" and "rem" or "div")
+    local result = value(body, ("%s i64 %s, %s"):format(instruction, a, divisor))
+
+    -- INT64_MIN % 1 is already the 0 that INT64_MIN % -1 gives.
+    local replaced = special
+    if op == "%" then
+        replaced = zero
+    end
+
+    return value(body, ("select i1 %s, i64 %s, i64 %s"):format(replaced, INT64_MIN, result))
+end
+
+--- Whether an operand is below zero as it was written, before it met the other
+--- side's kind: a `uint64` never is, and a number by its own sign.
+local function negative(body: Body, v: Value): string
+    if isFloat(v.kind) then
+        return value(body, ("fcmp olt %s %s, 0.0"):format(v.kind.llvm, v.text))
+    elseif v.kind.signed then
+        return value(body, ("icmp slt %s %s, 0"):format(v.kind.llvm, v.text))
+    end
+
+    return "false"
+end
+
+--- `left // right` over 64-bit integers, as the Lua backend's `__nuppFloorDiv`
+--- computes it from LuaJIT's `/`: the truncated quotient, one lower when it was
+--- inexact and the written operands differ in sign.
+local function floorDivision(body: Body, left: Value, right: Value, a: string, b: string, kind: Kind): string
+    local quotient = integerDivision(body, "/", a, b, kind)
+    local product = value(body, ("mul i64 %s, %s"):format(quotient, b))
+    local inexact = value(body, ("icmp ne i64 %s, %s"):format(product, a))
+    local signs = value(body, ("xor i1 %s, %s"):format(negative(body, left), negative(body, right)))
+    local adjust = value(body, ("and i1 %s, %s"):format(inexact, signs))
+    local step = value(body, ("zext i1 %s to i64"):format(adjust))
+
+    return value(body, ("sub i64 %s, %s"):format(quotient, step))
+end
+
 --- `left op right` over 64-bit integers, which wrap as LuaJIT's do.
-local function integerArithmetic(body: Body, op: string, a: string, b: string, kind: Kind): string
+local function integerArithmetic(
+    body: Body,
+    op: string,
+    left: Value,
+    right: Value,
+    a: string,
+    b: string,
+    kind: Kind
+): string
+    if op == "/" or op == "%" then
+        return integerDivision(body, op, a, b, kind)
+    elseif op == "//" then
+        return floorDivision(body, left, right, a, b, kind)
+    end
     local instruction = op == "+" and "add" or op == "-" and "sub" or "mul"
 
     return value(body, ("%s %s %s, %s"):format(instruction, kind.llvm, a, b))
@@ -740,6 +857,89 @@ local function logical(program: Program, body: Body, node: cst.Binop, op: string
     return Value(text = value(body, "load i1, ptr " .. slot), kind = BOOL)
 end
 
+const BITWISE: {
+    [string]: string
+} = {["&"] = "and", ["|"] = "or", ["~"] = "xor", ["<<"] = "shl", [">>"] = "lshr", ["~>>"] = "ashr",}
+
+--- A number as LuaJIT's bit operators read it: modulo 2^32, by adding
+--- 2^52 + 2^51 and keeping the low word, which rounds a fraction to nearest.
+--- A C integer narrower than 64 bits is already whole, so it only extends.
+local function word(body: Body, v: Value, node: any): string
+    if isInteger(v.kind) then
+        return convert(body, v, v.kind.signed and I32 or U32, node).text
+    end
+    local wide = convert(body, v, F64, node).text
+    local biased = value(body, ("fadd double %s, %s"):format(wide, llvmText.double(6755399441055744)))
+    local bits = value(body, "bitcast double " .. biased .. " to i64")
+
+    return value(body, "trunc i64 " .. bits .. " to i32")
+end
+
+--- An operand of a bit operator over 64-bit integers. A number truncates
+--- toward zero, as `lj_num2i64` does, or, beside a `uint64`, as `lj_num2u64`
+--- does; see `integer64`.
+local function word64(body: Body, v: Value, kind: Kind, node: any): string
+    if v.kind.llvm == "i64" then
+        return v.text
+    elseif isInteger(v.kind) then
+        return convert(body, v, I64, node).text
+    end
+
+    return convert(body, v, kind, node).text
+end
+
+--- What a 32-bit bit operation gives: the signed word LuaJIT returns, as a
+--- number, unless the checker established the result as `int32` or `uint32`.
+local function bitResult(body: Body, node: any, result: string): Value
+    local established = (node as any).fixedWidthEstablished
+    if established ~= nil and established.uint32 then
+        return Value(text = result, kind = U32)
+    elseif established ~= nil and established.int32 then
+        return Value(text = result, kind = I32)
+    end
+
+    return Value(text = value(body, "sitofp i32 " .. result .. " to double"), kind = F64)
+end
+
+--- `left op right` for a bit operator, as the patched LuaJIT's `lj_meta_bitop`
+--- computes it. Numbers meet as 32-bit words, and a shift reads its count's
+--- low five bits. An `int64` or `uint64` operand makes the operation 64-bit,
+--- with a `uint64` making it unsigned, and a shift reads six bits; a shift
+--- takes its width from its left operand alone.
+local function bitwise(
+    program: Program,
+    body: Body,
+    node: any,
+    op: string,
+    left: Value,
+    right: Value,
+    lhs: any,
+    rhs: any
+): Value
+    local instruction = BITWISE[op] as string
+    local shift = op == "<<" or op == ">>" or op == "~>>"
+    local wide = left.kind.llvm == "i64" or not shift and right.kind.llvm == "i64"
+    if not wide then
+        -- A number shifted by a 64-bit count reads the count's low word, as
+        -- `lj_carith_check64`'s result truncated to 32 bits.
+        local a = word(body, left, lhs)
+        local b = word(body, right, rhs)
+        if shift then
+            b = value(body, "and i32 " .. b .. ", 31")
+        end
+
+        return bitResult(body, node, value(body, ("%s i32 %s, %s"):format(instruction, a, b)))
+    end
+    local kind = shift and left.kind or common(left.kind, right.kind)
+    local a = word64(body, left, kind, lhs)
+    local b = word64(body, right, kind, rhs)
+    if shift then
+        b = value(body, "and i64 " .. b .. ", 63")
+    end
+
+    return Value(text = value(body, ("%s i64 %s, %s"):format(instruction, a, b)), kind = kind)
+end
+
 --- `left op right` once both sides are lowered. `node` is what a refusal names;
 --- `lhs` and `rhs`, the operands' own nodes.
 local function binaryValues(
@@ -778,11 +978,11 @@ local function binaryValues(
     if not arithmetic then
         refuse(node, "the operands of " .. op .. " must be numbers in a native program")
     end
-    if op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>" then
-        refuse(node, "a native program does not lower bitwise operators")
+    if BITWISE[op] ~= nil then
+        return bitwise(program, body, node, op, left, right, lhs, rhs)
     end
     local meet = common(left.kind, right.kind)
-    if order == nil and meet.llvm == "i64" and op ~= "+" and op ~= "-" and op ~= "*" then
+    if order == nil and meet.llvm == "i64" and op == "^" then
         refuse(node, "a native program does not lower " .. op .. " over 64-bit integers")
     end
     local a = convert(body, left, meet, lhs).text
@@ -798,7 +998,7 @@ local function binaryValues(
         return Value(text = floatArithmetic(program, body, op, a, b, meet), kind = meet)
     end
 
-    return Value(text = integerArithmetic(body, op, a, b, meet), kind = meet)
+    return Value(text = integerArithmetic(body, op, left, right, a, b, meet), kind = meet)
 end
 
 local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?): Value
@@ -812,8 +1012,13 @@ local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?
 
     -- A literal operand takes the other side's kind, so `n < 10` compares in
     -- `n`'s width rather than widening it. A literal has no effects, so reading
-    -- the other side first changes nothing.
+    -- the other side first changes nothing. A bit operator's literal stays a
+    -- number, as it is under LuaJIT, and is converted as LuaJIT converts one:
+    -- modulo 2^32, or beside a 64-bit integer, truncated.
     local function operand(v: Value): Kind?
+        if BITWISE[op] ~= nil then
+            return nil
+        end
         return (v.kind.llvm ~= "ptr" and v.kind.llvm ~= "void") and v.kind or nil
     end
 
@@ -822,7 +1027,7 @@ local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?
         local left = expression(program, body, node.lhs, operand(right))
         return binaryValues(program, body, node, op, left, right, node.lhs, node.rhs)
     end
-    local left = expression(program, body, node.lhs, ORDERS[op] == nil and want or nil)
+    local left = expression(program, body, node.lhs, ORDERS[op] == nil and BITWISE[op] == nil and want or nil)
     local right = expression(program, body, node.rhs, operand(left))
 
     return binaryValues(program, body, node, op, left, right, node.lhs, node.rhs)
@@ -843,6 +1048,13 @@ local function unary(program: Program, body: Body, node: cst.Unop, want: Kind?):
         elseif isInteger(operand.kind) or isFloat(operand.kind) then
             local wide = convert(body, operand, F64, node.operand)
             return Value(text = value(body, "fneg double " .. wide.text), kind = F64)
+        end
+    elseif op == "~" then
+        local operand = expression(program, body, node.operand, nil)
+        if operand.kind.llvm == "i64" then
+            return Value(text = value(body, "xor i64 " .. operand.text .. ", -1"), kind = operand.kind)
+        elseif isInteger(operand.kind) or isFloat(operand.kind) then
+            return bitResult(body, node, value(body, "xor i32 " .. word(body, operand, node.operand) .. ", -1"))
         end
     end
     refuse(node, "a native program cannot apply " .. op .. " here")
@@ -1328,7 +1540,8 @@ local function statement(program: Program, body: Body, stat: any): nil
             refuse(stat, "a native compound assignment updates a local, a field or an element")
         end
         local current = expression(program, body, target, nil)
-        local operand = expression(program, body, compound.value, current.kind)
+        local wanted = BITWISE[op] == nil and current.kind or nil
+        local operand = expression(program, body, compound.value, wanted)
         store(
             body,
             found as Local,
@@ -1543,7 +1756,8 @@ local function lowerDefinition(program: Program, attributes: string, item: Defin
         f = builder.func(program.module, header),
         scope = Scope(names = {}),
         result = callee.symbol == "main" and I32 or callee.result,
-        exits = {}
+        exits = {},
+        program = program
     )
     for index, kind in ipairs(callee.params) do
         local entry = declareLocal(body, item.paramNames[index], kind)
