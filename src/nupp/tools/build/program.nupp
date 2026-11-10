@@ -98,7 +98,13 @@ function program.build(
     config._target = checking
     local envMod = require("nupp.compiler.project.env")
     local environment = envMod.new(root, {config = config})
-    local path = envMod.findModulePath(environment, entry)
+    -- A module name or a `.nupp` path, as a bundle's entries are.
+    local path: string? = nil
+    if entry:match("%.nupp$") and fs.exists(fs.join(root, entry)) then
+        path = fs.join(root, entry)
+    else
+        path = envMod.findModulePath(environment, entry)
+    end
     if path == nil then
         return nil, "NUPP0003", "program target " .. name .. " names entry " .. entry .. ", which no include root has"
     end
