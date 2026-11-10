@@ -509,7 +509,7 @@ function expressions.layoutModel(ctx: context.Context, layoutName: string): expr
     if layout == nil then
         error("no layout " .. layoutName, 0)
     end
-    local placed = placement.of(layout as scalarIR.Layout, tostring(ctx.triple))
+    local placed = placement.of(layout as scalarIR.Layout, ctx.triple)
     local model = expressions.LayoutModel(
         members = {},
         index = {},

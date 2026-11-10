@@ -164,6 +164,20 @@ local function roundUp(value: integer, alignment: integer): integer
     return math.floor((value + alignment - 1) / alignment) * alignment
 end
 
+--- The alignment a fixed-width scalar `bytes` wide has inside a struct under
+--- `key`: its size, except where the ABI aligns an eight-byte one less.
+function targetLayout.scalarAlignment(key: string, bytes: integer): (integer?, string?)
+    local model = MODELS[key]
+    if not model then
+        return nil, "unknown target layout key " .. tostring(key)
+    end
+    if bytes == 8 then
+        return model.number.alignment, nil
+    end
+
+    return bytes, nil
+end
+
 --- The storage a `Fixed<lanes>` vector of an element `elementBytes` wide
 --- occupies under `key`, by the contract above. It is what a storage struct
 --- holding such a field is laid out by: `of` below, the generated C
