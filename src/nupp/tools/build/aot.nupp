@@ -44,6 +44,7 @@ local wasmBinding = require("nupp.compiler.aot.wasmbinding")
 local wasmBridge = require("nupp.compiler.aot.wasmbridge")
 local aotcheck = require("nupp.tools.build.aotcheck")
 local aotllvm = require("nupp.tools.build.aotllvm")
+local llvmProfile = require("nupp.compiler.aot.llvm.profile")
 local compile = require("nupp.compiler.aot.compile")
 local constspecialize = require("nupp.compiler.lua.constspecialize")
 local diagnosticMod = require("nupp.compiler.diagnostics")
@@ -789,7 +790,19 @@ function aot.link(
     if static then
         linkErr = aotllvm.archive(selected.triple, objects, output)
     else
-        linkErr = aotllvm.link(selected.triple, objects, output, root)
+        -- What the units define for others to resolve is what the library
+        -- publishes, read from the IR each object was compiled from.
+        local exports: {string} = {}
+        for _, one in ipairs(emitted) do
+            local ir, readErr = fs.readFile(one.output)
+            if ir == nil then
+                return tostring(readErr), nil
+            end
+            for _, name in ipairs(llvmProfile.publicSymbols(ir as string)) do
+                exports[#exports + 1] = name
+            end
+        end
+        linkErr = aotllvm.link(selected.triple, objects, output, root, exports)
     end
     if linkErr ~= nil then
         return linkErr, nil

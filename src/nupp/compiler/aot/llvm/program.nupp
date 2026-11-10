@@ -562,9 +562,12 @@ local function kernel(unit: llvmProgram.Unit, program: scalarIR.Program, oracle:
         scope = dwarf.subprogram(module, unit.lines as dwarf.Unit, program.name, firstLine(program))
         attrs = attrs .. " !dbg " .. tostring(scope)
     end
+    -- A native-only entry is reached only by other units of the library, so it
+    -- is hidden and stays out of what the library publishes.
+    local visibility = program.nativeOnly == true and "hidden " or ""
     local f = builder.func(
         module,
-        ("define %s @%s(%s) %s {"):format(result, symbol, table.concat(parameters, ", "), attrs)
+        ("define %s%s @%s(%s) %s {"):format(visibility, result, symbol, table.concat(parameters, ", "), attrs)
     )
 
     -- Counts arrive as `size_t` and are used as i64 throughout.
