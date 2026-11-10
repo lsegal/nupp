@@ -372,7 +372,7 @@ local function executable(
     end
     local ir, problem = require(
         "nupp.compiler.aot.llvm.native"
-    ).module(tree.root, (profile as {functionAttributes: string}).functionAttributes)
+    ).module(tree.root, target.triple, (profile as {functionAttributes: string}).functionAttributes)
     if ir == nil then
         local at = problem as {
             line: integer,
