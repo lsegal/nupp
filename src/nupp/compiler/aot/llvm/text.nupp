@@ -146,3 +146,89 @@ end
 export function integer(value: number): string
     return ("%.0f"):format(value)
 end
+
+--- The value `spelled` (digits in `base`, 10 or 16) stands for, as its decimal
+--- digits, least significant first.
+local function decimalDigits(spelled: string, base: number): {number}
+    local places: {number} = {0}
+    for at = 1, #spelled do
+        local carry = tonumber(spelled:sub(at, at), 16) as number
+        for place = 1, #places do
+            local amount = places[place] * base + carry
+            places[place] = amount % 10
+            carry = math.floor(amount / 10)
+        end
+        while carry > 0 do
+            places[#places + 1] = carry % 10
+            carry = math.floor(carry / 10)
+        end
+    end
+
+    return places
+end
+
+--- Whether the decimal digits `a` stand for less than `b`; neither has a
+--- leading zero.
+local function below(a: {number}, b: {number}): boolean
+    if #a ~= #b then
+        return #a < #b
+    end
+    for place = #a, 1, -1 do
+        if a[place] ~= b[place] then
+            return a[place] < b[place]
+        end
+    end
+
+    return false
+end
+
+--- `a - b` in decimal digits, where `b` is no more than `a`.
+local function minus(a: {number}, b: {number}): {number}
+    local places: {number} = {}
+    local borrow = 0
+    for place = 1, #a do
+        local amount = a[place] - (place <= #b and b[place] or 0) - borrow
+        borrow = amount < 0 and 1 or 0
+        places[place] = amount + borrow * 10
+    end
+    while #places > 1 and places[#places] == 0 do
+        places[#places] = nil
+    end
+
+    return places
+end
+
+local function spell(places: {number}): string
+    local parts: {string} = {}
+    for place = #places, 1, -1 do
+        parts[#parts + 1] = tostring(places[place])
+    end
+
+    return table.concat(parts)
+end
+
+--- The 64-bit constant the digits of an `LL` or `ULL` literal stand for,
+--- decimal or `0x` hex, negated when `negated`, wrapped to 64 bits as LuaJIT
+--- reads them and spelled as an unsigned or a two's-complement decimal. Nil
+--- when the digits need more than 64 bits, which LuaJIT refuses. The digits are
+--- worked in decimal, because a number holds integers only up to 2^53 exactly.
+export function wideInteger(digits: string, unsigned: boolean, negated: boolean?): string?
+    local hex = digits:match("^0[xX](%x+)$")
+    local spelled = hex or digits:match("^%d+$")
+    if spelled == nil then
+        return nil
+    end
+    local modulus = decimalDigits("18446744073709551616", 10)
+    local places = decimalDigits(spelled as string, hex ~= nil and 16 or 10)
+    if not below(places, modulus) then
+        return nil
+    end
+    if negated and (#places > 1 or places[1] ~= 0) then
+        places = minus(modulus, places)
+    end
+    if not unsigned and not below(places, decimalDigits("9223372036854775808", 10)) then
+        return "-" .. spell(minus(modulus, places))
+    end
+
+    return spell(places)
+end

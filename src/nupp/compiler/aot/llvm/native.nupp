@@ -396,21 +396,19 @@ local expression: function(Program, Body, any, Kind?): Value
 
 --- A numeric literal, in the kind it is wanted in when there is one, negated
 --- when it is the operand of a unary minus. An `LL` or `ULL` literal is an
---- `int64` or `uint64` whatever it is wanted as; any other is binary64 unless a
---- C integer is wanted, where the checker has already said it is exact.
+--- `int64` or `uint64` whatever it is wanted as, its value exact and wrapped to
+--- 64 bits as LuaJIT reads it; any other is binary64 unless a C integer is
+--- wanted, where the checker has already said it is exact.
 local function number(node: cst.NumberLit, want: Kind?, negated: boolean?): Value
     local spelling = (node.token as lexer.Token).text
     local digits, suffix = spelling:match("^(.-)([uU]?[lL][lL])$")
     if digits ~= nil then
         local wide = (suffix as string):sub(1, 1):lower() == "u" and U64 or I64
-        local decimal = (digits as string):match("^%d+$")
-        local text = decimal ~= nil and decimal
-            or tonumber(digits as string) ~= nil and llvmText.integer(tonumber(digits as string) as number)
-            or nil
+        local text = llvmText.wideInteger(digits as string, wide == U64, negated)
         if text == nil then
             refuse(node, "a native program cannot represent the number " .. spelling)
         end
-        return Value(text = negated and "-" .. (text as string) or text as string, kind = wide)
+        return Value(text = text as string, kind = wide)
     end
     local parsed = tonumber(spelling)
     if parsed == nil then
