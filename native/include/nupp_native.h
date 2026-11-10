@@ -39,7 +39,7 @@
 /* A value does not fit the range its ABI type, or Nupp's exact integers, can
  * carry. */
 #define NUPP_NATIVE_OUT_OF_RANGE 7
-/* The facility is absent from this machine, such as a GPU adapter. */
+/* The facility is absent from this machine. */
 #define NUPP_NATIVE_UNAVAILABLE 8
 
 /* A call that copies bytes into caller-owned storage writes the byte count to
@@ -51,7 +51,7 @@
 
 #define NUPP_NATIVE_FEATURE_BASE (UINT64_C(1) << 0)
 #define NUPP_NATIVE_FEATURE_UUID (UINT64_C(1) << 1)
-#define NUPP_NATIVE_FEATURE_GPU (UINT64_C(1) << 2)
+/* Bit 2 was the GPU provider, which is Nupp over wgpu-native now. */
 #define NUPP_NATIVE_FEATURE_URI (UINT64_C(1) << 3)
 #define NUPP_NATIVE_FEATURE_HTTP (UINT64_C(1) << 4)
 #define NUPP_NATIVE_FEATURE_PROCESS (UINT64_C(1) << 5)
@@ -66,8 +66,7 @@
 #define NUPP_NATIVE_FEATURE_AOT_RUNTIME (UINT64_C(1) << 12)
 /* The endpoint calls of the network family, which carry an IPv6 scope. */
 #define NUPP_NATIVE_FEATURE_NET_ENDPOINT (UINT64_C(1) << 13)
-/* The process-wide readiness generation, nuppNativePoll and nuppNativeWait,
- * and nuppNativeGpuSynchronizeReady when NUPP_NATIVE_FEATURE_GPU is set. */
+/* The process-wide readiness generation, nuppNativePoll and nuppNativeWait. */
 #define NUPP_NATIVE_FEATURE_READINESS (UINT64_C(1) << 14)
 
 #ifdef __cplusplus
@@ -118,9 +117,8 @@ NUPP_NATIVE_EXPORT int32_t nuppNativeXxh64Digest(
 /* Present when NUPP_NATIVE_FEATURE_READINESS is set. One process-wide
  * generation that every family advances when something a caller could be
  * waiting for changes: a socket or TLS session moves, a file transfer
- * settles, an HTTP client has events, a child exits or a pipe moves, or GPU
- * work finishes (see nuppNativeGpuSynchronizeReady). A caller waiting on any
- * mix of them sleeps here once.
+ * settles, an HTTP client has events, or a child exits or a pipe moves. A
+ * caller waiting on any mix of them sleeps here once.
  *
  * Poll the generation first, then check the resources you are waiting for
  * with their non-blocking calls, and wait from the generation you polled:
@@ -752,82 +750,6 @@ NUPP_NATIVE_EXPORT int32_t nuppNativeProcessWait(
     const uint64_t *readable, size_t readable_count,
     const uint64_t *writable, size_t writable_count,
     uint64_t timeout_ms, size_t *ready);
-
-/* Present when NUPP_NATIVE_FEATURE_GPU is set. Every object is an opaque,
- * generational integer handle; no provider-owned pointer crosses the ABI.
- *
- * - A context, and every buffer, kernel and binding set made in it, is used
- *   only from the thread that created the context. Another thread's call is
- *   refused with INVALID_ARGUMENT. Contexts do not wait on one another.
- * - Upload, download and binding offsets and sizes are multiples of 4 bytes,
- *   except that a range ending the buffer may end partway through a word.
- *   Binding offsets are also multiples of the device's minimum storage
- *   buffer offset alignment.
- * - One allocation may not be bound for reading and for writing in the same
- *   binding set.
- * - The workgroup size a kernel is created with must be the LocalSize its
- *   entry point compiles in. A dispatch covers ceil(work items / workgroup
- *   size) workgroups per dimension, at most the device's per-dimension limit
- *   (65535 on common adapters).
- * - A buffer holds at most one download: queue it, synchronize, then read
- *   it, before queuing the next.
- * - Validation failures inside the device and device faults are reported by
- *   the next synchronize, not by the call that caused them.
- * - Synchronize blocks until the submitted work finishes. A caller that must
- *   not block asks nuppNativeGpuSynchronizeReady first and, while it returns
- *   0, waits on the process readiness generation, which advances once the
- *   work is done; Synchronize then only maps the finished downloads.
- * - No usable adapter fails context creation with UNAVAILABLE. */
-/* Empty path restores NUPP_GPU_COSTS, appending to it after the first time the
- * process opened it. Nonempty paths select process-local JSONL. The switch
- * happens even when the previous output had a write failure, which is then
- * reported as INTERNAL. */
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuCostsOutput(const uint8_t *path, size_t length);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuCostsEnabled(void);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuCostMetadata(
-    uint64_t context, uint64_t handle, int32_t kernel, const uint8_t *json, size_t length);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuContextCreate(uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuContextDescription(
-    uint64_t context, uint8_t *output, size_t capacity, size_t *length);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuContextRelease(uint64_t context);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuBufferCreate(
-    uint64_t context, uint64_t size, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuBufferRelease(
-    uint64_t context, uint64_t buffer);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuBufferUpload(
-    uint64_t context, uint64_t buffer, uint64_t offset,
-    const void *data, size_t length);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuKernelCreate(
-    uint64_t context, const uint8_t *spirv, size_t spirv_length,
-    const char *entrypoint, size_t entrypoint_length,
-    uint32_t readonly_bindings, uint32_t writable_bindings,
-    uint64_t uniform_size, uint32_t workgroup_x, uint32_t workgroup_y,
-    uint32_t workgroup_z, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuKernelRelease(
-    uint64_t context, uint64_t kernel);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuBindingsCreate(
-    uint64_t context, uint64_t kernel, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuBindingsRelease(
-    uint64_t context, uint64_t bindings);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuBindingsSetBuffer(
-    uint64_t context, uint64_t bindings, int32_t writable, uint32_t slot,
-    uint64_t buffer, uint64_t offset, uint64_t size);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuDispatch(
-    uint64_t context, uint64_t bindings,
-    uint32_t work_items_x, uint32_t work_items_y, uint32_t work_items_z,
-    const uint8_t *uniforms, size_t uniform_length);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuDownloadQueue(
-    uint64_t context, uint64_t buffer, uint64_t offset, uint64_t size);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuSynchronize(uint64_t context);
-/* Present when NUPP_NATIVE_FEATURE_READINESS is also set. Writes 1 when the
- * context's submitted work has finished and 0 while it runs, and never
- * blocks. A failed wait for the device, a timeout included, is answered here
- * as INTERNAL. */
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuSynchronizeReady(
-    uint64_t context, uint32_t *ready);
-NUPP_NATIVE_EXPORT int32_t nuppNativeGpuDownloadRead(
-    uint64_t context, uint64_t buffer, uint64_t offset, uint64_t size,
-    void *output, size_t capacity);
 
 #ifdef __cplusplus
 }

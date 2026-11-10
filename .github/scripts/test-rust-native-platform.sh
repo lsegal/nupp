@@ -8,8 +8,8 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
-FEATURES=lpeg,native-checksum,native-compression,native-files,native-gpu,native-net,native-process,native-time,native-tls,workers
-HOST_FEATURES=lpeg,native-checksum,native-compression,native-files,native-gpu,native-net,native-process,native-tls,workers
+FEATURES=lpeg,native-checksum,native-compression,native-files,native-net,native-process,native-time,native-tls,workers
+HOST_FEATURES=lpeg,native-checksum,native-compression,native-files,native-net,native-process,native-tls,workers
 
 cd "$ROOT"
 
@@ -64,7 +64,7 @@ sdk=$(./scripts/toolchain host-library "$FEATURES")
 [ -f "$sdk/link.json" ]
 # Checksums are part of the base host; toolchain normalization omits their
 # compatibility feature from the Cargo feature list recorded in link.json.
-grep -F '"features": "lpeg,native-compression,native-files,native-gpu,native-net,native-process,native-tls,workers"' \
+grep -F '"features": "lpeg,native-compression,native-files,native-net,native-process,native-tls,workers"' \
     "$sdk/link.json" >/dev/null
 case "$(uname -s 2>/dev/null || printf unknown)" in
     MINGW*|MSYS*|CYGWIN*)
@@ -83,18 +83,8 @@ assert(__nuppHost.hostFeatures["native-checksum"])
 assert(__nuppHost.hostFeatures["native-time"])
 assert(__nuppHost.hostFeatures["native-compression"])
 assert(__nuppHost.hostFeatures["native-files"])
-assert(__nuppHost.hostFeatures["native-gpu"])
-local ffi = require("ffi")
-ffi.cdef[[
-uint64_t nuppNativeFeatures(void);
-int32_t nuppNativeGpuCostsOutput(const uint8_t *, size_t);
-int32_t nuppNativeGpuCostsEnabled(void);
-int32_t nuppNativeGpuCostMetadata(uint64_t, uint64_t, int32_t, const uint8_t *, size_t);
-]]
-assert(require("bit").band(tonumber(ffi.C.nuppNativeFeatures()), 4) ~= 0)
-assert(ffi.C.nuppNativeGpuCostsOutput(nil, 0) == 0)
-assert(type(ffi.C.nuppNativeGpuCostsEnabled()) == "number")
-assert(type(ffi.C.nuppNativeGpuCostMetadata) == "cdata")
+-- The GPU is Nupp over wgpu-native now: no host links it.
+assert(not __nuppHost.hostFeatures["native-gpu"])
 assert(__nuppHost.hostFeatures["native-net"])
 assert(__nuppHost.hostFeatures["native-process"])
 assert(__nuppHost.hostFeatures["native-tls"])

@@ -244,7 +244,7 @@ function M.offlineRustBuildNamesItsVendorContract()
     local env = environment(directory)
     env.NUPP_HOST_OFFLINE = "1"
     env.NUPP_RUST_VENDOR_DIR = nil
-    local status, output = run(env, "native-rust gpu")
+    local status, output = run(env, "native-rust http")
 
     assert(status ~= 0, output)
     assert(output:find("offline Rust builds require NUPP_RUST_VENDOR_DIR", 1, true), output)
@@ -255,7 +255,7 @@ function M.implicitCargoTargetCannotPoisonTheHostArtifactCache()
     local directory = temporary()
     local env = environment(directory)
     env.CARGO_BUILD_TARGET = "wasm32-unknown-unknown"
-    local status, output = run(env, "native-rust gpu")
+    local status, output = run(env, "native-rust http")
 
     assert(status ~= 0, output)
     assert(output:find("CARGO_BUILD_TARGET is unsupported", 1, true), output)
@@ -285,19 +285,16 @@ function M.hostBuildSelectsThePinnedWorkspaceBinary()
     assert(output:find(host, 1, true), output)
 end
 
-function M.gpuHostFeatureChangesTheCargoUnionAndArtifactKey()
+-- The GPU provider is Nupp over wgpu-native, which no host links, so a host
+-- that asks for it is asking for something that does not exist.
+function M.gpuIsNotAHostFeature()
     local directory = temporary()
     local env = environment(directory)
-    local plainStatus, plainOutput = run(env, "host-rust")
-    assert(plainStatus == 0, plainOutput)
-    local gpuStatus, gpuOutput = run(env, "host-rust native-gpu")
-    assert(gpuStatus == 0, gpuOutput)
-    local arguments = read(env.NUPP_TEST_CARGO_RECORD)
-    assert(arguments:find("--features native-gpu", 1, true), arguments)
-    assert(answer(plainOutput) ~= answer(gpuOutput), "GPU must select a distinct host artifact")
-    local aliasStatus, aliasOutput = run(env, "host-rust gpu")
-    assert(aliasStatus == 0, aliasOutput)
-    assert(answer(aliasOutput) == answer(gpuOutput), "the GPU alias must resolve to the same feature union")
+    for _, name in ipairs({"native-gpu", "gpu"}) do
+        local status, output = run(env, "host-rust " .. name)
+        assert(status ~= 0, output)
+        assert(output:find("unknown host feature " .. name, 1, true), output)
+    end
 end
 
 function M.anUnpinnedToolchainIsRejected()
@@ -392,7 +389,7 @@ function M.darwinExactRustToolsCarryTheirSysrootRuntime()
 end
 
 function M.gpuConformanceIsValidPosixShell()
-    for _, name in ipairs({"measure-gpu-provider.sh", "test-gpu-conformance.sh", "test-gpu-conformance-windows.sh",}) do
+    for _, name in ipairs({"test-gpu-conformance.sh", "test-gpu-conformance-windows.sh"}) do
         local script = ROOT .. "/.github/scripts/" .. name
         assert(os.execute("sh -n " .. quote(script)) == 0, name .. " is not valid POSIX shell")
     end
@@ -410,33 +407,24 @@ function M.gpuConformanceIsValidPosixShell()
     assert(windows:find("gemm-api.lua", 1, true), "Windows GPU conformance does not cross the public Nupp API")
     assert(typedGemm:find('os.monotonic', 1, true), "GPU conformance omits its packaged clock dependency")
     assert(gemm:find("generated.now()", 1, true), "GPU conformance does not use its packaged benchmark clock")
+    for name, script in pairs({linux = linux, windows = windows}) do
+        assert(script:find('"$root/bin/nupp" test gpudevicetest', 1, true), name .. " does not cross wgpu-native")
+        assert(script:find("counted-wgsl.lua", 1, true), name .. " does not execute the emitted WGSL")
+        assert(script:find("NUPP_WGPU_LIBRARY", 1, true), name .. " leaves LuaJIT without wgpu-native")
+        assert(not script:find("cargo test", 1, true) and not script:find("cargo\" test", 1, true),
+            name .. " still tests a Rust GPU crate")
+    end
 end
 
 -- Measurements live in their own workflow. A benchmark harness that does not
 -- compile is still a bug, and this is where it is caught; what it must not do
 -- is decide the result of an unrelated change, which is why these read
 -- `measurements.yml` rather than the gate.
-function M.gpuProviderMeasurementsCompareExactFeatureUnions()
+function M.gpuConformanceStaysInTheMergeGate()
+    -- No Rust provider is built with or without the GPU any more, so there is
+    -- nothing to measure; the conformance gate stays where merging depends on it.
     local workflow = read(ROOT .. "/.github/workflows/measurements.yml")
-    local measure = read(ROOT .. "/.github/scripts/measure-gpu-provider.sh")
-
-    assert(measure:find("base,files,http,net,process,tls,uri,uuid", 1, true))
-    assert(measure:find("base,files,gpu,http,net,process,tls,uri,uuid", 1, true))
-    assert(measure:find('"$exact_root/non-gpu"', 1, true), "the non-GPU cold build has no isolated target")
-    assert(measure:find('"$exact_root/gpu"', 1, true), "the GPU cold build has no isolated target")
-    assert(not measure:find("${RUNNER_TEMP", 1, true), "Git Bash receives a native Windows temporary path")
-    assert(measure:find("warm_ms", 1, true), "warm exact-feature lookup time is not recorded")
-    assert(measure:find("dynamic_bytes", 1, true), "dynamic provider size is not recorded")
-    assert(measure:find("static_bytes", 1, true), "static provider size is not recorded")
-    assert(measure:find("observations, not", 1, true), "hosted GPU timings look like acceptance thresholds")
-    assert(workflow:find("build/ci-gpu-provider ${{ matrix.backend }}", 1, true))
-    assert(workflow:find("backend: vulkan", 1, true), "the Vulkan provider is not measured")
-    assert(workflow:find("backend: dx12", 1, true), "the DX12 provider is not measured")
-    assert(workflow:find("gpu-provider-${{ matrix.artifact }}-${{ github.sha }}", 1, true))
-    assert(workflow:find("artifact: linux-vulkan", 1, true))
-    assert(workflow:find("artifact: windows-dx12", 1, true))
-    -- The conformance gate stays where merging depends on it. Only the sizes
-    -- and timings moved.
+    assert(not workflow:find("gpu-provider", 1, true), "measurements still build a GPU provider")
     local gate = read(ROOT .. "/.github/workflows/compiler.yml")
     assert(gate:find(".github/scripts/test-gpu-conformance.sh", 1, true), "Vulkan conformance left the merge gate")
     assert(
@@ -776,8 +764,8 @@ function M.windowsCiInstallsMatchingRustToolchains()
     local releaseInstalls = countOccurrences(release, gnu)
     assert(compilerInstalls == 2, "the Windows integration and DX12 conformance jobs do not provision GNU Rust")
     assert(
-        countOccurrences(measurements, gnu) == 3,
-        "the Windows native runtime, reification, and GPU provider measurements do not provision GNU Rust"
+        countOccurrences(measurements, gnu) == 2,
+        "the Windows native runtime and reification measurements do not provision GNU Rust"
     )
     assert(releaseInstalls == 1, "the ordinary Windows release host does not provision GNU Rust")
     assert(not release:find(gnullvm, 1, true), "a release job still provisions gnullvm Rust")
@@ -816,7 +804,7 @@ function M.retainedPlatformsGateTheExactRustNativeArtifacts()
     assert(gate:find("$channel-x86_64-pc-windows-gnu", 1, true), "the gate does not select Windows GNU Rust")
     assert(
         gate:find(
-            "lpeg,native-checksum,native-compression,native-files,native-gpu,native-net,native-process,native-time,native-tls,workers",
+            "lpeg,native-checksum,native-compression,native-files,native-net,native-process,native-time,native-tls,workers",
             1,
             true
         ),

@@ -1081,22 +1081,22 @@ function M.networkAndTlsAreRustOnlyToolchainFeatures()
     end
 end
 
-function M.gpuHostSelectionReachesTheProviderAndAdvertisedCapability()
+-- The GPU is Nupp over a prebuilt wgpu-native, fetched against a digest per
+-- platform rather than built into any host.
+function M.gpuIsAPinnedPrebuiltLibraryRatherThanAHostFeature()
     local driver = read(ROOT .. "/scripts/toolchain")
+    local pins = read(ROOT .. "/scripts/toolchain.pins")
     local cargo = read(ROOT .. "/native/crates/host/Cargo.toml")
     local runtime = read(ROOT .. "/native/crates/host/src/lua.rs")
-    assert(
-        driver:find('native-gpu|gpu) host_cargo_features="$host_cargo_features,native-gpu"', 1, true),
-        "the host driver must accept and forward the GPU feature"
-    )
-    assert(
-        cargo:find('native-gpu = ["nupp-native/gpu"]', 1, true),
-        "the host feature must enable the native GPU provider"
-    )
-    assert(
-        runtime:find('self.add_feature(c"native-gpu")?', 1, true),
-        "the packaged host must advertise its GPU capability"
-    )
+    assert(not driver:find("native-gpu", 1, true), "the host driver still forwards a GPU feature")
+    assert(not cargo:find("native-gpu", 1, true), "the host crate still has a GPU feature")
+    assert(not runtime:find("native-gpu", 1, true), "the packaged host still advertises a GPU capability")
+    assert(driver:find("build_wgpu", 1, true), "the toolchain cannot provision wgpu-native")
+    for _, platform in ipairs({"LINUX_X86_64", "LINUX_AARCH64", "MACOS_AARCH64", "MACOS_X86_64",
+        "WINDOWS_X86_64_GNU", "WINDOWS_AARCH64_MSVC"}) do
+        assert(pins:find("\nWGPU_SHA256_" .. platform .. "=%x+\n"), "wgpu-native has no digest for " .. platform)
+    end
+    assert(driver:find("-e '^WGPU_'", 1, true), "a wgpu-native bump rebuilds the native toolchain")
 end
 
 function M.deletedCHostDoesNotContributeCacheInputs()

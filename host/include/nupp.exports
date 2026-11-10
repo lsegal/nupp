@@ -338,27 +338,6 @@ nuppNativeProcessStreamWrite
 nuppNativeProcessStreamRelease
 nuppNativeProcessWait
 
-[native-gpu]
-nuppNativeGpuCostsOutput
-nuppNativeGpuCostsEnabled
-nuppNativeGpuCostMetadata
-nuppNativeGpuContextCreate
-nuppNativeGpuContextDescription
-nuppNativeGpuContextRelease
-nuppNativeGpuBufferCreate
-nuppNativeGpuBufferRelease
-nuppNativeGpuBufferUpload
-nuppNativeGpuKernelCreate
-nuppNativeGpuKernelRelease
-nuppNativeGpuBindingsCreate
-nuppNativeGpuBindingsRelease
-nuppNativeGpuBindingsSetBuffer
-nuppNativeGpuDispatch
-nuppNativeGpuDownloadQueue
-nuppNativeGpuSynchronize
-nuppNativeGpuSynchronizeReady
-nuppNativeGpuDownloadRead
-
 [native-codegen]
 # The code generator, declared by the compiler rather than a header.
 nuppCodegenArchive
