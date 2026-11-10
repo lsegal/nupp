@@ -105,6 +105,8 @@ local rules = {
     {"^editors/", {"editors"}},
 
     {"^bench/kernel%-subset%-spike/", {"aot", "measurement"}},
+    -- The GPU conformance jobs run these scripts against compiler-emitted kernels.
+    {"^bench/wgpu%-spike/", {"measurement", "gpu"}},
     -- The budget suites compile these and hold what they compile to: perfbudgettest
     -- the benchmark programs' bytecode, aotbudgettest the Mandelbrot kernels' native
     -- code. An edit to one moves a budget, so it has to reach the suite holding it.
@@ -143,6 +145,8 @@ local rules = {
     {"^scripts/lua51%-compat%-corpus%.sh$", {"tests", "compiler"}},
     {"^tests/integration/simd/", {"tests", "aot", "browser", "simd"}},
     {"^tests/integration/acceptance/", {"tests"}},
+    -- The device suite is what the GPU conformance jobs run on a real adapter.
+    {"^tests/stdlib/io/gpu/", {"tests", "gpu"}},
     {"^tests/", {"tests"}},
 
     -- Everything below decides how the whole tree is built, tested or released,

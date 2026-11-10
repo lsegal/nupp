@@ -38,7 +38,7 @@ usage: scripts/toolchain COMPONENT...
        scripts/toolchain --all
        scripts/toolchain --prefix
 
-Components: luajit luarocks lpeg lpeg-source stage0 migration-stage0 llvm
+Components: luajit luarocks lpeg lpeg-source stage0 migration-stage0 llvm wgpu
             browser-sources browser-emulator browser-guest
             native-rust FEATURES
             rust-vendor OUTPUT
@@ -166,7 +166,7 @@ sha256() { sha256_stdin < "$1"; }
 # found, which changes no artifact either.
 pins_digest() {
     grep '^[A-Z][A-Z0-9_]*=' "$ROOT/scripts/toolchain.pins" \
-        | grep -v -e '^STAGE0_' -e '^BROWSER_' -e '^LLVM_' -e '^[A-Z0-9_]*_MIRRORS=' \
+        | grep -v -e '^STAGE0_' -e '^BROWSER_' -e '^LLVM_' -e '^WGPU_' -e '^[A-Z0-9_]*_MIRRORS=' \
         | sha256_stdin
 }
 
@@ -886,7 +886,6 @@ select_host_features() {
             native-files|files|filesystem)
                 host_cargo_features="$host_cargo_features,native-files"
                 ;;
-            native-gpu|gpu) host_cargo_features="$host_cargo_features,native-gpu" ;;
             native-net|net) host_cargo_features="$host_cargo_features,native-net" ;;
             native-tls|tls) host_cargo_features="$host_cargo_features,native-tls" ;;
             native-process|process)
@@ -1501,9 +1500,6 @@ host_system_flags() {
     case "$PLATFORM" in
         darwin)
             printf '%s\n' -lm -lpthread -framework CoreFoundation -framework Security
-            case ",$1," in
-                *,native-gpu,*) printf '%s\n' -framework Metal -framework CoreGraphics -framework Foundation ;;
-            esac
             ;;
         windows)
             printf '%s\n' -lpthread -lpsapi -luser32 -ladvapi32 -liphlpapi -luserenv \
@@ -2099,6 +2095,68 @@ EOF
     release_lock
 }
 
+# --- wgpu-native ------------------------------------------------------------
+
+# The pinned prebuilt WebGPU library for this machine, or for the platform a
+# cross-platform build names by its target key. It is fetched rather than built,
+# so it is keyed by its own digest instead of the compiler pair, and every
+# worktree that pins the same release shares one copy. WGPU_LIBRARY is the
+# shared library a GPU program loads; nothing links against it. The Windows
+# x86_64 build is the GNU one, which needs nothing beyond the system's own DLLs.
+WGPU_LIBRARY=""
+build_wgpu() {
+    wgpu_platform=${1:-}
+    if [ -z "$wgpu_platform" ]; then
+        machine=$(uname -m 2>/dev/null || echo unknown)
+        case "$PLATFORM:$machine" in
+            posix:x86_64|posix:amd64)    wgpu_platform=x86_64-unknown-linux-gnu ;;
+            posix:aarch64|posix:arm64)   wgpu_platform=aarch64-unknown-linux-gnu ;;
+            darwin:arm64|darwin:aarch64) wgpu_platform=aarch64-apple-darwin ;;
+            darwin:x86_64)               wgpu_platform=x86_64-apple-darwin ;;
+            windows:x86_64|windows:amd64) wgpu_platform=x86_64-pc-windows-msvc ;;
+            windows:aarch64|windows:arm64) wgpu_platform=aarch64-pc-windows-msvc ;;
+            *) die "wgpu-native $WGPU_VERSION publishes no library for $UNAME $machine" ;;
+        esac
+    fi
+    case "$wgpu_platform" in
+        x86_64-unknown-linux-gnu)
+            WGPU_TARGET=linux-x86_64; wgpu_digest=$WGPU_SHA256_LINUX_X86_64; wgpu_file=libwgpu_native.so ;;
+        aarch64-unknown-linux-gnu)
+            WGPU_TARGET=linux-aarch64; wgpu_digest=$WGPU_SHA256_LINUX_AARCH64; wgpu_file=libwgpu_native.so ;;
+        aarch64-apple-darwin)
+            WGPU_TARGET=macos-aarch64; wgpu_digest=$WGPU_SHA256_MACOS_AARCH64; wgpu_file=libwgpu_native.dylib ;;
+        x86_64-apple-darwin)
+            WGPU_TARGET=macos-x86_64; wgpu_digest=$WGPU_SHA256_MACOS_X86_64; wgpu_file=libwgpu_native.dylib ;;
+        x86_64-pc-windows-msvc|x86_64-pc-windows-gnu)
+            WGPU_TARGET=windows-x86_64-gnu; wgpu_digest=$WGPU_SHA256_WINDOWS_X86_64_GNU; wgpu_file=wgpu_native.dll ;;
+        aarch64-pc-windows-msvc)
+            WGPU_TARGET=windows-aarch64-msvc; wgpu_digest=$WGPU_SHA256_WINDOWS_AARCH64_MSVC; wgpu_file=wgpu_native.dll ;;
+        *) die "wgpu-native $WGPU_VERSION publishes no library for $wgpu_platform" ;;
+    esac
+    out="$CACHE/wgpu/$wgpu_digest"
+    WGPU_LIBRARY="$out/$wgpu_file"
+    [ -f "$out/.complete" ] && [ -f "$WGPU_LIBRARY" ] && return 0
+    take_lock "wgpu-$wgpu_digest" "$out/.complete" || return 0
+    if [ -f "$out/.complete" ] && [ -f "$WGPU_LIBRARY" ]; then
+        release_lock
+        return 0
+    fi
+    command -v unzip >/dev/null 2>&1 || die "unpacking wgpu-native needs unzip"
+    name="wgpu-$WGPU_TARGET-$WGPU_VERSION"
+    file=$(archive "$name" "$(expand_pin "$WGPU_URL")" "$wgpu_digest" .zip)
+    staging="$out.$$"
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    unzip -q -o "$file" "lib/$wgpu_file" -d "$staging" \
+        || die "$name.zip did not contain lib/$wgpu_file"
+    rm -rf "$out"
+    mkdir -p "$out"
+    mv "$staging/lib/$wgpu_file" "$WGPU_LIBRARY"
+    rm -rf "$staging"
+    printf 'wgpu-native %s %s\n' "$WGPU_VERSION" "$WGPU_TARGET" > "$out/.complete"
+    release_lock
+}
+
 # --- entry ------------------------------------------------------------------
 
 [ "$#" -ge 1 ] || usage
@@ -2113,6 +2171,16 @@ case "$1" in
         # warm is the moment to pay for it: an ordinary command in a built tree
         # never asks.
         stage0 >/dev/null
+        exit 0
+        ;;
+    wgpu)
+        # A provider driver is handed its features, which mean nothing to a
+        # prebuilt library; a cross-platform build hands it the target key.
+        case "${2:-}" in
+            *-*) build_wgpu "$2" ;;
+            *)   build_wgpu ;;
+        esac
+        native_path "$WGPU_LIBRARY"
         exit 0
         ;;
     native-rust)

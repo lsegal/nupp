@@ -1699,6 +1699,10 @@ export record Program
     --- The exported registrar which returns the Lua C closure.
     registrar: string?
 
+    --- The C name `@aot(export = ...)` publishes this entry under, beside its
+    --- tier-spelled symbol.
+    exportName: string?
+
     params: {Param}
     layouts: {Layout}?
     regions: {Region}

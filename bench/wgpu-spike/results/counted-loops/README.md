@@ -14,8 +14,8 @@ out-of-range bounds, and all explicit steps, produce positioned refusals.
 
 Both shader routes passed 15 cases and 3,855 checked output values. The native
 binding is checked by `counted-api.lua` against ordinary Lua numeric loops;
-the WGSL route uses the independent Rust integer oracle in
-`native/crates/gpu/examples/counted_wgsl.rs`. Every one of the four SPIR-V
+the WGSL route used the independent Rust integer oracle that is now
+`bench/wgpu-spike/counted-wgsl.lua`, the same loops over 64-bit-exact numbers. Every one of the four SPIR-V
 modules passed `spirv-val`, and every WGSL module passed Naga validation before
 execution. `shader-hashes.json` identifies those validated shader bytes;
 `validators.log`, `spirv-pass.log` and `wgsl-pass.log` preserve the results.
@@ -29,7 +29,9 @@ for kernel in literal boundaries snapshots control; do
         --function "$kernel" bench/wgpu-spike/typed/counted.nupp \
         > "/private/tmp/nupp-counted-wgsl/$kernel.wgsl"
 done
-cargo run --locked -p nupp-native-gpu --example counted_wgsl -- \
+NUPP_WGPU_LIBRARY=$(scripts/toolchain wgpu) \
+LUA_PATH="build/?.lua;build/?/init.lua;;" \
+    "$(scripts/toolchain luajit)/bin/luajit" bench/wgpu-spike/counted-wgsl.lua \
     /private/tmp/nupp-counted-wgsl
 ```
 
@@ -65,7 +67,8 @@ example reproduces the same result. To reproduce after generating the four shade
 repro=$(mktemp -d)
 cp /private/tmp/nupp-counted-wgsl/*.wgsl "$repro/"
 cp bench/wgpu-spike/results/counted-loops/naga30-original.wgsl "$repro/literal.wgsl"
-cargo run --locked -p nupp-native-gpu --example counted_wgsl -- "$repro"
+NUPP_WGPU_LIBRARY=$(scripts/toolchain wgpu) LUA_PATH="build/?.lua;build/?/init.lua;;" \
+    "$(scripts/toolchain luajit)/bin/luajit" bench/wgpu-spike/counted-wgsl.lua "$repro"
 # Expected on the recorded Metal/Naga version: assertion failure, 70 versus 71.
 ```
 

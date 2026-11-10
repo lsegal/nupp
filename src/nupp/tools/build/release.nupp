@@ -21,7 +21,6 @@ local HOST_FEATURES: {
     "native-checksum",
     "native-compression",
     "native-files",
-    "native-gpu",
     "native-net",
     "native-process",
     "native-time",

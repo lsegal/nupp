@@ -9720,8 +9720,11 @@ function lower.contract(
         if written == "aot" then
             for _, argument in ipairs(link.annotationArgs or {}) do
                 local name = argument.name ~= nil and (argument.name as lexer.Token).text or nil
-                if name ~= "target" then
-                    context.reject(lower.site(link), "@aot takes target = \"cpu\", target = \"gpu\", or nothing")
+                if name ~= "target" and name ~= "export" then
+                    context.reject(
+                        lower.site(link),
+                        "@aot takes target = \"cpu\", target = \"gpu\", export = \"name\", or nothing"
+                    )
                 end
 
                 local value = argument.expr
@@ -9733,6 +9736,10 @@ function lower.contract(
                     elseif requested ~= "\"cpu\"" and requested ~= "'cpu'" then
                         context.reject(lower.site(argument), "@aot target must be \"cpu\" or \"gpu\"")
                     end
+                elseif name == "export" then
+                    local token = value ~= nil and cst.firstToken(value as cst.Node) or nil
+                    local written = token ~= nil and (token as lexer.Token).text or ""
+                    body.aotExport = written:match("^[\"'](.*)[\"']$")
                 end
             end
         elseif written == "relax" then
@@ -9916,6 +9923,12 @@ function lower.program(
     local sourceName = (fn.name as lexer.Token).text
     local name = specialization ~= nil and (specialization as lower.Specialization).name or sourceName
     local symbol = scalarIR.privateSymbol(name)
+    -- One C name stands for one function, so a family of const
+    -- specializations, several bodies under one declaration, has none to give.
+    local exportName = body.aotExport
+    if exportName ~= nil and specialization ~= nil then
+        context.reject(lower.site(body), "a C export cannot take const parameters")
+    end
 
     local resultTypes: {scalarIR.Type} = {}
     local resultSourceTypes: {string} = {}
@@ -10282,6 +10295,9 @@ function lower.program(
         end
 
         local entryMode = kernel.usesLua and "lua-builder" or "kernel"
+        if exportName ~= nil and kernel.usesLua then
+            context.reject(lower.site(body), "a C export cannot hold a value only the VM can")
+        end
         if hasSoa and kernel.usesLua then
             context.reject(lower.site(body), "SoA row-view parameters require a native kernel without Lua values")
         end
@@ -10294,6 +10310,7 @@ function lower.program(
             builderMode = kernel.builderMode,
             runtimeAbi = kernel.usesLua and "lua-5.1" or nil,
             registrar = kernel.usesLua and symbol .. "_register" or nil,
+            exportName = exportName,
             fpContract = contract.fpContract,
             fpTranscendentals = contract.fpTranscendentals,
             params = signature.params,
@@ -10371,6 +10388,7 @@ function lower.program(
             symbol = symbol,
             entryMode = "kernel",
             executionTarget = contract.target,
+            exportName = exportName,
             fpContract = contract.fpContract,
             fpTranscendentals = contract.fpTranscendentals,
             params = signature.params,

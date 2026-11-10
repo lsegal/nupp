@@ -6,7 +6,10 @@ in whichever module carries the VM -- the program itself when LuaJIT is linked
 into it, `lua51.dll` beside the interpreter otherwise -- and a library built
 once is loaded by both. So a DLL carries a jump for each API function through a
 slot of its own, and its entry point fills the slots from whichever loaded
-module exports the API, refusing to load when none does.
+module exports the API, refusing to load when that module lacks part of it. A
+process with no VM at all is a C program calling the library's `@aot(export)`
+functions, which never reach the API, so the DLL loads there with the slots
+empty.
 
 The rest are the system's: the C runtime's math and memory functions, imported
 from `msvcrt.dll` (the C runtime the Rust `windows-gnu` host itself uses) and,
@@ -172,7 +175,7 @@ function coff.binding(triple: string, names: {string}): string
     lines[#lines + 1] = "found:"
     lines[#lines + 1] = "  %module = phi ptr [ %self, %bind ], [ %lua, %library ]"
     lines[#lines + 1] = "  %none = icmp eq ptr %module, null"
-    lines[#lines + 1] = "  br i1 %none, label %fail, label %fill"
+    lines[#lines + 1] = "  br i1 %none, label %done, label %fill"
     lines[#lines + 1] = "fill:"
     local ok = "true"
     for position, name in ipairs(names) do
