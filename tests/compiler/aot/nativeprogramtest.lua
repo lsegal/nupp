@@ -271,17 +271,17 @@ function M.aNumberShiftedByA64BitCountAgreesWithLuaJIT()
 local count, big = 3LL, 0x100000021LL
 local a = 1 << count
 local b = -256 >> big
-local c = -256 ~>> 0x7FFFFFFFFFFFFFE4LL
+local c = -256 ~>> 9223372036854775780ULL
 return (a + b % 1000 + c) % 251
 ]]))()
     local executable, output = link([[
 local function main(): int32
     local count: int64 = 3LL
     local big: int64 = 0x100000021LL
-    local wide: uint64 = 0x7FFFFFFFFFFFFFE4ULL
-    local a: number = 1 << count
-    local b: number = -256 >> big
-    local c: number = -256 ~>> wide
+    local wide: uint64 = 9223372036854775780ULL
+    local a: integer = 1 << count
+    local b: integer = -256 >> big
+    local c: integer = -256 ~>> wide
     return math.i32.wrap((a + b % 1000 + c) % 251)
 end
 ]])
