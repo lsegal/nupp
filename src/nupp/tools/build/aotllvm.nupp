@@ -658,6 +658,12 @@ local function link(kit: string, output: string, runtime: string, archives: {str
     for _, flag in ipairs(flags) do
         argv[#argv + 1] = flag
     end
+    -- A native program may call anything libSystem has, and the kit's stubs
+    -- name only what the host bound. The rest binds when the program loads.
+    if runtime == "luajit" then
+        argv[#argv + 1] = "-undefined"
+        argv[#argv + 1] = "dynamic_lookup"
+    end
     -- The program's native code finds the runtime's entry points by name.
     argv[#argv + 1] = "-export_dynamic"
     local _, err = codegen.link(argv)
