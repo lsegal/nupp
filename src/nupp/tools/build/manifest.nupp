@@ -32,7 +32,8 @@ reads, so a consumer that asks for one gets an answer rather than `any`.
 --- Everything is optional because a target inherits the `build` table's keys and
 --- overrides the ones it names, so the merged result is what has to be complete.
 export type Target = {
-    --- "modules", "bundle", "binary", "component" or "docs"; absent means "modules".
+    --- "modules", "bundle", "binary", "component", "program" or "docs"; absent means
+    --- "modules".
     kind: string?,
 
     description: string?,
