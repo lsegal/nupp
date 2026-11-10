@@ -19,7 +19,8 @@ Arithmetic keeps the language's meaning rather than C's. `number` and `integer`
 are binary64, and so is arithmetic over `int32`, `uint32` and `float`: those are
 refinements a value enters through an establishing conversion such as
 `math.i32.wrap`, not types whose operators wrap. `//` and `%` floor. Only `int64`
-and `uint64` arithmetic is fixed-width, wrapping as LuaJIT's does.
+and `uint64` arithmetic is fixed-width, as LuaJIT's is: it wraps, `/` and `%`
+truncate, and `//` floors as the Lua backend's helper does.
 ]]
 module nupp.compiler.aot.llvm.native
 
@@ -470,8 +471,63 @@ intrinsic = function(program: Program, body: Body, node: cst.Call): Value?
     return Value(text = value(body, ("call double %s(double %s)"):format(name, argument.text)), kind = F64)
 end
 
+const INT64_MIN = "-9223372036854775808"
+
+--- `a / b` or `a % b` over 64-bit integers, as LuaJIT's `lj_carith_divi64` and
+--- its kin compute them: C's truncating division, except that dividing by zero
+--- gives INT64_MIN, and so does INT64_MIN / -1, whose remainder is 0. Those
+--- cases divide by 1 instead, so the instruction itself is always defined.
+local function integerDivision(body: Body, op: string, a: string, b: string, kind: Kind): string
+    local zero = value(body, ("icmp eq i64 %s, 0"):format(b))
+    local special = zero
+    if kind.signed then
+        local minusOne = value(body, ("icmp eq i64 %s, -1"):format(b))
+        local least = value(body, ("icmp eq i64 %s, %s"):format(a, INT64_MIN))
+        local overflow = value(body, ("and i1 %s, %s"):format(minusOne, least))
+        special = value(body, ("or i1 %s, %s"):format(zero, overflow))
+    end
+    local divisor = value(body, ("select i1 %s, i64 1, i64 %s"):format(special, b))
+    local instruction = (kind.signed and "s" or "u") .. (op == "%" and "rem" or "div")
+    local result = value(body, ("%s i64 %s, %s"):format(instruction, a, divisor))
+
+    -- INT64_MIN % 1 is already the 0 that INT64_MIN % -1 gives.
+    local replaced = op == "%" and zero or special
+    return value(body, ("select i1 %s, i64 %s, i64 %s"):format(replaced, INT64_MIN, result))
+end
+
+--- Whether an operand is below zero as it was written, before it met the other
+--- side's kind: a `uint64` never is, and a number by its own sign.
+local function negative(body: Body, v: Value): string
+    if isFloat(v.kind) then
+        return value(body, ("fcmp olt %s %s, 0.0"):format(v.kind.llvm, v.text))
+    elseif v.kind.signed then
+        return value(body, ("icmp slt %s %s, 0"):format(v.kind.llvm, v.text))
+    end
+
+    return "false"
+end
+
+--- `left // right` over 64-bit integers, as the Lua backend's `__nuppFloorDiv`
+--- computes it from LuaJIT's `/`: the truncated quotient, one lower when it was
+--- inexact and the written operands differ in sign.
+local function floorDivision(body: Body, left: Value, right: Value, a: string, b: string, kind: Kind): string
+    local quotient = integerDivision(body, "/", a, b, kind)
+    local product = value(body, ("mul i64 %s, %s"):format(quotient, b))
+    local inexact = value(body, ("icmp ne i64 %s, %s"):format(product, a))
+    local signs = value(body, ("xor i1 %s, %s"):format(negative(body, left), negative(body, right)))
+    local adjust = value(body, ("and i1 %s, %s"):format(inexact, signs))
+    local step = value(body, ("zext i1 %s to i64"):format(adjust))
+
+    return value(body, ("sub i64 %s, %s"):format(quotient, step))
+end
+
 --- `left op right` over 64-bit integers, which wrap as LuaJIT's do.
-local function integerArithmetic(body: Body, op: string, a: string, b: string, kind: Kind): string
+local function integerArithmetic(body: Body, op: string, left: Value, right: Value, a: string, b: string, kind: Kind): string
+    if op == "/" or op == "%" then
+        return integerDivision(body, op, a, b, kind)
+    elseif op == "//" then
+        return floorDivision(body, left, right, a, b, kind)
+    end
     local instruction = op == "+" and "add" or op == "-" and "sub" or "mul"
 
     return value(body, ("%s %s %s, %s"):format(instruction, kind.llvm, a, b))
@@ -573,7 +629,7 @@ local function binaryValues(
         refuse(node, "a native program does not lower bitwise operators")
     end
     local meet = common(left.kind, right.kind)
-    if order == nil and meet.llvm == "i64" and op ~= "+" and op ~= "-" and op ~= "*" then
+    if order == nil and meet.llvm == "i64" and op == "^" then
         refuse(node, "a native program does not lower " .. op .. " over 64-bit integers")
     end
     local a = convert(body, left, meet, lhs).text
@@ -589,7 +645,7 @@ local function binaryValues(
         return Value(text = floatArithmetic(program, body, op, a, b, meet), kind = meet)
     end
 
-    return Value(text = integerArithmetic(body, op, a, b, meet), kind = meet)
+    return Value(text = integerArithmetic(body, op, left, right, a, b, meet), kind = meet)
 end
 
 local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?): Value
