@@ -97,7 +97,9 @@ the 64-bit type, to `uint64` if either side is one: `-1LL < 5ULL` is false,
 A `number` converts as a store does, below. `/` and `%` are C's truncating
 division, and where C has no answer LuaJIT has one: a zero divisor gives
 `INT64_MIN` (2^63 for `uint64`), and so does `INT64_MIN / -1`, whose remainder
-is 0. `^` is an integer power and unary `-` wraps.
+is 0. `^` is an integer power and unary `-` wraps. A shift takes its width
+from its left operand alone: a `number` shifted by a 64-bit count reads the
+count's low 32 bits, so `1 << 3LL` is the number 8.
 
 A `number` stored into an integer field or span element converts as LuaJIT's
 FFI store does, which is not `wrap`: it truncates toward zero through `int64`

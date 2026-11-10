@@ -263,16 +263,31 @@ end
 
 -- LuaJIT shifts a number by an `int64` count as a 32-bit number, which is not
 -- the `int64` the checker gives the expression, so lowering refuses it.
-function M.aNumberShiftedByA64BitCountIsRefused()
+-- A number shifted by a 64-bit count reads the count's low word, as LuaJIT
+-- does, and stays a number.
+function M.aNumberShiftedByA64BitCountAgreesWithLuaJIT()
+    requireCodegen()
+    local expected = assert(load([[
+local count, big = 3LL, 0x100000021LL
+local a = 1 << count
+local b = -256 >> big
+local c = -256 ~>> 9223372036854775780ULL
+return (a + b % 1000 + c) % 251
+]]))()
     local executable, output = link([[
 local function main(): int32
     local count: int64 = 3LL
-    local shifted = 1 << count
-    return 0
+    local big: int64 = 0x100000021LL
+    local wide: uint64 = 9223372036854775780ULL
+    local a: integer = 1 << count
+    local b: integer = -256 >> big
+    local c: integer = -256 ~>> wide
+    return math.i32.wrap((a + b % 1000 + c) % 251)
 end
 ]])
-    test.eq(executable, nil)
-    assert(output:find("host.nupp:3:21: native: LuaJIT shifts a number by a 64-bit count", 1, true), output)
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, expected, ran)
 end
 
 -- A compound bit assignment stores what the operator gives, as LuaJIT does.
