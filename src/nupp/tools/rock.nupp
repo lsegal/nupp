@@ -204,7 +204,7 @@ export function test(root: string?, asked: string?): string?, string?
     if not packed then
         return nil, packErr
     end
-    local temp = os.tmpname()
+    local temp = process.tmpname()
     os.remove(temp)
     if not fs.mkdir(temp) then
         return nil, "cannot create temporary rock tree"
