@@ -661,13 +661,7 @@ local FEATURES: {[string]: native.Feature} = {
         runtimeModule = "nupp.runtime.provider.nativefiles",
         -- A file operation that waits performs `suspend`, so the runtime that
         -- answers it has to be in the target beside the program.
-        requires = {
-            "runtime.files",
-            "native.path",
-            "stdlib.io",
-            "runtime.spanview",
-            "runtime.suspension",
-        },
+        requires = {"runtime.files", "native.path", "stdlib.io", "runtime.spanview", "runtime.suspension",},
     },
     ["runtime.suspension"] = {
         -- Not a native library: a compiler-provided Nupp module a target needs its

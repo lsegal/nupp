@@ -22,7 +22,7 @@ export type System = {
     info: function(path: string, follow: boolean): (integer?, integer?, number?, boolean?, string?),
     openDirectory: function(path: string): (any, string?),
     readDirectory: function(listing: any): (string?, integer?, string?),
-    closeDirectory: function(listing: any): nil,
+    closeDirectory: function(listing: any): nil
 }
 
 local BRACKET = string.byte("[")
@@ -227,7 +227,7 @@ local type Walk = {
     components: {string},
     matches: {[string]: boolean},
     expanded: {[string]: boolean},
-    reads: integer,
+    reads: integer
 }
 
 -- A directory's entries as name and kind pairs, or nil when it cannot be read; a
@@ -334,13 +334,7 @@ export function expand(pattern: string, system: System, windows: boolean): ({str
     if root == nil then
         return nil, problem, 0
     end
-    local walk: Walk = {
-        system = system,
-        components = components as {string},
-        matches = {},
-        expanded = {},
-        reads = 0,
-    }
+    local walk: Walk = {system = system, components = components as {string}, matches = {}, expanded = {}, reads = 0,}
     local failure = descend(walk, root as string, 1, MAX_WALK_DEPTH)
     if failure ~= nil then
         return nil, failure, walk.reads

@@ -25,25 +25,30 @@ local system: any = windows and require("nupp.runtime.provider.nativefswindows")
 
 --- The most transfers that may be live at once.
 export const MAX_REQUESTS = 128
+
 --- The most bytes the live transfers may hold between them.
 export const MAX_BYTES = 268435456
+
 --- The largest one transfer may be.
 export const MAX_REQUEST_BYTES = 268435456
 
 --- The most I/O one step of one transfer performs.
 export const STEP_BYTES = 1048576
+
 local READ_CHUNK: integer = 65536
 local TEMPORARY_ATTEMPTS: integer = 64
 
 --- A transfer that is still moving.
 export const PENDING = 0
+
 --- A transfer that finished.
 export const READY = 1
+
 --- A transfer that stopped with a reason.
 export const FAILED = 2
+
 --- A transfer that was cancelled before it finished.
 export const CANCELED = 3
-
 
 --- How a write lands: in place, at the end, or through a temporary beside it.
 export type WriteMode = "replace" | "append" | "atomic"

@@ -169,7 +169,12 @@ local function writeAt(
     end
     local written: integer = 0
     while written < count do
-        local wrote, reason = system.fileWrite(handle, from + written, count - written, (not appending) and (start + written) or nil)
+        local wrote, reason = system.fileWrite(
+            handle,
+            from + written,
+            count - written,
+            (not appending) and (start + written) or nil
+        )
         if wrote == nil then
             return nil, nil, reason
         elseif wrote == 0 then
@@ -1193,20 +1198,25 @@ export function applicationBase(
 ): (string?, string?)
     local chosen = platform or (windows and "windows" or (darwin and "apple" or "xdg"))
     local lookup = environment or os.getenv
+
     local function setting(name: string): string?
         local value = lookup(name)
         if value == nil or value == "" then
             return nil
         end
+
         return value
     end
+
     local function homeDirectory(): (string?, string?)
         local value = setting(chosen == "windows" and "USERPROFILE" or "HOME")
         if value == nil then
             return nil, "the home directory is not set"
         end
+
         return value, nil
     end
+
     if which ~= 0 and which ~= 1 and which ~= 2 then
         return nil, "unknown application base"
     end

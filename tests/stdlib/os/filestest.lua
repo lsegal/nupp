@@ -834,7 +834,14 @@ function M.theProviderIsSelectedOnlyByReachingIt()
         }):find("nuppNativeFiles", 1, true),
         "selecting the feature installs no files ABI"
     )
-    for _, name in ipairs({"nativefiles", "nativepath", "nativefsposix", "nativefswindows", "nativefslane", "nativefsglob"}) do
+    for _, name in ipairs({
+        "nativefiles",
+        "nativepath",
+        "nativefsposix",
+        "nativefswindows",
+        "nativefslane",
+        "nativefsglob"
+    }) do
         local handle = assert(io.open("src/nupp/runtime/provider/" .. name .. ".nupp", "rb"))
         local source = handle:read("*a")
         handle:close()
@@ -1113,7 +1120,11 @@ function M.aRecursiveRemoveNeverLeavesTheTree()
     assert(files.symlink(inRoot("remove-links/outside"), inRoot("remove-links/tree/link"), "directory"))
     assert(os.remove(inRoot("remove-links/tree"), true))
     assert(not files.exists(inRoot("remove-links/tree")))
-    test.eq(assert(readFile(inRoot("remove-links/outside/victim"))), "outside", "a link inside the tree is not followed")
+    test.eq(
+        assert(readFile(inRoot("remove-links/outside/victim"))),
+        "outside",
+        "a link inside the tree is not followed"
+    )
 end
 
 function M.aRecursiveRemoveNeverFollowsADirectorySwappedForALink()
@@ -1229,12 +1240,18 @@ function M.applicationBasesFollowEachPlatformContract()
         XDG_CONFIG_HOME = "/xdg/config",
         XDG_DATA_HOME = "relative/data",
     }
+
     local function read(name)
         return environment[name]
     end
+
     local expected = {
         windows = {"C:/Users/Test/AppData/Roaming", "C:/Users/Test/AppData/Local", "C:/Users/Test/AppData/Local/Temp"},
-        apple = {"/home/test/Library/Preferences", "/home/test/Library/Application Support", "/home/test/Library/Caches"},
+        apple = {
+            "/home/test/Library/Preferences",
+            "/home/test/Library/Application Support",
+            "/home/test/Library/Caches"
+        },
         xdg = {"/xdg/config", "/home/test/.local/share", "/home/test/.cache"},
     }
     for platform, bases in pairs(expected) do
@@ -1247,9 +1264,11 @@ function M.applicationBasesFollowEachPlatformContract()
         end
         test.eq(select(2, nativeFiles.applicationBase(3, platform, read)), "unknown application base")
     end
+
     local function nothing()
         return nil
     end
+
     test.eq(select(2, nativeFiles.applicationBase(0, "xdg", nothing)), "the home directory is not set")
 end
 

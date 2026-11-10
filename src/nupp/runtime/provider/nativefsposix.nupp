@@ -88,7 +88,11 @@ typedef struct {
 ]]
 end
 
-ffi.cdef(STAT .. DIRENT .. ([[
+ffi.cdef(
+    STAT
+    .. DIRENT
+    .. (
+        [[
 int nupp_fs_open(const char *, int, ...) __asm__("open");
 int nupp_fs_openat(int, const char *, int, ...) __asm__("openat");
 int nupp_fs_close(int) __asm__("close");
@@ -123,13 +127,15 @@ void nupp_fs_free(void *) __asm__("free");
 char *nupp_fs_strerror(int) __asm__("strerror");
 int nupp_fs_getentropy(void *, size_t) __asm__("getentropy");
 int nupp_fs_executable(char *, uint32_t *) __asm__("_NSGetExecutablePath");
-]]):gsub("MODE", MODE):gsub("FDOPENDIR", label("fdopendir", "$INODE64")):gsub("OPENDIR", label("opendir", "$INODE64")):gsub(
-    "READDIR",
-    label("readdir", "$INODE64")
-):gsub("FSTATAT", label("fstatat", "$INODE64")):gsub("FSTAT\"", label("fstat", "$INODE64") .. "\""):gsub(
-    "REALPATH",
-    label("realpath", "$DARWIN_EXTSN")
-))
+]]
+    ):gsub("MODE", MODE)
+        :gsub("FDOPENDIR", label("fdopendir", "$INODE64"))
+        :gsub("OPENDIR", label("opendir", "$INODE64"))
+        :gsub("READDIR", label("readdir", "$INODE64"))
+        :gsub("FSTATAT", label("fstatat", "$INODE64"))
+        :gsub("FSTAT\"", label("fstat", "$INODE64") .. "\"")
+        :gsub("REALPATH", label("realpath", "$DARWIN_EXTSN"))
+)
 
 -- Each constant the two families number differently.
 local AT_FDCWD: integer = darwin and -2 or -100
@@ -940,8 +946,7 @@ export function parent(path: string): string
     local at = trimmed:match("^.*()/")
     if at == nil then
         return "."
-    end
-    if at == 1 then
+    elseif at == 1 then
         return "/"
     end
 

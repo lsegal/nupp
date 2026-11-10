@@ -302,7 +302,10 @@ function M.pathStagesOnlyTheGenericFilesystemSlice()
     local providerText = provider:read("*a")
     provider:close()
     assert(not providerText:find("nupp.runtime.native", 1, true), "the native path provider needs no Rust provider")
-    assert(not providerText:find("nuppNativeFiles", 1, true), "the native path provider asks the operating system itself")
+    assert(
+        not providerText:find("nuppNativeFiles", 1, true),
+        "the native path provider asks the operating system itself"
+    )
 end
 
 -- The scalar rules take the spelling convention as data, so both platforms are
