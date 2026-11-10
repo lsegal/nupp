@@ -953,8 +953,15 @@ host_export_arguments() {
             [ -z "$excluded" ] || printf '%s\n' '-C' "link-arg=-Wl,--exclude-libs=$excluded"
             ;;
         *)
+            # --exclude-libs cannot keep LLVM out here: rustc bundles its
+            # archives into the codegen crate's rlib, so the linker never sees
+            # them by name. Hidden by pattern instead, as C++, Rust and LLVM's
+            # C API. Exported, they also take the place of the LLVM a
+            # dlopen()ed library brings: Mesa's llvmpipe Vulkan driver then
+            # calls this LLVM and crashes in vkCreateDevice.
+            printf '%s\n' '{ global: *; local: _Z*; _R*; LLVM*; llvm_*; };' > "$out/host-exports.map"
             printf '%s\n' '-C' 'link-arg=-Wl,-E'
-            [ -z "$excluded" ] || printf '%s\n' '-C' "link-arg=-Wl,--exclude-libs=$excluded"
+            printf '%s\n' '-C' "link-arg=-Wl,--version-script=$out/host-exports.map"
             ;;
     esac
 }
