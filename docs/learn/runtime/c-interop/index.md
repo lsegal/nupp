@@ -864,7 +864,7 @@ generator lays out:
   a trailing `result` pointer. Its fields are `r1`, `r2` and so on.
 
 ```nupp
-local span = require("bytes.span")
+local span = bytes.span
 
 @aot(export = "game_saxpy")
 local function saxpy(exclusive out: span.WriteSpan<number>, borrows xs: span.Span<number>, a: number): nil
@@ -910,8 +910,7 @@ alignment and every field's offset, the same way it does for an exported
 struct:
 
 ```nupp
-local span = require("bytes.span")
-local simd = require("simd")
+local span = bytes.span
 
 local struct Particle
    mass: float
