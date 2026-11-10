@@ -174,10 +174,15 @@ function M.nativeHttpProvider(transport)
     return instance({[name] = true}, {["nupp.io.http.internal.transport"] = transport})(name)
 end
 
-function M.nativeGpu(native)
+function M.nativeGpu(device, costs)
     local name = "nupp.runtime.provider.nativegpu"
     return instance({[name] = true, ["nupp.runtime.provider.nativegpurelease"] = true}, {
-        ["nupp.runtime.native"] = native,
+        ["nupp.runtime.provider.gpudevice"] = device,
+        ["nupp.runtime.provider.gpucosts"] = costs or {
+            enabled = function()
+                return false
+            end,
+        },
     })(name)
 end
 

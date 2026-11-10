@@ -198,6 +198,63 @@ function native.sleep(waitMs: integer): integer
     return 0
 end
 
+const WAKE_KEY = "__nuppNativeWake"
+
+--- The handle every readiness advance signals, for a source that sleeps on
+--- operating-system handles of its own as well: a manual-reset event on
+--- Windows and a nonblocking pipe's read end elsewhere, as a `uint64_t`. One
+--- serves the whole Lua state and closes with it. Nil when the provider
+--- predates it or cannot open one.
+--- @export
+function native.wake(): any?
+    local cell: any = rawget(_G, WAKE_KEY)
+    if cell == nil then
+        local opened, open = pcall(function(): any
+            ffi.cdef[[
+            int32_t nuppNativeWakeOpen(uint64_t *handle);
+            int32_t nuppNativeWakeClose(uint64_t handle);
+            ]]
+            return native.C.nuppNativeWakeOpen
+        end)
+        local raw = ffi.new("uint64_t[1]")
+        if opened and open(raw) == 0 then
+            local close = native.C.nuppNativeWakeClose
+            cell = ffi.gc(raw, function(value: any): nil
+                close(value[0])
+            end)
+        else
+            cell = false
+        end
+        rawset(_G, WAKE_KEY, cell)
+    end
+    if not cell then
+        return nil
+    end
+
+    return cell[0]
+end
+
+--- Ends a pass the way `sleep` does, for a source sleeping on the `wake` handle
+--- instead: called after resetting that handle, it answers whether the
+--- generation still holds the snapshot's value, so that sleeping on the handle
+--- cannot miss an edge. Without a snapshot it takes one and answers false,
+--- since a check has to come between the two.
+--- @export
+--- @return whether the caller may sleep
+function native.settle(): boolean
+    if not snapshotTaken then
+        native.snapshot()
+
+        return false
+    end
+    snapshotTaken = false
+    if native.C.nuppNativePoll(found) ~= 0 then
+        return false
+    end
+
+    return found[0] == snapshot[0]
+end
+
 --- A native family's readiness pump, as the poll and wait of a suspension
 --- source: the poll snapshots the generation and then checks, and the wait
 --- sleeps on the generation.

@@ -3,11 +3,10 @@
 --[[
 Native filesystem environment for `host.path` API 1.
 
-This module requires the native filesystem feature at load time. It supplies the
-host separator, process working directory, and canonicalization through the
-operating system. Canonicalization may fail for inaccessible or missing paths
-and returns `nil, message`; temporary native string results are released after
-copying their bytes into Lua strings.
+This module supplies the host separator, process working directory, and
+canonicalization, asking the operating system through LuaJIT's FFI by way of
+`nativefswindows` or `nativefsposix`. Canonicalization may fail for
+inaccessible or missing paths and returns `nil, message`.
 
 Lexical path operations live in [](io). This provider supplies
 only environmental facts and filesystem resolution to [](io). It does
@@ -15,57 +14,19 @@ not register a second Path type or retain filesystem handles in returned paths.
 ]]
 module nupp.runtime.provider.nativepath
 
-const native = require("nupp.runtime.native")
+const ffi = require("ffi")
 
-cdef struct NuppNativeFilesystemSlice
-    data: cstring
-    length: uint64
-end
-
-native.ffi.cdef[[
-int32_t nuppNativeFilesCurrentDirectory(uint64_t *);
-int32_t nuppNativeFilesCanonicalize(
-    struct NuppNativeFilesystemSlice, uint64_t *);
-]]
-
-local ffi = native.ffi
-local C = native.C
-const FILESYSTEM_FEATURE = 64
-native.requireFeature(FILESYSTEM_FEATURE, "filesystem")
-
-local function slice(text: string): any
-    local value = ffi.new<NuppNativeFilesystemSlice>()
-    -- The slice points into the Lua string; every caller hands it to C and returns
-    -- while `text` is still a live argument of its own, so the string outlives the
-    -- call.
-    @unsafe do
-        value.data = text
-    end
-    value.length = #text
-
-    return value
-end
-
-local function answered(status: integer, output: any): (string?, string?)
-    if status ~= 0 then
-        return nil, ffi.string(C.nuppNativeLastError())
-    end
-
-    return native.bytes(output[0]), nil
-end
+local system: any = (ffi as any).os == "Windows" and require("nupp.runtime.provider.nativefswindows")
+    or require("nupp.runtime.provider.nativefsposix")
 
 export function sep(): string
     return package.config:sub(1, 1)
 end
 
 export function cwd(): (string?, string?)
-    local output = ffi.new("uint64_t[1]")
-
-    return answered(C.nuppNativeFilesCurrentDirectory(output), output)
+    return system.currentDirectory()
 end
 
 export function canonicalize(path: string): (string?, string?)
-    local output = ffi.new("uint64_t[1]")
-
-    return answered(C.nuppNativeFilesCanonicalize(slice(path), output), output)
+    return system.canonicalize(path)
 end

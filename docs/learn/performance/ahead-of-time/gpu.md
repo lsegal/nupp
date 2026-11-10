@@ -5,7 +5,7 @@ order: 637
 # GPU compute
 
 `@aot(target = "gpu")` turns one verified Nupp function into a typed kernel
-specification. Native targets emit SPIR-V for the Rust WGPU provider, while
+specification. Native targets emit SPIR-V for the wgpu-native GPU provider, while
 browser targets emit WGSL from the same checked operation sequence.
 
 ```nupp
@@ -232,7 +232,7 @@ host around this kernel.
 
 ## Inspection and limits
 
-`nupp aot --emit spirv FILE` writes the native WGPU module. On macOS WGPU
+`nupp aot --emit spirv FILE` writes the native wgpu module. On macOS wgpu
 translates that module for Metal internally; Nupp does not ship a second Metal
 artifact or a shader translator. `nupp aot --emit wgsl FILE` prints the browser
 WebGPU artifact when the kernel belongs to the portable profile. The AOT report

@@ -18,11 +18,8 @@
 # archives and stay uninstrumented: accesses made inside them are not
 # checked, and nothing they do is reported.
 #
-# Two crates are left out, the same two for both sanitizers:
+# One crate is left out, the same one for both sanitizers:
 #
-# - nupp-native-gpu drives a Vulkan/Metal driver through wgpu. The driver is
-#   an uninstrumented system library that races by design from ThreadSanitizer's
-#   point of view, and the tests need an adapter this job does not provision.
 # - nupp-native-codegen links the pinned LLVM (NUPP_LLVM_PREFIX, an hour to
 #   build from source) as uninstrumented C++, and does its work on the calling
 #   thread; what it would add is sanitizing LLVM, not this repository.
@@ -142,11 +139,9 @@ cargo_test --package nupp-native --no-default-features \
 cargo_test --package nupp-native-host --no-default-features \
     --features lpeg,native-compression,native-files,native-net,native-process,native-tls,workers
 
-# The provider exactly as scripts/test-rust-abi links it. The GPU is compiled
-# in because the smoke test asserts the feature set and that invalid GPU
-# handles are refused; it never opens an adapter, so no driver is loaded.
+# The provider exactly as scripts/test-rust-abi links it.
 cargo build --locked -Zbuild-std --target "$TARGET" --package nupp-native \
-    --no-default-features --features files,gpu,http,net,process,tls,uri,uuid --lib
+    --no-default-features --features files,http,net,process,tls,uri,uuid --lib
 DIRECTORY=$CARGO_TARGET_DIR/$TARGET/debug
 # Where the sanitizer runtime comes from differs. On Linux rustc links its
 # static runtime into executables only, so the C side is instrumented and

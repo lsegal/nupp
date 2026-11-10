@@ -1,5 +1,5 @@
 #!/bin/sh
-# Exact WGPU dispatch/readback through CI's software Vulkan device.
+# Exact wgpu-native dispatch/readback through CI's software Vulkan device.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
@@ -15,11 +15,9 @@ export NUPP_REQUIRE_GPU=1
 export NUPP_EXPECT_GPU_BACKEND=vulkan
 export NUPP_EXPECT_GPU_ADAPTER=llvmpipe
 
-# Adapter absence is a failure in conformance, not an optional unit-test skip.
-cargo test -p nupp-native-gpu adapter_compute_round_trip_when_available \
-    --locked -- --nocapture
-
 "$root/bin/nupp" build
+# Adapter absence is a failure in conformance, not an optional unit-test skip.
+"$root/bin/nupp" test gpudevicetest
 (
     cd "$bench"
     "$root/bin/nupp" build --target typed
@@ -29,6 +27,8 @@ typed=$bench/build/typed
 export LUA_PATH="$typed/?.lua;$typed/?/init.lua;$root/build/?.lua;$root/.rocks/share/lua/5.1/?.lua;$root/.rocks/share/lua/5.1/?/init.lua;;"
 export LUA_CPATH="$root/.rocks/lib/lua/5.1/?.so;;"
 export NUPP_NATIVE_LIBRARY="$typed/lib/nupp_native"
+NUPP_WGPU_LIBRARY=$("$root/scripts/toolchain" wgpu)
+export NUPP_WGPU_LIBRARY
 export GEMM_M=64 GEMM_N=64 GEMM_K=64
 
 "$luajit" "$bench/counted-api.lua"
@@ -39,5 +39,5 @@ for kernel in literal boundaries snapshots control; do
     "$root/bin/nupp" aot --emit wgsl --triple wasm32-unknown-emscripten \
         --function "$kernel" "$bench/typed/counted.nupp" > "$wgsl/$kernel.wgsl"
 done
-cargo run --locked -p nupp-native-gpu --example counted_wgsl -- "$wgsl"
+"$luajit" "$bench/counted-wgsl.lua" "$wgsl"
 "$luajit" "$bench/gemm-api.lua"

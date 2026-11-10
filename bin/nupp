@@ -246,7 +246,7 @@ build_native() {
     # already built (or named by NUPP_LLVM_PREFIX): building LLVM takes minutes
     # to an hour, and nothing but AOT compilation needs it. A tree without it
     # still builds and runs the compiler; `@aot` then says what is missing.
-    features=base,files,gpu,http,net,process,tls,uri,uuid
+    features=base,files,http,net,process,tls,uri,uuid
     if llvm_is_available; then
         features=$features,codegen
     fi
@@ -545,6 +545,36 @@ native_is_current() {
 
 if [ "$needs_native" = yes ] && ! native_is_current; then
     build_native || exit 1
+fi
+
+# The GPU provider is Nupp driving wgpu-native, a prebuilt library
+# `scripts/toolchain wgpu` fetches against a pinned digest. A built program
+# finds it staged beside itself; a program this launcher runs finds the copy
+# staged here, named outright the same way as the native provider above. A
+# machine that cannot fetch it still runs everything else: only opening a GPU
+# context says what is missing. A failed fetch is remembered beside the library,
+# so an offline machine asks once rather than on every command; `nupp clean` or
+# a pin bump asks again.
+if [ -z "${NUPP_WGPU_LIBRARY:-}" ]; then
+    case "$(uname -s 2>/dev/null)" in
+        MINGW*|MSYS*|CYGWIN*) WGPU_FILENAME=wgpu_native.dll ;;
+        Darwin*)              WGPU_FILENAME=libwgpu_native.dylib ;;
+        *)                    WGPU_FILENAME=libwgpu_native.so ;;
+    esac
+    NUPP_WGPU_LIBRARY="$LUA_ROOT/build/lib/$WGPU_FILENAME"
+    wgpu_unavailable="$NUPP_WGPU_LIBRARY.unavailable"
+    if { [ ! -f "$NUPP_WGPU_LIBRARY" ] || [ "$ROOT/scripts/toolchain.pins" -nt "$NUPP_WGPU_LIBRARY" ]; } \
+        && { [ ! -f "$wgpu_unavailable" ] || [ "$ROOT/scripts/toolchain.pins" -nt "$wgpu_unavailable" ]; }; then
+        mkdir -p "$(dirname "$NUPP_WGPU_LIBRARY")"
+        if fetched=$("$ROOT/scripts/toolchain" wgpu 2>/dev/null) \
+            && cp "$fetched" "$NUPP_WGPU_LIBRARY.$$" && mv -f "$NUPP_WGPU_LIBRARY.$$" "$NUPP_WGPU_LIBRARY"; then
+            rm -f "$wgpu_unavailable"
+        else
+            rm -f "$NUPP_WGPU_LIBRARY.$$"
+            : > "$wgpu_unavailable"
+        fi
+    fi
+    export NUPP_WGPU_LIBRARY
 fi
 
 if [ "$rebuild" = yes ] && ! built_is_current; then

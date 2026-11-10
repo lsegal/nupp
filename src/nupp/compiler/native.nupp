@@ -379,25 +379,26 @@ local FEATURES: {[string]: native.Feature} = {
     [
         "runtime.gpu_operations"
     ] = {name = "gpu_operations", runtimeModule = "nupp.gpu.operations", portableRuntime = true},
+    -- The provider is Nupp over the pinned wgpu-native library, which is
+    -- prebuilt per platform and staged beside the program as `lib/wgpu_native`.
+    -- No host links it, so a standalone binary or a foreign-platform stub cannot
+    -- carry it.
     ["native.gpu"] = {
         name = "gpu",
-        modules = {"nupp.runtime.provider.nativegpu"},
-        runtimeModule = "nupp.runtime.provider.nativegpu",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "gpu",
-        host = "native-gpu",
-        library = "nupp_native",
-        binary = true,
-        -- Synchronizing parks on the native readiness generation, so the runtime that
-        -- answers a suspension travels with the provider.
-        requires = {
-            "runtime.native",
-            "runtime.suspension",
-            "runtime.spanview",
-            "runtime.gpu_api",
-            "runtime.gpu_layout"
+        modules = {
+            "nupp.runtime.provider.nativegpu",
+            "nupp.runtime.provider.gpudevice",
+            "nupp.runtime.provider.gpucosts",
+            "nupp.runtime.provider.wgpu"
         },
+        runtimeModule = "nupp.runtime.provider.nativegpu",
+        provider = "wgpu_native",
+        providerDriver = "wgpu",
+        library = "wgpu_native",
+        binary = true,
+        -- Synchronizing parks in a suspension, so the runtime that answers one
+        -- travels with the provider.
+        requires = {"runtime.suspension", "runtime.spanview", "runtime.gpu_api", "runtime.gpu_layout"},
     },
     -- The runtime LLVM-compiled Lua builders call, which every provider built
     -- for a platform that has it carries; a loader reaching this module is
@@ -550,14 +551,10 @@ local FEATURES: {[string]: native.Feature} = {
         -- The public module records the facility at the call site; its internal
         -- provider records it when the module graph is followed directly.
         modules = {"nupp.runtime.provider.nativepath"},
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "filesystem",
         host = "native-files",
-        library = "nupp_native",
         binary = true,
         runtimeModule = "nupp.runtime.provider.nativepath",
-        requires = {"runtime.path", "runtime.native"},
+        requires = {"runtime.path"},
     },
     [
         "runtime.path"
@@ -651,23 +648,12 @@ local FEATURES: {[string]: native.Feature} = {
     ["native.files"] = {
         name = "files",
         modules = {"nupp.runtime.provider.nativefiles"},
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "files",
         host = "native-files",
-        library = "nupp_native",
         binary = true,
         runtimeModule = "nupp.runtime.provider.nativefiles",
         -- A file operation that waits performs `suspend`, so the runtime that
         -- answers it has to be in the target beside the program.
-        requires = {
-            "runtime.files",
-            "native.path",
-            "stdlib.io",
-            "runtime.spanview",
-            "runtime.suspension",
-            "runtime.native",
-        },
+        requires = {"runtime.files", "native.path", "stdlib.io", "runtime.spanview", "runtime.suspension",},
     },
     ["runtime.suspension"] = {
         -- Not a native library: a compiler-provided Nupp module a target needs its

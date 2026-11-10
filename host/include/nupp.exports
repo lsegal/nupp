@@ -216,6 +216,8 @@ nuppNativeWallMs
 nuppNativeSleepMs
 nuppNativePoll
 nuppNativeWait
+nuppNativeWakeOpen
+nuppNativeWakeClose
 nuppNativeAvailableParallelism
 nuppNativeRandomBytes
 nuppNativeXxh64Digest
@@ -325,26 +327,9 @@ nuppNativeProcessStreamWrite
 nuppNativeProcessStreamRelease
 nuppNativeProcessWait
 
-[native-gpu]
-nuppNativeGpuCostsOutput
-nuppNativeGpuCostsEnabled
-nuppNativeGpuCostMetadata
-nuppNativeGpuContextCreate
-nuppNativeGpuContextDescription
-nuppNativeGpuContextRelease
-nuppNativeGpuBufferCreate
-nuppNativeGpuBufferRelease
-nuppNativeGpuBufferUpload
-nuppNativeGpuKernelCreate
-nuppNativeGpuKernelRelease
-nuppNativeGpuBindingsCreate
-nuppNativeGpuBindingsRelease
-nuppNativeGpuBindingsSetBuffer
-nuppNativeGpuDispatch
-nuppNativeGpuDownloadQueue
-nuppNativeGpuSynchronize
-nuppNativeGpuSynchronizeReady
-nuppNativeGpuDownloadRead
+[native-panic-probe]
+# The provider's test-only panic probe, which no release build selects.
+nuppNativePanicProbe
 
 [native-codegen]
 # The code generator, declared by the compiler rather than a header.

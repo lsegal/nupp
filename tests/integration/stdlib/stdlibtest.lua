@@ -816,46 +816,33 @@ function M.nativeHttpProviderRejectsMalformedBoundaries()
 end
 
 function M.gpuAvailabilityAnswersWithoutRaising()
-    local ffi = require("ffi")
-
-    local function native(features, createStatus)
+    local function native(opens)
         local released = 0
-        local fixture = {
-            ffi = ffi,
-            C = {
-                nuppNativeFeatures = function()
-                    return features
-                end,
-                nuppNativeGpuContextCreate = function(output)
-                    output[0] = 9
-                    return createStatus
-                end,
-                nuppNativeGpuContextRelease = function(handle)
-                    testAssert.eq(handle, 9ULL)
-                    released = released + 1
-                    return 0
-                end,
-            },
-            requireFeature = function(bit)
-                if features & bit == 0 then
-                    error("the Rust native provider was built without GPU support", 3)
+        local context = {}
+        local device = {
+            open = function()
+                if not opens then
+                    return nil, "gpu: no suitable compute adapter is available: none"
                 end
+                return context
             end,
-            succeeded = function(status)
-                testAssert.eq(status, 0)
+            close = function(value)
+                assert(rawequal(value, context))
+                released = released + 1
+                return true
             end,
         }
 
-        return require("helpers.providerstate").nativeGpu(fixture), function()
+        return require("helpers.providerstate").nativeGpu(device), function()
             return released
         end
     end
 
-    local withoutFeature = native(0, 0)
-    testAssert.eq(withoutFeature.available(), false, "a provider built without GPU support has no device")
-    local noAdapter = native(4, 1)
-    testAssert.eq(noAdapter.available(), false, "a provider with no adapter has no device")
-    local adapter, released = native(4, 0)
+    local noAdapter = native(false)
+    testAssert.eq(noAdapter.available(), false, "a machine with no adapter or no wgpu-native has no device")
+    local ok, problem = pcall(noAdapter.open)
+    assert(not ok and tostring(problem):find("nupp: gpu: no suitable compute adapter", 1, true), tostring(problem))
+    local adapter, released = native(true)
     testAssert.eq(adapter.available(), true)
     testAssert.eq(released(), 1, "the probe closes the device it opened")
 
@@ -971,53 +958,33 @@ function M.anHttpClientPumpsItsTransfersOnRequest()
     testAssert.eq(polls, 3, "a closed client drives nothing")
 end
 
-function M.nativeGpuRejectsFractionalCountsBeforeTheAbi()
-    local ffi = require("ffi")
+function M.nativeGpuRejectsFractionalCountsBeforeTheDevice()
     local nextHandle = 0
-    local C = {
-        nuppNativeGpuCostsEnabled = function()
-            return 0
+    local function handle()
+        nextHandle = nextHandle + 1
+        return nextHandle
+    end
+    local device = setmetatable({
+        open = function()
+            return {}
         end,
-        nuppNativeGpuContextCreate = function(output)
-            nextHandle = nextHandle + 1
-            output[0] = nextHandle
-            return 0
-        end,
-        nuppNativeGpuContextRelease = function()
-            return 0
-        end,
-        nuppNativeGpuBufferCreate = function(_, _, output)
-            nextHandle = nextHandle + 1
-            output[0] = nextHandle
-            return 0
-        end,
-        nuppNativeGpuKernelCreate = function(_, _, _, _, _, _, _, _, _, _, _, output)
-            nextHandle = nextHandle + 1
-            output[0] = nextHandle
-            return 0
-        end,
-        nuppNativeGpuBindingsCreate = function(_, _, output)
-            nextHandle = nextHandle + 1
-            output[0] = nextHandle
-            return 0
-        end,
-    }
-    setmetatable(C, {
+        createbuffer = handle,
+        createkernel = handle,
+        createbindings = handle,
+    }, {
         __index = function()
             return function()
-                return 0
+                return true
             end
         end
     })
-    local provider = require("helpers.providerstate").nativeGpu({
-        C = C,
-        ffi = ffi,
-        requireFeature = function()
+    local enabled = false
+    local costs = {
+        enabled = function()
+            return enabled
         end,
-        succeeded = function(status)
-            testAssert.eq(status, 0)
-        end,
-    })
+    }
+    local provider = require("helpers.providerstate").nativeGpu(device, costs)
     local context = provider.open()
     local element = require("nupp.runtime.standardtable").Array.uint32
     for _, count in ipairs({1.5, math.huge, 0 / 0}) do
@@ -1036,13 +1003,11 @@ function M.nativeGpuRejectsFractionalCountsBeforeTheAbi()
     assert(not fractionalKernel and tostring(kernelProblem):find("read buffer count", 1, true), tostring(kernelProblem))
     assert(type(context.compilegenerated) == "function" and context.compileGenerated == nil)
     local cost
-    C.nuppNativeGpuCostsEnabled = function()
-        return 1
-    end
-    C.nuppNativeGpuCostMetadata = function(_, _, isKernel, text)
-        assert(isKernel == 1)
-        cost = require("testjson").decode(text)
-        return 0
+    enabled = true
+    device.metadata = function(_, _, isKernel, value)
+        assert(isKernel == true)
+        cost = value
+        return true
     end
     local kernel = context:compilegenerated(
         {

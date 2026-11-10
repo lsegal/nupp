@@ -44,6 +44,7 @@ local wasmBinding = require("nupp.compiler.aot.wasmbinding")
 local wasmBridge = require("nupp.compiler.aot.wasmbridge")
 local aotcheck = require("nupp.tools.build.aotcheck")
 local aotllvm = require("nupp.tools.build.aotllvm")
+local llvmProfile = require("nupp.compiler.aot.llvm.profile")
 local compile = require("nupp.compiler.aot.compile")
 local constspecialize = require("nupp.compiler.lua.constspecialize")
 local diagnosticMod = require("nupp.compiler.diagnostics")
@@ -789,7 +790,19 @@ function aot.link(
     if static then
         linkErr = aotllvm.archive(selected.triple, objects, output)
     else
-        linkErr = aotllvm.link(selected.triple, objects, output, root)
+        -- What the units define for others to resolve is what the library
+        -- publishes, read from the IR each object was compiled from.
+        local exports: {string} = {}
+        for _, one in ipairs(emitted) do
+            local ir, readErr = fs.readFile(one.output)
+            if ir == nil then
+                return tostring(readErr), nil
+            end
+            for _, name in ipairs(llvmProfile.publicSymbols(ir as string)) do
+                exports[#exports + 1] = name
+            end
+        end
+        linkErr = aotllvm.link(selected.triple, objects, output, root, exports)
     end
     if linkErr ~= nil then
         return linkErr, nil
@@ -854,6 +867,9 @@ function aot.emit(
     end
 
     local emitted: {aot.Emitted} = {}
+    -- C export name -> the source that claimed it: the library's C namespace
+    -- is one namespace, whichever files the names come from.
+    local exporters: {[string]: string} = {}
     local seen: {[string]: boolean} = {}
     local sources: {string} = {}
     local sourceText: {[string]: string} = {}
@@ -1047,7 +1063,35 @@ function aot.emit(
                     local lineFile = canonicalSource:sub(1, #canonicalRoot) == canonicalRoot
                         and canonicalSource:sub(#canonicalRoot + 1)
                         or canonicalSource
-                    local ir, why = aotllvm.emit(artifacts.programs, tierTarget.tier, tierTarget.triple, nil, lineFile)
+                    -- The narrowest tier runs on every machine the triple
+                    -- names, so it is the one a C export stands for.
+                    local exports = tierPosition == 1 and tierTarget.architecture ~= "wasm32"
+                    if exports then
+                        for _, program in ipairs(artifacts.programs) do
+                            local exportName = program.exportName
+                            if exportName ~= nil and program.executionTarget ~= "gpu" then
+                                local prior = exporters[exportName as string]
+                                if prior ~= nil then
+                                    return nil, (
+                                        "%s: C export %s is already published by %s"
+                                    ):format(
+                                        source,
+                                        exportName as string,
+                                        prior as string
+                                    ), produced, authoredUnused, constSelection, gpuSources
+                                end
+                                exporters[exportName as string] = source
+                            end
+                        end
+                    end
+                    local ir, why = aotllvm.emit(
+                        artifacts.programs,
+                        tierTarget.tier,
+                        tierTarget.triple,
+                        nil,
+                        lineFile,
+                        exports
+                    )
                     if ir == nil then
                         return nil, (
                             "%s: the LLVM backend cannot compile the %s tier: %s"

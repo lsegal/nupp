@@ -99,7 +99,8 @@ function aotllvm.emit(
     tier: string,
     triple: string,
     logical: boolean?,
-    sourceFile: string?
+    sourceFile: string?,
+    exports: boolean?
 ): (string?, string?)
     local selected, profileErr = llvmProfile.of(triple)
     if selected == nil then
@@ -126,7 +127,8 @@ function aotllvm.emit(
         sourceFile,
         logical,
         bridges,
-        aotllvm.wasmOracle()
+        aotllvm.wasmOracle(),
+        exports
     )
     if not ok then
         if llvmProgram.isUnsupported(module) then
@@ -339,8 +341,9 @@ end
 --- Links `objects` into the shared library `output` with lld. `root`, the
 --- project's directory, is left out of the object paths a Mach-O debug map
 --- records, so the library does not depend on where the project is checked out.
+--- `exports` names everything the library publishes; nothing else is.
 --- @return nil, or what went wrong
-function aotllvm.link(triple: string, objects: {string}, output: string, root: string?): string?
+function aotllvm.link(triple: string, objects: {string}, output: string, root: string?, exports: {string}?): string?
     local selected, profileErr = llvmProfile.of(triple)
     if selected == nil then
         return profileErr
@@ -368,7 +371,25 @@ function aotllvm.link(triple: string, objects: {string}, output: string, root: s
         linked[#linked + 1] = runtimeObject as string
     end
     local strip = root ~= nil and fs.absolute(root as string):gsub("/*$", "/") or nil
-    local argv = llvmProfile.sharedLink(selected as llvmProfile.Profile, staged, linked, fs.basename(output), strip)
+    local listed: string? = nil
+    if exports ~= nil then
+        listed = fs.dirname(objects[1] or output) .. "/" .. fs.basename(output) .. ".exports"
+        local wrote, writeErr = fs.writeFile(
+            listed as string,
+            llvmProfile.exportList(selected as llvmProfile.Profile, exports as {string})
+        )
+        if not wrote then
+            return tostring(writeErr)
+        end
+    end
+    local argv = llvmProfile.sharedLink(
+        selected as llvmProfile.Profile,
+        staged,
+        linked,
+        fs.basename(output),
+        strip,
+        listed
+    )
     if (selected as llvmProfile.Profile).format == "coff" then
         local glue, glueErr = windowsGlue(selected as llvmProfile.Profile, fs.dirname(objects[1] or output))
         if glue == nil then
@@ -384,6 +405,9 @@ function aotllvm.link(triple: string, objects: {string}, output: string, root: s
         end
     end
     local _, err = codegen.link(argv)
+    if listed ~= nil then
+        os.remove(listed as string)
+    end
     if err ~= nil then
         os.remove(staged)
 
@@ -490,14 +514,15 @@ function aotllvm.linkWasm(object: string, output: string, exports: {string}, lib
     return nil
 end
 
---- The ELF half of `linkStandalone`: a position-independent executable from
---- the kit's startup objects, the runtime and `archives` whole, the kit's
---- library stubs, and libgcc, bound to the dynamic linker the kit names.
+--- The ELF half of `link`: a position-independent executable from the kit's
+--- startup objects, `runtime` and `archives` whole, the kit's library stubs,
+--- and libgcc, bound to the dynamic linker the kit names.
 local function linkLinux(
     kit: string,
     manifest: any,
     machine: string,
     output: string,
+    runtime: string,
     archives: {string},
     flags: {string}
 ): string?
@@ -522,7 +547,7 @@ local function linkLinux(
         argv[#argv + 1] = kit .. "/" .. tostring(object)
     end
     argv[#argv + 1] = "--whole-archive"
-    argv[#argv + 1] = kit .. "/" .. tostring(manifest.runtime)
+    argv[#argv + 1] = runtime
     for _, archive in ipairs(archives) do
         argv[#argv + 1] = archive
     end
@@ -551,7 +576,14 @@ end
 --- A Windows kit records the link MinGW's driver ran for a probe program;
 --- lld's MinGW driver replays it with this program's archives, loaded whole,
 --- where the probe's object was.
-local function linkWindows(kit: string, manifest: any, output: string, archives: {string}, flags: {string}): string?
+local function linkWindows(
+    kit: string,
+    manifest: any,
+    output: string,
+    runtime: string,
+    archives: {string},
+    flags: {string}
+): string?
     if type(manifest.argv) ~= "table" then
         return "the link kit at " .. kit .. " records no link"
     end
@@ -560,7 +592,7 @@ local function linkWindows(kit: string, manifest: any, output: string, archives:
         if token == "{output}" then
             argv[#argv + 1] = output
         elseif token == "{runtime}" then
-            argv[#argv + 1] = kit .. "/" .. tostring(manifest.runtime)
+            argv[#argv + 1] = runtime
         elseif token == "{archives}" then
             argv[#argv + 1] = "--whole-archive"
             for _, archive in ipairs(archives) do
@@ -586,12 +618,11 @@ local function linkWindows(kit: string, manifest: any, output: string, archives:
     return nil
 end
 
---- Links a standalone program `output` from the link kit at `kit`: its
---- runtime and `archives` loaded whole (a program reaches native code by
---- name, which no archive scan sees), against the kit's stubs for the system
---- libraries, with lld in process.
---- @return nil, or what went wrong
-function aotllvm.linkStandalone(kit: string, output: string, archives: {string}, flags: {string}): string?
+--- Links `output` from the link kit at `kit`: the archive its manifest names
+--- under `runtime` and `archives` loaded whole (a program reaches native code
+--- by name, which no archive scan sees), against the kit's stubs for the
+--- system libraries, with lld in process.
+local function link(kit: string, output: string, runtime: string, archives: {string}, flags: {string}): string?
     local text = fs.readFile(kit .. "/kit.json")
     if text == nil then
         return "the link kit at " .. kit .. " has no kit.json"
@@ -606,11 +637,20 @@ function aotllvm.linkStandalone(kit: string, output: string, archives: {string},
     if selected == nil then
         return "the link kit at " .. kit .. " names no target this nupp can link for"
     end
+    local named = (manifest as {[string]: any})[runtime]
+    if type(named) ~= "string" then
+        return "the link kit at "
+            .. kit
+            .. " carries no "
+            .. runtime
+            .. " archive; rebuild it with scripts/toolchain kit"
+    end
+    local archive = kit .. "/" .. (named as string)
     local machine = (selected as llvmProfile.Profile).machine
     if manifest.platform == "linux" then
-        return linkLinux(kit, manifest, machine, output, archives, flags)
+        return linkLinux(kit, manifest, machine, output, archive, archives, flags)
     elseif manifest.platform == "windows" then
-        return linkWindows(kit, manifest, output, archives, flags)
+        return linkWindows(kit, manifest, output, archive, archives, flags)
     elseif manifest.platform ~= "macos" then
         return "the link kit at " .. kit .. " is for " .. tostring(manifest.platform) .. ", which this nupp cannot link"
     end
@@ -630,17 +670,23 @@ function aotllvm.linkStandalone(kit: string, output: string, archives: {string},
         "-o",
         output,
         "-force_load",
-        kit .. "/" .. tostring(manifest.runtime),
+        archive,
     }
-    for _, archive in ipairs(archives) do
+    for _, linked in ipairs(archives) do
         argv[#argv + 1] = "-force_load"
-        argv[#argv + 1] = archive
+        argv[#argv + 1] = linked
     end
     for _, library in ipairs(manifest.libraries) do
         argv[#argv + 1] = tostring(library)
     end
     for _, flag in ipairs(flags) do
         argv[#argv + 1] = flag
+    end
+    -- A native program may call anything libSystem has, and the kit's stubs
+    -- name only what the host bound. The rest binds when the program loads.
+    if runtime == "luajit" then
+        argv[#argv + 1] = "-undefined"
+        argv[#argv + 1] = "dynamic_lookup"
     end
     -- The program's native code finds the runtime's entry points by name.
     argv[#argv + 1] = "-export_dynamic"
@@ -652,6 +698,46 @@ function aotllvm.linkStandalone(kit: string, output: string, archives: {string},
     end
 
     return nil
+end
+
+--- Links a standalone program `output` from the link kit at `kit`: its
+--- runtime and `archives`, against the kit's stubs for the system libraries.
+--- @return nil, or what went wrong
+function aotllvm.linkStandalone(kit: string, output: string, archives: {string}, flags: {string}): string?
+    return link(kit, output, "runtime", archives, flags)
+end
+
+--- Links a native program `output` whose `main` is in `objects`, from the
+--- link kit at `kit`: the objects and the kit's static LuaJIT, exporting the
+--- Lua C API so a C module the program's Lua state loads binds against it.
+--- @return nil, or what went wrong
+function aotllvm.linkProgram(kit: string, output: string, objects: {string}): string?
+    return link(kit, output, "luajit", objects, {})
+end
+
+--- Compiles the LLVM IR `ir` of a native program for `triple` and links it
+--- into the executable `output` from the link kit at `kit`.
+--- @return nil, or what went wrong
+function aotllvm.program(ir: string, triple: string, kit: string, output: string): string?
+    local selected, profileErr = llvmProfile.of(triple)
+    if selected == nil then
+        return profileErr
+    end
+    local options = llvmProfile.options(selected as llvmProfile.Profile, "baseline")
+    options.verify = "1"
+    local compiled, err = codegen.compile(ir, "<native>", options)
+    if compiled == nil then
+        return "compiling the native program failed: " .. tostring(err)
+    end
+    local object = output .. ".o"
+    local wrote, writeErr = fs.writeFile(object, (compiled as codegen.Compiled).object)
+    if not wrote then
+        return tostring(writeErr)
+    end
+    local linkErr = aotllvm.linkProgram(kit, output, {object})
+    os.remove(object)
+
+    return linkErr
 end
 
 export = aotllvm

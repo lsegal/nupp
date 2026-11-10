@@ -302,7 +302,10 @@ in the tree carries their notices. `scripts/toolchain` compares each committed
 copy against the source it has just verified by digest and fails the build when
 they differ. `scripts/rust-dependency-notices --write` refreshes the Cargo
 aggregate; the test suite refuses a lockfile whose third-party package inventory
-is not represented there.
+is not represented there. The prebuilt wgpu-native library staged beside GPU
+programs carries its own Rust graph, so `scripts/rust-dependency-notices --write
+wgpu-native` generates a second notice from the lock file of the pinned
+`WGPU_VERSION`, and the suite refuses a pin that notice was not generated from.
 
 ## Signing for macOS
 
@@ -396,7 +399,7 @@ built by another release is refused by exact version rather than adapted.
 | Bench record | 4 | an older record is an inconclusive baseline | `src/debug/bench.nupp` `schema` |
 | Optimizer remarks | 1 | read by consumers | `src/nupp/tools/cli/compile.nupp` `schema` |
 | Trace reason catalog | 1 | read by consumers | `src/debug/profile/init.nupp` `catalogversion` |
-| GPU cost records | 1 | read by consumers | `native/crates/gpu/src/costs.rs` `schemaVersion` |
+| GPU cost records | 1 | read by consumers | `src/nupp/runtime/provider/gpucosts.nupp` `schemaVersion` |
 
 To bump one, change the constant and this row together; a test holds the two to
 the same number. A major ABI bump is two-phase when stage zero reads it: a

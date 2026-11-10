@@ -175,7 +175,7 @@ exit 0
     local asked = read(record)
     -- `codegen` joins the union only where a pinned LLVM is available, which a
     -- machine naming NUPP_LLVM_PREFIX (CI's) has.
-    local union = "native-rust base,files,gpu,http,net,process,tls,uri,uuid"
+    local union = "native-rust base,files,http,net,process,tls,uri,uuid"
     assert(
         asked == union .. "\n" or asked == union .. ",codegen\n",
         "the launcher requested the wrong development providers: " .. asked

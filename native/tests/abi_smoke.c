@@ -79,109 +79,14 @@ static int failed(const char *operation, int32_t status) {
     return 1;
 }
 
-/* Selects which GPU backends a context may use. wgpu reads WGPU_BACKEND each
- * time a context is created, so one process can ask for an adapter the machine
- * cannot have and then for a real one. */
-static void gpu_backend(const char *name) {
-#if defined(_WIN32)
-    _putenv_s("WGPU_BACKEND", name ? name : "");
-#else
-    if (name) {
-        setenv("WGPU_BACKEND", name, 1);
-    } else {
-        unsetenv("WGPU_BACKEND");
-    }
-#endif
-}
-
-/* Reads a file named relative to this source file, which the smoke build
- * compiles by its absolute path. */
-static unsigned char *read_beside(const char *relative, size_t *length) {
-    char path[4096];
-    const char *source = __FILE__;
-    const char *slash = strrchr(source, '/');
-    size_t prefix = slash ? (size_t)(slash - source) + 1 : 0;
-    FILE *file;
-    long end;
-    unsigned char *bytes;
-    if (prefix + strlen(relative) + 1 > sizeof path) return NULL;
-    memcpy(path, source, prefix);
-    strcpy(path + prefix, relative);
-    file = fopen(path, "rb");
-    if (!file) return NULL;
-    if (fseek(file, 0, SEEK_END) != 0 || (end = ftell(file)) <= 0
-        || fseek(file, 0, SEEK_SET) != 0) {
-        fclose(file);
-        return NULL;
-    }
-    bytes = malloc((size_t)end);
-    if (!bytes || fread(bytes, 1, (size_t)end, file) != (size_t)end) {
-        free(bytes);
-        fclose(file);
-        return NULL;
-    }
-    fclose(file);
-    *length = (size_t)end;
-    return bytes;
-}
-
-/* One word of a valid module changed, which naga's SPIR-V front end panics on
- * rather than rejecting. A release build catches that panic at the export and
- * answers INTERNAL; the process lives on to make another context. A machine
- * with no adapter has nothing to show. */
-static int malformed_spirv_answers_a_status(void) {
-    size_t length = 0;
-    unsigned char *spirv =
-        read_beside("../crates/native/testdata/naga-panic.spv", &length);
-    uint64_t context = 0, kernel = 0, fresh = 0;
-    int32_t status;
-    if (!spirv) {
-        fprintf(stderr, "cannot read the malformed SPIR-V fixture\n");
-        return 1;
-    }
-    status = nuppNativeGpuContextCreate(&context);
-    if (status == NUPP_NATIVE_UNAVAILABLE) {
-        free(spirv);
-        return 0;
-    }
-    if (status != NUPP_NATIVE_OK) {
-        free(spirv);
-        return failed("GPU context", status);
-    }
-    {
-        size_t description = 0;
-        if (nuppNativeGpuContextDescription(context, NULL, 0, &description)
-                != NUPP_NATIVE_BUFFER_TOO_SMALL || description == 0) {
-            fprintf(stderr, "a GPU description size query was not too small\n");
-            free(spirv);
-            return 1;
-        }
-    }
-    status = nuppNativeGpuKernelCreate(context, spirv, length, "main", 4,
-        1, 1, 16, 64, 1, 1, &kernel);
-    free(spirv);
-    if (status != NUPP_NATIVE_INTERNAL
-        || !strstr(nuppNativeLastError(), "panicked")) {
-        return failed("malformed SPIR-V kernel", status);
-    }
-    status = nuppNativeGpuContextCreate(&fresh);
-    if (status != NUPP_NATIVE_OK) {
-        return failed("GPU context after a panic", status);
-    }
-    nuppNativeGpuContextRelease(fresh);
-    nuppNativeGpuContextRelease(context);
-    return 0;
-}
-
 /* A settled whole-file read advances the one process-wide readiness
  * generation, so a caller that polled it, found the transfer pending, and
- * waits from it is woken by the transfer rather than by the timeout. A GPU
- * context with no work in flight is ready at once. */
+ * waits from it is woken by the transfer rather than by the timeout. */
 static int readiness_generation_wakes_waiters(void) {
     NuppNativeFilesSlice cargo = {
         (const uint8_t *)"Cargo.toml", sizeof "Cargo.toml" - 1};
-    uint64_t generation = 0, found = 0, transfer = 0, context = 0;
-    uint32_t state = NUPP_NATIVE_FILES_TRANSFER_PENDING, ready = 0;
+    uint64_t generation = 0, found = 0, transfer = 0;
+    uint32_t state = NUPP_NATIVE_FILES_TRANSFER_PENDING;
     int waits = 0;
     int32_t status;
     if (nuppNativePoll(NULL) != NUPP_NATIVE_INVALID_ARGUMENT
@@ -214,44 +119,13 @@ static int readiness_generation_wakes_waiters(void) {
         fprintf(stderr, "the whole-file read did not succeed\n");
         return 1;
     }
-    if (nuppNativeGpuSynchronizeReady(0, &ready) != NUPP_NATIVE_STALE_HANDLE) {
-        fprintf(stderr, "a stale GPU context was ready\n");
-        return 1;
-    }
-    status = nuppNativeGpuContextCreate(&context);
-    if (status == NUPP_NATIVE_UNAVAILABLE) return 0;
-    if (status != NUPP_NATIVE_OK) return failed("GPU context", status);
-    if (nuppNativeGpuSynchronizeReady(context, NULL)
-        != NUPP_NATIVE_INVALID_ARGUMENT) {
-        nuppNativeGpuContextRelease(context);
-        fprintf(stderr, "a GPU ready output of NULL was accepted\n");
-        return 1;
-    }
-    status = nuppNativeGpuSynchronizeReady(context, &ready);
-    nuppNativeGpuContextRelease(context);
-    if (status != NUPP_NATIVE_OK) return failed("GPU ready", status);
-    if (ready != 1) {
-        fprintf(stderr, "a GPU context with no work was not ready\n");
-        return 1;
-    }
     return 0;
-}
-
-/* A backend no adapter on this platform answers to. */
-static const char *absent_gpu_backend(void) {
-#if defined(__APPLE__)
-    return "dx12";
-#else
-    return "metal";
-#endif
 }
 
 int main(void) {
     size_t length = 0;
     uint8_t uuid[37];
     uint8_t digest[32];
-    uint8_t adapter[64];
-    size_t adapter_length = 0;
     uint64_t uri = 0;
     uint64_t client = 0;
     uint64_t file = 0;
@@ -270,14 +144,14 @@ int main(void) {
         return 1;
     }
     if ((nuppNativeFeatures() & (NUPP_NATIVE_FEATURE_BASE
-            | NUPP_NATIVE_FEATURE_UUID | NUPP_NATIVE_FEATURE_GPU
+            | NUPP_NATIVE_FEATURE_UUID
             | NUPP_NATIVE_FEATURE_URI | NUPP_NATIVE_FEATURE_HTTP
             | NUPP_NATIVE_FEATURE_PROCESS
             | NUPP_NATIVE_FEATURE_FILESYSTEM
             | NUPP_NATIVE_FEATURE_FILE_TRANSFER | NUPP_NATIVE_FEATURE_NET
             | NUPP_NATIVE_FEATURE_TLS))
         != (NUPP_NATIVE_FEATURE_BASE | NUPP_NATIVE_FEATURE_UUID
-            | NUPP_NATIVE_FEATURE_GPU | NUPP_NATIVE_FEATURE_URI
+            | NUPP_NATIVE_FEATURE_URI
             | NUPP_NATIVE_FEATURE_HTTP | NUPP_NATIVE_FEATURE_PROCESS
             | NUPP_NATIVE_FEATURE_FILESYSTEM
             | NUPP_NATIVE_FEATURE_FILE_TRANSFER | NUPP_NATIVE_FEATURE_NET
@@ -303,17 +177,6 @@ int main(void) {
             return 1;
         }
     }
-    if (nuppNativeGpuBufferRelease(0, 1)
-        != NUPP_NATIVE_STALE_HANDLE) {
-        fprintf(stderr, "invalid GPU context was accepted\n");
-        return 1;
-    }
-    if (nuppNativeGpuContextDescription(
-            0, adapter, sizeof adapter, &adapter_length)
-        != NUPP_NATIVE_STALE_HANDLE) {
-        fprintf(stderr, "invalid GPU context description was accepted\n");
-        return 1;
-    }
     {
         uint64_t bytes = 0;
         uint8_t one[1];
@@ -332,16 +195,6 @@ int main(void) {
             return 1;
         }
     }
-    {
-        uint64_t context = 0;
-        gpu_backend(absent_gpu_backend());
-        status = nuppNativeGpuContextCreate(&context);
-        gpu_backend(NULL);
-        if (status != NUPP_NATIVE_UNAVAILABLE) {
-            return failed("GPU context without an adapter", status);
-        }
-    }
-    if (malformed_spirv_answers_a_status()) return 1;
     if (readiness_generation_wakes_waiters()) return 1;
     status = nuppNativeFilesInfo(current, 1, &file_info);
     if (status != NUPP_NATIVE_OK) return failed("filesystem info", status);

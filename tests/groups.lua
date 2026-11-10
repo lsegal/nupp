@@ -41,6 +41,7 @@ local groups = {
         "nativefoundationstest",
         "netnativetest",
         "processnativetest",
+        "processprovidertest",
         "rustabitest",
         "tlstest",
     },
@@ -100,7 +101,7 @@ local groups = {
         "templategametest",
     },
 
-    ["gpu"] = {"gputest"},
+    ["gpu"] = {"gputest", "gpudevicetest"},
 
     -- Compact native and Wasm packs, their executable obligation ledger, and
     -- the structural checks which keep the replacement corpus bounded.
@@ -174,7 +175,7 @@ for name in (
 asserttest base64test bitsettest bufferapitest compressionprovidertest
 digestprovidertest digesttest sustest taskfailuretest taskstest
 workerstartuptest workersupporttest boundedcachetest clifacadetest portablefiletest
-processfiletest processprovidertest processtest scalaradapterstest jsonfuseddifferentialtest
+processfiletest processtest scalaradapterstest jsonfuseddifferentialtest
 jsonpolicytest valuebuildertest standardtabletest typefactoriestest
 ]]
 ):gmatch("%S+") do
@@ -206,7 +207,7 @@ quaterniontest soatest standardostest spiinterfacetest serdetest
 stringbuffernamespacetest reflectionnamestest storetest warntest bytecodelistingtest
 docheadingstest doclinkstest overloaddoctest duplicatestest fmtfuzztest
 fmttest fmtwidthtest moduleexportstest spinavigationtest cichangeclassifiertest
-toollayeringtest testrunnertest
+toollayeringtest testrunnertest llvmcontracttest kitarchivetest
 ]]
 ):gmatch("%S+") do
     scopes[name] = "component"
@@ -229,7 +230,7 @@ simdfleetequivalencetest simdlanetest simdmapinventorytest simdmatrixreporttest 
 simdobligationtest simdpackbudgettest simdprimitivedifferentialtest simdreducerdifferentialtest simdreducertest
 simdruntimeboundarytest simdruntimeidentitytest simdwasmalgorithmdifferentialtest simdwasmbrowsersmoketest simdwasmtimeconformancetest
 hostfacadestest stdlibtest templatetest publicclitest filecomponenttest
-httpnativetest netnativetest tlstest pathtest processnativetest
+httpnativetest netnativetest tlstest pathtest processnativetest processprovidertest
 uritest filestest hostchanneltest jsonfacadedefaulttest jsonschematest
 serdecontracttest benchprojectstest benchrunnertest bctest absoluteentrytest
 clitest duplicateclitest coveragereporttest coveragetest clidoctest
@@ -252,7 +253,7 @@ rusttoolchaintest toolchaintest
 end
 
 for name in (
-    "compressiontest digestboundarytest eventstest gputest hashstreamtest portableiocontractstest processcompat_test streamadapterstest"
+    "compressiontest digestboundarytest eventstest gputest gpudevicetest hashstreamtest portableiocontractstest processcompat_test streamadapterstest"
 ):gmatch("%S+") do
     scopes[name] = "integration"
 end
@@ -329,6 +330,8 @@ scopes.projectctest = "integration"
 scopes.projectbinarytest = "integration"
 scopes.projectfixpointtest = "integration"
 scopes.projectaottest = "integration"
+scopes.projectaotcexporttest = "integration"
+scopes.aotexportlisttest = "component"
 scopes.projectclinktest = "integration"
 scopes.projectcargotest = "integration"
 scopes.projectgeneratortest = "integration"
@@ -426,6 +429,8 @@ scopes.projectmaterializationtest = "integration"
 scopes.projectlayoutcachetest = "integration"
 
 scopes.projectaotlinktest = "integration"
+
+scopes.nativeprogramtest = "integration"
 
 scopes.projectaottest = "integration"
 

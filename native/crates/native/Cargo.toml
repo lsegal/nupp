@@ -14,7 +14,10 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 default = ["base"]
 base = []
 uuid = ["nupp-native-platform/uuid"]
-gpu = ["base", "dep:nupp-native-gpu"]
+# The pinned stage-zero compiler still asks for `gpu` when it stages the
+# compiler's own native facilities. The GPU provider is Nupp over wgpu-native
+# now, so the feature selects nothing; it goes once the pin moves past this.
+gpu = ["base"]
 uri = ["base", "dep:url"]
 http = ["base", "dep:nupp-native-http"]
 process = ["base", "dep:nupp-native-process"]
@@ -22,12 +25,13 @@ net = ["base", "dep:nupp-native-net"]
 tls = ["net", "dep:nupp-native-tls"]
 filesystem = ["base", "dep:nupp-native-files"]
 files = ["filesystem", "nupp-native-files/lane"]
+# A test-only export that panics inside the boundary: nuppNativePanicProbe.
+panic-probe = ["base"]
 # The AOT code generator: LLVM and lld, linked in (NUPP_LLVM_PREFIX).
 codegen = ["base", "dep:nupp-native-codegen", "nupp-native-codegen/llvm"]
 
 [dependencies]
 nupp-native-abi = { path = "../abi" }
-nupp-native-gpu = { path = "../gpu", optional = true }
 nupp-native-http = { path = "../http", optional = true }
 nupp-native-net = { path = "../net", optional = true }
 nupp-native-tls = { path = "../tls", optional = true }

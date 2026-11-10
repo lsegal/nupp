@@ -354,6 +354,43 @@ local function writeListing(listing: Listing): nil
     io.write("\n")
 end
 
+--- Links the checked `tree` as a native program whose `main` is the
+--- executable's own, writing it to `output`.
+local function executable(
+    tree: any,
+    path: string,
+    output: string?,
+    target: Target,
+    refuse: function(string, string): integer
+): integer
+    if output == nil then
+        return usageError("--emit executable needs --output PATH")
+    end
+    local profile = require("nupp.compiler.aot.llvm.profile").of(target.triple)
+    if profile == nil then
+        return refuse(report.UNKNOWN_NAME, "a native program cannot be built for " .. target.triple)
+    end
+    local ir, problem = require(
+        "nupp.compiler.aot.llvm.native"
+    ).module(tree.root, (profile as {functionAttributes: string}).functionAttributes)
+    if ir == nil then
+        local at = problem as {
+            line: integer,
+            column: integer,
+            message: string
+        }
+        return refuse(report.TOOL_FAILED, ("%s:%d:%d: native: %s"):format(path, at.line, at.column, at.message))
+    end
+    local linked, linkErr = require(
+        "nupp.tools.build.native"
+    ).linkProgram(target.triple, output as string, ir as string)
+    if linked == nil then
+        return refuse(report.TOOL_FAILED, tostring(linkErr))
+    end
+
+    return 0
+end
+
 local function run(options: any): integer
     local positional: {string} = {options.file}
     local aot = require("nupp.compiler.aot.compile")
@@ -419,6 +456,9 @@ local function run(options: any): integer
     local tree, source = require("nupp.tools.cli.compile").check(path, environment as {[string]: any}, {}, checked)
     if tree == nil then
         return checked and report.failure(REPORT_SCHEMA, checked, {file = path}) or 1
+    end
+    if options.emit == "executable" then
+        return executable(tree, path, options.output, selected as targets.Target, refuse)
     end
 
     local library = options.library or "<object>"
@@ -610,6 +650,10 @@ end
 --- execution. Select verified IR, LLVM IR, native GPU SPIR-V, browser GPU WGSL,
 --- native assembly, or the generated Nupp binding with `--emit`.
 ---
+--- `--emit executable` instead links the file as a native program: its `main` is
+--- the executable's own, and it reaches LuaJIT and other C libraries through
+--- its `cdef function` declarations. The program is written to `--output`.
+---
 --- Examples:
 ---
 ---     nupp aot bench/kernel-subset-spike/mandelbrot.nupp
@@ -618,12 +662,17 @@ end
 ---     nupp aot --emit asm --function scale src/kernel.nupp
 ---     nupp aot --emit wgsl --function transform src/gpu.nupp
 ---     nupp aot --format json src/kernel.nupp
+---     nupp aot --emit executable --output build/host src/host.nupp
 @cli("aot")
 @derive(cliModule.command)
 local record Aot
-    --- Artifact to print: ir, llvm, spirv, wgsl, asm, or binding.
-    @cli(value = "ARTIFACT", choices = {"ir", "llvm", "spirv", "wgsl", "asm", "binding"})
+    --- Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or executable.
+    @cli(value = "ARTIFACT", choices = {"ir", "llvm", "spirv", "wgsl", "asm", "binding", "executable"})
     emit: string?
+
+    --- Where --emit executable writes the program.
+    @cli(value = "PATH")
+    output: string?
 
     --- Show only this function.
     @cli(name = "function", value = "NAME")

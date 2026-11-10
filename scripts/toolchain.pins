@@ -40,6 +40,24 @@ LPEG_DIRECTORY='lpeg-${LPEG_VERSION}'
 # plain HTTP adds a place to look, not a thing to trust.
 LPEG_MIRRORS='https://deb.debian.org/debian/pool/main/l/lua-lpeg/lua-lpeg_${LPEG_VERSION}.orig.tar.gz http://distcache.freebsd.org/ports-distfiles/lpeg-${LPEG_VERSION}.tar.gz'
 
+# wgpu-native, the WebGPU implementation the native GPU provider drives through
+# LuaJIT's FFI. It is the one pin that is a prebuilt library rather than a
+# source: the release publishes one archive per platform, and the shared library
+# inside is staged beside a program that opens a GPU context. Each archive has
+# its own digest, named by the platform `scripts/toolchain wgpu` selects. Like
+# LLVM it has its own cache key, so a bump fetches one archive and rebuilds
+# nothing else. Its MIT and Apache-2.0 licences travel in host/notices. So does a
+# notice for the Rust crates its library contains: after a bump, refresh it with
+# `scripts/rust-dependency-notices --write wgpu-native`, or the tests refuse it.
+WGPU_VERSION=v29.0.1.1
+WGPU_URL='https://github.com/gfx-rs/wgpu-native/releases/download/${WGPU_VERSION}/wgpu-${WGPU_TARGET}-release.zip'
+WGPU_SHA256_LINUX_X86_64=95a4d90c071005a98d03eab348beaa6b07e16eb00d1dcdb9f8348f75eb97ec5a
+WGPU_SHA256_LINUX_AARCH64=015fcdf1dbae82e614a783cc38017e5399ae0927a889fe9b69c9b664bc61b47a
+WGPU_SHA256_MACOS_AARCH64=a5797a37b1adf720bcd5dcffb291edbbd5b7b14be0a3874c28e6393a655a7a3e
+WGPU_SHA256_MACOS_X86_64=8e2f7378548ddd0e2cf21e7d864dda46e953f0af724855a33778b85ead206d41
+WGPU_SHA256_WINDOWS_X86_64_GNU=d471e3614733c1d4ddd61bfd19868356477d0d37bf531bf8c6cb64a7f579bd2a
+WGPU_SHA256_WINDOWS_AARCH64_MSVC=4a876421a8c1e5fe72f849b3722214280fe485cb1c56f77f8b0c82414be5b29f
+
 # LLVM, the AOT code generator linked into `nupp`: its optimizer, its AArch64,
 # X86 and WebAssembly back ends, and lld's Mach-O, ELF, COFF/MinGW and Wasm
 # linkers. Built from the release source (the digest Homebrew pins) by

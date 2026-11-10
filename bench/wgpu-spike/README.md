@@ -4,9 +4,10 @@ These benchmarks exercise Nupp's native GPU architecture end to end:
 
 1. An ordinary checked `@aot(target = "gpu")` function lowers to canonical
    SPIR-V.
-2. Its generated typed binding loads the Rust `nupp_native` provider.
-3. WGPU selects Metal, Vulkan, DX12, or GLES and owns the platform-specific
-   translation and device API.
+2. Its generated typed binding drives the Nupp GPU provider, which loads the
+   pinned wgpu-native library staged beside the program.
+3. wgpu-native selects Metal, Vulkan, DX12, or GLES and owns the
+   platform-specific translation and device API.
 4. Resident buffers are uploaded, dispatched, synchronized, and downloaded
    through `gpu`.
 
@@ -30,9 +31,11 @@ bench/wgpu-spike/run-tiled-gemm.sh
 ```
 
 The launchers build the typed benchmark target, select
-`build/typed/lib/nupp_native`, and run with the repository's Lua paths. WGPU
-uses the best native adapter it can discover. Set `NUPP_REQUIRE_GPU=1` when an
-adapterless environment must fail instead of skipping an optional Rust probe.
+`build/typed/lib/nupp_native`, and run with the repository's Lua paths; name
+wgpu-native with `NUPP_WGPU_LIBRARY` (`scripts/toolchain wgpu` prints it) when
+running a script outside `nupp`. wgpu-native uses the best native adapter it
+can discover. Set `NUPP_REQUIRE_GPU=1` when an adapterless environment must
+fail instead of skipping the optional device tests.
 
 `run-mojo-mandelbrot.sh` is a same-machine Mojo/MAX control and needs a Mojo
 installation:

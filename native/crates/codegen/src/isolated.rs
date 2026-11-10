@@ -3,7 +3,7 @@
 //! LLVM ends a process on an internal error (`report_fatal_error`, a failed
 //! assertion in legalization), and the process is the user's `nupp`. On POSIX
 //! each job therefore runs in a forked child: it compiles, writes the object
-//! and its report beside the object, and exits. A child that dies instead is
+//! and its timings beside the object, and exits. A child that dies instead is
 //! that one module's error, carrying what LLVM printed. Children run side by
 //! side, which is also what makes a build's units compile in parallel.
 //!
@@ -22,20 +22,29 @@ pub struct Job {
     pub options: CompileOptions,
 }
 
-#[cfg(unix)]
-fn report_path(job: &Job) -> PathBuf {
+/// A file beside the job's object, named by `extension`.
+fn sidecar(job: &Job, extension: &str) -> PathBuf {
     let mut path = job.object.clone().into_os_string();
-    path.push(".report");
+    path.push(".");
+    path.push(extension);
     PathBuf::from(path)
 }
 
-/// Compiles one job here, writing its object; answers the report.
+/// Compiles one job here, writing its object, and its optimized IR and
+/// assembly beside it as `.ll` and `.s` when they were asked for; answers the
+/// phase timings.
 fn run(job: &Job) -> Result<String, String> {
     let ir = std::fs::read_to_string(&job.ir).map_err(|e| format!("cannot read {}: {e}", job.ir.display()))?;
     let name = job.ir.to_string_lossy();
     let compiled = compile(&ir, &name, &job.options)?;
     std::fs::write(&job.object, &compiled.object).map_err(|e| format!("cannot write {}: {e}", job.object.display()))?;
-    Ok(compiled.report())
+    for (output, extension) in [(&compiled.optimized_ir, "ll"), (&compiled.assembly, "s")] {
+        if let Some(text) = output {
+            let path = sidecar(job, extension);
+            std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        }
+    }
+    Ok(compiled.timings.text())
 }
 
 #[cfg(unix)]
@@ -52,7 +61,7 @@ mod posix {
     pub const WNOHANG: c_int = 1;
 }
 
-/// Compiles every job, at most `width` at a time, answering each one's report
+/// Compiles every job, at most `width` at a time, answering each one's timings
 /// or error in job order.
 pub fn compile_files(jobs: &[Job], width: usize) -> Vec<Result<String, String>> {
     #[cfg(unix)]
@@ -82,7 +91,7 @@ fn forked(jobs: &[Job], width: usize) -> Vec<Result<String, String>> {
     while next < jobs.len() || !running.is_empty() {
         while next < jobs.len() && running.len() < width {
             let job = &jobs[next];
-            let _ = std::fs::remove_file(report_path(job));
+            let _ = std::fs::remove_file(sidecar(job, "report"));
             let errors = std::fs::File::create(stderr_path(job));
             let pid = unsafe { posix::fork() };
             if pid == 0 {
@@ -95,7 +104,7 @@ fn forked(jobs: &[Job], width: usize) -> Vec<Result<String, String>> {
                     Ok(report) => (0, report),
                     Err(error) => (1, error),
                 };
-                let _ = std::fs::write(report_path(job), text);
+                let _ = std::fs::write(sidecar(job, "report"), text);
                 unsafe { posix::_exit(code) };
             }
             if pid < 0 {
@@ -135,9 +144,9 @@ fn forked(jobs: &[Job], width: usize) -> Vec<Result<String, String>> {
         let pid = finished.unwrap_or_default();
         let Some(index) = running.remove(&pid) else { continue };
         let job = &jobs[index];
-        let report = std::fs::read_to_string(report_path(job)).unwrap_or_default();
+        let report = std::fs::read_to_string(sidecar(job, "report")).unwrap_or_default();
         let printed = std::fs::read_to_string(stderr_path(job)).unwrap_or_default();
-        let _ = std::fs::remove_file(report_path(job));
+        let _ = std::fs::remove_file(sidecar(job, "report"));
         let _ = std::fs::remove_file(stderr_path(job));
         if status == -1 {
             results[index] = Some(if report.is_empty() {

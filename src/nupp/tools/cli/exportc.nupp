@@ -1,6 +1,7 @@
 module nupp.tools.cli.exportc
 
--- `nupp export-c`: canonical C declarations for ordinary Nupp structs.
+-- `nupp export-c`: canonical C declarations for ordinary Nupp structs, and
+-- prototypes for the C functions a Nupp library imports or exports.
 
 local usageError = require("nupp.tools.cli.error").forCommand("export-c")
 local cliModule = require("io.cli")
@@ -29,6 +30,178 @@ local function walk(node: any, visit: function(any, any): nil, context: any)
     for _, child in ipairs(node) do
         walk(child, visit, context)
     end
+end
+
+-- The C type of each scalar IR value type an `@aot` entry passes or returns.
+-- Read from the lowered program rather than the source, so an `integer`
+-- crosses as whatever lowering made of it, which is what the entry takes.
+local ENTRY_VALUES: {
+    [string]: string
+} = {f64 = "number", f32 = "float", i32 = "int32", u32 = "uint32", i64 = "int64", u64 = "uint64", bool = "boolean",}
+
+-- The physical storage types a span element may name, which a span holds as
+-- written rather than as its value type.
+local SPAN_STORAGE: {
+    [string]: boolean
+} = {
+    number = true,
+    float = true,
+    int8 = true,
+    int16 = true,
+    int32 = true,
+    int64 = true,
+    uint8 = true,
+    uint16 = true,
+    uint32 = true,
+    uint64 = true,
+    boolean = true,
+}
+
+local function entryValue(typeName: any): any?
+    local tag = ENTRY_VALUES[tostring(typeName)]
+
+    return tag and {tag = tag} or nil
+end
+
+-- What one element of a span is stored as, by the same rule the code
+-- generator's `types.storage` uses: the source type when it names a storage
+-- type, the value type otherwise.
+local function spanElement(param: any): any?
+    if param.sourceType and SPAN_STORAGE[param.sourceType] then
+        return {tag = param.sourceType}
+    end
+
+    return entryValue(param.type)
+end
+
+-- A name for an entry parameter a C reader can follow. A SoA view's columns
+-- are lowered under private names, so each is spelled `<view>_<field>`.
+local function parameterName(param: any): string
+    if param.soa then
+        return param.soa.view .. "_" .. param.soa.field
+    end
+
+    return param.name
+end
+
+-- The C signature an `@aot(export = ...)` entry is published with, or nil and
+-- why it has none. Written from the lowered program, which is what the code
+-- generator lays the entry out from: span pointers and uniforms in parameter
+-- order, then the span counts as `size_t` (one per span when the counts are
+-- independent, one shared count otherwise), then a pointer to the struct
+-- several results are written to.
+local function exportedSignature(program: any): (any?, string?)
+    if program.executionTarget == "gpu" then
+        return nil, "it is a GPU entry"
+    end
+    if program.entryMode ~= "kernel" then
+        return nil, "its entry takes or returns Lua values"
+    end
+    local scalarIR = require("nupp.compiler.aot.scalar")
+    local params: {any} = {}
+    local taken: {[string]: boolean} = {}
+
+    local function add(name: string, t: any): nil
+        while taken[name] do
+            name = name .. "_"
+        end
+        taken[name] = true
+        params[#params + 1] = {name = name, type = t, mode = "plain"}
+    end
+
+    for _, param in ipairs(program.params) do
+        taken[parameterName(param)] = true
+    end
+    local spans: {any} = {}
+    for _, param in ipairs(program.params) do
+        local name = parameterName(param)
+        taken[name] = nil
+        if scalarIR.isSpan(param) then
+            local element = spanElement(param)
+            if not element then
+                return nil, ("span parameter %q does not hold numbers, booleans or fixed-width integers"):format(name)
+            end
+            if param.kind == "read_span" then
+                element = {tag = "const", inner = element}
+            end
+            add(name, {tag = "ptr", elem = element})
+            spans[#spans + 1] = param
+        elseif param.kind == "uniform" then
+            local t = entryValue(param.type)
+            if not t then
+                return nil, ("parameter %q is not a number, float, boolean or fixed-width integer"):format(name)
+            end
+            add(name, t)
+        else
+            return nil, ("parameter %q is not a span or a uniform"):format(name)
+        end
+    end
+    local size = {tag = "size_t"}
+    if scalarIR.independentCounts(program) then
+        for _, param in ipairs(spans) do
+            if param.soa == nil or param.soa.ordinal == 1 then
+                add("count_" .. (param.soa and param.soa.view or param.name), size)
+            end
+        end
+    else
+        add("count", size)
+    end
+    local results = program.resultTypes or {}
+    local result, resultStruct = nil, nil
+    if #results == 1 then
+        result = entryValue(results[1])
+        if not result then
+            return nil, "its result is not a number, float, boolean or fixed-width integer"
+        end
+    elseif #results > 1 then
+        local tag = tostring(program.exportName) .. "_result"
+        local fields: {any} = {}
+        for position, resultType in ipairs(results) do
+            local t = entryValue(resultType)
+            if not t then
+                return nil, ("result %d is not a number, float, boolean or fixed-width integer"):format(position)
+            end
+            fields[position] = {name = "r" .. tostring(position), type = t}
+        end
+        resultStruct = {tag = tag, fields = fields}
+        add("result", {tag = "ptr", elem = {tag = "nominal", declKind = "struct", cdefKind = "struct", cdefName = tag}})
+    end
+    local signature = require(
+        "nupp.compiler.cinterop.cabi"
+    ).functionRecord(tostring(program.exportName), params, result, false, "c")
+    signature.resultStruct = resultStruct
+
+    return signature, nil
+end
+
+-- The C signature of every `@aot(export = ...)` entry of one checked file, by
+-- C name, or nil and why the file's entries could not be lowered.
+local function exportedSignatures(
+    source: string,
+    path: string,
+    parsed: any
+): ({[string]: any}?, {[string]: string}?, string?)
+    local programs, problems = require("nupp.compiler.aot.compile").lower(source, path, parsed, nil)
+    if #problems > 0 then
+        local first = problems[1]
+        return nil, nil, (
+            "lowering refused it (%s:%d:%d: %s)"
+        ):format(first.file, first.line, first.column, first.message)
+    end
+    local signatures: {[string]: any} = {}
+    local refusals: {[string]: string} = {}
+    for _, program in ipairs(programs) do
+        if program.exportName ~= nil then
+            local signature, why = exportedSignature(program)
+            if signature then
+                signatures[program.exportName] = signature
+            else
+                refusals[program.exportName] = tostring(why)
+            end
+        end
+    end
+
+    return signatures, refusals, nil
 end
 
 local function diagnostic(path: string, node: any, code: string, message: string, help: string?): any
@@ -100,6 +273,9 @@ local function run(options: any): integer
     local checker = require("nupp.compiler.check")
     local allDiagnostics: {any} = {}
     local types, functions, sites = {}, {}, {}
+    -- Selection -> why that `@aot(export)` function has no C signature.
+    local unexportable: {[string]: string} = {}
+    local unexportableFiles: {[string]: string} = {}
 
     -- A struct type does not say which of its fields are bitfields, but the field's
     -- declaration does, and the checker names each field by that declaration's token.
@@ -111,6 +287,10 @@ local function run(options: any): integer
         if node.kind == "cdefFunc" and node.name and node.cAbiSignature then
             local qualified = (moduleName and moduleName .. "." or "") .. node.name.text
             functions[qualified], sites[qualified] = node.cAbiSignature, node
+        elseif node.kind == "localFuncStmt" and node.name and node.body and node.body.aotExport then
+            local qualified = (moduleName and moduleName .. "." or "") .. node.name.text
+            sites[qualified] = node
+            context.exports[#context.exports + 1] = {qualified = qualified, cName = node.body.aotExport}
         elseif node.kind == "fieldDecl" and node.name and node.bitWidth then
             bitfields[node.name] = node.bitWidth
             bitfieldFiles[node.name] = context.path
@@ -140,7 +320,28 @@ local function run(options: any): integer
                     local qualified = (moduleName and moduleName .. "." or "") .. name
                     types[qualified], sites[qualified] = t, exports.typeDefs[name]
                 end
-                walk(result.root, collectCdefFunction, {moduleName = moduleName, path = path})
+                local context = {moduleName = moduleName, path = path, exports = {}}
+                walk(result.root, collectCdefFunction, context)
+                -- An export's prototype is what lowering made of it, so a file
+                -- with any is lowered, once, after it checks cleanly.
+                local fatal = false
+                for _, one in ipairs(diagnostics) do
+                    fatal = fatal or require("nupp.compiler.diagnostics").isFatal(one)
+                end
+                if #context.exports > 0 and not fatal then
+                    local signatures, refusals, why = exportedSignatures(source as string, path, result)
+                    for _, entry in ipairs(context.exports) do
+                        local signature = signatures and signatures[entry.cName] or nil
+                        if signature then
+                            functions[entry.qualified] = signature
+                        else
+                            unexportable[entry.qualified] = refusals and refusals[entry.cName]
+                                or why
+                                or "lowering published no entry for it"
+                            unexportableFiles[entry.qualified] = path
+                        end
+                    end
+                end
             end
         end
     end
@@ -245,6 +446,17 @@ local function run(options: any): integer
             if t and t.tag == "nominal" and t.declKind == "struct" and not t.cdefName then
                 describe(t, cabi.identity(t))
             end
+        elseif unexportable[selection] then
+            allDiagnostics[
+                #allDiagnostics + 1
+            ] = diagnostic(
+                unexportableFiles[selection] as string,
+                sites[selection],
+                "NUPP2203",
+                ("cannot export %s to C: %s"):format(selection, unexportable[selection] as string),
+                "export a function whose parameters are scalars or spans of them, and whose results are scalars"
+            )
+            failed = true
         else
             allDiagnostics[
                 #allDiagnostics + 1
@@ -253,7 +465,7 @@ local function run(options: any): integer
                 nil,
                 "NUPP2101",
                 "selected C export does not exist: " .. selection,
-                "select a module-qualified exported struct or cdef function from the named sources"
+                "select a module-qualified exported struct, cdef function or @aot(export) function from the named sources"
             )
             failed = true
         end
@@ -299,11 +511,12 @@ local function run(options: any): integer
     return failed and 1 or 0
 end
 
---- Export canonical C declarations for Nupp structs.
+--- Export canonical C declarations for Nupp structs and C functions.
 ---
 --- Examples:
 ---
 ---     nupp export-c -o include/game.h src/game.nupp game.Position
+---     nupp export-c -o include/game.h src/game.nupp game.add
 ---     nupp export-c --target library -o include/library.h src/library.nupp library.Widget
 ---     nupp export-c --json -o include/game.h src/game.nupp game.Position
 @cli("export-c")

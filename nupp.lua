@@ -237,6 +237,22 @@ local RESOURCES = {
         output = "nupp/compiler/nupp/runtime/provider/nativepath.nupp"
     },
     {
+        source = "src/nupp/runtime/provider/nativefsposix.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativefsposix.nupp"
+    },
+    {
+        source = "src/nupp/runtime/provider/nativefswindows.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativefswindows.nupp"
+    },
+    {
+        source = "src/nupp/runtime/provider/nativefsglob.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativefsglob.nupp"
+    },
+    {
+        source = "src/nupp/runtime/provider/nativefslane.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativefslane.nupp"
+    },
+    {
         source = "src/nupp/runtime/provider/nativenet.nupp",
         output = "nupp/compiler/nupp/runtime/provider/nativenet.nupp"
     },
@@ -256,6 +272,15 @@ local RESOURCES = {
         source = "src/nupp/runtime/provider/nativegpu.nupp",
         output = "nupp/compiler/nupp/runtime/provider/nativegpu.nupp"
     },
+    {
+        source = "src/nupp/runtime/provider/gpudevice.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/gpudevice.nupp"
+    },
+    {
+        source = "src/nupp/runtime/provider/gpucosts.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/gpucosts.nupp"
+    },
+    {source = "src/nupp/runtime/provider/wgpu.nupp", output = "nupp/compiler/nupp/runtime/provider/wgpu.nupp"},
     {source = "src/nupp/runtime/bitops.nupp", output = "nupp/compiler/nupp/runtime/bitops.nupp"},
     {source = "src/nupp/gpu/api.nupp", output = "nupp/compiler/nupp/gpu/api.nupp"},
     {source = "src/nupp/gpu/types.nupp", output = "nupp/compiler/nupp/gpu/types.nupp"},
