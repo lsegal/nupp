@@ -216,6 +216,8 @@ nuppNativeWallMs
 nuppNativeSleepMs
 nuppNativePoll
 nuppNativeWait
+nuppNativeWakeOpen
+nuppNativeWakeClose
 nuppNativeAvailableParallelism
 nuppNativeRandomBytes
 nuppNativeXxh64Digest

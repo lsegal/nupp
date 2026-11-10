@@ -14,3 +14,9 @@ async = ["dep:tokio"]
 
 [dependencies]
 tokio = { version = "1", features = ["fs", "io-util", "net", "rt-multi-thread", "sync", "time"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }

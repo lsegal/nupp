@@ -1337,9 +1337,9 @@ local BLOCKING_WAIT_MS = 20
 -- Blocks in the platform until something in `interest` moves, then drives one pass.
 --
 -- Only ever reached with no handler installed. Nobody to yield to, so blocking here is
--- the whole point: `waitReady` sleeps on Rust-owned activity until a child or stream
--- moves, or the timeout passes, where spinning on a non-blocking poll would burn a
--- core to learn nothing.
+-- the whole point: `waitReady` sleeps in the kernel until a child or stream moves,
+-- another native family reports activity, or the timeout passes, where spinning on
+-- a non-blocking poll would burn a core to learn nothing.
 --
 -- Bounded rather than indefinite, because a deadline has to be reached even when the
 -- child never speaks again, and never overshooting it: a wait longer than what is left
