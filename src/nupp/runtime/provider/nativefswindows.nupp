@@ -1,0 +1,1041 @@
+@!internal
+
+--[[The Windows side of the native filesystem provider, through LuaJIT's FFI.
+
+Paths cross as UTF-8 and reach the wide-character Win32 functions as UTF-16;
+paths the system answers come back as UTF-8 with forward slashes. A path that is
+not valid UTF-8, or an answer that is not valid UTF-16, is refused rather than
+guessed at. Every failure answers the system's message for its error code
+followed by `(os error N)`, the spelling the former Rust provider gave.
+
+The declarations are renamed onto `nupp_fs_*` through `__asm__` labels, because
+other modules declare some of the same functions with their own prototypes and
+LuaJIT refuses a second, different declaration of one name.
+]]
+module nupp.runtime.provider.nativefswindows
+
+const ffi = require("ffi")
+
+local C: any = ffi.C
+
+ffi.cdef[[
+typedef struct {
+    uint32_t attributes;
+    uint64_t created; uint64_t accessed; uint64_t written;
+    uint32_t sizeHigh; uint32_t sizeLow;
+} __attribute__((packed)) nupp_fs_attributes;
+typedef struct {
+    uint32_t attributes;
+    uint32_t createdLow; uint32_t createdHigh;
+    uint32_t accessedLow; uint32_t accessedHigh;
+    uint32_t writtenLow; uint32_t writtenHigh;
+    uint32_t sizeHigh; uint32_t sizeLow;
+    uint32_t reserved0; uint32_t reserved1;
+    uint16_t name[260]; uint16_t alternate[14];
+    uint32_t fileType; uint32_t creatorType; uint16_t finderFlags;
+} nupp_fs_find;
+typedef struct {
+    uint32_t attributes;
+    uint32_t createdLow; uint32_t createdHigh;
+    uint32_t accessedLow; uint32_t accessedHigh;
+    uint32_t writtenLow; uint32_t writtenHigh;
+    uint32_t volume; uint32_t sizeHigh; uint32_t sizeLow;
+    uint32_t links; uint32_t indexHigh; uint32_t indexLow;
+} nupp_fs_handle_info;
+int32_t nupp_fs_utf16(uint32_t, uint32_t, const char *, int32_t, uint16_t *, int32_t)
+    __asm__("MultiByteToWideChar");
+int32_t nupp_fs_utf8(uint32_t, uint32_t, const uint16_t *, int32_t, char *, int32_t, void *, void *)
+    __asm__("WideCharToMultiByte");
+uint32_t nupp_fs_last_error(void) __asm__("GetLastError");
+uint32_t nupp_fs_format(uint32_t, const void *, uint32_t, uint32_t, uint16_t *, uint32_t, void *)
+    __asm__("FormatMessageW");
+int32_t nupp_fs_get_attributes(const uint16_t *, int32_t, nupp_fs_attributes *)
+    __asm__("GetFileAttributesExW");
+uint32_t nupp_fs_attributes_of(const uint16_t *) __asm__("GetFileAttributesW");
+int32_t nupp_fs_set_attributes(const uint16_t *, uint32_t) __asm__("SetFileAttributesW");
+void *nupp_fs_find_first(const uint16_t *, int32_t, nupp_fs_find *, int32_t, void *, uint32_t)
+    __asm__("FindFirstFileExW");
+int32_t nupp_fs_find_next(void *, nupp_fs_find *) __asm__("FindNextFileW");
+int32_t nupp_fs_find_close(void *) __asm__("FindClose");
+void *nupp_fs_create(const uint16_t *, uint32_t, uint32_t, void *, uint32_t, uint32_t, void *)
+    __asm__("CreateFileW");
+int32_t nupp_fs_close(void *) __asm__("CloseHandle");
+int32_t nupp_fs_handle_info(void *, nupp_fs_handle_info *) __asm__("GetFileInformationByHandle");
+int32_t nupp_fs_read(void *, void *, uint32_t, uint32_t *, void *) __asm__("ReadFile");
+int32_t nupp_fs_write(void *, const void *, uint32_t, uint32_t *, void *) __asm__("WriteFile");
+int32_t nupp_fs_seek(void *, int64_t, int64_t *, uint32_t) __asm__("SetFilePointerEx");
+int32_t nupp_fs_size(void *, int64_t *) __asm__("GetFileSizeEx");
+int32_t nupp_fs_sync(void *) __asm__("FlushFileBuffers");
+int32_t nupp_fs_control(void *, uint32_t, void *, uint32_t, void *, uint32_t, uint32_t *, void *)
+    __asm__("DeviceIoControl");
+uint8_t nupp_fs_symlink(const uint16_t *, const uint16_t *, uint32_t) __asm__("CreateSymbolicLinkW");
+int32_t nupp_fs_mkdir(const uint16_t *, void *) __asm__("CreateDirectoryW");
+int32_t nupp_fs_rmdir(const uint16_t *) __asm__("RemoveDirectoryW");
+int32_t nupp_fs_unlink(const uint16_t *) __asm__("DeleteFileW");
+int32_t nupp_fs_move(const uint16_t *, const uint16_t *, uint32_t) __asm__("MoveFileExW");
+uint32_t nupp_fs_cwd(uint32_t, uint16_t *) __asm__("GetCurrentDirectoryW");
+uint32_t nupp_fs_final_path(void *, uint16_t *, uint32_t, uint32_t) __asm__("GetFinalPathNameByHandleW");
+uint32_t nupp_fs_module_path(void *, uint16_t *, uint32_t) __asm__("GetModuleFileNameW");
+uint32_t nupp_fs_temp_path(uint32_t, uint16_t *) __asm__("GetTempPathW");
+int32_t nupp_fs_random(void *, uint8_t *, uint32_t, uint32_t) __asm__("BCryptGenRandom");
+]]
+
+local CP_UTF8 = 65001
+local MB_ERR_INVALID_CHARS = 0x8
+local WC_ERR_INVALID_CHARS = 0x80
+local FORMAT_MESSAGE_FROM_SYSTEM = 0x1000
+local FORMAT_MESSAGE_IGNORE_INSERTS = 0x200
+local INVALID_ATTRIBUTES = 0xFFFFFFFF
+local FILE_ATTRIBUTE_READONLY = 0x1
+local FILE_ATTRIBUTE_DIRECTORY = 0x10
+local FILE_ATTRIBUTE_NORMAL = 0x80
+local FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+local GENERIC_READ = 0x80000000
+local GENERIC_WRITE = 0x40000000
+local FILE_READ_ATTRIBUTES = 0x80
+-- What append mode asks for: the right to add at the end, without the right to
+-- write anywhere else.
+local FILE_APPEND_ACCESS = 0x120116
+local FILE_SHARE_ALL = 0x7
+local CREATE_NEW = 1
+local CREATE_ALWAYS = 2
+local OPEN_EXISTING = 3
+local OPEN_ALWAYS = 4
+local FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+local FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+local FSCTL_GET_REPARSE_POINT = 0x000900A8
+local IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+local IO_REPARSE_TAG_SYMLINK = 0xA000000C
+local SYMLINK_FLAG_RELATIVE = 1
+local MOVEFILE_REPLACE_EXISTING = 0x1
+local MOVEFILE_WRITE_THROUGH = 0x8
+local SYMBOLIC_LINK_FLAG_DIRECTORY = 0x1
+local SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 0x2
+local FIND_EX_INFO_BASIC = 1
+local FIND_FIRST_EX_LARGE_FETCH = 2
+local FILE_BEGIN = 0
+local FILE_CURRENT = 1
+local ERROR_FILE_NOT_FOUND = 2
+local ERROR_PATH_NOT_FOUND = 3
+local ERROR_ACCESS_DENIED = 5
+local ERROR_INVALID_DRIVE = 15
+local ERROR_NO_MORE_FILES = 18
+local ERROR_SHARING_VIOLATION = 32
+local ERROR_BAD_NETPATH = 53
+local ERROR_BAD_NET_NAME = 67
+local ERROR_FILE_EXISTS = 80
+local ERROR_INVALID_PARAMETER = 87
+local ERROR_ALREADY_EXISTS = 183
+local ERROR_DIRECTORY = 267
+local BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2
+-- 100-nanosecond intervals between 1601-01-01 and 1970-01-01.
+local EPOCH_OFFSET = 11644473600
+
+local FILE = 1
+local DIRECTORY = 2
+local SYMLINK = 4
+
+local INVALID_HANDLE: any = ffi.cast("void *", -1)
+
+local MAX_WALK_DEPTH = 512
+
+----------------------------------------------------------------------------
+-- Text and failures
+----------------------------------------------------------------------------
+
+--- The system's message for an error code, in the spelling Rust's `io::Error` used.
+local function described(code: integer): string
+    local buffer = ffi.new("uint16_t[512]")
+    local length = C.nupp_fs_format(
+        FORMAT_MESSAGE_FROM_SYSTEM + FORMAT_MESSAGE_IGNORE_INSERTS,
+        nil,
+        code,
+        0,
+        buffer,
+        512,
+        nil
+    ) as integer
+    local words = "Unknown error"
+    if length > 0 then
+        local size = C.nupp_fs_utf8(CP_UTF8, 0, buffer, length, nil, 0, nil, nil) as integer
+        if size > 0 then
+            local text = ffi.new("char[?]", size)
+            C.nupp_fs_utf8(CP_UTF8, 0, buffer, length, text, size, nil, nil)
+            words = (ffi.string(text, size):gsub("[\r\n]+$", ""))
+        end
+    end
+
+    return words .. " (os error " .. tostring(code) .. ")"
+end
+
+local function lastError(): integer
+    return C.nupp_fs_last_error() as integer
+end
+
+local function failure(): (nil, string, integer)
+    local code = lastError()
+
+    return nil, described(code), code
+end
+
+--- UTF-16 for a UTF-8 path, NUL-terminated, or why it cannot be one.
+local function wide(text: string, what: string): (any, string?)
+    if text:find("\0", 1, true) ~= nil then
+        return nil, what .. " contains an embedded NUL"
+    end
+    if text == "" then
+        return ffi.new("uint16_t[1]"), nil
+    end
+    local count = C.nupp_fs_utf16(CP_UTF8, MB_ERR_INVALID_CHARS, text, #text, nil, 0) as integer
+    if count == 0 then
+        return nil, what .. " is not valid UTF-8"
+    end
+    local buffer = ffi.new("uint16_t[?]", count + 1)
+    C.nupp_fs_utf16(CP_UTF8, MB_ERR_INVALID_CHARS, text, #text, buffer, count)
+
+    return buffer, nil
+end
+
+--- UTF-8 for `count` UTF-16 units, or nil when they are not valid UTF-16.
+local function narrow(units: any, count: integer): string?
+    if count == 0 then
+        return ""
+    end
+    local size = C.nupp_fs_utf8(CP_UTF8, WC_ERR_INVALID_CHARS, units, count, nil, 0, nil, nil) as integer
+    if size == 0 then
+        return nil
+    end
+    local text = ffi.new("char[?]", size)
+    C.nupp_fs_utf8(CP_UTF8, WC_ERR_INVALID_CHARS, units, count, text, size, nil, nil)
+
+    return ffi.string(text, size)
+end
+
+local function unitsLength(units: any, limit: integer): integer
+    local count = 0
+    while count < limit and units[count] ~= 0 do
+        count = count + 1
+    end
+
+    return count
+end
+
+-- A path the system answered, as the provider hands paths out.
+local function answered(units: any, count: integer): (string?, string?)
+    local text = narrow(units, count)
+    if text == nil then
+        return nil, "path result is not valid UTF-8"
+    end
+
+    return (text:gsub("\\", "/")), nil
+end
+
+local function seconds(low: integer, high: integer): number
+    return (high * 4294967296 + low) / 1e7 - EPOCH_OFFSET
+end
+
+local function notFound(code: integer): boolean
+    return code == ERROR_FILE_NOT_FOUND
+        or code == ERROR_PATH_NOT_FOUND
+        or code == ERROR_INVALID_DRIVE
+        or code == ERROR_BAD_NETPATH
+        or code == ERROR_BAD_NET_NAME
+end
+
+----------------------------------------------------------------------------
+-- Describing paths
+----------------------------------------------------------------------------
+
+local attributeBuffer: any = ffi.new("nupp_fs_attributes")
+local findBuffer: any = ffi.new("nupp_fs_find")
+local handleBuffer: any = ffi.new("nupp_fs_handle_info")
+
+-- A reparse point whose tag says it names another path is a link, as Rust and the
+-- shell both treat it: symbolic links and junctions alike.
+local function nameSurrogate(tag: integer): boolean
+    return bit.band(tag, 0x20000000) ~= 0
+end
+
+-- The reparse tag of a path that has one, read from its directory entry.
+local function reparseTag(path: any): integer?
+    local search = C.nupp_fs_find_first(path, FIND_EX_INFO_BASIC, findBuffer, 0, nil, 0)
+    if search == INVALID_HANDLE then
+        return nil
+    end
+    C.nupp_fs_find_close(search)
+
+    return tonumber(findBuffer.reserved0) as integer
+end
+
+local function openForInfo(path: any, follow: boolean): any
+    local flags = FILE_FLAG_BACKUP_SEMANTICS
+    if not follow then
+        flags = flags + FILE_FLAG_OPEN_REPARSE_POINT
+    end
+
+    return C.nupp_fs_create(path, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, nil, OPEN_EXISTING, flags, nil)
+end
+
+--- Describes a path: its kind, size, modification time in seconds since the epoch,
+--- and whether the platform refuses writes to it.
+export function info(path: string, follow: boolean): (integer?, integer?, number?, boolean?, string?)
+    local name, refused = wide(path, "path")
+    if name == nil then
+        return nil, nil, nil, nil, refused
+    end
+    if C.nupp_fs_get_attributes(name, 0, attributeBuffer) == 0 then
+        local _, reason = failure()
+        return nil, nil, nil, nil, reason
+    end
+    local attributes = tonumber(attributeBuffer.attributes) as integer
+    local reparse = bit.band(attributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0
+    if not reparse or not follow then
+        local kind = bit.band(attributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0 and DIRECTORY or FILE
+        if reparse then
+            local tag = reparseTag(name)
+            if tag ~= nil and nameSurrogate(tag) then
+                kind = SYMLINK
+            end
+        end
+        local written: integer = tonumber(attributeBuffer.written) as integer
+        local size = (tonumber(attributeBuffer.sizeHigh) as integer) * 4294967296
+            + (tonumber(attributeBuffer.sizeLow) as integer)
+
+        return kind, size, written / 1e7 - EPOCH_OFFSET, bit.band(attributes, FILE_ATTRIBUTE_READONLY) ~= 0, nil
+    end
+    -- A link followed: describe what the system opens through it.
+    local handle = openForInfo(name, true)
+    if handle == INVALID_HANDLE then
+        local _, reason = failure()
+        return nil, nil, nil, nil, reason
+    end
+    local got = C.nupp_fs_handle_info(handle, handleBuffer)
+    local code = lastError()
+    C.nupp_fs_close(handle)
+    if got == 0 then
+        return nil, nil, nil, nil, described(code)
+    end
+    local target = tonumber(handleBuffer.attributes) as integer
+
+    return bit.band(target, FILE_ATTRIBUTE_DIRECTORY) ~= 0 and DIRECTORY or FILE,
+        (tonumber(handleBuffer.sizeHigh) as integer) * 4294967296 + (tonumber(handleBuffer.sizeLow) as integer),
+        seconds(tonumber(handleBuffer.writtenLow) as integer, tonumber(handleBuffer.writtenHigh) as integer),
+        bit.band(target, FILE_ATTRIBUTE_READONLY) ~= 0,
+        nil
+end
+
+--- Whether a path resolves, following links: absence is `false`, and a lookup that
+--- cannot tell is a reason.
+export function exists(path: string): (boolean?, string?)
+    local name, refused = wide(path, "path")
+    if name == nil then
+        return nil, refused
+    end
+    local handle = openForInfo(name, true)
+    if handle ~= INVALID_HANDLE then
+        C.nupp_fs_close(handle)
+        return true, nil
+    end
+    local code = lastError()
+    if notFound(code) then
+        return false, nil
+    end
+    -- Something holds it open without sharing: it is there.
+    if code == ERROR_SHARING_VIOLATION then
+        return true, nil
+    end
+
+    return nil, described(code)
+end
+
+--- Whether a path is a directory, following links.
+export function isDirectory(path: string): boolean
+    local name = wide(path, "path")
+    if name == nil then
+        return false
+    end
+    local attributes = C.nupp_fs_attributes_of(name) as integer
+
+    return attributes ~= INVALID_ATTRIBUTES and bit.band(attributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0
+end
+
+--- Reads a link's target without resolving it.
+export function readLink(path: string): (string?, string?)
+    local name, refused = wide(path, "path")
+    if name == nil then
+        return nil, refused
+    end
+    local handle = openForInfo(name, false)
+    if handle == INVALID_HANDLE then
+        local _, reason = failure()
+        return nil, reason
+    end
+    local size = 16384
+    local buffer: any = ffi.new("uint8_t[?]", size)
+    local returned: any = ffi.new("uint32_t[1]")
+    local read = C.nupp_fs_control(handle, FSCTL_GET_REPARSE_POINT, nil, 0, buffer, size, returned, nil)
+    local code = lastError()
+    C.nupp_fs_close(handle)
+    if read == 0 then
+        return nil, described(code)
+    end
+    local header: any = ffi.cast("uint32_t *", buffer)
+    local tag = tonumber(header[0]) as integer
+    local fields: any = ffi.cast("uint16_t *", buffer + 8)
+    local pathBuffer: any
+    local relative = false
+    if tag == IO_REPARSE_TAG_SYMLINK then
+        relative = bit.band(tonumber(ffi.cast("uint32_t *", buffer + 16)[0]) as integer, SYMLINK_FLAG_RELATIVE) ~= 0
+        pathBuffer = buffer + 20
+    elseif tag == IO_REPARSE_TAG_MOUNT_POINT then
+        pathBuffer = buffer + 16
+    else
+        return nil, "Unsupported reparse point type"
+    end
+    local offset = tonumber(fields[0]) as integer
+    local length = tonumber(fields[1]) as integer
+    local units: any = ffi.cast("uint16_t *", pathBuffer + offset)
+    local target, problem = answered(units, length // 2)
+    if target == nil then
+        return nil, problem
+    end
+    local text = target as string
+    -- An absolute target carries the system's internal `\??\` prefix. Show the
+    -- path a user would write instead.
+    if not relative and text:sub(1, 4) == "/??/" then
+        local rest = text:sub(5)
+        if rest:sub(1, 4):upper() == "UNC/" then
+            text = "//" .. rest:sub(5)
+        elseif rest:match("^%a:") then
+            text = rest
+        else
+            text = "//?/" .. rest
+        end
+    end
+
+    return text, nil
+end
+
+--- Creates a symbolic link of the requested kind.
+export function createSymlink(target: string, link: string, directory: boolean): (boolean, string?)
+    -- A relative target is resolved by the system with backslashes only.
+    local to, refused = wide((target:gsub("/", "\\")), "symlink target")
+    if to == nil then
+        return false, refused
+    end
+    local at, refusedLink = wide(link, "symlink path")
+    if at == nil then
+        return false, refusedLink
+    end
+    local flags = directory and SYMBOLIC_LINK_FLAG_DIRECTORY or 0
+    if C.nupp_fs_symlink(at, to, flags + SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) ~= 0 then
+        return true, nil
+    end
+    -- Systems before developer mode existed refuse the flag that asks for it.
+    if lastError() == ERROR_INVALID_PARAMETER and C.nupp_fs_symlink(at, to, flags) ~= 0 then
+        return true, nil
+    end
+    local _, reason = failure()
+
+    return false, reason
+end
+
+--- Sets or clears the read-only attribute.
+export function setReadOnly(path: string, readOnly: boolean): (boolean, string?)
+    local name, refused = wide(path, "path")
+    if name == nil then
+        return false, refused
+    end
+    local attributes = C.nupp_fs_attributes_of(name) as integer
+    if attributes == INVALID_ATTRIBUTES then
+        local _, reason = failure()
+        return false, reason
+    end
+    local wanted = readOnly and bit.bor(attributes, FILE_ATTRIBUTE_READONLY)
+        or bit.band(attributes, bit.bnot(FILE_ATTRIBUTE_READONLY))
+    if wanted == 0 then
+        wanted = FILE_ATTRIBUTE_NORMAL
+    end
+    if C.nupp_fs_set_attributes(name, wanted) == 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+--- Creates one directory. Windows has no owner-only mode to ask for, so `private`
+--- changes nothing. The third answer says whether it failed because the name was
+--- taken or because a parent was missing.
+export function makeDirectory(path: string, _private: boolean): (boolean, string?, string?)
+    local name, refused = wide(path, "path")
+    if name == nil then
+        return false, refused, nil
+    end
+    if C.nupp_fs_mkdir(name, nil) ~= 0 then
+        return true, nil, nil
+    end
+    local _, reason, code = failure()
+    local why: string? = nil
+    if code == ERROR_ALREADY_EXISTS or code == ERROR_FILE_EXISTS then
+        why = "exists"
+    elseif code == ERROR_PATH_NOT_FOUND then
+        why = "missing"
+    end
+
+    return false, reason, why
+end
+
+--- Renames a path, replacing what the destination held.
+export function rename(from: string, to: string): (boolean, string?)
+    local source, refused = wide(from, "source path")
+    if source == nil then
+        return false, refused
+    end
+    local destination, refusedTo = wide(to, "destination path")
+    if destination == nil then
+        return false, refusedTo
+    end
+    if C.nupp_fs_move(source, destination, MOVEFILE_REPLACE_EXISTING + MOVEFILE_WRITE_THROUGH) == 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+----------------------------------------------------------------------------
+-- Directories
+----------------------------------------------------------------------------
+
+local function entryKind(entry: any): integer
+    local attributes = tonumber(entry.attributes) as integer
+    if bit.band(attributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0 and nameSurrogate(tonumber(entry.reserved0) as integer) then
+        return SYMLINK
+    end
+
+    return bit.band(attributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0 and DIRECTORY or FILE
+end
+
+local function closeSearch(box: any): nil
+    local search = box.search
+    if search ~= nil then
+        box.search = nil
+        C.nupp_fs_find_close(search)
+    end
+end
+
+ffi.cdef[[
+typedef struct { void *search; int32_t pending; nupp_fs_find entry; } nupp_fs_listing;
+]]
+
+local function pattern(path: string): string
+    local last = path:sub(-1)
+    if path == "" then
+        return "*"
+    end
+    if last == "/" or last == "\\" then
+        return path .. "*"
+    end
+
+    return path .. "\\*"
+end
+
+--- Opens a directory for reading its entries in turn.
+export function openDirectory(path: string): (any, string?)
+    local name, refused = wide(pattern(path), "path")
+    if name == nil then
+        return nil, refused
+    end
+    local box: any = ffi.new("nupp_fs_listing")
+    local search = C.nupp_fs_find_first(name, FIND_EX_INFO_BASIC, box.entry, 0, nil, FIND_FIRST_EX_LARGE_FETCH)
+    if search == INVALID_HANDLE then
+        local code = lastError()
+        -- Every directory lists at least `.`, so a search that finds nothing named
+        -- something that is not one.
+        if code == ERROR_FILE_NOT_FOUND then
+            code = ERROR_DIRECTORY
+        end
+        return nil, described(code)
+    end
+    box.search = search
+    box.pending = 1
+
+    return ffi.gc(box, closeSearch), nil
+end
+
+--- Answers the next entry's name and kind, skipping `.` and `..`; no name and no
+--- reason is the end.
+export function readDirectory(box: any): (string?, integer?, string?)
+    while true do
+        if box.search == nil then
+            return nil, nil, nil
+        end
+        if box.pending == 0 then
+            if C.nupp_fs_find_next(box.search, box.entry) == 0 then
+                local code = lastError()
+                closeSearch(box)
+                if code == ERROR_NO_MORE_FILES then
+                    return nil, nil, nil
+                end
+                return nil, nil, described(code)
+            end
+        end
+        box.pending = 0
+        local units = box.entry.name
+        local name = narrow(units, unitsLength(units, 260))
+        if name == nil then
+            return nil, nil, "directory entry name is not valid UTF-8"
+        end
+        if name ~= "." and name ~= ".." then
+            return name, entryKind(box.entry), nil
+        end
+    end
+end
+
+--- Closes a directory opened by `openDirectory`. Repeated calls do nothing.
+export function closeDirectory(box: any): nil
+    ffi.gc(box, nil)
+    closeSearch(box)
+end
+
+----------------------------------------------------------------------------
+-- Removing a tree
+----------------------------------------------------------------------------
+
+local function unlinkFile(name: any): integer?
+    if C.nupp_fs_unlink(name) ~= 0 then
+        return nil
+    end
+    local code = lastError()
+    if notFound(code) then
+        return nil
+    end
+    -- A read-only file refuses deletion until the attribute is cleared.
+    if code == ERROR_ACCESS_DENIED then
+        local attributes = C.nupp_fs_attributes_of(name) as integer
+        if attributes ~= INVALID_ATTRIBUTES and bit.band(attributes, FILE_ATTRIBUTE_READONLY) ~= 0 then
+            C.nupp_fs_set_attributes(name, bit.band(attributes, bit.bnot(FILE_ATTRIBUTE_READONLY)) + FILE_ATTRIBUTE_NORMAL)
+            if C.nupp_fs_unlink(name) ~= 0 then
+                return nil
+            end
+            return lastError()
+        end
+    end
+
+    return code
+end
+
+local function removeDirectory(name: any): integer?
+    if C.nupp_fs_rmdir(name) ~= 0 then
+        return nil
+    end
+    local code = lastError()
+    if notFound(code) then
+        return nil
+    end
+
+    return code
+end
+
+local emptyTree: function(path: string, depth: integer, root: string): string?
+
+-- A reparse point inside the tree is removed as the link it is, never entered, so
+-- the walk cannot leave the tree it was asked to remove.
+emptyTree = function(path: string, depth: integer, root: string): string?
+    if depth == 0 then
+        return root .. ": the directory tree is deeper than " .. tostring(MAX_WALK_DEPTH) .. " levels"
+    end
+    local listing, reason = openDirectory(path)
+    if listing == nil then
+        return reason
+    end
+    local entries: {any} = {}
+    while true do
+        local name, _, problem = readDirectory(listing)
+        if problem ~= nil then
+            closeDirectory(listing)
+            return problem
+        end
+        if name == nil then
+            break
+        end
+        local entry: any = listing.entry
+        entries[#entries + 1] = {name = name, attributes = tonumber(entry.attributes) as integer,}
+    end
+    closeDirectory(listing)
+    for _, entry in ipairs(entries) do
+        local child = path .. "\\" .. (entry.name as string)
+        local name = wide(child, "path")
+        local attributes = entry.attributes as integer
+        local isDirectoryEntry = bit.band(attributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0
+        local isReparse = bit.band(attributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0
+        local code: integer? = nil
+        if isDirectoryEntry and not isReparse then
+            local nested = emptyTree(child, depth - 1, root)
+            if nested ~= nil then
+                return nested
+            end
+            code = removeDirectory(name)
+        elseif isDirectoryEntry then
+            code = removeDirectory(name)
+        else
+            code = unlinkFile(name)
+        end
+        if code ~= nil then
+            return described(code)
+        end
+    end
+
+    return nil
+end
+
+--- Removes a file, a link, or a directory, with its contents when `recursive`.
+export function remove(path: string, recursive: boolean): (boolean, string?)
+    local name, refused = wide(path, "path")
+    if name == nil then
+        return false, refused
+    end
+    local attributes = C.nupp_fs_attributes_of(name) as integer
+    if attributes == INVALID_ATTRIBUTES then
+        local _, reason = failure()
+        return false, reason
+    end
+    local isDirectoryEntry = bit.band(attributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0
+    local isReparse = bit.band(attributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0
+    if not isDirectoryEntry then
+        if C.nupp_fs_unlink(name) == 0 then
+            local _, reason = failure()
+            return false, reason
+        end
+        return true, nil
+    end
+    if recursive and not isReparse then
+        local problem = emptyTree((path:gsub("/", "\\")), MAX_WALK_DEPTH, path)
+        if problem ~= nil then
+            return false, problem
+        end
+    end
+    if C.nupp_fs_rmdir(name) == 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+----------------------------------------------------------------------------
+-- Open files
+----------------------------------------------------------------------------
+
+local function closeHandle(box: any): nil
+    local handle = box[0]
+    if handle ~= nil then
+        box[0] = nil
+        C.nupp_fs_close(handle)
+    end
+end
+
+local function boxed(handle: any): any
+    local box: any = ffi.new("void *[1]")
+    box[0] = handle
+
+    return ffi.gc(box, closeHandle)
+end
+
+-- How each open mode opens: the access it asks for and what it does to a file that
+-- is, or is not, there.
+local OPEN_ACCESS = {
+    [0] = GENERIC_READ,
+    [1] = GENERIC_WRITE,
+    [2] = FILE_APPEND_ACCESS,
+    [3] = GENERIC_READ + GENERIC_WRITE,
+    [4] = GENERIC_READ + GENERIC_WRITE,
+    [5] = GENERIC_READ + FILE_APPEND_ACCESS,
+}
+local OPEN_DISPOSITION = {
+    [0] = OPEN_EXISTING,
+    [1] = CREATE_ALWAYS,
+    [2] = OPEN_ALWAYS,
+    [3] = OPEN_EXISTING,
+    [4] = CREATE_ALWAYS,
+    [5] = OPEN_ALWAYS,
+}
+
+local function openWith(path: string, access: integer, disposition: integer): (any, string?, boolean?)
+    local name, refused = wide(path, "path")
+    if name == nil then
+        return nil, refused, nil
+    end
+    local handle = C.nupp_fs_create(name, access, FILE_SHARE_ALL, nil, disposition, FILE_ATTRIBUTE_NORMAL, nil)
+    if handle == INVALID_HANDLE then
+        local _, reason, code = failure()
+        return nil, reason, code == ERROR_FILE_EXISTS or code == ERROR_ALREADY_EXISTS
+    end
+
+    return boxed(handle), nil, nil
+end
+
+--- Opens a file in one of the provider's numbered modes.
+export function openFile(path: string, selected: integer): (any, string?)
+    local file, reason = openWith(path, OPEN_ACCESS[selected] as integer, OPEN_DISPOSITION[selected] as integer)
+
+    return file, reason
+end
+
+--- Opens a file for reading.
+export function openReading(path: string): (any, string?)
+    local file, reason = openWith(path, GENERIC_READ, OPEN_EXISTING)
+
+    return file, reason
+end
+
+--- Creates a file that must not already exist. The third answer says whether the
+--- name was taken.
+export function createFile(path: string, _private: boolean): (any, string?, boolean?)
+    return openWith(path, GENERIC_WRITE, CREATE_NEW)
+end
+
+--- Creates or truncates a file for writing.
+export function replaceFile(path: string, _permissions: integer?): (any, string?)
+    local file, reason = openWith(path, GENERIC_WRITE, CREATE_ALWAYS)
+
+    return file, reason
+end
+
+local transferred: any = ffi.new("uint32_t[1]")
+local position: any = ffi.new("int64_t[1]")
+-- One call moves at most this much, below the 32-bit count the API takes.
+local MAX_CALL = 1073741824
+
+local function seekTo(file: any, offset: integer): boolean
+    return C.nupp_fs_seek(file[0], offset, nil, FILE_BEGIN) ~= 0
+end
+
+--- Reads up to `count` bytes at the handle's own position.
+export function streamRead(file: any, into: any, count: integer): (integer?, string?, boolean?)
+    if C.nupp_fs_read(file[0], into, math.min(count, MAX_CALL), transferred, nil) == 0 then
+        local code = lastError()
+        -- A pipe whose writer has gone reads as the end.
+        if code == 109 then
+            return 0, nil, nil
+        end
+        return nil, described(code), nil
+    end
+
+    return tonumber(transferred[0]) as integer, nil, nil
+end
+
+--- Reads up to `count` bytes at `offset`.
+export function fileRead(file: any, into: any, count: integer, offset: integer): (integer?, string?, boolean?)
+    if not seekTo(file, offset) then
+        local _, reason = failure()
+        return nil, reason, nil
+    end
+
+    return streamRead(file, into, count)
+end
+
+--- Writes up to `count` bytes at `offset`, or at the end when `offset` is nil.
+export function fileWrite(file: any, from: any, count: integer, offset: integer?): (integer?, string?)
+    if offset ~= nil and not seekTo(file, offset) then
+        local _, reason = failure()
+        return nil, reason
+    end
+    if C.nupp_fs_write(file[0], from, math.min(count, MAX_CALL), transferred, nil) == 0 then
+        local _, reason = failure()
+        return nil, reason
+    end
+
+    return tonumber(transferred[0]) as integer, nil
+end
+
+--- Where the handle's own position stands, which after an append is the end the
+--- write landed at.
+export function filePosition(file: any): (integer?, string?)
+    if C.nupp_fs_seek(file[0], 0, position, FILE_CURRENT) == 0 then
+        local _, reason = failure()
+        return nil, reason
+    end
+
+    return tonumber(position[0]) as integer, nil
+end
+
+--- The open file's byte length.
+export function fileSize(file: any): (integer?, string?)
+    if C.nupp_fs_size(file[0], position) == 0 then
+        local _, reason = failure()
+        return nil, reason
+    end
+
+    return tonumber(position[0]) as integer, nil
+end
+
+--- Pushes the file's contents to the device.
+export function fileSync(file: any): (boolean, string?)
+    if C.nupp_fs_sync(file[0]) == 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+--- Closes an open file. Repeated calls do nothing.
+export function fileClose(file: any): nil
+    ffi.gc(file, nil)
+    closeHandle(file)
+end
+
+--- Windows keeps no permission bits a replacement could copy.
+export function permissions(_path: string): integer?
+    return nil
+end
+
+--- Windows keeps no permission bits a replacement could copy.
+export function applyPermissions(_file: any, _bits: integer): (boolean, string?)
+    return true, nil
+end
+
+--- A rename on Windows is durable once `MoveFileExW` returns with write-through.
+export function syncDirectory(_path: string): (boolean, string?)
+    return true, nil
+end
+
+----------------------------------------------------------------------------
+-- Where things are
+----------------------------------------------------------------------------
+
+local function fetched(fill: function(size: integer, buffer: any): integer): (string?, string?)
+    local size = 512
+    while true do
+        local buffer = ffi.new("uint16_t[?]", size)
+        local count = fill(size, buffer)
+        if count == 0 then
+            local _, reason = failure()
+            return nil, reason
+        end
+        if count < size then
+            return answered(buffer, count)
+        end
+        size = count + 1
+    end
+end
+
+--- The working directory.
+export function currentDirectory(): (string?, string?)
+    return fetched(function(size: integer, buffer: any): integer
+        return C.nupp_fs_cwd(size, buffer) as integer
+    end)
+end
+
+--- A path with every link resolved and every `.` and `..` removed.
+export function canonicalize(path: string): (string?, string?)
+    local name, refused = wide(path, "path")
+    if name == nil then
+        return nil, refused
+    end
+    local handle = openForInfo(name, true)
+    if handle == INVALID_HANDLE then
+        local _, reason = failure()
+        return nil, reason
+    end
+    local resolved, reason = fetched(function(size: integer, buffer: any): integer
+        return C.nupp_fs_final_path(handle, buffer, size, 0) as integer
+    end)
+    C.nupp_fs_close(handle)
+    if resolved == nil then
+        return nil, reason
+    end
+    -- The system answers the verbatim form, `\\?\C:\...`, which is what Rust's
+    -- canonicalize answers too.
+
+    return resolved, nil
+end
+
+--- The running executable's path.
+export function executablePath(): (string?, string?)
+    local size = 512
+    while true do
+        local buffer = ffi.new("uint16_t[?]", size)
+        local count = C.nupp_fs_module_path(nil, buffer, size) as integer
+        if count == 0 then
+            local _, reason = failure()
+            return nil, reason
+        end
+        if count < size then
+            return answered(buffer, count)
+        end
+        size = size * 2
+    end
+end
+
+--- The directory temporaries go in by default.
+export function temporaryDirectory(): string
+    local directory = fetched(function(size: integer, buffer: any): integer
+        return C.nupp_fs_temp_path(size, buffer) as integer
+    end)
+    if directory == nil then
+        return "."
+    end
+
+    return ((directory as string):gsub("/$", ""))
+end
+
+local bcrypt: any = nil
+
+--- Bytes from the system's secure random source.
+export function randomBytes(count: integer): (string?, string?)
+    if bcrypt == nil then
+        local loaded, library = pcall(ffi.load, "bcrypt")
+        if not loaded then
+            return nil, tostring(library)
+        end
+        bcrypt = library
+    end
+    local buffer = ffi.new("uint8_t[?]", count)
+    local status = bcrypt.nupp_fs_random(nil, buffer, count, BCRYPT_USE_SYSTEM_PREFERRED_RNG) as integer
+    if status ~= 0 then
+        return nil, ("BCryptGenRandom failed with status 0x%08x"):format(bit.band(status, 0xFFFFFFFF))
+    end
+
+    return ffi.string(buffer, count), nil
+end
+
+--- The environment variable naming the home directory.
+export const HOME = "USERPROFILE"
+
+--- Whether a path is absolute: a drive root or a UNC path.
+export function isAbsolute(path: string): boolean
+    return path:match("^%a:[/\\]") ~= nil or path:match("^[/\\][/\\]") ~= nil
+end
+
+--- Whether a character separates path components.
+export function isSeparator(character: string): boolean
+    return character == "/" or character == "\\"
+end
+
+--- Joins a directory and a name with one separator.
+export function join(directory: string, name: string): string
+    local last = directory:sub(-1)
+    if directory == "" or last == "/" or last == "\\" then
+        return directory .. name
+    end
+
+    return directory .. "/" .. name
+end
+
+--- The directory holding a path; a bare name lives in the working directory.
+export function parent(path: string): string
+    local trimmed = path:gsub("[/\\]+$", "")
+    local at = trimmed:match("^.*()[/\\]")
+    if at == nil then
+        local drive = trimmed:match("^(%a:)")
+        return drive ~= nil and drive or "."
+    end
+    if at == 1 or (at == 3 and trimmed:match("^%a:")) then
+        return trimmed:sub(1, at as integer)
+    end
+
+    return trimmed:sub(1, (at as integer) - 1)
+end

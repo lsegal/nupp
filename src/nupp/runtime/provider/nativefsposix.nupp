@@ -1,0 +1,946 @@
+@!internal
+
+--[[The POSIX side of the native filesystem provider, through LuaJIT's FFI.
+
+Paths are the platform's own bytes, so a name that is not UTF-8 opens, lists
+and globs like any other. Every failure answers the C library's words for its
+`errno` followed by `(os error N)`, the spelling the former Rust provider gave,
+so callers classifying a reason by its text see what they always did.
+
+The C declarations are renamed onto `nupp_fs_*` through `__asm__` labels: other
+modules declare the same C functions with their own prototypes, and LuaJIT
+refuses a second, different declaration of one name. The structures that differ
+between systems -- `stat` and `dirent` -- are declared once for the running one.
+Intel macOS keeps its 32-bit-inode structures under the plain names, so there
+the 64-bit-inode entry points are reached by their `$INODE64` names.
+]]
+module nupp.runtime.provider.nativefsposix
+
+const ffi = require("ffi")
+
+local C: any = ffi.C
+local system: string = (ffi as any).os
+local arch: string = (ffi as any).arch
+local darwin = system == "OSX"
+local inode64 = darwin and arch == "x64"
+
+local function label(name: string, darwinName: string?): string
+    if inode64 and darwinName ~= nil then
+        return name .. darwinName
+    end
+
+    return name
+end
+
+local STAT: string
+local DIRENT: string
+local MODE: string
+if darwin then
+    MODE = "uint16_t"
+    STAT = [[
+typedef struct {
+    int32_t dev; uint16_t mode; uint16_t nlink; uint64_t ino;
+    uint32_t uid; uint32_t gid; int32_t rdev;
+    int64_t atime; int64_t atime_nsec; int64_t mtime; int64_t mtime_nsec;
+    int64_t ctime; int64_t ctime_nsec; int64_t birthtime; int64_t birthtime_nsec;
+    int64_t size; int64_t blocks; int32_t blksize; uint32_t flags; uint32_t gen;
+    int32_t lspare; int64_t qspare[2]; uint8_t slack[64];
+} nupp_fs_stat;
+]]
+    DIRENT = [[
+typedef struct {
+    uint64_t ino; uint64_t seekoff; uint16_t reclen; uint16_t namlen; uint8_t type;
+    char name[1024];
+} nupp_fs_dirent;
+]]
+elseif arch == "x64" then
+    MODE = "uint32_t"
+    STAT = [[
+typedef struct {
+    uint64_t dev; uint64_t ino; uint64_t nlink; uint32_t mode; uint32_t uid;
+    uint32_t gid; int32_t pad0; uint64_t rdev; int64_t size; int64_t blksize;
+    int64_t blocks; int64_t atime; int64_t atime_nsec; int64_t mtime;
+    int64_t mtime_nsec; int64_t ctime; int64_t ctime_nsec; int64_t reserved[3];
+    uint8_t slack[64];
+} nupp_fs_stat;
+]]
+    DIRENT = [[
+typedef struct {
+    uint64_t ino; int64_t off; uint16_t reclen; uint8_t type; char name[256];
+} nupp_fs_dirent;
+]]
+else
+    -- The generic layout every other 64-bit Linux architecture shares.
+    MODE = "uint32_t"
+    STAT = [[
+typedef struct {
+    uint64_t dev; uint64_t ino; uint32_t mode; uint32_t nlink; uint32_t uid;
+    uint32_t gid; uint64_t rdev; uint64_t pad1; int64_t size; int32_t blksize;
+    int32_t pad2; int64_t blocks; int64_t atime; int64_t atime_nsec; int64_t mtime;
+    int64_t mtime_nsec; int64_t ctime; int64_t ctime_nsec; uint32_t unused[2];
+    uint8_t slack[64];
+} nupp_fs_stat;
+]]
+    DIRENT = [[
+typedef struct {
+    uint64_t ino; int64_t off; uint16_t reclen; uint8_t type; char name[256];
+} nupp_fs_dirent;
+]]
+end
+
+ffi.cdef(STAT .. DIRENT .. ([[
+int nupp_fs_open(const char *, int, ...) __asm__("open");
+int nupp_fs_openat(int, const char *, int, ...) __asm__("openat");
+int nupp_fs_close(int) __asm__("close");
+int64_t nupp_fs_read(int, void *, size_t) __asm__("read");
+int64_t nupp_fs_write(int, const void *, size_t) __asm__("write");
+int64_t nupp_fs_pread(int, void *, size_t, int64_t) __asm__("pread");
+int64_t nupp_fs_pwrite(int, const void *, size_t, int64_t) __asm__("pwrite");
+int64_t nupp_fs_lseek(int, int64_t, int) __asm__("lseek");
+int nupp_fs_fsync(int) __asm__("fsync");
+int nupp_fs_fchmod(int, MODE) __asm__("fchmod");
+int nupp_fs_chmod(const char *, MODE) __asm__("chmod");
+int nupp_fs_mkdir(const char *, MODE) __asm__("mkdir");
+int nupp_fs_rmdir(const char *) __asm__("rmdir");
+int nupp_fs_unlink(const char *) __asm__("unlink");
+int nupp_fs_unlinkat(int, const char *, int) __asm__("unlinkat");
+int nupp_fs_rename(const char *, const char *) __asm__("rename");
+int nupp_fs_symlink(const char *, const char *) __asm__("symlink");
+int64_t nupp_fs_readlink(const char *, char *, size_t) __asm__("readlink");
+int nupp_fs_fstatat(int, const char *, nupp_fs_stat *, int) __asm__("FSTATAT");
+int nupp_fs_fstat(int, nupp_fs_stat *) __asm__("FSTAT");
+int nupp_fs_xstatat(int, int, const char *, nupp_fs_stat *, int) __asm__("__fxstatat");
+int nupp_fs_xstat(int, int, nupp_fs_stat *) __asm__("__fxstat");
+void *nupp_fs_opendir(const char *) __asm__("OPENDIR");
+void *nupp_fs_fdopendir(int) __asm__("FDOPENDIR");
+nupp_fs_dirent *nupp_fs_readdir(void *) __asm__("READDIR");
+int nupp_fs_closedir(void *) __asm__("closedir");
+int nupp_fs_dirfd(void *) __asm__("dirfd");
+int nupp_fs_dup(int) __asm__("dup");
+char *nupp_fs_getcwd(char *, size_t) __asm__("getcwd");
+char *nupp_fs_realpath(const char *, char *) __asm__("REALPATH");
+void nupp_fs_free(void *) __asm__("free");
+char *nupp_fs_strerror(int) __asm__("strerror");
+int nupp_fs_getentropy(void *, size_t) __asm__("getentropy");
+int nupp_fs_executable(char *, uint32_t *) __asm__("_NSGetExecutablePath");
+]]):gsub("MODE", MODE):gsub("FSTATAT", label("fstatat", "$INODE64")):gsub("FSTAT\"", label("fstat", "$INODE64") .. "\""):gsub(
+    "OPENDIR",
+    label("opendir", "$INODE64")
+):gsub("FDOPENDIR", label("fdopendir", "$INODE64")):gsub("READDIR", label("readdir", "$INODE64")):gsub(
+    "REALPATH",
+    label("realpath", "$DARWIN_EXTSN")
+))
+
+-- Each constant the two families number differently.
+local AT_FDCWD = darwin and -2 or -100
+local AT_SYMLINK_NOFOLLOW = darwin and 0x20 or 0x100
+local AT_REMOVEDIR = darwin and 0x80 or 0x200
+local O_RDONLY = 0
+local O_WRONLY = 1
+local O_RDWR = 2
+local O_CREAT = darwin and 0x200 or 0x40
+local O_EXCL = darwin and 0x800 or 0x80
+local O_TRUNC = darwin and 0x400 or 0x200
+local O_APPEND = darwin and 0x8 or 0x400
+local O_NONBLOCK = darwin and 0x4 or 0x800
+local O_CLOEXEC = darwin and 0x1000000 or 0x80000
+local O_DIRECTORY = darwin and 0x100000 or (arch == "x64" and 0x10000 or 0x4000)
+local O_NOFOLLOW = darwin and 0x100 or (arch == "x64" and 0x20000 or 0x8000)
+local SEEK_CUR = 1
+local EINTR = 4
+local ENOENT = 2
+local EEXIST = 17
+local ENOTDIR = 20
+local ERANGE = 34
+local EAGAIN = darwin and 35 or 11
+local ELOOP = darwin and 62 or 40
+local S_IFMT = 0xF000
+local S_IFDIR = 0x4000
+local S_IFREG = 0x8000
+local S_IFLNK = 0xA000
+local DT_UNKNOWN = 0
+local DT_DIR = 4
+local DT_REG = 8
+local DT_LNK = 10
+
+-- The kinds the provider numbers: a file, a directory, something else, a link.
+local FILE = 1
+local DIRECTORY = 2
+local OTHER = 3
+local SYMLINK = 4
+
+-- What a recursive remove and a glob refuse to descend past.
+local MAX_WALK_DEPTH = 512
+
+--- The platform's words for an `errno`, in the spelling Rust's `io::Error` used.
+local function described(code: integer): string
+    local text = C.nupp_fs_strerror(code)
+    local words = text ~= nil and ffi.string(text) or "Unknown error"
+
+    return words .. " (os error " .. tostring(code) .. ")"
+end
+
+local function failure(): (nil, string, integer)
+    local code = ffi.errno() as integer
+
+    return nil, described(code), code
+end
+
+-- A NUL ends a C string early, so a path carrying one would name a different file.
+local function checked(path: string, what: string): string?
+    if path:find("\0", 1, true) ~= nil then
+        return what .. " contains an embedded NUL"
+    end
+
+    return nil
+end
+
+local mode: function(value: integer): any = function(value: integer): any
+    return ffi.cast(MODE, value)
+end
+
+local statBuffer: any = ffi.new("nupp_fs_stat")
+
+-- glibc before 2.33 exports only the versioned `__fxstat*` entry points.
+local direct = pcall(function(): any
+    return C.nupp_fs_fstatat
+end)
+local STAT_VERSION = arch == "x64" and 1 or 0
+
+local function statAt(directory: integer, path: string, follow: boolean, into: any): integer
+    local flags = follow and 0 or AT_SYMLINK_NOFOLLOW
+    if direct then
+        return C.nupp_fs_fstatat(directory, path, into, flags)
+    end
+
+    return C.nupp_fs_xstatat(STAT_VERSION, directory, path, into, flags)
+end
+
+local function statDescriptor(descriptor: integer, into: any): integer
+    if direct then
+        return C.nupp_fs_fstat(descriptor, into)
+    end
+
+    return C.nupp_fs_xstat(STAT_VERSION, descriptor, into)
+end
+
+local function kindOf(bits: integer): integer
+    local format = bit.band(bits, S_IFMT)
+    if format == S_IFLNK then
+        return SYMLINK
+    elseif format == S_IFREG then
+        return FILE
+    elseif format == S_IFDIR then
+        return DIRECTORY
+    end
+
+    return OTHER
+end
+
+--- Describes a path: its kind, size, modification time in seconds since the epoch,
+--- and whether no one may write it.
+export function info(path: string, follow: boolean): (integer?, integer?, number?, boolean?, string?)
+    local refused = checked(path, "path")
+    if refused ~= nil then
+        return nil, nil, nil, nil, refused
+    end
+    if statAt(AT_FDCWD, path, follow, statBuffer) ~= 0 then
+        local _, reason = failure()
+        return nil, nil, nil, nil, reason
+    end
+    local bits = tonumber(statBuffer.mode) as integer
+    local modified = (tonumber(statBuffer.mtime) as number) + (tonumber(statBuffer.mtime_nsec) as number) / 1e9
+
+    return kindOf(bits), tonumber(statBuffer.size) as integer, modified, bit.band(bits, 146) == 0, nil
+end
+
+--- Whether a path resolves, following links: absence is `false`, and a lookup that
+--- cannot tell is a reason.
+export function exists(path: string): (boolean?, string?)
+    local refused = checked(path, "path")
+    if refused ~= nil then
+        return nil, refused
+    end
+    if statAt(AT_FDCWD, path, true, statBuffer) == 0 then
+        return true, nil
+    end
+    local _, reason, code = failure()
+    if code == ENOENT or code == ENOTDIR then
+        return false, nil
+    end
+
+    return nil, reason
+end
+
+--- Whether a path is a directory, following links.
+export function isDirectory(path: string): boolean
+    return checked(path, "path") == nil
+        and statAt(AT_FDCWD, path, true, statBuffer) == 0
+        and bit.band(tonumber(statBuffer.mode) as integer, S_IFMT) == S_IFDIR
+end
+
+--- Reads a link's target without resolving it.
+export function readLink(path: string): (string?, string?)
+    local refused = checked(path, "path")
+    if refused ~= nil then
+        return nil, refused
+    end
+    local size = 256
+    while true do
+        local buffer = ffi.new("char[?]", size)
+        local count = tonumber(C.nupp_fs_readlink(path, buffer, size)) as integer
+        if count < 0 then
+            local _, reason = failure()
+            return nil, reason
+        end
+        if count < size then
+            return ffi.string(buffer, count), nil
+        end
+        size = size * 2
+    end
+end
+
+--- Creates a symbolic link. Only Windows tells file links from directory links.
+export function createSymlink(target: string, link: string, _directory: boolean): (boolean, string?)
+    local refused = checked(target, "symlink target") or checked(link, "symlink path")
+    if refused ~= nil then
+        return false, refused
+    end
+    if C.nupp_fs_symlink(target, link) ~= 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+--- Sets or clears every write permission bit.
+export function setReadOnly(path: string, readOnly: boolean): (boolean, string?)
+    local refused = checked(path, "path")
+    if refused ~= nil then
+        return false, refused
+    end
+    if statAt(AT_FDCWD, path, true, statBuffer) ~= 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+    local bits = bit.band(tonumber(statBuffer.mode) as integer, 4095)
+    local wanted = readOnly and bit.band(bits, bit.bnot(146)) or bit.bor(bits, 146)
+    if C.nupp_fs_chmod(path, mode(wanted)) ~= 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+--- Creates one directory, private to its owner when asked. The third answer says
+--- whether it failed because the name was taken or because a parent was missing.
+export function makeDirectory(path: string, private: boolean): (boolean, string?, string?)
+    local refused = checked(path, "path")
+    if refused ~= nil then
+        return false, refused, nil
+    end
+    if C.nupp_fs_mkdir(path, mode(private and 448 or 511)) == 0 then
+        return true, nil, nil
+    end
+    local _, reason, code = failure()
+
+    return false, reason, code == EEXIST and "exists" or (code == ENOENT and "missing" or nil)
+end
+
+--- Renames a path, replacing what the destination held.
+export function rename(from: string, to: string): (boolean, string?)
+    local refused = checked(from, "source path") or checked(to, "destination path")
+    if refused ~= nil then
+        return false, refused
+    end
+    if C.nupp_fs_rename(from, to) ~= 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+----------------------------------------------------------------------------
+-- Directories
+----------------------------------------------------------------------------
+
+local function closeStream(box: any): nil
+    if box[0] ~= nil then
+        C.nupp_fs_closedir(box[0])
+        box[0] = nil
+    end
+end
+
+--- Opens a directory for reading its entries in turn.
+export function openDirectory(path: string): (any, string?)
+    local refused = checked(path, "path")
+    if refused ~= nil then
+        return nil, refused
+    end
+    local stream = C.nupp_fs_opendir(path)
+    if stream == nil then
+        local _, reason = failure()
+        return nil, reason
+    end
+    local box: any = ffi.new("void *[1]")
+    box[0] = stream
+
+    return ffi.gc(box, closeStream), nil
+end
+
+--- Answers the next entry's name and kind, skipping `.` and `..`; no name and no
+--- reason is the end. A kind the directory does not record is looked up without
+--- following a link.
+export function readDirectory(box: any): (string?, integer?, string?)
+    local stream = box[0]
+    if stream == nil then
+        return nil, nil, nil
+    end
+    while true do
+        ffi.errno(0)
+        local entry = C.nupp_fs_readdir(stream)
+        if entry == nil then
+            local code = ffi.errno() as integer
+            if code ~= 0 then
+                return nil, nil, described(code)
+            end
+
+            return nil, nil, nil
+        end
+        local name = ffi.string(entry.name)
+        if name ~= "." and name ~= ".." then
+            local recorded = entry.type as integer
+            local kind: integer
+            if recorded == DT_DIR then
+                kind = DIRECTORY
+            elseif recorded == DT_REG then
+                kind = FILE
+            elseif recorded == DT_LNK then
+                kind = SYMLINK
+            elseif recorded == DT_UNKNOWN then
+                if statAt(C.nupp_fs_dirfd(stream), name, false, statBuffer) ~= 0 then
+                    return nil, nil, described(ffi.errno() as integer)
+                end
+                kind = kindOf(tonumber(statBuffer.mode) as integer)
+            else
+                kind = OTHER
+            end
+
+            return name, kind, nil
+        end
+    end
+end
+
+--- Closes a directory opened by `openDirectory`. Repeated calls do nothing.
+export function closeDirectory(box: any): nil
+    ffi.gc(box, nil)
+    closeStream(box)
+end
+
+----------------------------------------------------------------------------
+-- Removing a tree
+----------------------------------------------------------------------------
+
+local function openDirectoryAt(parent: integer, name: string): (integer?, integer?)
+    local flags = O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC
+    local descriptor = C.nupp_fs_openat(parent, name, ffi.new("int32_t", flags)) as integer
+    if descriptor < 0 then
+        return nil, ffi.errno() as integer
+    end
+
+    return descriptor, nil
+end
+
+local function notADirectory(code: integer): boolean
+    return code == ELOOP or code == ENOTDIR
+end
+
+local function unlinkAt(parent: integer, name: string, flags: integer): integer?
+    if C.nupp_fs_unlinkat(parent, name, flags) == 0 then
+        return nil
+    end
+    local code = ffi.errno() as integer
+    -- Somebody else removed it first; the goal is met either way.
+    if code == ENOENT then
+        return nil
+    end
+
+    return code
+end
+
+-- The entries are read in full before any is removed, so the removal never races
+-- the directory stream's own position. The stream gets a duplicate descriptor
+-- because closing it closes what it was given.
+local function entriesAt(directory: integer): ({any}?, integer?)
+    local duplicate = C.nupp_fs_dup(directory) as integer
+    if duplicate < 0 then
+        return nil, ffi.errno() as integer
+    end
+    local stream = C.nupp_fs_fdopendir(duplicate)
+    if stream == nil then
+        local code = ffi.errno() as integer
+        C.nupp_fs_close(duplicate)
+        return nil, code
+    end
+    local names: {any} = {}
+    local problem: integer? = nil
+    while true do
+        ffi.errno(0)
+        local entry = C.nupp_fs_readdir(stream)
+        if entry == nil then
+            local code = ffi.errno() as integer
+            if code ~= 0 then
+                problem = code
+            end
+            break
+        end
+        local name = ffi.string(entry.name)
+        if name ~= "." and name ~= ".." then
+            local recorded = entry.type as integer
+            local directoryFlag: boolean? = nil
+            if recorded == DT_DIR then
+                directoryFlag = true
+            elseif recorded ~= DT_UNKNOWN then
+                directoryFlag = false
+            end
+            names[#names + 1] = {name = name, directory = directoryFlag,}
+        end
+    end
+    C.nupp_fs_closedir(stream)
+    if problem ~= nil then
+        return nil, problem
+    end
+
+    return names, nil
+end
+
+-- Called between deciding an entry is a directory and descending into it, the
+-- window a concurrent swap exploits; tests install one to perform that swap.
+local beforeDescend: (function(string))? = nil
+
+--- Installs the hook a test uses to swap a directory mid-walk, or removes it.
+export function setBeforeDescend(hook: (function(string))?): nil
+    beforeDescend = hook
+end
+
+local emptyDirectory: function(directory: integer, depth: integer, root: string): string?
+
+emptyDirectory = function(directory: integer, depth: integer, root: string): string?
+    if depth == 0 then
+        return root .. ": the directory tree is deeper than " .. tostring(MAX_WALK_DEPTH) .. " levels"
+    end
+    local entries, problem = entriesAt(directory)
+    if entries == nil then
+        return described(problem as integer)
+    end
+    for _, entry in ipairs(entries) do
+        local name = entry.name as string
+        local isDirectoryEntry = entry.directory as boolean?
+        local skip = false
+        if isDirectoryEntry == nil then
+            if statAt(directory, name, false, statBuffer) == 0 then
+                isDirectoryEntry = bit.band(tonumber(statBuffer.mode) as integer, S_IFMT) == S_IFDIR
+            else
+                local code = ffi.errno() as integer
+                if code ~= ENOENT then
+                    return described(code)
+                end
+                skip = true
+            end
+        end
+        if not skip then
+            if not isDirectoryEntry then
+                local code = unlinkAt(directory, name, 0)
+                if code ~= nil then
+                    return described(code)
+                end
+            else
+                local hook = beforeDescend
+                if hook ~= nil then
+                    hook(name)
+                end
+                local child, code = openDirectoryAt(directory, name)
+                if child ~= nil then
+                    local nested = emptyDirectory(child, depth - 1, root)
+                    C.nupp_fs_close(child)
+                    if nested ~= nil then
+                        return nested
+                    end
+                    local removed = unlinkAt(directory, name, AT_REMOVEDIR)
+                    if removed ~= nil then
+                        return described(removed)
+                    end
+                elseif notADirectory(code as integer) then
+                    -- Swapped for something that is not a directory since it was
+                    -- examined: it is removed as whatever it now is.
+                    local removed = unlinkAt(directory, name, 0)
+                    if removed ~= nil then
+                        return described(removed)
+                    end
+                elseif code ~= ENOENT then
+                    return described(code as integer)
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+--- Removes a file, a link, or a directory. A recursive remove walks by descriptor:
+--- every directory below the root is opened relative to its parent without
+--- following a link, and every entry is unlinked relative to it, so a directory
+--- swapped for a link while the walk runs is removed as the link it now is.
+export function remove(path: string, recursive: boolean): (boolean, string?)
+    local refused = checked(path, "path")
+    if refused ~= nil then
+        return false, refused
+    end
+    if statAt(AT_FDCWD, path, false, statBuffer) ~= 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+    if bit.band(tonumber(statBuffer.mode) as integer, S_IFMT) ~= S_IFDIR then
+        if C.nupp_fs_unlink(path) ~= 0 then
+            local _, reason = failure()
+            return false, reason
+        end
+        return true, nil
+    end
+    if recursive then
+        local directory, code = openDirectoryAt(AT_FDCWD, path)
+        if directory ~= nil then
+            local problem = emptyDirectory(directory, MAX_WALK_DEPTH, path)
+            C.nupp_fs_close(directory)
+            if problem ~= nil then
+                return false, problem
+            end
+        elseif notADirectory(code as integer) then
+            if C.nupp_fs_unlink(path) ~= 0 then
+                local _, reason = failure()
+                return false, reason
+            end
+            return true, nil
+        else
+            return false, described(code as integer)
+        end
+    end
+    if C.nupp_fs_rmdir(path) ~= 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+----------------------------------------------------------------------------
+-- Open files
+----------------------------------------------------------------------------
+
+local function closeDescriptor(box: any): nil
+    local descriptor = box[0] as integer
+    if descriptor >= 0 then
+        box[0] = -1
+        C.nupp_fs_close(descriptor)
+    end
+end
+
+local function boxed(descriptor: integer): any
+    local box: any = ffi.new("int32_t[1]")
+    box[0] = descriptor
+
+    return ffi.gc(box, closeDescriptor)
+end
+
+-- How each open mode opens: read, write, append, and the three update modes.
+local OPEN_FLAGS = {
+    [0] = O_RDONLY,
+    [1] = O_WRONLY + O_CREAT + O_TRUNC,
+    [2] = O_WRONLY + O_APPEND + O_CREAT,
+    [3] = O_RDWR,
+    [4] = O_RDWR + O_CREAT + O_TRUNC,
+    [5] = O_RDWR + O_APPEND + O_CREAT,
+}
+
+local function openWith(path: string, flags: integer, permissions: integer): (any, string?, boolean?)
+    local refused = checked(path, "path")
+    if refused ~= nil then
+        return nil, refused, nil
+    end
+    while true do
+        local descriptor = C.nupp_fs_open(path, flags + O_CLOEXEC, ffi.new("int32_t", permissions)) as integer
+        if descriptor >= 0 then
+            return boxed(descriptor), nil, nil
+        end
+        local code = ffi.errno() as integer
+        if code ~= EINTR then
+            return nil, described(code), code == EEXIST
+        end
+    end
+end
+
+--- Opens a file in one of the provider's numbered modes.
+export function openFile(path: string, selected: integer): (any, string?)
+    local file, reason = openWith(path, OPEN_FLAGS[selected] as integer, 438)
+
+    return file, reason
+end
+
+--- Opens a file for reading without blocking on a FIFO that has no writer.
+export function openReading(path: string): (any, string?)
+    local file, reason = openWith(path, O_RDONLY + O_NONBLOCK, 0)
+
+    return file, reason
+end
+
+--- Creates a file that must not already exist, private to its owner when asked.
+--- The third answer says whether the name was taken.
+export function createFile(path: string, private: boolean): (any, string?, boolean?)
+    return openWith(path, O_WRONLY + O_CREAT + O_EXCL, private and 384 or 438)
+end
+
+--- Creates or truncates a file for writing, with the given permission bits.
+export function replaceFile(path: string, permissions: integer?): (any, string?)
+    local file, reason = openWith(path, O_WRONLY + O_CREAT + O_TRUNC, permissions or 438)
+
+    return file, reason
+end
+
+--- Reads up to `count` bytes at `offset`. A read that would block answers zero
+--- bytes and `true`.
+export function fileRead(file: any, into: any, count: integer, offset: integer): (integer?, string?, boolean?)
+    while true do
+        local got = tonumber(C.nupp_fs_pread(file[0], into, count, offset)) as integer
+        if got >= 0 then
+            return got, nil, nil
+        end
+        local code = ffi.errno() as integer
+        if code == EAGAIN then
+            return 0, nil, true
+        end
+        if code ~= EINTR then
+            return nil, described(code), nil
+        end
+    end
+end
+
+--- Reads up to `count` bytes at the descriptor's own position, for streams that
+--- have no offsets. A read that would block answers zero bytes and `true`.
+export function streamRead(file: any, into: any, count: integer): (integer?, string?, boolean?)
+    while true do
+        local got = tonumber(C.nupp_fs_read(file[0], into, count)) as integer
+        if got >= 0 then
+            return got, nil, nil
+        end
+        local code = ffi.errno() as integer
+        if code == EAGAIN then
+            return 0, nil, true
+        end
+        if code ~= EINTR then
+            return nil, described(code), nil
+        end
+    end
+end
+
+--- Writes up to `count` bytes at `offset`, or at the end when `offset` is nil.
+export function fileWrite(file: any, from: any, count: integer, offset: integer?): (integer?, string?)
+    while true do
+        local wrote: integer
+        if offset == nil then
+            wrote = tonumber(C.nupp_fs_write(file[0], from, count)) as integer
+        else
+            wrote = tonumber(C.nupp_fs_pwrite(file[0], from, count, offset)) as integer
+        end
+        if wrote >= 0 then
+            return wrote, nil
+        end
+        local code = ffi.errno() as integer
+        if code ~= EINTR then
+            return nil, described(code)
+        end
+    end
+end
+
+--- Where the descriptor's own position stands, which after an append is the end
+--- the write landed at.
+export function filePosition(file: any): (integer?, string?)
+    local at = tonumber(C.nupp_fs_lseek(file[0], 0, SEEK_CUR)) as integer
+    if at < 0 then
+        local _, reason = failure()
+        return nil, reason
+    end
+
+    return at, nil
+end
+
+--- The open file's byte length.
+export function fileSize(file: any): (integer?, string?)
+    if statDescriptor(file[0], statBuffer) ~= 0 then
+        local _, reason = failure()
+        return nil, reason
+    end
+
+    return tonumber(statBuffer.size) as integer, nil
+end
+
+--- Pushes the file's contents to the device.
+export function fileSync(file: any): (boolean, string?)
+    if C.nupp_fs_fsync(file[0]) ~= 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+--- Closes an open file. Repeated calls do nothing.
+export function fileClose(file: any): nil
+    ffi.gc(file, nil)
+    closeDescriptor(file)
+end
+
+--- A path's permission bits, to give a replacement the same ones.
+export function permissions(path: string): integer?
+    if checked(path, "path") ~= nil or statAt(AT_FDCWD, path, true, statBuffer) ~= 0 then
+        return nil
+    end
+
+    return bit.band(tonumber(statBuffer.mode) as integer, 4095)
+end
+
+--- Gives an open file the permission bits `permissions` read.
+export function applyPermissions(file: any, bits: integer): (boolean, string?)
+    if C.nupp_fs_fchmod(file[0], mode(bits)) ~= 0 then
+        local _, reason = failure()
+        return false, reason
+    end
+
+    return true, nil
+end
+
+--- Pushes a directory's entries to the device, so a rename into it survives a
+--- crash.
+export function syncDirectory(path: string): (boolean, string?)
+    local directory, reason = openWith(path, O_RDONLY, 0)
+    if directory == nil then
+        return false, reason
+    end
+    local synced, problem = fileSync(directory)
+    fileClose(directory)
+
+    return synced, problem
+end
+
+----------------------------------------------------------------------------
+-- Where things are
+----------------------------------------------------------------------------
+
+--- The working directory.
+export function currentDirectory(): (string?, string?)
+    local size = 512
+    while true do
+        local buffer = ffi.new("char[?]", size)
+        if C.nupp_fs_getcwd(buffer, size) ~= nil then
+            return ffi.string(buffer), nil
+        end
+        local code = ffi.errno() as integer
+        if code ~= ERANGE then
+            return nil, described(code)
+        end
+        size = size * 2
+    end
+end
+
+--- A path with every link resolved and every `.` and `..` removed.
+export function canonicalize(path: string): (string?, string?)
+    local refused = checked(path, "path")
+    if refused ~= nil then
+        return nil, refused
+    end
+    local resolved = C.nupp_fs_realpath(path, nil)
+    if resolved == nil then
+        local _, reason = failure()
+        return nil, reason
+    end
+    local answer = ffi.string(resolved)
+    C.nupp_fs_free(resolved)
+
+    return answer, nil
+end
+
+--- The running executable's path.
+export function executablePath(): (string?, string?)
+    if darwin then
+        local size: any = ffi.new("uint32_t[1]", 1024)
+        local buffer = ffi.new("char[?]", 1024)
+        if C.nupp_fs_executable(buffer, size) ~= 0 then
+            buffer = ffi.new("char[?]", size[0])
+            if C.nupp_fs_executable(buffer, size) ~= 0 then
+                return nil, "the executable path is unavailable"
+            end
+        end
+        return ffi.string(buffer), nil
+    end
+
+    return readLink("/proc/self/exe")
+end
+
+--- The directory temporaries go in by default.
+export function temporaryDirectory(): string
+    local configured = os.getenv("TMPDIR")
+    if configured ~= nil and configured ~= "" then
+        return configured
+    end
+
+    return "/tmp"
+end
+
+--- Bytes from the system's secure random source.
+export function randomBytes(count: integer): (string?, string?)
+    local buffer = ffi.new("uint8_t[?]", count)
+    if C.nupp_fs_getentropy(buffer, count) ~= 0 then
+        local _, reason = failure()
+        return nil, reason
+    end
+
+    return ffi.string(buffer, count), nil
+end
+
+--- The environment variable naming the home directory.
+export const HOME = "HOME"
+
+--- Whether a path is absolute.
+export function isAbsolute(path: string): boolean
+    return path:sub(1, 1) == "/"
+end
+
+--- Whether a character separates path components.
+export function isSeparator(character: string): boolean
+    return character == "/"
+end
+
+--- Joins a directory and a name with one separator.
+export function join(directory: string, name: string): string
+    if directory == "" or directory:sub(-1) == "/" then
+        return directory .. name
+    end
+
+    return directory .. "/" .. name
+end
+
+--- The directory holding a path; a bare name lives in the working directory.
+export function parent(path: string): string
+    local trimmed = path:gsub("/+$", "")
+    local at = trimmed:match("^.*()/")
+    if at == nil then
+        return "."
+    end
+    if at == 1 then
+        return "/"
+    end
+
+    return trimmed:sub(1, (at as integer) - 1)
+end
