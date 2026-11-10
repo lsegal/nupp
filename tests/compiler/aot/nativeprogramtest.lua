@@ -341,6 +341,48 @@ end
     test.eq(ran, tostring(w):match("^-?%d+") .. " " .. tostring(u):match("^%d+"))
 end
 
+-- A compound arithmetic assignment on an `int64` or `uint64` local keeps all 64
+-- bits, as the binary operator does. LuaJIT has no `//`, so the reference
+-- divides with `/`, which agrees while the operands are not negative.
+function M.wideArithmeticCompoundAssignmentsAgreeWithLuaJIT()
+    requireCodegen()
+    local w, u = assert(load([[
+local w = 7LL w = w + 2LL w = w * 3 w = w / 2LL w = w - 20 w = w % 5 w = w / 1
+w = w + 4294967296LL w = w * 3 w = w - 1
+local u = 0ULL - 3ULL u = u + 1 u = u - 2ULL u = u * 3ULL u = u / 7 u = u % 1000003ULL u = u / 2ULL
+return w, u
+]]))()
+    local executable, output = link([[
+cdef function printf(borrows format: cstring, ...): int32
+
+local function main(): int32
+    local w: int64 = 7LL
+    w += 2LL
+    w *= 3
+    w //= 2LL
+    w -= 20
+    w %= 5
+    w /= 1
+    w += 4294967296LL
+    w *= 3
+    w -= 1
+    local u: uint64 = 0ULL - 3ULL
+    u += 1
+    u -= 2ULL
+    u *= 3ULL
+    u //= 7
+    u %= 1000003ULL
+    u /= 2ULL
+    printf("%lld %llu\n", w, u)
+    return 0
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+    test.eq(ran, tostring(w):match("^-?%d+") .. " " .. tostring(u):match("^%d+"))
+end
+
 local INT64_MIN = "(-9223372036854775807LL - 1LL)"
 local INT64_MAX = "9223372036854775807LL"
 local UINT64_MAX = "(0ULL - 1ULL)"

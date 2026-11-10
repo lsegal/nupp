@@ -1547,7 +1547,9 @@ export function install(c: state.Checker): state.StatHandlers
             or nil
         -- Arithmetic converts the other operand to the 64-bit box, and to unsigned
         -- when either side is, as the binary operator does.
-        local wideArith = op ~= ".." and op ~= "??" and not bitop
+        local wideArith = op ~= ".."
+            and op ~= "??"
+            and not bitop
             and (
                 (targetT.tag == "uint64" or valueT.tag == "uint64") and T.uint64
                 or (targetT.tag == "int64" or valueT.tag == "int64") and T.int64
