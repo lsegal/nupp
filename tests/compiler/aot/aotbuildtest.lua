@@ -2777,7 +2777,16 @@ return {rows = rows}
     local library = assert(read(dir .. "/build/native/lib/native_aot.dll"), "the DLL is linked")
     test.eq(library:sub(1, 2), "MZ", "a PE image")
     assert(library:find("msvcrt.dll", 1, true), "the C runtime's math is imported")
-    assert(library:find("ks_dll_main", 1, true), "the entry point binds the Lua API")
+    -- The entry point is the image's own, named in its optional header rather
+    -- than in what it exports.
+    local function u32(offset)
+        local a, b, c, d = library:byte(offset + 1, offset + 4)
+        return a + b * 256 + c * 65536 + d * 16777216
+    end
+    local header = u32(0x3c)
+    test.eq(library:sub(header + 1, header + 4), "PE\0\0", "the PE header")
+    assert(u32(header + 4 + 20 + 16) ~= 0, "the entry point binds the Lua API")
+    assert(not library:find("ks_dll_main", 1, true), "the entry point is not exported")
 end
 
 --- The runtime reaches the Lua API through pointers, one per function
