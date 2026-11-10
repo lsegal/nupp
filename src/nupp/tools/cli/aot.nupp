@@ -371,7 +371,10 @@ local function executable(
         if at == nil then
             return refuse(report.UNKNOWN_NAME, tostring(problem))
         end
-        local position = at as {line: integer, column: integer}
+        local position = at as {
+            line: integer,
+            column: integer
+        }
         return refuse(
             report.TOOL_FAILED,
             ("%s:%d:%d: native: %s"):format(path, position.line, position.column, tostring(problem))

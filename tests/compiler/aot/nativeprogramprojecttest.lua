@@ -34,14 +34,16 @@ local function write(path, text)
 end
 
 local function program(exit)
-    return ([[
+    return (
+        [[
 cdef function puts(borrows s: cstring): int32
 
 local function main(): int32
     puts("native %d")
     return %d
 end
-]]):format(exit, exit)
+]]
+    ):format(exit, exit)
 end
 
 --- A project whose `host` target is the program in `src/host.nupp`.

@@ -30,7 +30,10 @@ end
 --- The LLVM IR of the checked `tree` as a native program for `triple`, or nil
 --- and why not: a triple with no link profile, or a source position lowering
 --- refused and its message.
-function program.lower(tree: any, triple: string): (string?, string?, {line: integer, column: integer}?)
+function program.lower(tree: any, triple: string): (string?, string?, {
+    line: integer,
+    column: integer
+}?)
     local profile = require("nupp.compiler.aot.llvm.profile").of(triple)
     if profile == nil then
         return nil, "a native program cannot be built for " .. triple, nil
@@ -73,13 +76,11 @@ end
 ---
 --- @return what was built, or nil, a NUPP code and a message; nil with no
 ---   code is a source the checker refused, whose diagnostics are reported
-function program.build(
-    root: string,
-    config: Config,
-    target: Target,
-    name: string,
-    opts: {outDir: string?, checkOnly: boolean?, diagnostics: {any}?}
-): (program.Outcome?, string?, string?)
+function program.build(root: string, config: Config, target: Target, name: string, opts: {
+    outDir: string?,
+    checkOnly: boolean?,
+    diagnostics: {any}?
+}): (program.Outcome?, string?, string?)
     local selected, targetErr = require("nupp.compiler.aot.target").select(target.aotTarget, nil)
     if selected == nil then
         return nil, "NUPP0002", tostring(targetErr)
@@ -108,12 +109,9 @@ function program.build(
     if path == nil then
         return nil, "NUPP0003", "program target " .. name .. " names entry " .. entry .. ", which no include root has"
     end
-    local tree = require("nupp.tools.cli.compile").check(
-        path as string,
-        environment as {[string]: any},
-        {},
-        opts.diagnostics
-    )
+    local tree = require(
+        "nupp.tools.cli.compile"
+    ).check(path as string, environment as {[string]: any}, {}, opts.diagnostics)
     if tree == nil then
         return nil, nil, nil
     end
@@ -126,9 +124,14 @@ function program.build(
         if at == nil then
             return nil, "NUPP0004", tostring(lowerErr)
         end
-        local position = at as {line: integer, column: integer}
+        local position = at as {
+            line: integer,
+            column: integer
+        }
 
-        return nil, "NUPP0004", ("%s:%d:%d: native: %s"):format(path as string, position.line, position.column, tostring(lowerErr))
+        return nil, "NUPP0004", (
+            "%s:%d:%d: native: %s"
+        ):format(path as string, position.line, position.column, tostring(lowerErr))
     end
     local aotllvm = require("nupp.tools.build.aotllvm")
     local available, availableErr = aotllvm.selected()

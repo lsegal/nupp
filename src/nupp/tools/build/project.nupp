@@ -479,7 +479,10 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
             end
             return 1
         end
-        local outcome = built as {output: string?, linked: boolean}
+        local outcome = built as {
+            output: string?,
+            linked: boolean
+        }
         report:finish(opts.checkOnly and "checked" or outcome.linked and "built" or "reused", targetKey)
         if opts.produced then
             opts.produced.target = targetKey

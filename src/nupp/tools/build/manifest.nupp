@@ -655,7 +655,8 @@ local function validateTarget(target, label, dependencies)
         and kind ~= "component"
         and kind ~= "program"
     then
-        return nil, label .. ".kind must be \"modules\", \"bundle\", \"binary\", \"component\", \"program\", or \"docs\""
+        return nil, label
+            .. ".kind must be \"modules\", \"bundle\", \"binary\", \"component\", \"program\", or \"docs\""
     end
     if kind ~= "docs" then
         local valid, err = validateKeys(target, TARGET_KEYS, label)
