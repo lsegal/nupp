@@ -810,6 +810,101 @@ type. An ordinary struct does not cross this boundary by value. `export-c` is
 the only publisher: there is no annotation, no user-selected C tag, and no
 parallel header generator.
 
+## Export functions to C
+
+A C program can call Nupp code that is compiled ahead of time. Name the C
+function with `@aot(export = ...)` on a top-level local function:
+
+```nupp
+@aot(export = "game_add")
+local function add(a: int32, b: int32): int32
+   return a + b
+end
+
+return {add = add}
+```
+
+Build the target with `aot = "require"`. Its AOT library then defines
+`game_add` as well as the symbols the Lua wrapper calls:
+
+- `lib/lib<target>_aot.a` when the target sets `aotLinkage = "static"`;
+- `lib/lib<target>_aot.so`, `.dylib` or `<target>_aot.dll` otherwise.
+
+The C name is an alias of the narrowest feature tier's code, which runs on every
+machine the target triple describes. A Windows DLL loads into a process with no
+Lua in it, because these functions never call the Lua API.
+
+`export-c` declares the function when you select it by its module-qualified
+Nupp name:
+
+```bash
+nupp export-c -o game.h src/game.nupp game.add
+```
+
+```c
+int32_t game_add(int32_t a, int32_t b);
+```
+
+The prototype follows the AOT entry ABI. `number` and `integer` are `double`,
+because that is how Lua holds them. `float` is `float`, `boolean` is `bool`,
+and the fixed-width integers keep their widths.
+
+An exported function can also take spans of those scalars and return several
+values. `export-c` writes the prototype from the same lowered entry the code
+generator lays out:
+
+- Each span is a pointer, in parameter order between the scalars. A
+  `borrows` span is `const T *` and an `exclusive` writable span is `T *`.
+- The counts follow as `size_t`. A loop over one span whose guards relate every
+  other span to it shares one `count`. Any other body takes a `count_<name>`
+  per span.
+- Several results are written to a generated `<c_name>_result` struct, through
+  a trailing `result` pointer. Its fields are `r1`, `r2` and so on.
+
+```nupp
+@aot(export = "game_saxpy")
+local function saxpy(exclusive out: span.WriteSpan<number>, borrows xs: span.Span<number>, a: number): nil
+   assert(#out == #xs, "length mismatch")
+   for i = 1, #out do
+      out[i] = a * xs[i]
+   end
+end
+
+@aot(export = "game_bounds")
+local function bounds(borrows values: span.Span<number>): (number, number)
+   local low = 1e300
+   local high = -1e300
+   for i = 1, #values do
+      local value = values[i]
+      if value < low then
+         low = value
+      end
+      if value > high then
+         high = value
+      end
+   end
+   return low, high
+end
+```
+
+```c
+typedef struct game_bounds_result {
+    double r1;
+    double r2;
+} game_bounds_result;
+
+void game_saxpy(double *out, const double *xs, double a, size_t count);
+void game_bounds(const double *values, size_t count_values, struct game_bounds_result *result);
+```
+
+A span of structs has no declaration yet, and `export-c` refuses it with
+NUPP2203.
+
+The build refuses a few more cases. The name must be a literal C identifier.
+A GPU kernel, a function that holds Lua values, and a function with const
+parameters have no single C function to publish. Two functions in one library
+may not claim the same name.
+
 ## JIT-sensitive C boundaries
 
 C-derived callback positions are tracked semantically through declarations and

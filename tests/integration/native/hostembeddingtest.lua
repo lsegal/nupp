@@ -4,7 +4,7 @@ local test = require("assert")
 
 local HERE = require("helpers.paths").absoluteTests
 local ROOT = HERE .. "/.."
-local FEATURES = "lpeg,native-checksum,native-compression,native-files,native-gpu,native-net,native-process,native-time,native-tls,workers"
+local FEATURES = "lpeg,native-checksum,native-compression,native-files,native-net,native-panic-probe,native-process,native-time,native-tls,workers"
 
 local M = {}
 
@@ -737,32 +737,22 @@ function M.hotReloadAttachesToALoadedComponent()
     assert(output:find("closed says = ", 1, true), output)
 end
 
--- One export, called from C through the static SDK, that hands naga a SPIR-V
--- module it panics on. The provider catches the panic at its export and answers
--- a status, the export raises it, and nupp_call reports it: the host lives on to
--- make another call. A machine with no adapter has nothing to show.
+-- One export, called from C through the static SDK, that crosses into the
+-- provider's panic probe. The provider catches the panic at its export and
+-- answers a status, the export raises it, and nupp_call reports it: the host
+-- lives on to make another call.
 local PANIC_COMPONENT = [[-- NUPP-COMPONENT 1
 return {
   format = 1,
   hostAbi = 1,
   install = function()
     local ffi = require("ffi")
-    ffi.cdef("int32_t nuppNativeGpuContextCreate(uint64_t *);"
-      .. "int32_t nuppNativeGpuKernelCreate(uint64_t, const uint8_t *, size_t, const char *, size_t,"
-      .. " uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t, uint64_t *);"
-      .. "const char *nuppNativeLastError(void);")
-    local function kernel(spirv)
-      local context = ffi.new("uint64_t[1]")
-      local status = ffi.C.nuppNativeGpuContextCreate(context)
-      if status == 8 then
-        return "unavailable"
-      end
-      assert(status == 0, ffi.string(ffi.C.nuppNativeLastError()))
-      local output = ffi.new("uint64_t[1]")
-      status = ffi.C.nuppNativeGpuKernelCreate(context[0], spirv, #spirv, "main", 4, 1, 1, 16, 64, 1, 1, output)
+    ffi.cdef("int32_t nuppNativePanicProbe(void); const char *nuppNativeLastError(void);")
+    local function panic()
+      local status = ffi.C.nuppNativePanicProbe()
       error(("status %d: %s"):format(status, ffi.string(ffi.C.nuppNativeLastError())))
     end
-    return {exports = {["gpu.kernel"] = kernel, ["gpu.after"] = function() return "alive" end}, start = function() end}
+    return {exports = {["provider.panic"] = panic, ["provider.after"] = function() return "alive" end}, start = function() end}
   end,
 }
 ]]
@@ -791,34 +781,31 @@ static void print_value(const char *label, const nupp_value *value) {
 int main(int argc, char **argv) {
     nupp_runtime *runtime = NULL;
     nupp_component *component = NULL;
-    nupp_handle *kernel = NULL, *after = NULL;
+    nupp_handle *panic = NULL, *after = NULL;
     nupp_error *error = NULL;
-    nupp_value argument = {0}, result = {0};
-    size_t count = 0, length = 0, spirv_length = 0;
-    unsigned char *bytes, *spirv;
+    nupp_value result = {0};
+    size_t count = 0, length = 0;
+    unsigned char *bytes;
     nupp_status status;
 
-    if (argc != 3 || !(bytes = read_all(argv[1], &length)) || !(spirv = read_all(argv[2], &spirv_length))) return 2;
+    if (argc != 2 || !(bytes = read_all(argv[1], &length))) return 2;
     if (nupp_runtime_new(NULL, &runtime, &error) != NUPP_STATUS_OK) return 1;
     if (nupp_component_load(runtime, bytes, length, argv[1], &component, &error) != NUPP_STATUS_OK) return 1;
-    if (nupp_export_find(runtime, component, "gpu.kernel", &kernel, &error) != NUPP_STATUS_OK) return 1;
-    if (nupp_export_find(runtime, component, "gpu.after", &after, &error) != NUPP_STATUS_OK) return 1;
-    argument.kind = NUPP_VALUE_BYTES;
-    argument.data = spirv;
-    argument.length = spirv_length;
-    status = nupp_call(runtime, kernel, &argument, 1, &result, 1, &count, &error);
+    if (nupp_export_find(runtime, component, "provider.panic", &panic, &error) != NUPP_STATUS_OK) return 1;
+    if (nupp_export_find(runtime, component, "provider.after", &after, &error) != NUPP_STATUS_OK) return 1;
+    status = nupp_call(runtime, panic, NULL, 0, &result, 1, &count, &error);
     if (status == NUPP_STATUS_OK) {
-        print_value("kernel", &result);
+        print_value("panic", &result);
         nupp_value_release(runtime, &result, NULL);
     } else {
-        printf("kernel status = %d\nkernel message = %s\n", (int)status, error ? nupp_error_message(error) : "");
+        printf("panic status = %d\npanic message = %s\n", (int)status, error ? nupp_error_message(error) : "");
         nupp_error_free(error);
     }
     error = NULL;
     if (nupp_call(runtime, after, NULL, 0, &result, 1, &count, &error) != NUPP_STATUS_OK) return 1;
     print_value("after", &result);
     nupp_value_release(runtime, &result, NULL);
-    nupp_handle_release(runtime, kernel, NULL);
+    nupp_handle_release(runtime, panic, NULL);
     nupp_handle_release(runtime, after, NULL);
     nupp_component_release(runtime, component, NULL);
     nupp_runtime_shutdown(runtime, NULL);
@@ -850,17 +837,10 @@ function M.aNativePanicUnderACallAnswersAStatus()
         )
     )
     assert(status == 0, output)
-    status, output = run(
-        (
-            "%s %s %s"
-        ):format(quote(executable), quote(component), quote(ROOT .. "/native/crates/native/testdata/naga-panic.spv"))
-    )
+    status, output = run(("%s %s"):format(quote(executable), quote(component)))
     assert(status == 0, output)
-    if output:find("kernel = unavailable", 1, true) then
-        test.suite.skip("no GPU adapter to hand the malformed module to")
-    end
-    assert(output:find("kernel status = 3", 1, true), output)
-    assert(output:find("status 5: native provider panicked", 1, true), output)
+    assert(output:find("panic status = 3", 1, true), output)
+    assert(output:find("status 5: native provider panicked: the panic probe tripped", 1, true), output)
     assert(output:find("after = alive", 1, true), output)
 end
 

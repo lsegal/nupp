@@ -39,7 +39,7 @@ The commands, in the order `nupp help` lists them:
 - [`run`](#run): compile and run a Nupp or Lua program
 - [`import-c`](#import-c): generate typed Nupp bindings from a C header
 - [`migrate`](#migrate): migrate typed foreign source into Nupp
-- [`export-c`](#export-c): export canonical C declarations for Nupp structs
+- [`export-c`](#export-c): export canonical C declarations for Nupp structs and C functions
 - [`rock`](#rock): create and package typed LuaRocks libraries
 - [`lsp`](#lsp): language-server and semantic source operations
 - [`version`](#version): print the compiler version
@@ -436,6 +436,10 @@ With no artifact, reports whether each function uses scalar, explicit SIMD, or G
 execution. Select verified IR, LLVM IR, native GPU SPIR-V, browser GPU WGSL,
 native assembly, or the generated Nupp binding with `--emit`.
 
+`--emit executable` instead links the file as a native program: its `main` is
+the executable's own, and it reaches LuaJIT and other C libraries through
+its `cdef function` declarations. The program is written to `--output`.
+
 Examples:
 
     nupp aot bench/kernel-subset-spike/mandelbrot.nupp
@@ -444,6 +448,7 @@ Examples:
     nupp aot --emit asm --function scale src/kernel.nupp
     nupp aot --emit wgsl --function transform src/gpu.nupp
     nupp aot --format json src/kernel.nupp
+    nupp aot --emit executable --output build/host src/host.nupp
 
 Usage:
   nupp aot [options] FILE
@@ -452,7 +457,9 @@ Arguments:
   FILE  Source file to inspect.
 
 Options:
-  --emit ARTIFACT  Artifact to print: ir, llvm, spirv, wgsl, asm, or binding.
+  --emit ARTIFACT  Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or
+                   executable.
+  --output PATH    Where --emit executable writes the program.
   --function NAME  Show only this function.
   --triple TRIPLE  Target triple to compile for.
   --features TIER  CPU feature tier to promise.
@@ -2159,11 +2166,12 @@ planner. `--dry-run` reports the complete plan without writing or removing files
 ### `export-c`
 
 ```text [nupp export-c --help]
-Export canonical C declarations for Nupp structs.
+Export canonical C declarations for Nupp structs and C functions.
 
 Examples:
 
     nupp export-c -o include/game.h src/game.nupp game.Position
+    nupp export-c -o include/game.h src/game.nupp game.add
     nupp export-c --target library -o include/library.h src/library.nupp library.Widget
     nupp export-c --json -o include/game.h src/game.nupp game.Position
 
@@ -2185,11 +2193,14 @@ Options:
   --no-color      Never color output
 ```
 
-The command writes one target-specific header from selected exported structs
-and `cdef` functions. It includes transitive layout dependencies, stable C
-names, layout assertions, and the typed declarations used by native wrappers.
+The command writes one target-specific header from selected exported structs,
+`cdef` functions and `@aot(export)` functions. It includes transitive layout
+dependencies, stable C names, layout assertions, and the typed declarations used
+by native wrappers.
 See [c-interop.md](../learn/runtime/c-interop/index.md#export-ordinary-structs-to-c) for
-what a struct has to be for a header to be exportable from it.
+what a struct has to be for a header to be exportable from it, and
+[Export functions to C](../learn/runtime/c-interop/index.md#export-functions-to-c)
+for the functions a C program can call.
 
 ### `rock`
 
@@ -2503,7 +2514,8 @@ Commands:
   run              Compile and run a Nupp or Lua program.
   import-c         Generate typed Nupp bindings from a C header.
   migrate          Migrates annotated Lua or retired serialization APIs.
-  export-c         Export canonical C declarations for Nupp structs.
+  export-c         Export canonical C declarations for Nupp structs and C
+                   functions.
   rock             Package and check typed LuaRocks libraries.
   lsp              Language-server and semantic source operations.
   version          Print the compiler version.

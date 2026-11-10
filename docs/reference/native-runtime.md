@@ -16,14 +16,15 @@ The boundary is deliberately narrow:
 | Layer | Owner | Responsibilities |
 | --- | --- | --- |
 | language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, and the filesystem services, which call the operating system through FFI |
-| native provider | Rust | clocks, UUIDs, URI, HTTP, TCP, UDP, path sockets, TLS, processes, and GPU resources |
+| native provider | Rust | clocks, UUIDs, URI, HTTP, TCP, UDP, path sockets, TLS, and processes |
+| GPU provider | Nupp | GPU contexts, resources, validation, dispatch, readback, and cost records, over the pinned wgpu-native library |
 | host | Rust | payload discovery, LuaJIT state lifetime, native preload registration, workers, components, embedding handles, and shutdown |
 | VM and compatibility modules | C | LuaJIT and the retained LPeg module |
 | generated AOT | C, platform object code, or shader code | compiler-admitted kernels and their bindings |
 
 Rust resources cross into LuaJIT as fixed-width values and generational
-handles. Nupp code never receives a Rust reference, future, WGPU object, Tokio
-handle, or Reqwest response. Rust executor threads never enter LuaJIT; they
+handles. Nupp code never receives a Rust reference, future, Tokio handle, or
+Reqwest response. Rust executor threads never enter LuaJIT; they
 publish bounded completion records which the owning Lua lane consumes.
 
 ## Compiler-selected features
@@ -31,8 +32,8 @@ publish bounded completion records which the owning Lua lane consumes.
 Authors select APIs, not Cargo features. The compiler records effects from the
 reachable program and closes their dependencies. The build then asks
 `scripts/toolchain` for an exact-feature provider and host. Default Cargo
-features are disabled, so an HTTP-free program does not acquire Reqwest and a
-GPU-free program does not acquire WGPU.
+features are disabled, so an HTTP-free program does not acquire Reqwest, and a
+GPU-free program stages no wgpu-native library.
 
 | Nupp facility | Rust provider feature | Host feature when linked into a stub |
 | --- | --- | --- |
@@ -44,7 +45,7 @@ GPU-free program does not acquire WGPU.
 | TCP, UDP, DNS, and Unix path sockets | `net` | `native-net` |
 | TLS over a Rust-owned network stream | `tls` | `native-tls` |
 | child processes and pipes | `process` | `native-process` |
-| native GPU compute | `io.gpu` | provider archive |
+| native GPU compute | none: Nupp over wgpu-native | none: `lib/wgpu_native` beside the program |
 | workers and shared immutable bytes | host-owned | `workers` |
 | `lpeg` | retained LPeg | `lpeg` |
 
@@ -98,20 +99,20 @@ panic's text as the last error.
 
 Every native family advances one process-wide readiness generation when
 something a caller could be waiting for changes: a socket or TLS session moves,
-a whole-file transfer settles, an HTTP client has events, a child exits or one
-of its pipes moves, or GPU work finishes. `nuppNativePoll` snapshots it and
+a whole-file transfer settles, an HTTP client has events, or a child exits or
+one of its pipes moves. `nuppNativePoll` snapshots it and
 `nuppNativeWait` sleeps until it moves past a snapshot. A caller polls first,
 checks what it is waiting for with the families' non-blocking calls, and waits
 from the snapshot, so an edge after the poll ends the wait at once and none is
 lost.
 
 So every native wait in a Lua state sleeps on the same thing, and a program
-waiting on a socket, a child and a GPU dispatch at once wakes for whichever
+waiting on a socket and a child at once wakes for whichever
 moves first. `nupp.runtime.native` keeps one snapshot for all of them, and each
-family's readiness source sleeps from it. GPU `synchronize` parks on it too:
-`nuppNativeGpuSynchronizeReady` returns whether the submitted work is done
-without blocking, and a helper thread advances the generation when it is, so a
-task deadline reaches the wait and other tasks run meanwhile.
+family's readiness source sleeps from it. GPU `synchronize` is the exception:
+wgpu-native reports finished work only when asked, so its readiness source
+polls the device and sleeps one bounded slice between polls. It is still a
+suspension, so a task deadline reaches the wait and other tasks run meanwhile.
 
 The per-family poll and wait calls that came before are superseded and stay
 declared, because the pinned stage-zero compiler still calls them.
@@ -120,9 +121,14 @@ declared, because the pinned stage-zero compiler still calls them.
 
 The current implementation choices are:
 
-- WGPU owns GPU device discovery, resources, command submission, and backend
-  selection. Native targets enable Metal on macOS, DX12 and Vulkan on Windows,
-  and Vulkan and GLES on other Unix systems.
+- wgpu-native owns GPU device discovery, resources, command submission, and
+  backend selection, behind its C API. `nupp.runtime.provider.gpudevice` is the
+  Nupp layer over it, reached through LuaJIT's FFI: handle tables, range and
+  alignment checks, SPIR-V workgroup checks, downloads, timestamps and cost
+  records. `scripts/toolchain wgpu` fetches the prebuilt library for each
+  platform against a digest in `scripts/toolchain.pins`; it uses Metal on macOS,
+  DX12 and Vulkan on Windows, and Vulkan and GLES on other Unix systems, and
+  `WGPU_BACKEND` narrows the choice.
 - Tokio owns the shared asynchronous executor and the file, network, process,
   timer, and cancellation lanes built on it. Nupp uses Tokio rather than a
   second Mio-based reactor.
@@ -153,6 +159,8 @@ claim that every executable byte is Rust. Native builds still retain:
   builder entry calls through a table the provider hands it;
 - LLVM and lld, linked into `nupp` as the AOT code generator and never into the
   programs it builds;
+- the pinned, prebuilt wgpu-native library, which a GPU program loads beside
+  itself;
 - operating-system libraries, GPU drivers, and platform SDKs selected by Rust
   crates and the final linker.
 
@@ -203,8 +211,8 @@ that a particular commit completed them. The Rust-host cutover is exercised on
 the retained Linux, macOS, and Windows runners, including the executable host,
 static application host, static and dynamic embedding SDKs, workers, appended
 compiler payloads, unpacked release artifacts, and byte-identical compiler and
-binary packaging fixpoints. The Windows gate also exercises the DirectX 12 WGPU
-adapter rather than relying only on the cross-platform software adapter.
+binary packaging fixpoints. The Windows gate also exercises the DirectX 12
+wgpu-native adapter rather than relying only on the cross-platform software adapter.
 Manual release rehearsals do not hold Apple Developer ID credentials and cannot
 exercise optional tag-only signing and notarization. The same release matrix
 still builds and verifies an unsigned macOS archive without those credentials.
@@ -221,7 +229,11 @@ artifact:
   The C embedding header remains, so existing hosts migrate at the SDK boundary
   rather than by embedding Rust types.
 - SDL GPU, SPIRV-Cross, MSL artifacts, and the SDL provider ABI were removed.
-  Native GPU builds accept canonical SPIR-V and execute it through WGPU.
+  Native GPU builds accept canonical SPIR-V and execute it through wgpu-native.
+- The Rust GPU crate, its `nuppNativeGpu*` provider exports, the
+  `NUPP_NATIVE_FEATURE_GPU` bit and the `native-gpu` host feature were removed.
+  The GPU provider is Nupp over wgpu-native, staged beside a program, so a
+  standalone binary cannot carry it.
 - Curl and ada were removed. URI behavior follows Rust's WHATWG `url` contract,
   and HTTP follows the documented Reqwest contract rather than curl parity.
 - Libuv and mbedTLS were removed. Tokio owns network resources and Rustls owns

@@ -100,7 +100,7 @@ local groups = {
         "templategametest",
     },
 
-    ["gpu"] = {"gputest"},
+    ["gpu"] = {"gputest", "gpudevicetest"},
 
     -- Compact native and Wasm packs, their executable obligation ledger, and
     -- the structural checks which keep the replacement corpus bounded.
@@ -206,7 +206,7 @@ quaterniontest soatest standardostest spiinterfacetest serdetest
 stringbuffernamespacetest reflectionnamestest storetest warntest bytecodelistingtest
 docheadingstest doclinkstest overloaddoctest duplicatestest fmtfuzztest
 fmttest fmtwidthtest moduleexportstest spinavigationtest cichangeclassifiertest
-toollayeringtest testrunnertest
+toollayeringtest testrunnertest llvmcontracttest kitarchivetest
 ]]
 ):gmatch("%S+") do
     scopes[name] = "component"
@@ -252,7 +252,7 @@ rusttoolchaintest toolchaintest
 end
 
 for name in (
-    "compressiontest digestboundarytest eventstest gputest hashstreamtest portableiocontractstest processcompat_test streamadapterstest"
+    "compressiontest digestboundarytest eventstest gputest gpudevicetest hashstreamtest portableiocontractstest processcompat_test streamadapterstest"
 ):gmatch("%S+") do
     scopes[name] = "integration"
 end
@@ -329,6 +329,8 @@ scopes.projectctest = "integration"
 scopes.projectbinarytest = "integration"
 scopes.projectfixpointtest = "integration"
 scopes.projectaottest = "integration"
+scopes.projectaotcexporttest = "integration"
+scopes.aotexportlisttest = "component"
 scopes.projectclinktest = "integration"
 scopes.projectcargotest = "integration"
 scopes.projectgeneratortest = "integration"
@@ -426,6 +428,8 @@ scopes.projectmaterializationtest = "integration"
 scopes.projectlayoutcachetest = "integration"
 
 scopes.projectaotlinktest = "integration"
+
+scopes.nativeprogramtest = "integration"
 
 scopes.projectaottest = "integration"
 
