@@ -11,6 +11,8 @@ local libraryName = fixture.libraryName
 local M = {}
 
 local SOURCE = [[
+local span = require("bytes.span")
+
 @aot(export = "game_add")
 local function add(a: int32, b: int32): int32
    return a + b
@@ -24,7 +26,34 @@ local function scale(value: integer, by: float, enabled: boolean): number
    return value
 end
 
-return {add = add, scale = scale}
+-- A map kernel: the guard relates its spans, so they share one count.
+@aot(export = "game_saxpy")
+local function saxpy(exclusive out: span.WriteSpan<number>, borrows xs: span.Span<number>, a: number): nil
+   assert(#out == #xs, "length mismatch")
+   for i = 1, #out do
+      out[i] = a * xs[i]
+   end
+end
+
+-- A block kernel: each span has its own count, and several results come
+-- back through a struct.
+@aot(export = "game_bounds")
+local function bounds(borrows values: span.Span<number>, borrows weights: span.Span<float>): (number, number, boolean)
+   local low = 1e300
+   local high = -1e300
+   for i = 1, #values do
+      local value = values[i]
+      if value < low then
+         low = value
+      end
+      if value > high then
+         high = value
+      end
+   end
+   return low, high, #weights == #values
+end
+
+return {add = add, scale = scale, saxpy = saxpy, bounds = bounds}
 ]]
 
 local PROGRAM = [[
@@ -32,7 +61,15 @@ local PROGRAM = [[
 #include "game.h"
 
 int main(void) {
+    double xs[3] = {1.0, 3.0, 2.0};
+    double out[3] = {0.0, 0.0, 0.0};
+    float weights[2] = {1.0f, 2.0f};
+    game_bounds_result bounds;
+    game_saxpy(out, xs, 2.0, 3);
+    game_bounds(xs, weights, 3, 2, &bounds);
     printf("%d %.1f %.1f\n", (int)game_add(2, 3), game_scale(5, 1.5f, true), game_scale(5, 1.5f, false));
+    printf("%.1f %.1f %.1f\n", out[0], out[1], out[2]);
+    printf("%.1f %.1f %d\n", bounds.r1, bounds.r2, (int)bounds.r3);
     return 0;
 }
 ]]
@@ -55,9 +92,10 @@ local function library(linkage)
     )
     testAssert.eq(project.build(dir), 0)
     local nupp = require("helpers.paths").root .. "/bin/nupp"
-    local code, text = process.capture({nupp, "export-c", "-o", "game.h", "src/main.nupp", "main.add", "main.scale"}, {
-        cwd = dir
-    })
+    local code, text = process.capture(
+        {nupp, "export-c", "-o", "game.h", "src/main.nupp", "main.add", "main.scale", "main.saxpy", "main.bounds"},
+        {cwd = dir}
+    )
     testAssert.eq(code, 0, text)
     assert(exists(dir .. "/game.h"), "export-c writes the header: " .. text)
 
@@ -67,7 +105,13 @@ end
 local function run(dir, program)
     local code, text = process.capture({program})
     testAssert.eq(code, 0, text)
-    testAssert.eq(text:match("[^\r\n]+"), "5 7.5 5.0", "C reaches every exported function through the header")
+    local lines = {}
+    for line in text:gmatch("[^\r\n]+") do
+        lines[#lines + 1] = line
+    end
+    testAssert.eq(lines[1], "5 7.5 5.0", "C reaches every scalar export through the header")
+    testAssert.eq(lines[2], "2.0 6.0 4.0", "C passes arrays to a span export and their shared count")
+    testAssert.eq(lines[3], "1.0 3.0 0", "C reads several results through the declared struct")
     remove(dir)
 end
 

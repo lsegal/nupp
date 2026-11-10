@@ -757,6 +757,7 @@ local function scale(value: integer, by: float, enabled: boolean): number
 end
 @aot(export = "game_reset")
 local function reset(): nil
+   local zero = 0
 end
 game.add, game.scale, game.reset = add, scale, reset
 return game
@@ -776,26 +777,91 @@ return game
     os.execute("rm -rf '" .. dir .. "'")
 end
 
-function M.exportCRefusesAnAotExportWithoutAScalarSignature()
+function M.exportCDeclaresSpanAndMultiResultAotExports()
+    -- Spans cross as pointers in parameter order, then their counts: one
+    -- shared count when guards relate every span (a map kernel), one per span
+    -- otherwise (a block kernel). Several results come back through a struct.
     local dir = exportProject(
         [[
 local span = require("bytes.span")
 local game = {}
-@aot(export = "game_total")
-local function total(borrows values: span.Span<float>): number
-   local sum = 0.0
-   for index = 1, #values do
-      sum = sum + values[index]
+@aot(export = "game_saxpy")
+local function saxpy(exclusive out: span.WriteSpan<number>, borrows xs: span.Span<number>, a: number): nil
+   assert(#out == #xs, "length mismatch")
+   for i = 1, #out do
+      out[i] = a * xs[i]
    end
-   return sum
 end
-game.total = total
+@aot(export = "game_bounds")
+local function bounds(borrows values: span.Span<number>, borrows weights: span.Span<float>): (number, number, boolean)
+   local low = 1e300
+   local high = -1e300
+   for i = 1, #values do
+      local value = values[i]
+      if value < low then
+         low = value
+      end
+      if value > high then
+         high = value
+      end
+   end
+   return low, high, #weights == #values
+end
+game.saxpy, game.bounds = saxpy, bounds
 return game
 ]]
     )
-    local output, code = captureStatusAt(dir, "export-c -o game.h src/game.nupp game.total")
-    assert(code ~= 0, "a span parameter has no C prototype yet: " .. output)
-    assert(output:find("NUPP2203", 1, true) and output:find('parameter "values" is not a number', 1, true), output)
+    local output, code = captureStatusAt(dir, "export-c -o game.h src/game.nupp game.saxpy game.bounds")
+    assert(code == 0, output)
+    local header = assert(io.open(dir .. "/game.h", "rb")):read("*a")
+    assert(header:find("void game_saxpy(double *out, const double *xs, double a, size_t count);", 1, true), header)
+    assert(
+        header:find(
+            "typedef struct game_bounds_result {\n    double r1;\n    double r2;\n    bool r3;\n} game_bounds_result;",
+            1,
+            true
+        ),
+        header
+    )
+    assert(
+        header:find(
+            "void game_bounds(const double *values, const float *weights, size_t count_values, size_t count_weights, struct game_bounds_result *result);",
+            1,
+            true
+        ),
+        header
+    )
+    assert(
+        os.execute(("cd '%s' && cc -std=c11 -fsyntax-only game.h"):format(dir)) == 0,
+        "an independent C compiler accepts the exported prototypes"
+    )
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
+function M.exportCRefusesAnAotExportOverASpanOfStructs()
+    local dir = exportProject(
+        [[
+local span = require("bytes.span")
+local game = {}
+local struct Pair
+   x: float
+   n: int32
+end
+@aot(export = "game_first")
+local function first(borrows pairs: span.Span<Pair>): number
+   local total = 0.0
+   for index = 1, #pairs do
+      total = total + pairs[index].x
+   end
+   return total
+end
+game.first = first
+return game
+]]
+    )
+    local output, code = captureStatusAt(dir, "export-c -o game.h src/game.nupp game.first")
+    assert(code ~= 0, "a span of structs has no C prototype yet: " .. output)
+    assert(output:find("NUPP2203", 1, true) and output:find('span parameter "pairs" does not hold', 1, true), output)
     assert(not io.open(dir .. "/game.h", "rb"), "no header is written")
     os.execute("rm -rf '" .. dir .. "'")
 end

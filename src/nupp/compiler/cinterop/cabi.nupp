@@ -40,6 +40,7 @@ local SCALARS: {
     uint16 = "uint16_t",
     uint32 = "uint32_t",
     uint64 = "uint64_t",
+    size_t = "size_t",
     cstring = "const char *",
     string = "const char *",
     voidptr = "void *",
@@ -426,6 +427,23 @@ function cabi.header(aggregates: {any}, functions: {any}, guard: string?): strin
             ):format(guard, description.typedef, field.name, field.offset, description.identity, field.name)
         end
         out[#out + 1] = ""
+    end
+    -- The struct a function returning several values writes them to, declared
+    -- ahead of the prototype that points at it.
+    for _, signature in ipairs(functions or {}) do
+        local resultStruct = signature.resultStruct
+        if resultStruct then
+            out[#out + 1] = "typedef struct " .. resultStruct.tag .. " {"
+            for _, field in ipairs(resultStruct.fields) do
+                local declaration, why = renderDeclaration(field.type, field.name)
+                if not declaration then
+                    return nil, ("%s field %s %s"):format(resultStruct.tag, field.name, why or "has no C spelling")
+                end
+                out[#out + 1] = "    " .. declaration .. ";"
+            end
+            out[#out + 1] = "} " .. resultStruct.tag .. ";"
+            out[#out + 1] = ""
+        end
     end
     for _, signature in ipairs(functions or {}) do
         local prototype, why = cabi.prototype(signature, false)
