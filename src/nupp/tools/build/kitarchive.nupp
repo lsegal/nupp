@@ -167,10 +167,9 @@ function kitarchive.unpack(bytes: string, root: string): string?
                 end
             end
         else
-            return ("the kit archive holds %s, of tar type '%s', which a kit never carries"):format(
-                member,
-                string.char(kind)
-            )
+            return (
+                "the kit archive holds %s, of tar type '%s', which a kit never carries"
+            ):format(member, string.char(kind))
         end
     end
 

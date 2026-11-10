@@ -112,12 +112,16 @@ record codegen.Options
     triple: string
     cpu: string
     features: string
+
     --- 0-3: `default<O0>` .. `default<O3>`, and the matching code-generation level.
     opt: integer
+
     --- Also return the assembly listing (a second code generation).
     assembly: boolean
+
     --- Also return the optimized IR.
     optimizedIr: boolean
+
     --- Run the numeric-contract checks over the optimized IR, and over the
     --- assembly when it is produced.
     verify: boolean
@@ -177,13 +181,12 @@ end
 --- A plain-text report of one compile: its phase timings in microseconds,
 --- the object's size, then one contract violation per line.
 function codegen.report(timings: {number}, objectBytes: integer, violations: {string}): string
-    local lines: {string} = {
-        ("parse-us=%.0f\noptimize-us=%.0f\ncodegen-us=%.0f\nobject-bytes=%d\n"):format(
-            timings[1] or 0,
-            timings[2] or 0,
-            timings[3] or 0,
-            objectBytes
-        ),
+    local lines: {
+        string
+    } = {
+        (
+            "parse-us=%.0f\noptimize-us=%.0f\ncodegen-us=%.0f\nobject-bytes=%d\n"
+        ):format(timings[1] or 0, timings[2] or 0, timings[3] or 0, objectBytes),
     }
     for _, violation in ipairs(violations) do
         lines[#lines + 1] = "violation=" .. violation:gsub("\n", " ") .. "\n"
@@ -266,10 +269,7 @@ function codegen.compile(ir: string, name: string, options: {[string]: string}):
         local spent = ffi.new("uint64_t[1]")
         local assembly = ffi.new("uint64_t[1]")
         local optimized = ffi.new("uint64_t[1]")
-        native.succeeded(
-            C.nuppCodegenCompile(ir, #ir, name, #name, text, #text, object, spent, assembly, optimized),
-            2
-        )
+        native.succeeded(C.nuppCodegenCompile(ir, #ir, name, #name, text, #text, object, spent, assembly, optimized), 2)
         local objectBytes = take(object[0]) or ""
         local listing = take(assembly[0])
         local optimizedIr = take(optimized[0])

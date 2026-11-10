@@ -45,12 +45,15 @@ function M.fusedMultiplyAddNeedsTheContractLicence()
 end
 
 function M.quotedNamesAndInlineAttributesAreRead()
-    local ir = table.concat({
-        'define double @"with.dots"(double %a) "nupp-fp-contract" {',
-        "  %r = call double @llvm.fma.f64(double %a, double %a, double %a)",
-        "  ret double %r",
-        "}",
-    }, "\n")
+    local ir = table.concat(
+        {
+            'define double @"with.dots"(double %a) "nupp-fp-contract" {',
+            "  %r = call double @llvm.fma.f64(double %a, double %a, double %a)",
+            "  ret double %r",
+            "}",
+        },
+        "\n"
+    )
     local bad = contract.ir(ir)
     assert(#bad == 0, table.concat(bad, "\n"))
     local asm = '"with.dots":\n\tvfmadd231sd %xmm1, %xmm0, %xmm2\n'
@@ -67,25 +70,30 @@ function M.fusedInstructionsOutsideContractFunctions()
 end
 
 function M.localLabelsStayInTheirFunction()
-    local asm = table.concat({
-        "_plain:",
-        "LBB0_1:",
-        ".Ltmp0:",
-        "ltmp1:",
-        "\tvfmadd213pd %ymm2, %ymm1, %ymm0",
-        "_relaxed:",
-        "\tf64x2.relaxed_madd",
-        "",
-    }, "\r\n")
+    local asm = table.concat(
+        {
+            "_plain:",
+            "LBB0_1:",
+            ".Ltmp0:",
+            "ltmp1:",
+            "\tvfmadd213pd %ymm2, %ymm1, %ymm0",
+            "_relaxed:",
+            "\tf64x2.relaxed_madd",
+            "",
+        },
+        "\r\n"
+    )
     local bad = contract.fusedInstructions(asm, IR)
     assert(#bad == 1, table.concat(bad, "\n"))
     assert(bad[1] == "plain: vfmadd213pd %ymm2, %ymm1, %ymm0", bad[1])
 end
 
 function M.optionsParseKeyValueLines()
-    local options = assert(codegen.parseOptions(
-        "  triple=x86_64-unknown-linux-gnu\n\ncpu=x86-64-v3\nfeatures=+avx2,+fma\nopt=2\nassembly=1\noptimized-ir=true\nverify=0\n"
-    ))
+    local options = assert(
+        codegen.parseOptions(
+            "  triple=x86_64-unknown-linux-gnu\n\ncpu=x86-64-v3\nfeatures=+avx2,+fma\nopt=2\nassembly=1\noptimized-ir=true\nverify=0\n"
+        )
+    )
     assert(options.triple == "x86_64-unknown-linux-gnu")
     assert(options.cpu == "x86-64-v3")
     assert(options.features == "+avx2,+fma")
@@ -124,7 +132,7 @@ function M.reportListsTimingsThenViolations()
     local report = codegen.report({12.4, 3.6, 1000}, 42, {"plain: one", "two\nlines"})
     assert(
         report == "parse-us=12\noptimize-us=4\ncodegen-us=1000\nobject-bytes=42\n"
-            .. "violation=plain: one\nviolation=two lines\n",
+        .. "violation=plain: one\nviolation=two lines\n",
         report
     )
     assert(codegen.report({}, 0, {}) == "parse-us=0\noptimize-us=0\ncodegen-us=0\nobject-bytes=0\n")
