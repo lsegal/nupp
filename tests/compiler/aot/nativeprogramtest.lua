@@ -290,6 +290,31 @@ end
     test.eq(status, expected, ran)
 end
 
+-- 64-bit literals a double cannot hold exactly, hex ones among them, and the
+-- ones LuaJIT wraps: a signed literal past 2^63, and a negated one.
+local WIDE_LITERALS = {
+    "0x7FFFFFFFFFFFFFE4ULL % 1000ULL", "0x7FFFFFFFFFFFFFE4ULL & 0xFFFFULL", "0x7FFFFFFFFFFFFFE4ULL >> 1",
+    "0xFFFFFFFFFFFFFFFFULL", "0xFFFFFFFFFFFFFFFFULL % 1000ULL", "0x20000000000001ULL",
+    "0xFFFFFFFFFFFFFFFFLL", "0x8000000000000001LL", "0x7FFFFFFFFFFFFFE4LL % 1000LL",
+    "-0x1ULL", "-0x8000000000000000LL", "-0x7FFFFFFFFFFFFFE4LL", "0x000000000000000000ABLL",
+    "9223372036854775809LL", "18446744073709551615LL", "-18446744073709551615ULL",
+}
+
+-- A 64-bit literal lowers to the exact value LuaJIT reads it as, hex spellings
+-- above 2^53 included. The program exits with the first case that disagrees.
+function M.wideLiteralsAgreeWithLuaJIT()
+    requireCodegen()
+    local lines = {}
+    for index, expression in ipairs(WIDE_LITERALS) do
+        local expected = tostring(assert(load("return " .. expression, "=" .. expression))())
+        lines[#lines + 1] = ("    if (%s) ~= %s then\n        return %d\n    end\n"):format(expression, expected, index)
+    end
+    local executable, output = link("local function main(): int32\n" .. table.concat(lines) .. "    return 0\nend\n")
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ("%s: %s"):format(tostring(WIDE_LITERALS[status]), ran))
+end
+
 -- A compound bit assignment stores what the operator gives, as LuaJIT does.
 function M.bitCompoundAssignmentsAgreeWithLuaJIT()
     requireCodegen()
