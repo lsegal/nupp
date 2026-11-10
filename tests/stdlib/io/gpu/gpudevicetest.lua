@@ -147,6 +147,61 @@ function M.aDeclaredWorkgroupSizeMustBeTheCompiledOne()
     fails(function() device.checkworkgroupsize(truncated, short, "main", {64, 1, 1}) end, "invalid length")
 end
 
+-- A valid compute module with one word changed: its 32-bit integer type
+-- declares 367 bits, and naga's SPIR-V front end panics laying that out.
+local function nagaPanicModule()
+    local file = assert(io.open(require("helpers.paths").tests .. "/fixtures/naga-panic.spv", "rb"))
+    local bytes = file:read("*a")
+    file:close()
+    return bytes
+end
+
+local function layoutOf(module)
+    local spirv, count = device.spirvwords(words(module))
+    device.checklayout(spirv, count)
+end
+
+-- A header, then %1 = OpTypeInt 32 0 and %2 = OpConstant %1 length, then
+-- whatever array declarations follow.
+local function moduleWithArrays(length, ...)
+    local module = {0x07230203, 0x00010300, 0, 20, 0, 4 * 65536 + 21, 1, 32, 0, 4 * 65536 + 43, 1, 2, length}
+    for _, word in ipairs({...}) do
+        module[#module + 1] = word
+    end
+    return module
+end
+
+function M.typesNagaCannotLayOutAreRefused()
+    local spirv, count = device.spirvwords(nagaPanicModule())
+    fails(function() device.checklayout(spirv, count) end, "SPIR-V type %3 has an unsupported 367-bit width")
+    for _, bits in ipairs({8, 16, 32, 64}) do
+        layoutOf({0x07230203, 0x00010300, 0, 20, 0, 4 * 65536 + 21, 1, bits, 1, 3 * 65536 + 22, 2, bits})
+    end
+    fails(function() layoutOf({0x07230203, 0x00010300, 0, 20, 0, 4 * 65536 + 21, 1, 0, 0}) end,
+        "SPIR-V type %1 has an unsupported 0-bit width")
+    fails(function() layoutOf({0x07230203, 0x00010300, 0, 20, 0, 3 * 65536 + 22, 1, 24}) end,
+        "SPIR-V type %1 has an unsupported 24-bit width")
+end
+
+function M.arraysPastTheTypeSizeLimitAreRefused()
+    -- %3 = OpTypeArray %1 %2: 2^28 four-byte elements are exactly 1 GiB.
+    layoutOf(moduleWithArrays(0x10000000, 4 * 65536 + 28, 3, 1, 2))
+    fails(function() layoutOf(moduleWithArrays(0x10000001, 4 * 65536 + 28, 3, 1, 2)) end,
+        "SPIR-V array type %3 is larger than the 1073741824-byte type limit")
+    -- %4 = OpTypeArray %3 %2: an array of arrays multiplies the sizes.
+    fails(function() layoutOf(moduleWithArrays(0x8000, 4 * 65536 + 28, 3, 1, 2, 4 * 65536 + 28, 4, 3, 2)) end,
+        "SPIR-V array type %4 is larger than")
+    -- OpDecorate %3 ArrayStride 0x40000001 on %3 = OpTypeRuntimeArray %1.
+    fails(function() layoutOf(moduleWithArrays(1, 4 * 65536 + 71, 3, 6, 0x40000001, 3 * 65536 + 29, 3, 1)) end,
+        "SPIR-V array type %3 is larger than")
+    -- %3 = struct { %1 at offset 0x3ffffffc } spans exactly 1 GiB, so an
+    -- array of two is too large.
+    fails(function()
+        layoutOf(moduleWithArrays(2, 5 * 65536 + 72, 3, 0, 35, 0x3ffffffc, 3 * 65536 + 30, 3, 1,
+            4 * 65536 + 28, 4, 3, 2))
+    end, "SPIR-V array type %4 is larger than")
+end
+
 function M.closingAfterAWriteErrorPreservesTheErrorAndResetsTheSink()
     local path = temporary("close")
     assert(costs.configure(path) == nil)
@@ -261,6 +316,17 @@ function M.invalidSpirvIsAValidationFailureWhenAvailable()
     assert(problem and problem:find("^gpu: GPU validation: "), tostring(problem))
     local buffer = check(device.createbuffer(gpu, 16))
     check(device.releasebuffer(gpu, buffer))
+    check(device.close(gpu))
+end
+
+function M.aModuleNagaWouldPanicOnFailsWithoutEndingTheProcessWhenAvailable()
+    local gpu = open()
+    local _, problem = device.createkernel(gpu, nagaPanicModule(), "main", 1, 1, 16, {64, 1, 1})
+    assert(problem == "gpu: SPIR-V type %3 has an unsupported 367-bit width", tostring(problem))
+    local other = check(device.open())
+    local buffer = check(device.createbuffer(other, 16))
+    check(device.releasebuffer(other, buffer))
+    check(device.close(other))
     check(device.close(gpu))
 end
 
