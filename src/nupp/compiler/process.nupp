@@ -271,6 +271,7 @@ end
 --- A temporary name the compiler can write, under the user's temporary
 --- directory on Windows rather than the drive root.
 function process.tmpname(): string
+    @allow("deprecated")
     local name = os.tmpname()
     if not windows then
         return name
