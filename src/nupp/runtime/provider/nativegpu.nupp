@@ -2,8 +2,9 @@
 --[[
 Native resident-compute implementation bound to native targets.
 
-`open` creates a device context through [](nupp.runtime.native). The artifact
-must carry the native GPU feature and a compatible host driver. Generated shader
+`open` creates a device context through [](nupp.runtime.provider.gpudevice),
+which drives the pinned wgpu-native library the build stages beside the program.
+Generated shader
 artifacts, layout facts, buffer counts, and binding offsets are checked before
 dispatch; this module does not choose the compiler's target representation.
 
@@ -19,38 +20,12 @@ operate on the retained context without further service resolution.
 ]]
 module nupp.runtime.provider.nativegpu
 
-local native = require("nupp.runtime.native")
+local device = require("nupp.runtime.provider.gpudevice")
+local costs = require("nupp.runtime.provider.gpucosts")
 local suspension = require("nupp.suspension")
 local layoutFacts = require("nupp.gpu.layoutfacts").layoutFacts
 local span = require("bytes.span")
-local ffi = native.ffi
-local C = native.C
-native.ffi.cdef[[
-int32_t nuppNativeGpuCostsOutput(const uint8_t *, size_t);
-int32_t nuppNativeGpuCostsEnabled(void);
-int32_t nuppNativeGpuCostMetadata(uint64_t, uint64_t, int32_t, const uint8_t *, size_t);
-int32_t nuppNativeGpuContextCreate(uint64_t *);
-int32_t nuppNativeGpuContextDescription(uint64_t, uint8_t *, size_t, size_t *);
-int32_t nuppNativeGpuContextRelease(uint64_t);
-int32_t nuppNativeGpuBufferCreate(uint64_t, uint64_t, uint64_t *);
-int32_t nuppNativeGpuBufferRelease(uint64_t, uint64_t);
-int32_t nuppNativeGpuBufferUpload(uint64_t, uint64_t, uint64_t, const void *, size_t);
-int32_t nuppNativeGpuKernelCreate(
-    uint64_t, const uint8_t *, size_t, const char *, size_t,
-    uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t, uint64_t *);
-int32_t nuppNativeGpuKernelRelease(uint64_t, uint64_t);
-int32_t nuppNativeGpuBindingsCreate(uint64_t, uint64_t, uint64_t *);
-int32_t nuppNativeGpuBindingsRelease(uint64_t, uint64_t);
-int32_t nuppNativeGpuBindingsSetBuffer(
-    uint64_t, uint64_t, int32_t, uint32_t, uint64_t, uint64_t, uint64_t);
-int32_t nuppNativeGpuDispatch(
-    uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, const uint8_t *, size_t);
-int32_t nuppNativeGpuDownloadQueue(uint64_t, uint64_t, uint64_t, uint64_t);
-int32_t nuppNativeGpuSynchronize(uint64_t);
-int32_t nuppNativeGpuSynchronizeReady(uint64_t, uint32_t *);
-int32_t nuppNativeGpuDownloadRead(
-    uint64_t, uint64_t, uint64_t, uint64_t, void *, size_t);
-]]
+local ffi = require("ffi")
 
 local shared = require("nupp.gpu.types")
 local api = require("nupp.gpu.api")
@@ -111,52 +86,22 @@ local function live(borrows self: gpu.Context): any
     return self._handle
 end
 
+-- Raises a device failure from the caller's caller, the way every operation here
+-- reports one; answers the result otherwise.
+local function succeeded(level: integer, value: any, problem: string?): any
+    if problem ~= nil then
+        error("nupp: " .. problem, level + 1)
+    end
+
+    return value
+end
+
 local function whole(value: any, what: string, minimum: integer, maximum: integer): integer
     if type(value) ~= "number" or value ~= math.floor(value) or value < minimum or value > maximum then
         error(("nupp: GPU %s must be an integer from %d through %d"):format(what, minimum, maximum), 3)
     end
 
     return value as integer
-end
-
--- Keep the element type on the span crossing the native boundary. Casting the
--- pointer to bytes would erase its borrow provenance; only the C declaration
--- needs to forget the pointee type.
-local function uploadTyped<T>(
-    context: any,
-    buffer: any,
-    borrows source: const T[?],
-    offset: integer,
-    bytes: integer
-): integer
-    local call = C.nuppNativeGpuBufferUpload as function(
-        any,
-        any,
-        integer,
-        borrows source: const T[?],
-        integer
-    ): integer
-
-    return call(context, buffer, offset, source, bytes)
-end
-
-local function readTyped<T>(
-    context: any,
-    buffer: any,
-    borrows destination: T[?],
-    offset: integer,
-    bytes: integer
-): integer
-    local call = C.nuppNativeGpuDownloadRead as function(
-        any,
-        any,
-        integer,
-        integer,
-        borrows destination: T[?],
-        integer
-    ): integer
-
-    return call(context, buffer, offset, bytes, destination, bytes)
 end
 
 --- The per-dimension workgroup bound every WebGPU device guarantees.
@@ -174,44 +119,37 @@ local function dispatchNative(
     threads: integer,
     borrows uniforms: const uint8[?],
     bytes: integer
-): integer
-    local call = C.nuppNativeGpuDispatch as function(
-        any,
-        any,
-        integer,
-        integer,
-        integer,
-        borrows uniforms: const uint8[?],
-        integer
-    ): integer
+): (any, string?)
     local groups = math.ceil(count / threads)
     if groups <= WORKGROUPS_PER_DIMENSION then
-        return call(context, bindings, count, 1, 1, uniforms, bytes)
+        return device.dispatch(context, bindings, {count, 1, 1}, uniforms, bytes)
     end
     local rows = math.ceil(groups / WORKGROUPS_PER_DIMENSION)
 
-    return call(context, bindings, WORKGROUPS_PER_DIMENSION * threads, rows, 1, uniforms, bytes)
+    return device.dispatch(context, bindings, {WORKGROUPS_PER_DIMENSION * threads, rows, 1}, uniforms, bytes)
 end
 
 local contextdestroy = require("nupp.runtime.provider.nativegpurelease").destroy
 
 --- Selects process-local JSONL GPU costs; nil restores NUPP_GPU_COSTS.
+--- @raises string when the output cannot be opened, or the previous one failed a write
 function gpu.costsOutput(path: string?): nil
-    native.requireFeature(4, "GPU cost instrumentation")
-    native.succeeded(C.nuppNativeGpuCostsOutput(path, path and #path or 0), 2)
+    local problem = costs.configure(path ~= "" and path or nil)
+    if problem ~= nil then
+        error("nupp: gpu: " .. problem, 2)
+    end
 end
 
 local function costMetadata(context: any, handle: any, kernel: boolean, metadata: any): nil
-    if C.nuppNativeGpuCostsEnabled() == 0 then
+    if not costs.enabled() then
         return
     end
-    local json = require("serde.json")
     if kernel then
+        local json = require("serde.json")
         metadata.readonlyNames = json.asarray(metadata.readonlyNames or {})
         metadata.writableNames = json.asarray(metadata.writableNames or {})
     end
-    local encoded = json.encodevalue(metadata)
-    native.succeeded(C.nuppNativeGpuCostMetadata(context, handle, kernel and 1 or 0, encoded, #encoded), 2)
+    succeeded(3, device.metadata(context, handle, kernel, metadata))
 end
 
 local function costLayout(
@@ -223,7 +161,7 @@ local function costLayout(
     offset: integer,
     count: integer
 ): nil
-    if C.nuppNativeGpuCostsEnabled() == 0 then
+    if not costs.enabled() then
         return
     end
     costMetadata(context, handle, false, {
@@ -237,16 +175,7 @@ local function costLayout(
 end
 
 function gpu.Context.driver(borrows self: gpu.Context): string
-    local length = ffi.new("size_t[1]")
-    local handle = live(self)
-    local probed = C.nuppNativeGpuContextDescription(handle, nil, 0, length)
-    if probed ~= native.BUFFER_TOO_SMALL then
-        native.succeeded(probed, 2)
-    end
-    local output = ffi.new("uint8_t[?]", length[0])
-    native.succeeded(C.nuppNativeGpuContextDescription(handle, output, length[0], length), 2)
-
-    return ffi.string(output, length[0])
+    return device.description(live(self))
 end
 
 function gpu.Context.buffer<T>(
@@ -279,9 +208,7 @@ function gpu.Context._allocate<T>(
     if width <= 0 or count == 0 or count > 4294967295 // width then
         error("nupp: GPU buffer must contain 1 through 4294967295 bytes", 3)
     end
-    local output = ffi.new("uint64_t[1]")
-    native.succeeded(C.nuppNativeGpuBufferCreate(live(self), width * count, output), 3)
-    local handle = output[0]
+    local handle = succeeded(3, device.createbuffer(live(self), width * count))
     costMetadata(live(self), handle, false, {format = tostring(element), elementBytes = width, shape = {count}})
 
     return shared.Buffer<T>(
@@ -324,25 +251,14 @@ function gpu.Context.compilegenerated(
     if type(spirv) ~= "string" or #spirv == 0 or type(entrypoint) ~= "string" or #entrypoint == 0 then
         error("nupp: native GPU kernels need non-empty SPIR-V and an entrypoint", 2)
     end
-    local output = ffi.new("uint64_t[1]")
-    native.succeeded(
-        C.nuppNativeGpuKernelCreate(
-            live(self),
-            spirv,
-            #spirv,
-            entrypoint,
-            #entrypoint,
-            readonlybuffers,
-            writablebuffers,
-            uniformbytes,
+    local handle = succeeded(
+        2,
+        device.createkernel(live(self), spirv, entrypoint, readonlybuffers, writablebuffers, uniformbytes, {
             group,
             1,
-            1,
-            output
-        ),
-        2
+            1
+        })
     )
-    local handle = output[0]
     local identity = artifacts as any
     costMetadata(live(self), handle, true, {
         sourceFile = identity.sourcefile,
@@ -368,14 +284,14 @@ function gpu.Context._releaseBuffer(borrows self: gpu.Context, buffer: any): nil
     if self._closed or self._handle == nil then
         return
     end
-    native.succeeded(C.nuppNativeGpuBufferRelease(self._handle, buffer._handle), 3)
+    succeeded(3, device.releasebuffer(self._handle, buffer._handle))
 end
 
 function gpu.Context._releaseKernel(borrows self: gpu.Context, handle: any): nil
     if self._closed or self._handle == nil then
         return
     end
-    native.succeeded(C.nuppNativeGpuKernelRelease(self._handle, handle), 3)
+    succeeded(3, device.releasekernel(self._handle, handle))
 end
 
 function gpu.Binding.close(borrows self: gpu.Binding): nil
@@ -388,7 +304,7 @@ function gpu.Binding.close(borrows self: gpu.Binding): nil
     if context._closed or context._handle == nil then
         return
     end
-    native.succeeded(C.nuppNativeGpuBindingsRelease(context._handle, binding._handle), 2)
+    succeeded(2, device.releasebindings(context._handle, binding._handle))
 end
 
 --- The allocation states bound on a side of a binding: its read slots or its
@@ -442,17 +358,9 @@ function gpu.Binding.setread<T>(
         buffer._offset,
         buffer.count
     )
-    native.succeeded(
-        C.nuppNativeGpuBindingsSetBuffer(
-            self._context,
-            self._handle,
-            0,
-            slot,
-            buffer._handle,
-            0,
-            buffer._capacity * buffer._width
-        ),
-        2
+    succeeded(
+        2,
+        device.setbuffer(self._context, self._handle, false, slot, buffer._handle, 0, buffer._capacity * buffer._width)
     )
     self._read[slot + 1] = 1
     self._bufferStates[slot + 1] = buffer._state
@@ -498,17 +406,9 @@ function gpu.Binding.setwrite<T>(
         buffer._offset,
         buffer.count
     )
-    native.succeeded(
-        C.nuppNativeGpuBindingsSetBuffer(
-            self._context,
-            self._handle,
-            1,
-            slot,
-            buffer._handle,
-            0,
-            buffer._capacity * buffer._width
-        ),
-        2
+    succeeded(
+        2,
+        device.setbuffer(self._context, self._handle, true, slot, buffer._handle, 0, buffer._capacity * buffer._width)
     )
     self._write[slot + 1] = 1
     local position = self._readonlyBuffers + slot + 1
@@ -549,10 +449,15 @@ function gpu.Binding.dispatchpacked(borrows self: gpu.Binding, uniforms: any, un
         end
     end
     local uniformPointer = ffi.cast<const uint8[?]>(uniforms)
-    native.succeeded(
-        dispatchNative(self._context, self._handle, self.count, self._kernel._threads, uniformPointer, uniformbytes),
-        2
+    local done, problem = dispatchNative(
+        self._context,
+        self._handle,
+        self.count,
+        self._kernel._threads,
+        uniformPointer,
+        uniformbytes
     )
+    succeeded(2, done, problem)
 end
 
 function gpu.Context.upload<T>(
@@ -572,9 +477,9 @@ function gpu.Context.upload<T>(
     end
     costLayout(live(self), buffer._handle, buffer._shape, buffer._strides, buffer._width, buffer._offset, buffer.count)
     local pointer, count = source:ref()
-    native.succeeded(
-        uploadTyped(live(self), buffer._handle, pointer, buffer._offset * buffer._width, buffer._width * count),
-        2
+    succeeded(
+        2,
+        device.upload(live(self), buffer._handle, buffer._offset * buffer._width, pointer, buffer._width * count)
     )
 end
 
@@ -587,43 +492,29 @@ function gpu.Context.enqueuedownload<T>(borrows self: gpu.Context, borrows buffe
         error("nupp: GPU downloads require a dense tensor view", 2)
     end
     costLayout(live(self), buffer._handle, buffer._shape, buffer._strides, buffer._width, buffer._offset, buffer.count)
-    native.succeeded(
-        C.nuppNativeGpuDownloadQueue(
-            live(self),
-            buffer._handle,
-            buffer._offset * buffer._width,
-            buffer.count * buffer._width
-        ),
-        2
+    succeeded(
+        2,
+        device.queuedownload(live(self), buffer._handle, buffer._offset * buffer._width, buffer.count * buffer._width)
     )
 end
 
-const READINESS_FEATURE = 16384
-
--- Whether the context's submitted work has finished, or why that cannot be told.
--- Never blocks: while the work runs, the provider advances the readiness generation
--- once it is done.
-local function workDone(handle: any, ready: any): (boolean, string?)
-    if C.nuppNativeGpuSynchronizeReady(handle, ready) ~= 0 then
-        return false, "nupp: " .. ffi.string(C.nuppNativeLastError())
-    end
-
-    return ready[0] ~= 0, nil
-end
+-- Where the device's readiness source runs in a pass: beside the other native
+-- families' sources.
+const READINESS_PRIORITY = 20
 
 --- Parks until the context's submitted work finishes, then settles its downloads.
 ---
---- The wait is a suspension on the readiness generation every native family
---- shares, so a task deadline or a cancellation reaches it and other work keeps
---- running meanwhile; a frame with nobody to yield to sleeps until the device is
---- done. Only mapping the finished downloads happens in the blocking call.
+--- The wait is a suspension, so a task deadline or a cancellation reaches it and
+--- other work keeps running meanwhile. wgpu-native reports completion only when
+--- asked, so the source polls the device and its wait sleeps one bounded slice
+--- before the scheduler asks again; a frame with nobody to yield to sleeps the
+--- same way until the device is done. Only mapping the finished downloads happens
+--- in the blocking call.
 --- @raises string when the context is closed, the device cannot be waited for, or
 ---     the work it finished reports a validation failure or device fault
 function gpu.Context.synchronize(borrows self: gpu.Context): nil
     local handle = live(self)
-    native.requireFeature(READINESS_FEATURE, "readiness")
-    local ready = ffi.new("uint32_t[1]")
-    local done, failure = workDone(handle, ready)
+    local done, failure = device.workdone(handle)
     if not done and failure == nil then
         -- The check's failure is the waiter's to raise, not the driver's that polled
         -- it, so it is handed over through the resumption.
@@ -634,12 +525,12 @@ function gpu.Context.synchronize(borrows self: gpu.Context): nil
             local waiting = true
             context:source(
                 "nupp-gpu",
-                native.READINESS_PRIORITY,
-                native.pump(function(): integer
+                READINESS_PRIORITY,
+                function(): integer
                     if not waiting then
                         return 0
                     end
-                    local finished, reason = workDone(handle, ready)
+                    local finished, reason = device.workdone(handle)
                     if not finished and reason == nil then
                         return 0
                     end
@@ -647,7 +538,12 @@ function gpu.Context.synchronize(borrows self: gpu.Context): nil
                     resume(reason)
 
                     return 1
-                end)
+                end,
+                function(waitMs: integer): integer
+                    device.pause(waitMs)
+
+                    return 0
+                end
             )
 
             return function(): nil
@@ -656,9 +552,9 @@ function gpu.Context.synchronize(borrows self: gpu.Context): nil
         end)
     end
     if failure ~= nil then
-        error(failure, 2)
+        error("nupp: " .. failure, 2)
     end
-    native.succeeded(C.nuppNativeGpuSynchronize(handle), 2)
+    succeeded(2, device.synchronize(handle))
 end
 
 function gpu.Context.readdownloaded<T>(
@@ -677,9 +573,9 @@ function gpu.Context.readdownloaded<T>(
         error("nupp: GPU download span length does not match its buffer", 2)
     end
     local pointer, count = destination:ref()
-    native.succeeded(
-        readTyped(live(self), buffer._handle, pointer, buffer._offset * buffer._width, buffer._width * count),
-        2
+    succeeded(
+        2,
+        device.readdownload(live(self), buffer._handle, buffer._offset * buffer._width, buffer._width * count, pointer)
     )
 end
 
@@ -715,9 +611,7 @@ function gpu.Context.bindkernel(
     end
     count = whole(count, "dispatch count", 1, 4294967295)
     local context = live(self)
-    local output = ffi.new("uint64_t[1]")
-    native.succeeded(C.nuppNativeGpuBindingsCreate(context, kernel._handle, output), 2)
-    local handle = output[0]
+    local handle = succeeded(2, device.createbindings(context, kernel._handle))
     local spans = kernel._readonlyBuffers + kernel._writableBuffers
     local spanCounts: {integer} = {}
     local spanOffsets: {integer} = {}
@@ -754,23 +648,17 @@ end
 
 --- Opens and closes a device to learn whether one can be opened.
 function gpu.available(): boolean
-    if not pcall(native.requireFeature, 4, "GPU support") then
+    local context = device.open()
+    if context == nil then
         return false
     end
-    local output = ffi.new("uint64_t[1]")
-    if C.nuppNativeGpuContextCreate(output) ~= 0 then
-        return false
-    end
-    C.nuppNativeGpuContextRelease(output[0])
+    device.close(context)
 
     return true
 end
 
 function gpu.open(): api.KernelContext
-    native.requireFeature(4, "GPU support")
-    local output = ffi.new("uint64_t[1]")
-    native.succeeded(C.nuppNativeGpuContextCreate(output), 2)
-    local handle = output[0]
+    local handle = succeeded(2, device.open())
 
     return gpu.Context(_destroy = contextdestroy, _handle = handle, _closed = false)
 end

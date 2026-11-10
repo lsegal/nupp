@@ -191,7 +191,8 @@ function stage.build(
         driver: string,
         library: string,
         names: {string},
-        providerFeatures: {string}
+        providerFeatures: {string},
+        platform: string?
     }} = {}
     local providerKeys: {string} = {}
     for _, feature in ipairs(native.features(effects)) do
@@ -211,14 +212,17 @@ function stage.build(
                 -- current-machine sidecar beside a foreign executable is invalid.
                 goto continue
             end
-            if selectedPlatform and not feature.host then
+            -- A prebuilt provider exists for every platform, so a foreign
+            -- target stages its own copy rather than this machine's.
+            local foreign = selectedPlatform and feature.providerDriver == "wgpu" and selectedPlatform or nil
+            if selectedPlatform and not feature.host and not foreign then
                 return nil, (
                     "binary target %s needs sidecar-only native feature %s; no %s provider artifact exists"
                 ):format(tostring(selectedPlatform), feature.name, tostring(selectedPlatform))
             end
             local libraryName = feature.library as string
             local driver = feature.providerDriver or "native"
-            local key = driver .. "\0" .. feature.provider .. "\0" .. libraryName
+            local key = driver .. "\0" .. feature.provider .. "\0" .. libraryName .. "\0" .. (foreign or "")
             local provider = providers[key]
             if not provider then
                 provider = {
@@ -227,6 +231,7 @@ function stage.build(
                     library = libraryName,
                     names = {},
                     providerFeatures = {},
+                    platform = foreign,
                 }
                 providers[key] = provider
                 providerKeys[#providerKeys + 1] = key
@@ -247,15 +252,25 @@ function stage.build(
         end
         table.sort(provider.names)
         table.sort(provider.providerFeatures)
-        local built, problem = driven(compilerRoot, provider.driver, provider.providerFeatures)
+        local built, problem = driven(
+            compilerRoot,
+            provider.driver,
+            provider.platform and {provider.platform as string} or provider.providerFeatures
+        )
         if not built then
             return nil, ("cannot build native facilities %s:\n%s"):format(table.concat(provider.names, ", "), problem)
         end
         local filename = libraryFile(provider.library)
         -- The sidecar has one public name on POSIX. Windows' loader appends
         -- `.dll` to an extensionless path, so keep that suffix there while
-        -- leaving the provider name stable everywhere else.
-        local staged = jit.os == "Windows" and filename or provider.library
+        -- leaving the provider name stable everywhere else. A foreign target
+        -- is named for the system it runs on.
+        local windowsTarget = jit.os == "Windows"
+        if provider.platform then
+            windowsTarget = (provider.platform as string):find("windows", 1, true) ~= nil
+            filename = provider.library .. ".dll"
+        end
+        local staged = windowsTarget and filename or provider.library
         local output = join(root, join(outDir, join("lib", staged)))
         local copied, err = fs.copyFile(built, output)
         if not copied then

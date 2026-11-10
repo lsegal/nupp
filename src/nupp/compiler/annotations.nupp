@@ -580,8 +580,15 @@ function annotations.hydrateBuiltins(registry: annotations.Registry, typesApi: a
             "Selects the execution family: `\"cpu\"` (the default) or `\"gpu\"`.",
             "docs/api.md#annotation-aot"
         ),
+        export = member(
+            "export",
+            optional(typesApi.string),
+            true,
+            "Publishes the compiled function as a C function of this name in the AOT library.",
+            "docs/api.md#annotation-aot"
+        ),
     }
-    aot.memberOrder = {"target"}
+    aot.memberOrder = {"target", "export"}
 
     local event = registry:get("event")
     event.members = {

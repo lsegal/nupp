@@ -514,6 +514,11 @@ local function preamble(program: scalarIR.Program): {string}
             #lines + 1
         ] = "runtime " .. tostring(program.runtimeAbi) .. " registrar(" .. tostring(program.registrar) .. ")"
     end
+    -- In the text the unit's cache key is taken over, so renaming an export
+    -- does not reuse an object that still defines the old name.
+    if program.exportName ~= nil then
+        lines[#lines + 1] = "export c(" .. tostring(program.exportName) .. ")"
+    end
 
     -- The contract is part of what the IR means and not a build setting,
     -- because it decides what the function answers rather than only how fast it

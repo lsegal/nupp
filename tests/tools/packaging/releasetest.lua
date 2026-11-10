@@ -91,7 +91,7 @@ function M.recordsAndVerifiesACompleteStubCatalog()
         for _, feature in ipairs(record.hostFeatures) do
             features[feature] = true
         end
-        assert(features["native-gpu"], "released catalog hosts promise GPU support")
+        assert(not features["native-gpu"], "the GPU is staged beside a program, not linked into a host")
         assert(features["native-time"], "released catalog hosts promise their base clocks")
     end
     assert(text:find('\n  "catalogRelease":', 1, true), "the immutable catalog is stable readable JSON")

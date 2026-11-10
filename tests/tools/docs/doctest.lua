@@ -7439,7 +7439,7 @@ local VERSION_SOURCES = {
     ["Bench record"] = {"src/debug/bench.nupp", "export const schema = (%d+)"},
     ["Optimizer remarks"] = {"src/nupp/tools/cli/compile.nupp", "local document = {%s*schema = (%d+),"},
     ["Trace reason catalog"] = {"src/debug/profile/init.nupp", "export const catalogversion = (%d+)"},
-    ["GPU cost records"] = {"native/crates/gpu/src/costs.rs", "values%[\"schemaVersion\"%] = json!%((%d+)%)"},
+    ["GPU cost records"] = {"src/nupp/runtime/provider/gpucosts.nupp", "values%.schemaVersion = (%d+)"},
 }
 
 function M.theVersionsRegistryMatchesTheConstants()

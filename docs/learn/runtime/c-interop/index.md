@@ -810,6 +810,52 @@ type. An ordinary struct does not cross this boundary by value. `export-c` is
 the only publisher: there is no annotation, no user-selected C tag, and no
 parallel header generator.
 
+## Export functions to C
+
+A C program can call Nupp code that is compiled ahead of time. Name the C
+function with `@aot(export = ...)` on a top-level local function:
+
+```nupp
+@aot(export = "game_add")
+local function add(a: int32, b: int32): int32
+   return a + b
+end
+
+return {add = add}
+```
+
+Build the target with `aot = "require"`. Its AOT library then defines
+`game_add` as well as the symbols the Lua wrapper calls:
+
+- `lib/lib<target>_aot.a` when the target sets `aotLinkage = "static"`;
+- `lib/lib<target>_aot.so`, `.dylib` or `<target>_aot.dll` otherwise.
+
+The C name is an alias of the narrowest feature tier's code, which runs on every
+machine the target triple describes. A Windows DLL loads into a process with no
+Lua in it, because these functions never call the Lua API.
+
+`export-c` declares the function when you select it by its module-qualified
+Nupp name:
+
+```bash
+nupp export-c -o game.h src/game.nupp game.add
+```
+
+```c
+int32_t game_add(int32_t a, int32_t b);
+```
+
+The prototype follows the AOT entry ABI. `number` and `integer` are `double`,
+because that is how Lua holds them. `float` is `float`, `boolean` is `bool`,
+and the fixed-width integers keep their widths. An exported function takes and
+returns these scalars only. `export-c` refuses one with a span parameter or
+several results with NUPP2203, because the header cannot state those yet.
+
+The build refuses a few more cases. The name must be a literal C identifier.
+A GPU kernel, a function that holds Lua values, and a function with const
+parameters have no single C function to publish. Two functions in one library
+may not claim the same name.
+
 ## JIT-sensitive C boundaries
 
 C-derived callback positions are tracked semantically through declarations and

@@ -17,6 +17,7 @@ notices remain complete in one place.
 | [LPeg](https://www.inf.puc-rio.br/~roberto/lpeg/) | `1.1.0` | MIT | [notices/LPeg-LICENSE.txt](notices/LPeg-LICENSE.txt) |
 | [Lunajson](https://github.com/grafi-tt/lunajson) | `1.2.3` | MIT | [notices/lunajson-LICENSE.txt](notices/lunajson-LICENSE.txt) |
 | Rust dependency graph | `Cargo.lock` | Mixed permissive licenses | [notices/Rust-dependencies.html](notices/Rust-dependencies.html) |
+| [wgpu-native](https://github.com/gfx-rs/wgpu-native) | `v29.0.1.1` | MIT or Apache-2.0 | [notices/wgpu-native-LICENSE.MIT.txt](notices/wgpu-native-LICENSE.MIT.txt), [notices/wgpu-native-LICENSE.APACHE.txt](notices/wgpu-native-LICENSE.APACHE.txt) |
 
 LuaJIT's notice also carries the public-domain statement for dlmalloc, which
 LuaJIT includes; it is reproduced there rather than summarised here.
@@ -33,6 +34,10 @@ Rust graph supplies feature-selected native providers including networking and
 TLS. A build that does not select one of those does not distribute it;
 the notices stay here because each binary's features are decided independently.
 Lunajson's decoder and encoder are vendored into the portable compiler runtime.
+wgpu-native is not built here: the GPU provider stages its prebuilt release
+library beside a program that opens a GPU context, so it travels with GPU
+programs rather than with any host. That library carries wgpu's own Rust
+dependency graph, whose notices its release describes.
 
 The Rust notice deliberately covers every third-party package in `Cargo.lock`,
 including target-specific, build and development dependencies. This is broader

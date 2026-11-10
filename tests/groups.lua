@@ -100,7 +100,7 @@ local groups = {
         "templategametest",
     },
 
-    ["gpu"] = {"gputest"},
+    ["gpu"] = {"gputest", "gpudevicetest"},
 
     -- Compact native and Wasm packs, their executable obligation ledger, and
     -- the structural checks which keep the replacement corpus bounded.
@@ -252,7 +252,7 @@ rusttoolchaintest toolchaintest
 end
 
 for name in (
-    "compressiontest digestboundarytest eventstest gputest hashstreamtest portableiocontractstest processcompat_test streamadapterstest"
+    "compressiontest digestboundarytest eventstest gputest gpudevicetest hashstreamtest portableiocontractstest processcompat_test streamadapterstest"
 ):gmatch("%S+") do
     scopes[name] = "integration"
 end
@@ -329,6 +329,7 @@ scopes.projectctest = "integration"
 scopes.projectbinarytest = "integration"
 scopes.projectfixpointtest = "integration"
 scopes.projectaottest = "integration"
+scopes.projectaotcexporttest = "integration"
 scopes.projectclinktest = "integration"
 scopes.projectcargotest = "integration"
 scopes.projectgeneratortest = "integration"

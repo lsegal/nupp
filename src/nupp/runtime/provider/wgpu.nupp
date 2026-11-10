@@ -1,0 +1,679 @@
+@!internal
+--[[
+LuaJIT FFI binding for the pinned wgpu-native library.
+
+Declares the slice of `webgpu.h` and `wgpu.h` that
+[](nupp.runtime.provider.gpudevice) drives, loads the library the build staged
+beside the program, and owns the C callbacks wgpu-native reports into. The
+declarations follow the headers of the release `scripts/toolchain.pins` names;
+bumping that pin means checking these layouts against the new headers.
+
+The library is found through `NUPP_WGPU_LIBRARY`, then as `lib/wgpu_native`
+beside the program (with its `.dll` suffix on Windows), then by the platform
+loader's own search. `nupp` itself names the toolchain's copy in the variable.
+]]
+module nupp.runtime.provider.wgpu
+
+local ffi = require("ffi")
+
+ffi.cdef[[
+typedef uint64_t WGPUFlags;
+typedef uint32_t WGPUBool;
+typedef struct WGPUAdapterImpl *WGPUAdapter;
+typedef struct WGPUBindGroupImpl *WGPUBindGroup;
+typedef struct WGPUBindGroupLayoutImpl *WGPUBindGroupLayout;
+typedef struct WGPUBufferImpl *WGPUBuffer;
+typedef struct WGPUCommandBufferImpl *WGPUCommandBuffer;
+typedef struct WGPUCommandEncoderImpl *WGPUCommandEncoder;
+typedef struct WGPUComputePassEncoderImpl *WGPUComputePassEncoder;
+typedef struct WGPUComputePipelineImpl *WGPUComputePipeline;
+typedef struct WGPUDeviceImpl *WGPUDevice;
+typedef struct WGPUInstanceImpl *WGPUInstance;
+typedef struct WGPUPipelineLayoutImpl *WGPUPipelineLayout;
+typedef struct WGPUQuerySetImpl *WGPUQuerySet;
+typedef struct WGPUQueueImpl *WGPUQueue;
+typedef struct WGPUShaderModuleImpl *WGPUShaderModule;
+
+typedef struct WGPUStringView {
+    const char *data;
+    size_t length;
+} WGPUStringView;
+
+typedef struct WGPUChainedStruct {
+    struct WGPUChainedStruct *next;
+    uint32_t sType;
+} WGPUChainedStruct;
+
+typedef struct WGPUFuture {
+    uint64_t id;
+} WGPUFuture;
+
+/* Every callback info shares this layout; the uncaptured-error one alone has
+   no mode, and is declared separately below. */
+typedef struct WGPUCallbackInfo {
+    WGPUChainedStruct *nextInChain;
+    uint32_t mode;
+    void *callback;
+    void *userdata1;
+    void *userdata2;
+} WGPUCallbackInfo;
+
+typedef struct WGPUUncapturedErrorCallbackInfo {
+    WGPUChainedStruct *nextInChain;
+    void *callback;
+    void *userdata1;
+    void *userdata2;
+} WGPUUncapturedErrorCallbackInfo;
+
+typedef struct WGPUInstanceExtras {
+    WGPUChainedStruct chain;
+    WGPUFlags backends;
+    WGPUFlags flags;
+    uint32_t dx12ShaderCompiler;
+    uint32_t gles3MinorVersion;
+    uint32_t glFenceBehaviour;
+    WGPUStringView dxcPath;
+    uint32_t dxcMaxShaderModel;
+    uint32_t dx12PresentationSystem;
+    const uint8_t *budgetForDeviceCreation;
+    const uint8_t *budgetForDeviceLoss;
+    void *displayHandle;
+} WGPUInstanceExtras;
+
+typedef struct WGPUInstanceDescriptor {
+    WGPUChainedStruct *nextInChain;
+    size_t requiredFeatureCount;
+    const uint32_t *requiredFeatures;
+    const void *requiredLimits;
+} WGPUInstanceDescriptor;
+
+typedef struct WGPURequestAdapterOptions {
+    WGPUChainedStruct *nextInChain;
+    uint32_t featureLevel;
+    uint32_t powerPreference;
+    WGPUBool forceFallbackAdapter;
+    uint32_t backendType;
+    void *compatibleSurface;
+} WGPURequestAdapterOptions;
+
+typedef struct WGPUAdapterInfo {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView vendor;
+    WGPUStringView architecture;
+    WGPUStringView device;
+    WGPUStringView description;
+    uint32_t backendType;
+    uint32_t adapterType;
+    uint32_t vendorID;
+    uint32_t deviceID;
+    uint32_t subgroupMinSize;
+    uint32_t subgroupMaxSize;
+} WGPUAdapterInfo;
+
+typedef struct WGPULimits {
+    WGPUChainedStruct *nextInChain;
+    uint32_t maxTextureDimension1D;
+    uint32_t maxTextureDimension2D;
+    uint32_t maxTextureDimension3D;
+    uint32_t maxTextureArrayLayers;
+    uint32_t maxBindGroups;
+    uint32_t maxBindGroupsPlusVertexBuffers;
+    uint32_t maxBindingsPerBindGroup;
+    uint32_t maxDynamicUniformBuffersPerPipelineLayout;
+    uint32_t maxDynamicStorageBuffersPerPipelineLayout;
+    uint32_t maxSampledTexturesPerShaderStage;
+    uint32_t maxSamplersPerShaderStage;
+    uint32_t maxStorageBuffersPerShaderStage;
+    uint32_t maxStorageTexturesPerShaderStage;
+    uint32_t maxUniformBuffersPerShaderStage;
+    uint64_t maxUniformBufferBindingSize;
+    uint64_t maxStorageBufferBindingSize;
+    uint32_t minUniformBufferOffsetAlignment;
+    uint32_t minStorageBufferOffsetAlignment;
+    uint32_t maxVertexBuffers;
+    uint64_t maxBufferSize;
+    uint32_t maxVertexAttributes;
+    uint32_t maxVertexBufferArrayStride;
+    uint32_t maxInterStageShaderVariables;
+    uint32_t maxColorAttachments;
+    uint32_t maxColorAttachmentBytesPerSample;
+    uint32_t maxComputeWorkgroupStorageSize;
+    uint32_t maxComputeInvocationsPerWorkgroup;
+    uint32_t maxComputeWorkgroupSizeX;
+    uint32_t maxComputeWorkgroupSizeY;
+    uint32_t maxComputeWorkgroupSizeZ;
+    uint32_t maxComputeWorkgroupsPerDimension;
+    uint32_t maxImmediateSize;
+} WGPULimits;
+
+typedef struct WGPUQueueDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+} WGPUQueueDescriptor;
+
+typedef struct WGPUDeviceDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+    size_t requiredFeatureCount;
+    const uint32_t *requiredFeatures;
+    const WGPULimits *requiredLimits;
+    WGPUQueueDescriptor defaultQueue;
+    WGPUCallbackInfo deviceLostCallbackInfo;
+    WGPUUncapturedErrorCallbackInfo uncapturedErrorCallbackInfo;
+} WGPUDeviceDescriptor;
+
+typedef struct WGPUBufferDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+    WGPUFlags usage;
+    uint64_t size;
+    WGPUBool mappedAtCreation;
+} WGPUBufferDescriptor;
+
+typedef struct WGPUBufferBindingLayout {
+    WGPUChainedStruct *nextInChain;
+    uint32_t type;
+    WGPUBool hasDynamicOffset;
+    uint64_t minBindingSize;
+} WGPUBufferBindingLayout;
+
+typedef struct WGPUSamplerBindingLayout {
+    WGPUChainedStruct *nextInChain;
+    uint32_t type;
+} WGPUSamplerBindingLayout;
+
+typedef struct WGPUTextureBindingLayout {
+    WGPUChainedStruct *nextInChain;
+    uint32_t sampleType;
+    uint32_t viewDimension;
+    WGPUBool multisampled;
+} WGPUTextureBindingLayout;
+
+typedef struct WGPUStorageTextureBindingLayout {
+    WGPUChainedStruct *nextInChain;
+    uint32_t access;
+    uint32_t format;
+    uint32_t viewDimension;
+} WGPUStorageTextureBindingLayout;
+
+typedef struct WGPUBindGroupLayoutEntry {
+    WGPUChainedStruct *nextInChain;
+    uint32_t binding;
+    WGPUFlags visibility;
+    uint32_t bindingArraySize;
+    WGPUBufferBindingLayout buffer;
+    WGPUSamplerBindingLayout sampler;
+    WGPUTextureBindingLayout texture;
+    WGPUStorageTextureBindingLayout storageTexture;
+} WGPUBindGroupLayoutEntry;
+
+typedef struct WGPUBindGroupLayoutDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+    size_t entryCount;
+    const WGPUBindGroupLayoutEntry *entries;
+} WGPUBindGroupLayoutDescriptor;
+
+typedef struct WGPUPipelineLayoutDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+    size_t bindGroupLayoutCount;
+    const WGPUBindGroupLayout *bindGroupLayouts;
+    uint32_t immediateSize;
+} WGPUPipelineLayoutDescriptor;
+
+typedef struct WGPUShaderSourceSPIRV {
+    WGPUChainedStruct chain;
+    uint32_t codeSize;
+    const uint32_t *code;
+} WGPUShaderSourceSPIRV;
+
+typedef struct WGPUShaderSourceWGSL {
+    WGPUChainedStruct chain;
+    WGPUStringView code;
+} WGPUShaderSourceWGSL;
+
+typedef struct WGPUShaderModuleDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+} WGPUShaderModuleDescriptor;
+
+typedef struct WGPUComputeState {
+    WGPUChainedStruct *nextInChain;
+    WGPUShaderModule module;
+    WGPUStringView entryPoint;
+    size_t constantCount;
+    const void *constants;
+} WGPUComputeState;
+
+typedef struct WGPUComputePipelineDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+    WGPUPipelineLayout layout;
+    WGPUComputeState compute;
+} WGPUComputePipelineDescriptor;
+
+typedef struct WGPUBindGroupEntry {
+    WGPUChainedStruct *nextInChain;
+    uint32_t binding;
+    WGPUBuffer buffer;
+    uint64_t offset;
+    uint64_t size;
+    void *sampler;
+    void *textureView;
+} WGPUBindGroupEntry;
+
+typedef struct WGPUBindGroupDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+    WGPUBindGroupLayout layout;
+    size_t entryCount;
+    const WGPUBindGroupEntry *entries;
+} WGPUBindGroupDescriptor;
+
+typedef struct WGPUCommandEncoderDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+} WGPUCommandEncoderDescriptor;
+
+typedef struct WGPUCommandBufferDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+} WGPUCommandBufferDescriptor;
+
+typedef struct WGPUPassTimestampWrites {
+    WGPUChainedStruct *nextInChain;
+    WGPUQuerySet querySet;
+    uint32_t beginningOfPassWriteIndex;
+    uint32_t endOfPassWriteIndex;
+} WGPUPassTimestampWrites;
+
+typedef struct WGPUComputePassDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+    const WGPUPassTimestampWrites *timestampWrites;
+} WGPUComputePassDescriptor;
+
+typedef struct WGPUQuerySetDescriptor {
+    WGPUChainedStruct *nextInChain;
+    WGPUStringView label;
+    uint32_t type;
+    uint32_t count;
+} WGPUQuerySetDescriptor;
+
+uint32_t wgpuGetVersion(void);
+WGPUInstance wgpuCreateInstance(const WGPUInstanceDescriptor *descriptor);
+void wgpuInstanceRelease(WGPUInstance instance);
+void wgpuInstanceProcessEvents(WGPUInstance instance);
+WGPUFuture wgpuInstanceRequestAdapter(WGPUInstance instance,
+    const WGPURequestAdapterOptions *options, WGPUCallbackInfo callbackInfo);
+
+uint32_t wgpuAdapterGetInfo(WGPUAdapter adapter, WGPUAdapterInfo *info);
+void wgpuAdapterInfoFreeMembers(WGPUAdapterInfo adapterInfo);
+uint32_t wgpuAdapterGetLimits(WGPUAdapter adapter, WGPULimits *limits);
+WGPUBool wgpuAdapterHasFeature(WGPUAdapter adapter, uint32_t feature);
+WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter,
+    const WGPUDeviceDescriptor *descriptor, WGPUCallbackInfo callbackInfo);
+void wgpuAdapterRelease(WGPUAdapter adapter);
+
+WGPUQueue wgpuDeviceGetQueue(WGPUDevice device);
+uint32_t wgpuDeviceGetLimits(WGPUDevice device, WGPULimits *limits);
+WGPUBuffer wgpuDeviceCreateBuffer(WGPUDevice device, const WGPUBufferDescriptor *descriptor);
+WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice device,
+    const WGPUBindGroupLayoutDescriptor *descriptor);
+WGPUPipelineLayout wgpuDeviceCreatePipelineLayout(WGPUDevice device,
+    const WGPUPipelineLayoutDescriptor *descriptor);
+WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice device,
+    const WGPUShaderModuleDescriptor *descriptor);
+WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice device,
+    const WGPUComputePipelineDescriptor *descriptor);
+WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice device, const WGPUBindGroupDescriptor *descriptor);
+WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice device,
+    const WGPUCommandEncoderDescriptor *descriptor);
+WGPUQuerySet wgpuDeviceCreateQuerySet(WGPUDevice device, const WGPUQuerySetDescriptor *descriptor);
+void wgpuDevicePushErrorScope(WGPUDevice device, uint32_t filter);
+WGPUFuture wgpuDevicePopErrorScope(WGPUDevice device, WGPUCallbackInfo callbackInfo);
+/* wgpu.h: answers whether the queue is empty. Both are Rust bools. */
+bool wgpuDevicePoll(WGPUDevice device, bool wait, const uint64_t *submissionIndex);
+void wgpuDeviceDestroy(WGPUDevice device);
+void wgpuDeviceRelease(WGPUDevice device);
+
+void wgpuQueueWriteBuffer(WGPUQueue queue, WGPUBuffer buffer, uint64_t bufferOffset,
+    const void *data, size_t size);
+void wgpuQueueSubmit(WGPUQueue queue, size_t commandCount, const WGPUCommandBuffer *commands);
+float wgpuQueueGetTimestampPeriod(WGPUQueue queue);
+void wgpuQueueRelease(WGPUQueue queue);
+
+WGPUFuture wgpuBufferMapAsync(WGPUBuffer buffer, WGPUFlags mode, size_t offset, size_t size,
+    WGPUCallbackInfo callbackInfo);
+const void *wgpuBufferGetConstMappedRange(WGPUBuffer buffer, size_t offset, size_t size);
+void wgpuBufferUnmap(WGPUBuffer buffer);
+void wgpuBufferDestroy(WGPUBuffer buffer);
+void wgpuBufferRelease(WGPUBuffer buffer);
+
+WGPUComputePassEncoder wgpuCommandEncoderBeginComputePass(WGPUCommandEncoder encoder,
+    const WGPUComputePassDescriptor *descriptor);
+void wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder encoder, WGPUBuffer source,
+    uint64_t sourceOffset, WGPUBuffer destination, uint64_t destinationOffset, uint64_t size);
+void wgpuCommandEncoderResolveQuerySet(WGPUCommandEncoder encoder, WGPUQuerySet querySet,
+    uint32_t firstQuery, uint32_t queryCount, WGPUBuffer destination, uint64_t destinationOffset);
+WGPUCommandBuffer wgpuCommandEncoderFinish(WGPUCommandEncoder encoder,
+    const WGPUCommandBufferDescriptor *descriptor);
+void wgpuCommandEncoderRelease(WGPUCommandEncoder encoder);
+void wgpuCommandBufferRelease(WGPUCommandBuffer commandBuffer);
+
+void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder pass, WGPUComputePipeline pipeline);
+void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder pass, uint32_t groupIndex,
+    WGPUBindGroup group, size_t dynamicOffsetCount, const uint32_t *dynamicOffsets);
+void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder pass, uint32_t x, uint32_t y,
+    uint32_t z);
+void wgpuComputePassEncoderEnd(WGPUComputePassEncoder pass);
+void wgpuComputePassEncoderRelease(WGPUComputePassEncoder pass);
+
+WGPUBindGroupLayout wgpuComputePipelineGetBindGroupLayout(WGPUComputePipeline pipeline,
+    uint32_t groupIndex);
+void wgpuComputePipelineRelease(WGPUComputePipeline pipeline);
+void wgpuBindGroupRelease(WGPUBindGroup group);
+void wgpuBindGroupLayoutRelease(WGPUBindGroupLayout layout);
+void wgpuPipelineLayoutRelease(WGPUPipelineLayout layout);
+void wgpuShaderModuleRelease(WGPUShaderModule module);
+void wgpuQuerySetDestroy(WGPUQuerySet querySet);
+void wgpuQuerySetRelease(WGPUQuerySet querySet);
+]]
+
+-- Every wgpu-native callback takes its message as a `WGPUStringView` by value,
+-- and a LuaJIT callback cannot take a struct by value. The ABIs agree on where
+-- such a sixteen-byte struct goes, though: Windows x64 passes a pointer to a
+-- copy, and SysV x64 and AArch64 pass its two fields in the next two integer
+-- registers. So each callback is declared the way its ABI receives it, and
+-- `message` below reads either spelling.
+const MESSAGE_BY_POINTER = ffi.os == "Windows" and ffi.arch == "x64"
+if MESSAGE_BY_POINTER then
+    ffi.cdef[[
+typedef void (*NuppWgpuAdapterCallback)(uint32_t, WGPUAdapter, const WGPUStringView *, void *, void *);
+typedef void (*NuppWgpuDeviceCallback)(uint32_t, WGPUDevice, const WGPUStringView *, void *, void *);
+typedef void (*NuppWgpuMapCallback)(uint32_t, const WGPUStringView *, void *, void *);
+typedef void (*NuppWgpuScopeCallback)(uint32_t, uint32_t, const WGPUStringView *, void *, void *);
+typedef void (*NuppWgpuLostCallback)(const WGPUDevice *, uint32_t, const WGPUStringView *, void *, void *);
+typedef void (*NuppWgpuErrorCallback)(const WGPUDevice *, uint32_t, const WGPUStringView *, void *, void *);
+]]
+else
+    ffi.cdef[[
+typedef void (*NuppWgpuAdapterCallback)(uint32_t, WGPUAdapter, const char *, size_t, void *, void *);
+typedef void (*NuppWgpuDeviceCallback)(uint32_t, WGPUDevice, const char *, size_t, void *, void *);
+typedef void (*NuppWgpuMapCallback)(uint32_t, const char *, size_t, void *, void *);
+typedef void (*NuppWgpuScopeCallback)(uint32_t, uint32_t, const char *, size_t, void *, void *);
+typedef void (*NuppWgpuLostCallback)(const WGPUDevice *, uint32_t, const char *, size_t, void *, void *);
+typedef void (*NuppWgpuErrorCallback)(const WGPUDevice *, uint32_t, const char *, size_t, void *, void *);
+]]
+end
+
+--- `WGPUCallbackMode_AllowSpontaneous`: wgpu-native calls back from inside the
+--- call that settles the operation, on the calling thread.
+export const CALLBACK_SPONTANEOUS: integer = 3
+
+export const STATUS_SUCCESS: integer = 1
+export const BUFFER_USAGE_MAP_READ: integer = 0x1
+export const BUFFER_USAGE_COPY_SRC: integer = 0x4
+export const BUFFER_USAGE_COPY_DST: integer = 0x8
+export const BUFFER_USAGE_UNIFORM: integer = 0x40
+export const BUFFER_USAGE_STORAGE: integer = 0x80
+export const BUFFER_USAGE_QUERY_RESOLVE: integer = 0x200
+export const BUFFER_BINDING_UNIFORM: integer = 2
+export const BUFFER_BINDING_STORAGE: integer = 3
+export const BUFFER_BINDING_READ_ONLY_STORAGE: integer = 4
+export const SHADER_STAGE_COMPUTE: integer = 0x4
+export const MAP_MODE_READ: integer = 0x1
+export const QUERY_TYPE_TIMESTAMP: integer = 2
+export const FEATURE_TIMESTAMP_QUERY: integer = 9
+export const FEATURE_LEVEL_CORE: integer = 2
+export const POWER_HIGH_PERFORMANCE: integer = 2
+export const ERROR_FILTER_VALIDATION: integer = 1
+export const ERROR_TYPE_NO_ERROR: integer = 1
+export const STYPE_SHADER_SOURCE_SPIRV: integer = 0x1
+export const STYPE_SHADER_SOURCE_WGSL: integer = 0x2
+export const STYPE_INSTANCE_EXTRAS: integer = 0x00030004
+
+--- `WGPU_WHOLE_SIZE` as the `size_t` wgpuBufferMapAsync takes.
+export const WHOLE_MAP_SIZE: any = ffi.cast("size_t", -1)
+
+-- `WGPUInstanceBackend` bits, for the WGPU_BACKEND names wgpu reads.
+const BACKENDS: {[string]: integer} = {vulkan = 1, gl = 2, gles = 2, metal = 4, dx12 = 8, d3d12 = 8}
+
+-- `WGPUBackendType`, as wgpu's own `Backend::to_str` spells each.
+const BACKEND_NAMES: {
+    [integer]: string
+} = {[1] = "noop", [2] = "webgpu", [4] = "dx12", [5] = "metal", [6] = "vulkan", [7] = "gl", [8] = "gl",}
+
+--- The name wgpu gives a `WGPUBackendType`.
+export function backendname(value: integer): string
+    return BACKEND_NAMES[value] or "empty"
+end
+
+--- The instance backends WGPU_BACKEND asks for, or zero for every one.
+--- @raises string when a name in the variable is not a backend
+export function requestedbackends(): integer
+    local wanted = os.getenv("WGPU_BACKEND")
+    if wanted == nil or wanted == "" then
+        return 0
+    end
+    local bits = 0
+    for name in wanted:lower():gmatch("[^,%s]+") do
+        local bit = BACKENDS[name]
+        if bit == nil then
+            error(("WGPU_BACKEND names unknown backend %q"):format(name), 0)
+        end
+        bits = bits | bit
+    end
+
+    return bits as integer
+end
+
+const STAGED = ffi.os == "Windows" and "/lib/wgpu_native.dll" or "/lib/wgpu_native"
+
+local function open(): any
+    local wanted = os.getenv("NUPP_WGPU_LIBRARY")
+    if wanted ~= nil and wanted ~= "" then
+        return ffi.load(wanted)
+    end
+    local source = debug.getinfo(1, "S").source
+    local root = source:match("^@(.+)/[^/]+$") or "."
+    for _, base in ipairs({root, root .. "/..", root .. "/../..", root .. "/../../.."}) do
+        local found, value = pcall(ffi.load, base .. STAGED)
+        if found then
+            return value
+        end
+    end
+
+    return ffi.load("wgpu_native")
+end
+
+local loaded: any = nil
+
+--- The wgpu-native library, loaded on first use.
+--- @raises string when no wgpu-native library can be loaded
+export function library(): any
+    if loaded == nil then
+        local ok, value = pcall(open)
+        if not ok then
+            error("cannot load wgpu-native: " .. tostring(value), 0)
+        end
+        loaded = value
+    end
+
+    return loaded
+end
+
+--- A callback's message, from whichever spelling its ABI delivered.
+export function message(first: any, second: any): string
+    if MESSAGE_BY_POINTER then
+        if first == nil or first.data == nil then
+            return ""
+        end
+        return ffi.string(first.data, first.length)
+    end
+    if first == nil then
+        return ""
+    end
+
+    return ffi.string(first, second)
+end
+
+-- The settlements callbacks deliver, keyed by the integer each request carries
+-- in its first userdata. Callbacks are created once: LuaJIT has a fixed number
+-- of callback slots, and one per request would exhaust them.
+local settled: {[integer]: any} = {}
+local nextToken: integer = 0
+
+--- A fresh token a request carries in its first userdata, and its result slot.
+export function token(): (any, integer)
+    nextToken = (nextToken + 1) as integer
+    settled[nextToken] = false
+
+    return ffi.cast("void *", nextToken), nextToken
+end
+
+--- Takes what the callback for `key` delivered, or false if it has not run.
+export function take(key: integer): any
+    local value = settled[key]
+    settled[key] = nil
+
+    return value
+end
+
+local function keyOf(userdata: any): integer
+    return tonumber(ffi.cast("intptr_t", userdata)) as integer
+end
+
+local function deliver(userdata: any, value: any): nil
+    local key = keyOf(userdata)
+    if settled[key] ~= nil then
+        settled[key] = value
+    end
+end
+
+-- Device faults by device key: uncaptured errors and loss, both reported
+-- whenever wgpu-native notices them, drained by the context that owns them.
+local faults: {[integer]: {string}} = {}
+
+--- Starts collecting faults for one device and returns its userdata.
+export function faultsink(): (any, integer)
+    nextToken = (nextToken + 1) as integer
+    faults[nextToken] = {}
+
+    return ffi.cast("void *", nextToken), nextToken
+end
+
+--- Takes every fault recorded for a device since the last call.
+export function takefaults(key: integer): {string}
+    local recorded = faults[key]
+    if recorded == nil then
+        return {}
+    end
+    faults[key] = {}
+
+    return recorded
+end
+
+--- Stops collecting faults for a device.
+export function dropfaults(key: integer): nil
+    faults[key] = nil
+end
+
+local function record(userdata: any, text: string): nil
+    local recorded = faults[keyOf(userdata)]
+    if recorded ~= nil then
+        recorded[#recorded + 1] = text
+    end
+end
+
+const LOST_REASONS: {
+    [integer]: string
+} = {[1] = "Unknown", [2] = "Destroyed", [3] = "CallbackCancelled", [4] = "FailedCreation",}
+
+const ERROR_TYPES: {
+    [integer]: string
+} = {[2] = "Validation Error", [3] = "Out of Memory", [4] = "Internal error", [5] = "Unknown error",}
+
+--- How wgpu describes an error type.
+export function errortype(value: integer): string
+    return ERROR_TYPES[value] or ("error type " .. tostring(value))
+end
+
+local adapterCallback: any = nil
+local deviceCallback: any = nil
+local mapCallback: any = nil
+local scopeCallback: any = nil
+local lostCallback: any = nil
+local errorCallback: any = nil
+
+-- A callback runs Lua inside the C call that settles it, which a compiled trace
+-- cannot do. These bodies, and every function that makes such a call, stay
+-- interpreted.
+local function onAdapter(status: integer, adapter: any, first: any, second: any, third: any, fourth: any): nil
+    local userdata = MESSAGE_BY_POINTER and second or third
+    deliver(userdata, {status = status, value = adapter, message = message(first, second)})
+end
+
+local function onDevice(status: integer, device: any, first: any, second: any, third: any, fourth: any): nil
+    local userdata = MESSAGE_BY_POINTER and second or third
+    deliver(userdata, {status = status, value = device, message = message(first, second)})
+end
+
+local function onMap(status: integer, first: any, second: any, third: any, fourth: any): nil
+    local userdata = MESSAGE_BY_POINTER and second or third
+    deliver(userdata, {status = status, message = message(first, second)})
+end
+
+local function onScope(status: integer, kind: integer, first: any, second: any, third: any, fourth: any): nil
+    local userdata = MESSAGE_BY_POINTER and second or third
+    deliver(userdata, {status = status, kind = kind, message = message(first, second)})
+end
+
+local function onLost(device: any, reason: integer, first: any, second: any, third: any, fourth: any): nil
+    local userdata = MESSAGE_BY_POINTER and second or third
+    record(userdata, ("device lost (%s): %s"):format(LOST_REASONS[reason] or tostring(reason), message(first, second)))
+end
+
+local function onError(device: any, kind: integer, first: any, second: any, third: any, fourth: any): nil
+    local userdata = MESSAGE_BY_POINTER and second or third
+    local text = message(first, second)
+    record(userdata, text ~= "" and text or errortype(kind))
+end
+
+jit.off(onAdapter)
+jit.off(onDevice)
+jit.off(onMap)
+jit.off(onScope)
+jit.off(onLost)
+jit.off(onError)
+
+--- The callback pointers, created on first use.
+export function callbacks(): {[string]: any}
+    if adapterCallback == nil then
+        adapterCallback = ffi.cast("NuppWgpuAdapterCallback", onAdapter)
+        deviceCallback = ffi.cast("NuppWgpuDeviceCallback", onDevice)
+        mapCallback = ffi.cast("NuppWgpuMapCallback", onMap)
+        scopeCallback = ffi.cast("NuppWgpuScopeCallback", onScope)
+        lostCallback = ffi.cast("NuppWgpuLostCallback", onLost)
+        errorCallback = ffi.cast("NuppWgpuErrorCallback", onError)
+    end
+
+    return {
+        adapter = ffi.cast("void *", adapterCallback),
+        device = ffi.cast("void *", deviceCallback),
+        map = ffi.cast("void *", mapCallback),
+        scope = ffi.cast("void *", scopeCallback),
+        lost = ffi.cast("void *", lostCallback),
+        error = ffi.cast("void *", errorCallback),
+    }
+end
+
+--- A `WGPUStringView` over a Lua string, which must outlive the call.
+export function view(text: string?): any
+    if text == nil then
+        return ffi.new("WGPUStringView", {nil, ffi.cast("size_t", -1)})
+    end
+
+    return ffi.new("WGPUStringView", {text, #text})
+end

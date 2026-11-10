@@ -379,25 +379,26 @@ local FEATURES: {[string]: native.Feature} = {
     [
         "runtime.gpu_operations"
     ] = {name = "gpu_operations", runtimeModule = "nupp.gpu.operations", portableRuntime = true},
+    -- The provider is Nupp over the pinned wgpu-native library, which is
+    -- prebuilt per platform and staged beside the program as `lib/wgpu_native`.
+    -- No host links it, so a standalone binary or a foreign-platform stub cannot
+    -- carry it.
     ["native.gpu"] = {
         name = "gpu",
-        modules = {"nupp.runtime.provider.nativegpu"},
-        runtimeModule = "nupp.runtime.provider.nativegpu",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "gpu",
-        host = "native-gpu",
-        library = "nupp_native",
-        binary = true,
-        -- Synchronizing parks on the native readiness generation, so the runtime that
-        -- answers a suspension travels with the provider.
-        requires = {
-            "runtime.native",
-            "runtime.suspension",
-            "runtime.spanview",
-            "runtime.gpu_api",
-            "runtime.gpu_layout"
+        modules = {
+            "nupp.runtime.provider.nativegpu",
+            "nupp.runtime.provider.gpudevice",
+            "nupp.runtime.provider.gpucosts",
+            "nupp.runtime.provider.wgpu"
         },
+        runtimeModule = "nupp.runtime.provider.nativegpu",
+        provider = "wgpu_native",
+        providerDriver = "wgpu",
+        library = "wgpu_native",
+        binary = true,
+        -- Synchronizing parks in a suspension, so the runtime that answers one
+        -- travels with the provider.
+        requires = {"runtime.suspension", "runtime.spanview", "runtime.gpu_api", "runtime.gpu_layout"},
     },
     -- The runtime LLVM-compiled Lua builders call, which every provider built
     -- for a platform that has it carries; a loader reaching this module is
