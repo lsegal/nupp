@@ -373,8 +373,246 @@ end
     assert(output:find("native: a native program does not lower ^ over 64-bit integers", 1, true), output)
 end
 
+local ffi = require("ffi")
+
+-- The structs the field cases declare, as LuaJIT lays them out.
+ffi.cdef([[
+typedef struct {
+    int8_t tag;
+    float weight;
+} nuppNativeProgramInner;
+
+typedef struct {
+    bool flag;
+    int8_t small;
+    uint16_t count;
+    int32_t index;
+    uint32_t id;
+    int64_t big;
+    double value;
+    nuppNativeProgramInner inner;
+    void *next;
+} nuppNativeProgramNode;
+]])
+
+local STRUCTS = [[
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+cdef function printf(borrows format: cstring, ...): int32
+
+cdef struct Inner
+    tag: int8
+    weight: float
+end
+
+cdef struct Node
+    flag: boolean
+    small: int8
+    count: uint16
+    index: integer
+    id: uint32
+    big: int64
+    value: number
+    inner: Inner
+    next: Node*?
+end
+]]
+
+--- `n`'s fields and the bytes of `count` structs from it, as the native
+--- program below prints them.
+local function describe(n, count)
+    local big = tostring(n[0].big):gsub("LL$", "")
+    local fields = ("%d %g %g %g %.10g %s %g %g %.17g %d %.10g %g\n"):format(
+        n[0].flag and 1 or 0,
+        n[0].small,
+        n[0].count,
+        n[0].index,
+        n[0].id,
+        big,
+        n[0].value,
+        n[0].inner.tag,
+        n[0].inner.weight,
+        n[1].flag and 1 or 0,
+        n[1].id,
+        n[1].inner.tag
+    )
+    local bytes = ffi.cast("uint8_t *", n)
+    local listed = {}
+    for i = 0, count * ffi.sizeof("nuppNativeProgramNode") - 1 do
+        listed[#listed + 1] = ("%g "):format(bytes[i])
+    end
+
+    return fields .. table.concat(listed) .. "\n"
+end
+
+-- Each field read and write through a `cdef struct` pointer, nested structs and
+-- `p[i]` of a struct included, gives what the same code gives under LuaJIT: the
+-- same values read back, and the same bytes in memory, padding included.
+function M.cdefStructFieldsReadAndWriteAsUnderLuaJIT()
+    requireCodegen()
+    local size = ffi.sizeof("nuppNativeProgramNode")
+    local executable, output = link(STRUCTS .. ([[
+
+const SIZE = %d
+
+local function main(): int32
+    local nodes = calloc(2, SIZE) as Node*
+    local other = calloc(1, SIZE) as Node*
+    @unsafe do
+        nodes.flag = true
+        nodes.small = -5
+        nodes.count = 65535
+        nodes.count += 2
+        nodes.index = -7
+        nodes.index *= 3
+        nodes.id = 4000000000
+        nodes.big = 9223372036854775807LL
+        nodes.big += 1LL
+        nodes.value = 2.5
+        nodes.value *= 3
+        nodes.inner.tag = -9
+        nodes.inner.weight = 0.1
+        nodes[1].id = nodes.id + 1
+        nodes[1].inner.tag = nodes.inner.tag * 2
+        nodes.next = other
+        nodes.next.id = 5
+        nodes[1].flag = other.id == 5 and not nodes[1].flag
+        nodes.next = nil
+        printf(
+            "%%d %%g %%g %%g %%.10g %%lld %%g %%g %%.17g %%d %%.10g %%g\n",
+            nodes.flag,
+            nodes.small,
+            nodes.count,
+            nodes.index,
+            nodes.id,
+            nodes.big,
+            nodes.value,
+            nodes.inner.tag,
+            nodes.inner.weight,
+            nodes[1].flag,
+            nodes[1].id,
+            nodes[1].inner.tag
+        )
+        local bytes = nodes as uint8*
+        for i = 0, 2 * SIZE - 1 do
+            printf("%%g ", bytes[i])
+        end
+    end
+    printf("\n")
+    free(nodes)
+    free(other)
+    return 0
+end
+]]):format(size))
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+
+    local n = ffi.new("nuppNativeProgramNode[2]")
+    local other = ffi.new("nuppNativeProgramNode[1]")
+    n[0].flag = true
+    n[0].small = -5
+    n[0].count = 65535
+    n[0].count = n[0].count + 2
+    n[0].index = -7
+    n[0].index = n[0].index * 3
+    n[0].id = 4000000000
+    n[0].big = 9223372036854775807LL
+    n[0].big = n[0].big + 1LL
+    n[0].value = 2.5
+    n[0].value = n[0].value * 3
+    n[0].inner.tag = -9
+    n[0].inner.weight = 0.1
+    n[1].id = n[0].id + 1
+    n[1].inner.tag = n[0].inner.tag * 2
+    n[0].next = other
+    ffi.cast("nuppNativeProgramNode *", n[0].next).id = 5
+    n[1].flag = other[0].id == 5 and not n[1].flag
+    n[0].next = nil
+    test.eq(ran, (describe(n, 2):gsub("%s+$", "")))
+end
+
 -- What lowering refuses is reported where it was written, before anything is
 -- compiled, so this needs no code generator.
+function M.aCdefUnionsFieldIsRefusedWhereItIsRead()
+    local executable, output = link([[
+cdef union Bits
+    whole: uint32
+    half: uint16
+end
+
+cdef function calloc(count: uint64, size: uint64): voidptr
+
+local function main(): int32
+    local bits = calloc(1, 64) as Bits*
+    @unsafe do
+        return math.i32.wrap(bits.half)
+    end
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("host.nupp:11:30: native: Bits is a cdef union, which a native program does not lay out", 1, true), output)
+end
+
+function M.aBitfieldStructsFieldIsRefused()
+    local executable, output = link([[
+cdef struct Flags
+    low: uint32 : 3
+    high: uint32 : 29
+end
+
+cdef function calloc(count: uint64, size: uint64): voidptr
+
+local function main(): int32
+    local flags = calloc(1, 64) as Flags*
+    @unsafe do
+        return math.i32.wrap(flags.low)
+    end
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("native: field low of cdef struct Flags is a bitfield", 1, true), output)
+end
+
+function M.aWholeStructReadIsRefused()
+    local executable, output = link([[
+cdef struct Pair
+    a: int32
+    b: int32
+end
+
+cdef function calloc(count: uint64, size: uint64): voidptr
+
+local function main(): int32
+    local items = calloc(1, 64) as Pair*
+    @unsafe do
+        local first = items[0]
+    end
+    return 0
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("native: a native program reads a cdef struct's fields, not the whole struct", 1, true), output)
+end
+
+function M.anArrayFieldIsRefused()
+    local executable, output = link([[
+cdef struct Buffer
+    bytes: uint8[4]
+end
+
+cdef function calloc(count: uint64, size: uint64): voidptr
+
+local function main(): int32
+    local buffer = calloc(1, 64) as Buffer*
+    @unsafe do
+        return math.i32.wrap(buffer.bytes[0])
+    end
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("native: field bytes of cdef struct Buffer is a C array", 1, true), output)
+end
 function M.aTopLevelStatementIsRefusedWhereItIsWritten()
     local executable, output = link([[
 print("not native")
