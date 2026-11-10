@@ -74,6 +74,103 @@ local function spanElement(param: any): any?
     return entryValue(param.type)
 end
 
+-- The storage type of each element a stored vector field may have, by its IR
+-- element name.
+local VECTOR_ELEMENTS: {
+    [string]: string
+} = {
+    f64 = "number",
+    f32 = "float",
+    i8 = "int8",
+    u8 = "uint8",
+    i16 = "int16",
+    u16 = "uint16",
+    i32 = "int32",
+    u32 = "uint32",
+    i64 = "int64",
+    u64 = "uint64",
+}
+
+-- The C struct one element of a span of `layoutName` is, declared as the
+-- code generator indexes it: from the lowered layout's placement, with its
+-- padding spelled as byte arrays and a stored vector as an array aligned as
+-- the target layout model aligns it. Named after the export, since each
+-- entry's object reports the layout of its own copy of the struct.
+local function elementStruct(program: any, layoutName: string, key: string): (any?, string?)
+    local layout = nil
+    for _, candidate in ipairs(program.layouts or {}) do
+        if candidate.name == layoutName and candidate.nativeOnly ~= true then
+            layout = candidate
+        end
+    end
+    if layout == nil then
+        return nil, ("its lowered program has no layout for struct %s"):format(layoutName)
+    end
+    local ok, placed = pcall(require("nupp.compiler.aot.placement").of, layout, key)
+    if not ok then
+        return nil, ("struct %s has no placement for %s: %s"):format(layoutName, key, tostring(placed))
+    end
+    local cabi = require("nupp.compiler.cinterop.cabi")
+    local tag = tostring(program.exportName) .. "_" .. layoutName
+    local taken: {[string]: boolean} = {}
+    for _, field in ipairs(layout.fields) do
+        taken[field.name] = true
+    end
+    local fields: {any} = {}
+    local paddings = 0
+    for _, slot in ipairs(placed.slots) do
+        local field = slot.field
+        if field == nil then
+            paddings = paddings + 1
+            local name = "nupp_padding_" .. tostring(paddings)
+            while taken[name] do
+                name = name .. "_"
+            end
+            taken[name] = true
+            fields[
+                #fields + 1
+            ] = {
+                name = name,
+                cType = cabi.declaration({tag = "carray", elem = {tag = "uint8"}, count = slot.bytes}, name),
+                offset = slot.offset,
+            }
+        else
+            local t = nil
+            if slot.lanes ~= nil then
+                t = {tag = "carray", elem = {tag = VECTOR_ELEMENTS[slot.element as string]}, count = slot.lanes}
+            elseif field.sourceType and SPAN_STORAGE[field.sourceType] then
+                t = {tag = field.sourceType}
+            else
+                t = entryValue(field.type)
+            end
+            local cType = t and cabi.declaration(t, field.name) or nil
+            if not cType then
+                return nil, ("field %s.%s has no C spelling"):format(layoutName, field.name)
+            end
+            fields[
+                #fields + 1
+            ] = {
+                name = field.name,
+                cType = cType,
+                offset = slot.offset,
+                alignas = slot.lanes ~= nil and placed.fieldAlignment[field.name] or nil,
+            }
+        end
+    end
+    local description = {
+        identity = tag,
+        tag = tag,
+        typedef = tag,
+        size = placed.size,
+        alignment = placed.alignment,
+        fields = fields,
+        dependencies = {},
+    }
+    description.type = description
+
+    return description, nil
+end
+
 -- A name for an entry parameter a C reader can follow. A SoA view's columns
 -- are lowered under private names, so each is spelled `<view>_<field>`.
 local function parameterName(param: any): string
@@ -89,8 +186,9 @@ end
 -- generator lays the entry out from: span pointers and uniforms in parameter
 -- order, then the span counts as `size_t` (one per span when the counts are
 -- independent, one shared count otherwise), then a pointer to the struct
--- several results are written to.
-local function exportedSignature(program: any): (any?, string?)
+-- several results are written to. A span of structs points at the struct its
+-- lowered layout places under the target layout `key`.
+local function exportedSignature(program: any, key: string): (any?, string?)
     if program.executionTarget == "gpu" then
         return nil, "it is a GPU entry"
     end
@@ -113,13 +211,34 @@ local function exportedSignature(program: any): (any?, string?)
         taken[parameterName(param)] = true
     end
     local spans: {any} = {}
+    -- The struct each span of structs points at, by layout name and in the
+    -- order first reached.
+    local elementStructs: {any} = {}
+    local byLayout: {[string]: any} = {}
     for _, param in ipairs(program.params) do
         local name = parameterName(param)
         taken[name] = nil
         if scalarIR.isSpan(param) then
             local element = spanElement(param)
+            local matched = tostring(param.type):match("^struct:(.+)$")
+            if matched ~= nil then
+                local layoutName = matched as string
+                local description = byLayout[layoutName]
+                if description == nil then
+                    local why = nil
+                    description, why = elementStruct(program, layoutName, key)
+                    if description == nil then
+                        return nil, ("span parameter %q: %s"):format(name, tostring(why))
+                    end
+                    byLayout[layoutName] = description
+                    elementStructs[#elementStructs + 1] = description
+                end
+                element = {tag = "nominal", declKind = "struct", cdefKind = "struct", cdefName = description.tag}
+            end
             if not element then
-                return nil, ("span parameter %q does not hold numbers, booleans or fixed-width integers"):format(name)
+                return nil, (
+                    "span parameter %q does not hold numbers, booleans, fixed-width integers or structs"
+                ):format(name)
             end
             if param.kind == "read_span" then
                 element = {tag = "const", inner = element}
@@ -170,6 +289,7 @@ local function exportedSignature(program: any): (any?, string?)
         "nupp.compiler.cinterop.cabi"
     ).functionRecord(tostring(program.exportName), params, result, false, "c")
     signature.resultStruct = resultStruct
+    signature.elementStructs = elementStructs
 
     return signature, nil
 end
@@ -179,7 +299,8 @@ end
 local function exportedSignatures(
     source: string,
     path: string,
-    parsed: any
+    parsed: any,
+    key: string
 ): ({[string]: any}?, {[string]: string}?, string?)
     local programs, problems = require("nupp.compiler.aot.compile").lower(source, path, parsed, nil)
     if #problems > 0 then
@@ -192,7 +313,7 @@ local function exportedSignatures(
     local refusals: {[string]: string} = {}
     for _, program in ipairs(programs) do
         if program.exportName ~= nil then
-            local signature, why = exportedSignature(program)
+            local signature, why = exportedSignature(program, key)
             if signature then
                 signatures[program.exportName] = signature
             else
@@ -329,7 +450,12 @@ local function run(options: any): integer
                     fatal = fatal or require("nupp.compiler.diagnostics").isFatal(one)
                 end
                 if #context.exports > 0 and not fatal then
-                    local signatures, refusals, why = exportedSignatures(source as string, path, result)
+                    local signatures, refusals, why = exportedSignatures(
+                        source as string,
+                        path,
+                        result,
+                        layoutKey as string
+                    )
                     for _, entry in ipairs(context.exports) do
                         local signature = signatures and signatures[entry.cName] or nil
                         if signature then
@@ -436,6 +562,9 @@ local function run(options: any): integer
             describe(types[selection], selection)
         elseif functions[selection] then
             functionSignatures[#functionSignatures + 1] = functions[selection]
+            for _, description in ipairs(functions[selection].elementStructs or {}) do
+                aggregateDescriptions[#aggregateDescriptions + 1] = description
+            end
             for _, parameter in ipairs(functions[selection].params or {}) do
                 local t = pointedAt(parameter.type)
                 if t and t.tag == "nominal" and t.declKind == "struct" and not t.cdefName then
@@ -454,7 +583,7 @@ local function run(options: any): integer
                 sites[selection],
                 "NUPP2203",
                 ("cannot export %s to C: %s"):format(selection, unexportable[selection] as string),
-                "export a function whose parameters are scalars or spans of them, and whose results are scalars"
+                "export a function whose parameters are scalars or spans of scalars or structs, and whose results are scalars"
             )
             failed = true
         else
