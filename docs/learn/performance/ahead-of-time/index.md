@@ -98,3 +98,5 @@ See these pages for each part of the AOT pipeline.
 - [Wasm applications](wasm.md) for the browser guest and Wasm side modules.
 - [GPU compute](gpu.md) for native resident buffers, workgroup kernels, and
   browser WebGPU.
+- [Native programs](native-programs.md) for executables whose `main` is Nupp,
+  with C calls, callbacks, threads and atomics.

@@ -1671,12 +1671,24 @@ deterministic_archive() {
     return $archive_status
 }
 
+# The system libraries wgpu-native's static library calls into on macOS: the
+# native static libraries rustc reports for it, which are also what the
+# release's shared library loads.
+KIT_WGPU_LIBRARIES_DARWIN="-framework QuartzCore -framework Metal -framework Foundation
+-framework CoreFoundation -lobjc -liconv"
+
 build_kit() {
     features=${1:-}
     build_host stub "$features"
     host_out=$HOST_OUT
+    kit_wgpu=""
+    case "$PLATFORM" in
+        # Before the kit's lock: a run holds one lock at a time.
+        darwin) build_wgpu_static; kit_wgpu=$WGPU_STATIC ;;
+    esac
     # Public feature sets can share a Rust host but advertise different kit metadata.
-    digest=$(printf 'kit-5|%s|%s' "$(basename "$host_out")" "$features" | sha256_stdin | cut -c1-16)
+    digest=$(printf 'kit-6|%s|%s|%s' "$(basename "$host_out")" "$features" "${kit_wgpu:+$WGPU_VERSION}" \
+        | sha256_stdin | cut -c1-16)
     out="$PREFIX/kits/$digest"
     KIT_OUT=$out
     take_lock "kit-$digest" "$out/.complete" || return 0
@@ -1709,23 +1721,52 @@ build_kit() {
     set -- "$@" -Wl,-export_dynamic
     "$@" >&2
 
-    # Which library each symbol binds to, and what each library is.
+    # A second probe links wgpu-native's static library in as well, keeping
+    # every entry point it exports, so the stubs also carry what a standalone
+    # GPU program binds. The libraries only it needs are recorded apart from
+    # the kit's own, so a program without GPU never loads Metal.
     nm -m "$probe" | sed -n 's/^ *(undefined) [a-z ]*external \([^ ]*\) (from \([^)]*\)).*/\2 \1/p' \
-        | LC_ALL=C sort -u > "$out/binds"
+        > "$out/binds"
     otool -L "$probe" | sed -n '2,$p' > "$out/libraries"
+    : > "$out/gpu-libraries"
+    if [ -n "$kit_wgpu" ]; then
+        set -- "$CC" -o "$probe-gpu" "-Wl,-force_load,$out/libnupp-runtime.a" "-Wl,-force_load,$probe-aot.o"
+        while IFS= read -r flag; do
+            [ -z "$flag" ] || set -- "$@" "$flag"
+        done < "$probe-flags"
+        set -- "$@" "$kit_wgpu"
+        for symbol in $(nm -gUj "$kit_wgpu" | grep '^_wgpu' | LC_ALL=C sort -u); do
+            set -- "$@" "-Wl,-u,$symbol"
+        done
+        # shellcheck disable=SC2086 # one flag per word
+        set -- "$@" $KIT_WGPU_LIBRARIES_DARWIN -Wl,-export_dynamic
+        "$@" >&2
+        nm -m "$probe-gpu" | sed -n 's/^ *(undefined) [a-z ]*external \([^ ]*\) (from \([^)]*\)).*/\2 \1/p' \
+            >> "$out/binds"
+        otool -L "$probe-gpu" | sed -n '2,$p' | while read -r path rest; do
+            grep -qF "$path " "$out/libraries" || printf '\t%s %s\n' "$path" "$rest"
+        done > "$out/gpu-libraries"
+        cat "$out/gpu-libraries" >> "$out/libraries"
+    fi
+    LC_ALL=C sort -u -o "$out/binds" "$out/binds"
+
+    # Which library each symbol binds to, and what each library is.
     : > "$out/flags"
+    : > "$out/gpu-flags"
     while read -r path rest; do
         name=$(basename "$path")
+        listed="$out/flags"
+        ! grep -qF "$path " "$out/gpu-libraries" || listed="$out/gpu-flags"
         case "$path" in
             */Frameworks/*.framework/*)
                 short=$name
                 stub="$out/sdk/System/Library/Frameworks/$name.framework/$name.tbd"
-                printf '%s\n' "-framework" "$name" >> "$out/flags"
+                printf '%s\n' "-framework" "$name" >> "$listed"
                 ;;
             *)
-                short=$(printf '%s' "$name" | sed 's/\.dylib$//; s/\.[A-Z]$//')
+                short=$(printf '%s' "$name" | sed 's/\.dylib$//; s/\.[A-Z0-9]*$//')
                 stub="$out/sdk/usr/lib/$short.tbd"
-                printf '%s\n' "-l${short#lib}" >> "$out/flags"
+                printf '%s\n' "-l${short#lib}" >> "$listed"
                 ;;
         esac
         compatibility=$(printf '%s' "$rest" | sed -n 's/.*compatibility version \([0-9.]*\).*/\1/p')
@@ -1750,9 +1791,17 @@ build_kit() {
         printf '  "syslibroot": "sdk",\n'
         printf '  "libraries": ['
         awk '{ printf "%s\"%s\"", (NR > 1 ? ", " : ""), $0 }' "$out/flags"
-        printf ']\n}\n'
+        printf ']'
+        if [ -n "$kit_wgpu" ]; then
+            # What a standalone program linking a provider statically adds.
+            printf ',\n  "providers": {"wgpu": ['
+            awk '{ printf "%s\"%s\"", (NR > 1 ? ", " : ""), $0 }' "$out/gpu-flags"
+            printf ']}'
+        fi
+        printf '\n}\n'
     } > "$out/kit.json"
-    rm -f "$probe" "$probe-aot.c" "$probe-aot.o" "$probe-flags" "$out/binds" "$out/libraries" "$out/flags"
+    rm -f "$probe" "$probe-gpu" "$probe-aot.c" "$probe-aot.o" "$probe-flags" "$out/binds" "$out/libraries" \
+        "$out/gpu-libraries" "$out/flags" "$out/gpu-flags"
     printf 'ok\n' > "$out/.complete"
     release_lock
 }

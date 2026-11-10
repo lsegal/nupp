@@ -131,19 +131,27 @@ end
 --- archive, and the provider's entry points kept, because the provider finds
 --- them by name in the process and nothing in the link refers to them. Every
 --- kit's link exports what it keeps, which is where LuaJIT's `ffi.C` looks.
-function stage.linkedProviders(effects: {[string]: any}?, platform: string): ({string}?, string?)
+--- A macOS link also names the system frameworks the provider calls into,
+--- which the kit at `kit` stubs apart from its own libraries.
+function stage.linkedProviders(effects: {[string]: any}?, platform: string, kit: string?): ({string}?, string?)
     local flags: {string} = {}
     local compilerRoot = envMod.compilerRoot()
+    local macos = platform:find("apple-darwin", 1, true) ~= nil
     for _, feature in ipairs(native.features(effects)) do
         local symbols = feature.linkedSymbols
         if symbols then
-            -- A macOS kit stubs only the system libraries its own probe link
-            -- bound, so it has none of the frameworks wgpu-native calls into.
-            if platform:find("apple-darwin", 1, true) then
-                return nil, (
-                    "standalone binary for %s cannot link native feature %s; "
-                    .. "its link kit has no stubs for the system frameworks the provider needs"
-                ):format(platform, feature.name)
+            local libraries: {string}? = nil
+            if macos then
+                if kit ~= nil then
+                    local kits = require("nupp.tools.build.kits")
+                    libraries = kits.providerLibraries(kit as string, tostring(feature.providerDriver))
+                end
+                if libraries == nil then
+                    return nil, (
+                        "standalone binary for %s cannot link native feature %s; "
+                        .. "its link kit has no stubs for the system frameworks the provider needs"
+                    ):format(platform, feature.name)
+                end
             end
             if not compilerRoot then
                 return nil, "native feature "
@@ -158,7 +166,17 @@ function stage.linkedProviders(effects: {[string]: any}?, platform: string): ({s
             end
             flags[#flags + 1] = archive as string
             for _, symbol in ipairs(symbols as {string}) do
-                flags[#flags + 1] = "--undefined=" .. symbol
+                -- Mach-O names carry a leading underscore and ld64 spells
+                -- the option its own way.
+                if macos then
+                    flags[#flags + 1] = "-u"
+                    flags[#flags + 1] = "_" .. symbol
+                else
+                    flags[#flags + 1] = "--undefined=" .. symbol
+                end
+            end
+            for _, library in ipairs(libraries or {}) do
+                flags[#flags + 1] = library
             end
         end
     end
@@ -202,13 +220,13 @@ function stage.linkHost(
             return driven(compilerRoot as string, "kit", featureNames)
         end
     end
-    local linkedFlags, linkedErr = stage.linkedProviders(effects, linked as string)
-    if linkedFlags == nil then
-        return nil, linkedErr
-    end
     local kit, kitErr = require("nupp.tools.build.kits").resolve(linked as string, featureNames, build)
     if kit == nil then
         return nil, kitErr
+    end
+    local linkedFlags, linkedErr = stage.linkedProviders(effects, linked as string, kit as string)
+    if linkedFlags == nil then
+        return nil, linkedErr
     end
     local allFlags: {string} = {}
     for _, flag in ipairs(flags) do
