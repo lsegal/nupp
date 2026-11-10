@@ -322,7 +322,11 @@ export function checklayout(words: any, count: integer): nil
             local element = layouts[words[first + 1]]
             if element then
                 local length = op == OP_TYPE_ARRAY and (constants[words[first + 2]] or 0) or 1
-                local stride = strides[id] or roundUp(element[1], element[2])
+                -- naga reads an `ArrayStride` of 0 as no stride at all.
+                local stride: number = strides[id] or 0
+                if stride == 0 then
+                    stride = roundUp(element[1], element[2])
+                end
                 if length > MAX_TYPE_BYTES or length * stride > MAX_TYPE_BYTES then
                     fail(("SPIR-V array type %%%d is larger than the %d-byte type limit"):format(id, MAX_TYPE_BYTES))
                 end
@@ -338,6 +342,357 @@ export function checklayout(words: any, count: integer): nil
                 alignment = math.max(alignment, member[2])
             end
             layouts[id] = {roundUp(span, alignment), alignment}
+        end
+    end
+end
+
+-- Each opcode in `ranges`, a list of `{first, last}` or `{only}`.
+local function opcodes(ranges: {{integer}}): {[integer]: boolean}
+    local set: {[integer]: boolean} = {}
+    for _, range in ipairs(ranges) do
+        for op = range[1], range[2] or range[1] do
+            set[op] = true
+        end
+    end
+
+    return set
+end
+
+-- What `checkstructure` knows about the instructions naga's front end parses,
+-- from the SPIR-V grammar.
+local RESULT_TYPED = opcodes({
+    {1}, {12}, {41, 44}, {46}, {48, 51}, {54, 55}, {57}, {59}, {61}, {65, 66}, {68}, {77, 84}, {86, 98}, {100},
+    {103, 104}, {106, 107}, {109, 115}, {124}, {126, 148}, {154, 159}, {164, 191}, {194, 205}, {207, 215},
+    {227}, {229, 230}, {232, 242}, {245}, {334, 335}, {337, 339}, {345, 366}, {6035},
+})
+local RESULT_ONLY = opcodes({{7}, {11}, {19, 30}, {32, 33}, {248}})
+local TYPES = opcodes({{19, 24}, {28, 30}, {32, 33}})
+local NUMERIC_TYPES = opcodes({{20, 24}})
+-- Conversions, arithmetic, relational, logical and bit instructions: naga
+-- takes the scalar kind of their result and operand types without checking
+-- there is one.
+local NUMERIC = opcodes({{109, 115}, {124}, {126, 148}, {154, 159}, {164, 168}, {170, 191}, {194, 205}})
+local ATOMICS = opcodes({{227, 230}, {232, 242}, {6035}})
+local DERIVATIVES = opcodes({{207, 215}})
+-- Image and sampler types and instructions, and the quad operations.
+local UNBOUND = opcodes({{25, 27}, {86, 107}, {365, 366}})
+-- Decorations naga reads no literal for, whatever the word count says.
+local FLAG_DECORATIONS = opcodes({{3, 5}, {13, 14}, {16, 18}, {21}, {23, 25}, {5285}})
+-- Module-scope results naga keeps as values a function can name.
+local MODULE_VALUES = opcodes({{1}, {41, 44}, {46}, {48, 51}, {59}})
+
+const OP_SOURCE_EXTENSION = 4
+const OP_STRING = 7
+const OP_EXT_INST_IMPORT = 11
+const OP_EXT_INST = 12
+const OP_TYPE_VOID = 19
+const OP_TYPE_FUNCTION = 33
+const OP_FUNCTION = 54
+const OP_FUNCTION_END = 56
+const OP_FUNCTION_CALL = 57
+const OP_VARIABLE = 59
+const OP_ACCESS_CHAIN = 65
+const OP_IN_BOUNDS_ACCESS_CHAIN = 66
+const OP_COMPOSITE_CONSTRUCT = 80
+const OP_COMPOSITE_INSERT = 82
+const OP_COPY_OBJECT = 83
+const OP_ATOMIC_STORE = 228
+const OP_PHI = 245
+const OP_LOOP_MERGE = 246
+const OP_SELECTION_MERGE = 247
+const OP_LABEL = 248
+const OP_BRANCH = 249
+const OP_BRANCH_CONDITIONAL = 250
+const OP_SWITCH = 251
+const DECORATION_SPEC_ID = 1
+const NON_SEMANTIC_DEBUG_INFO = "NonSemantic.Shader.DebugInfo.100"
+-- naga builds one expression per element of an array `OpCompositeInsert`
+-- indexes, whichever element it selects.
+const MAX_INSERT_ELEMENTS = 65536
+
+-- Whether a SPIR-V literal string starting at word `from` ends in word `last`.
+local function stringEndsAt(words: any, from: integer, last: integer): boolean
+    for index = from, last do
+        local word = words[index]
+        for shift = 0, 24, 8 do
+            if ((word >> shift) & 0xff) == 0 then
+                return index == last
+            end
+        end
+    end
+
+    return false
+end
+
+local function wordCount(op: integer, at: integer): never
+    fail(("SPIR-V instruction %d at word %d has a word count naga reads differently"):format(op, at))
+end
+
+-- Whether naga keeps `def` as a value the function `scope` can name.
+local function namedValue(words: any, defs: {[integer]: any}, imports: {[integer]: string}, def: any, scope: integer): boolean
+    if def == nil or def.type == nil or def.op == OP_FUNCTION or defs[def.type].op == OP_TYPE_VOID then
+        return false
+    end
+    if def.scope == 0 then
+        return MODULE_VALUES[def.op] == true
+    end
+
+    return def.scope == scope
+        and not (def.op == OP_EXT_INST and imports[words[def.first + 2]] == NON_SEMANTIC_DEBUG_INFO)
+end
+
+-- Refuses an atomic whose pointer, walked from the global variable at its
+-- root, steps through anything but structs and arrays or ends anywhere but an
+-- integer or float. naga's atomic upgrade expects nothing else.
+local function checkatomic(words: any, defs: {[integer]: any}, constants: {[integer]: number}, pointer: integer, at: integer): nil
+    local steps: {{integer}} = {}
+    local def = defs[pointer]
+    local before = at
+    while def ~= nil and def.at < before and def.op ~= OP_VARIABLE do
+        before = def.at
+        if def.op == OP_ACCESS_CHAIN or def.op == OP_IN_BOUNDS_ACCESS_CHAIN then
+            steps[#steps + 1] = {def.first + 3, def.last}
+        elseif def.op ~= OP_COPY_OBJECT then
+            return
+        end
+        def = defs[words[def.first + 2]]
+    end
+    if def == nil or def.op ~= OP_VARIABLE or def.at >= before then
+        return
+    end
+    local pointerType = defs[def.type]
+    local ty: integer? = pointerType.op == OP_TYPE_POINTER and words[pointerType.first + 2] or nil
+    for step = #steps, 1, -1 do
+        for index = steps[step][1], steps[step][2] do
+            local shape = ty and defs[ty]
+            if shape and shape.op == OP_TYPE_STRUCT then
+                local member = constants[words[index]]
+                if member == nil or member >= shape.last - shape.first then
+                    fail(("SPIR-V atomic at word %d selects no member of struct %%%d"):format(at, ty))
+                end
+                ty = words[shape.first + 1 + member]
+            elseif shape and (shape.op == OP_TYPE_ARRAY or shape.op == OP_TYPE_RUNTIME_ARRAY) then
+                ty = words[shape.first + 1]
+            else
+                fail(("SPIR-V atomic at word %d indexes something other than a struct or an array"):format(at))
+            end
+        end
+    end
+    local leaf = ty and defs[ty]
+    if leaf == nil or (leaf.op ~= OP_TYPE_INT and leaf.op ~= OP_TYPE_FLOAT) then
+        fail(("SPIR-V atomic at word %d does not reach an integer or a float"):format(at))
+    end
+end
+
+-- Refuses an `OpCompositeInsert` whose indices leave its composite type, or
+-- that indexes an array naga would build too many expressions for.
+local function checkinsert(words: any, defs: {[integer]: any}, constants: {[integer]: number}, first: integer, last: integer): nil
+    local ty: integer = words[first]
+    for index = first + 4, last do
+        local shape = defs[ty]
+        local selection: integer = words[index]
+        local length: number? = nil
+        local element: integer = 0
+        if shape == nil then
+            return
+        elseif shape.op == OP_TYPE_STRUCT then
+            length = shape.last - shape.first
+            element = words[shape.first + 1 + math.min(selection, length)]
+        elseif shape.op == OP_TYPE_ARRAY then
+            length = constants[words[shape.first + 2]]
+            element = words[shape.first + 1]
+            if length ~= nil and length > MAX_INSERT_ELEMENTS then
+                fail(("SPIR-V OpCompositeInsert at word %d indexes an array of %d elements; at most %d are supported"):format(first - 1, length, MAX_INSERT_ELEMENTS))
+            end
+        elseif shape.op == OP_TYPE_VECTOR or shape.op == OP_TYPE_MATRIX then
+            length = words[shape.first + 2]
+            element = words[shape.first + 1]
+        end
+        if length == nil then
+            return
+        end
+        if selection >= length then
+            fail(("SPIR-V OpCompositeInsert at word %d selects element %d of %%%d, which has %d"):format(first - 1, selection, ty, length))
+        end
+        ty = element
+    end
+end
+
+--- Refuses a module that would reach one of the other panics in naga's SPIR-V
+--- front end (wgpu v29), which abort the process from inside wgpu-native the
+--- way a layout failure does. Each rule holds for every module naga parses
+--- without panicking, except two: images and samplers, which a GPU kernel
+--- never binds, and the quad operations, whose capability naga refuses.
+---
+--- - Result ids are below the module's bound and defined once. A result type
+---   is a type naga records: never a function type, and void only for a
+---   function, a call or an extended instruction.
+--- - Every instruction spans exactly the words naga reads for it, so nothing
+---   hides in another's padding: flag decorations and `SpecId`, scalar
+---   constants, `OpString`, `OpSourceExtension`, `OpExtInst`, `OpPhi`,
+---   `OpSwitch`, the derivatives and the `LocalSize` execution mode.
+--- - Conversions and arithmetic, relational, logical and bit instructions
+---   take and give scalars, vectors or matrices.
+--- - An `OpCompositeConstruct` has a constituent, and an `OpCompositeInsert`'s
+---   indices stay inside its type.
+--- - An `OpSwitch` selector is an integer of at most 32 bits defined before
+---   it; an `OpPhi` names values naga keeps and labels of its own function,
+---   which is where every branch and merge goes; a call names a function.
+--- - An atomic's pointer reaches an integer or float through structs and
+---   arrays alone.
+export function checkstructure(words: any, count: integer): nil
+    if count < 5 then
+        return
+    end
+    local bound: integer = words[3]
+    -- Each result id's opcode, result type, function (0 at module scope) and
+    -- words.
+    local defs: {[integer]: any} = {}
+    local constants: {[integer]: number} = {}
+    local imports: {[integer]: string} = {}
+    local calls: {{integer}} = {}
+    local scope, functions = 0, 0
+    local labels: {[integer]: boolean} = {}
+    local targets: {{integer}} = {}
+    local phis: {{integer}} = {}
+    for _, instruction in ipairs(spirvInstructions(words, count)) do
+        local op, first, last = instruction[1], instruction[2], instruction[3]
+        local operands = last - first + 1
+        local at = first - 1
+        if UNBOUND[op] then
+            fail(("SPIR-V instruction %d at word %d uses images, samplers or quads, which GPU kernels do not support"):format(op, at))
+        end
+        local resultType: integer? = nil
+        local result: integer? = nil
+        if RESULT_TYPED[op] and operands >= 2 then
+            resultType, result = words[first], words[first + 1]
+        elseif RESULT_ONLY[op] and operands >= 1 then
+            result = words[first]
+        end
+        if resultType ~= nil then
+            local declared = defs[resultType]
+            if declared == nil or not TYPES[declared.op] or declared.op == OP_TYPE_FUNCTION
+                or (declared.op == OP_TYPE_VOID and op ~= OP_FUNCTION and op ~= OP_FUNCTION_CALL and op ~= OP_EXT_INST)
+            then
+                fail(("SPIR-V instruction at word %d has result type %%%d, which is not a value type"):format(at, resultType))
+            end
+        end
+        if result ~= nil then
+            if result == 0 or result >= bound then
+                fail(("SPIR-V id %%%d at word %d is outside the module's bound %d"):format(result, at, bound))
+            end
+            if defs[result] ~= nil then
+                fail(("SPIR-V id %%%d is defined twice"):format(result))
+            end
+            defs[result] = {op = op, type = resultType, scope = scope, at = at, first = first, last = last}
+        end
+
+        if op == OP_STRING or op == OP_SOURCE_EXTENSION then
+            if not stringEndsAt(words, op == OP_STRING and first + 1 or first, last) then
+                wordCount(op, at)
+            end
+        elseif op == OP_EXT_INST_IMPORT and operands >= 2 then
+            imports[words[first]] = spirvString(words, first + 1, last)
+        elseif op == OP_EXT_INST and operands < 4 then
+            wordCount(op, at)
+        elseif (op == OP_DECORATE or op == OP_MEMBER_DECORATE) and operands >= 2 then
+            local base = op == OP_DECORATE and 2 or 3
+            local decoration: integer = words[first + base - 1]
+            if (FLAG_DECORATIONS[decoration] and operands ~= base)
+                or (decoration == DECORATION_SPEC_ID and operands ~= base + 1)
+            then
+                wordCount(op, at)
+            end
+        elseif op == OP_EXECUTION_MODE and operands >= 2 and words[first + 1] == EXECUTION_MODE_LOCAL_SIZE then
+            if operands ~= 5 then
+                wordCount(op, at)
+            end
+        elseif (op == OP_CONSTANT or op == OP_SPEC_CONSTANT) and operands >= 3 then
+            local shape = defs[words[first]]
+            if shape.op == OP_TYPE_INT or shape.op == OP_TYPE_FLOAT then
+                if operands ~= (words[shape.first + 1] == 64 and 4 or 3) then
+                    wordCount(op, at)
+                end
+                if shape.op == OP_TYPE_INT then
+                    constants[words[first + 1]] = words[first + 2] + (operands == 4 and words[first + 3] * 0x100000000 or 0)
+                end
+            end
+        elseif DERIVATIVES[op] and operands ~= 3 then
+            wordCount(op, at)
+        elseif NUMERIC[op] and operands >= 2 then
+            for index = first + 2, last do
+                local operand = defs[words[index]]
+                local ty = operand and operand.type and defs[operand.type]
+                if ty and not NUMERIC_TYPES[ty.op] then
+                    fail(("SPIR-V instruction %d at word %d needs a scalar, vector or matrix where %%%d is not one"):format(op, at, words[index]))
+                end
+            end
+            if not NUMERIC_TYPES[defs[words[first]].op] and (op < 149 or op > 152) then
+                fail(("SPIR-V instruction %d at word %d needs a scalar, vector or matrix result"):format(op, at))
+            end
+        elseif op == OP_COMPOSITE_CONSTRUCT and operands < 3 then
+            fail(("SPIR-V OpCompositeConstruct at word %d has no constituents"):format(at))
+        elseif op == OP_COMPOSITE_INSERT and operands >= 4 then
+            checkinsert(words, defs, constants, first, last)
+        elseif ATOMICS[op] and operands >= 3 then
+            checkatomic(words, defs, constants, op == OP_ATOMIC_STORE and words[first] or words[first + 2], at)
+        elseif op == OP_FUNCTION then
+            functions += 1
+            scope = functions
+            labels, targets, phis = {}, {}, {}
+        elseif op == OP_FUNCTION_CALL and operands >= 3 then
+            calls[#calls + 1] = {words[first + 2], at}
+        elseif op == OP_LABEL and operands >= 1 then
+            labels[words[first]] = true
+        elseif op == OP_PHI then
+            if operands < 4 or operands % 2 ~= 0 then
+                wordCount(op, at)
+            end
+            phis[#phis + 1] = {at, first, last}
+        elseif op == OP_SWITCH then
+            if operands < 2 or operands % 2 ~= 0 then
+                wordCount(op, at)
+            end
+            local selector = defs[words[first]]
+            local shape = selector and selector.type and defs[selector.type]
+            if not namedValue(words, defs, imports, selector, scope) or shape.op ~= OP_TYPE_INT or words[shape.first + 1] > 32 then
+                fail(("SPIR-V OpSwitch at word %d needs an integer selector of at most 32 bits defined before it"):format(at))
+            end
+            targets[#targets + 1] = {words[first + 1], at}
+            for index = first + 3, last, 2 do
+                targets[#targets + 1] = {words[index], at}
+            end
+        elseif op == OP_BRANCH or op == OP_SELECTION_MERGE then
+            targets[#targets + 1] = {words[first], at}
+        elseif op == OP_BRANCH_CONDITIONAL and operands >= 3 then
+            targets[#targets + 1] = {words[first + 1], at}
+            targets[#targets + 1] = {words[first + 2], at}
+        elseif op == OP_LOOP_MERGE and operands >= 2 then
+            targets[#targets + 1] = {words[first], at}
+            targets[#targets + 1] = {words[first + 1], at}
+        elseif op == OP_FUNCTION_END then
+            for _, target in ipairs(targets) do
+                if not labels[target[1]] then
+                    fail(("SPIR-V branch at word %d goes to %%%d, which is no label of its function"):format(target[2], target[1]))
+                end
+            end
+            for _, phi in ipairs(phis) do
+                for index = phi[2] + 2, phi[3], 2 do
+                    if not namedValue(words, defs, imports, defs[words[index]], scope) then
+                        fail(("SPIR-V OpPhi at word %d takes %%%d, which is no value of its function"):format(phi[1], words[index]))
+                    end
+                    if not labels[words[index + 1]] then
+                        fail(("SPIR-V OpPhi at word %d names %%%d, which is no label of its function"):format(phi[1], words[index + 1]))
+                    end
+                end
+            end
+            scope = 0
+        end
+    end
+    for _, call in ipairs(calls) do
+        local callee = defs[call[1]]
+        if callee == nil or callee.op ~= OP_FUNCTION then
+            fail(("SPIR-V call at word %d names %%%d, which is no function"):format(call[2], call[1]))
         end
     end
 end
@@ -775,6 +1130,7 @@ local function createKernel(context: any, descriptor: any): integer
     -- Nothing catches a panic inside wgpu-native, so a module naga's front end
     -- would panic on is refused before it gets there.
     checklayout(words, count)
+    checkstructure(words, count)
     local library = context.lib
     library.wgpuDevicePushErrorScope(context.device, wgpu.ERROR_FILTER_VALIDATION)
     local entry: any = {
