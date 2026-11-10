@@ -9,6 +9,12 @@ calls to declared C functions, opaque pointers, C strings, pointer reads and
 writes, and Nupp functions handed to C as function pointers, such as a
 `lua_CFunction` registered with `lua_pushcclosure`.
 
+The same function pointers start OS threads: a program declares its platform's
+thread, mutex and condition variable functions (`pthread_create`, or Windows'
+`CreateThread`) and passes a Nupp function as the entry. Atomics are the one
+part C reaches through its compiler rather than a library, so the libatomic
+functions a program declares are lowered in place; see "Atomics" below.
+
 The file's top level holds only `cdef function` declarations and functions, and
 every function is lowered as a C function. A function's parameters and result
 must have C types, written out. `main` takes nothing or `(argc, argv)` and
@@ -170,12 +176,16 @@ local function extension(kind: Kind): string
 end
 
 --- A function the program can call: one it defines, or a C one it declares.
+--- A declared libatomic function names the operation it is lowered to in
+--- place, and the width of the integer it acts on.
 local record Callee
     symbol: string
     params: {Kind}
     result: Kind
     varargs: boolean
     foreign: boolean
+    atomic: string?
+    width: integer?
 end
 
 --- A name a body can read: a local's stack slot.
@@ -350,6 +360,155 @@ local function calleeOf(program: Program, body: Body, node: any): Callee?
     return program.callees[name]
 end
 
+--[[
+Atomics. A native program declares libatomic's sized functions, such as
+`__atomic_fetch_add_8`, and each call is lowered in place to the LLVM atomic
+instruction it stands for, as a C compiler lowers its `__atomic` builtins; no
+libatomic is linked. The memory orders are GCC's: 0 relaxed, 1 consume, 2
+acquire, 3 release, 4 acq_rel, 5 seq_cst. An order that is not a literal is
+seq_cst, as it is in C.
+]]
+
+--- The libatomic operations, by the name between `__atomic_` and the size, as
+--- the LLVM operation each is lowered to.
+const ATOMIC_OPERATIONS: {
+    [string]: string
+} = {
+    load = "load",
+    store = "store",
+    exchange = "xchg",
+    compare_exchange = "cmpxchg",
+    fetch_add = "add",
+    fetch_sub = "sub",
+    fetch_and = "and",
+    fetch_or = "or",
+    fetch_xor = "xor",
+    fetch_nand = "nand",
+}
+
+--- GCC's memory orders, indexed from 1, as LLVM's orderings.
+const ATOMIC_ORDERS: {string} = {"monotonic", "acquire", "acquire", "release", "acq_rel", "seq_cst"}
+
+--- The orders each kind of access admits; anything else is refused.
+const LOAD_ORDERS: {[integer]: boolean} = {[0] = true, [1] = true, [2] = true, [5] = true}
+
+const STORE_ORDERS: {[integer]: boolean} = {[0] = true, [3] = true, [5] = true}
+const ANY_ORDER: {[integer]: boolean} = {[0] = true, [1] = true, [2] = true, [3] = true, [4] = true, [5] = true}
+
+--- The LLVM types of an atomic operation's parameters and result at `width`.
+local function atomicShape(operation: string, width: integer): ({string}, string)
+    local w = "i" .. tostring(width)
+    if operation == "load" then
+        return {"ptr", "i32"}, w
+    elseif operation == "store" then
+        return {"ptr", w, "i32"}, "void"
+    elseif operation == "cmpxchg" then
+        return {"ptr", "ptr", w, "i32", "i32"}, "i1"
+    end
+
+    return {"ptr", w, "i32"}, w
+end
+
+--- `callee` as the atomic operation its declared name `name` stands for, or
+--- unchanged when it names none.
+local function atomicCallee(stat: any, name: string, callee: Callee): Callee
+    local spelled, bytes = name:match("^__atomic_([%a_]+)_(%d+)$")
+    if spelled == nil then
+        return callee
+    end
+    local operation = ATOMIC_OPERATIONS[spelled as string]
+    local width = (tonumber(bytes as string) as integer) * 8
+    if operation == nil or WIDTHS["i" .. tostring(width)] == nil then
+        refuse(stat, name .. " is not a libatomic operation a native program can lower")
+    end
+    local params, result = atomicShape(operation as string, width)
+    local matches = #callee.params == #params and callee.result.llvm == result and not callee.varargs
+    for index, kind in ipairs(callee.params) do
+        matches = matches and kind.llvm == params[index]
+    end
+    if not matches then
+        refuse(
+            stat,
+            ("%s takes (%s) and returns %s, as libatomic declares it"):format(name, table.concat(params, ", "), result)
+        )
+    end
+    callee.atomic = operation
+    callee.width = width
+
+    return callee
+end
+
+--- The LLVM ordering of the memory order `node`, which `allowed` admits.
+local function memoryOrder(program: Program, body: Body, node: any, allowed: {[integer]: boolean}): string
+    local inner = node
+    while inner ~= nil and inner.kind == "paren" do
+        inner = (inner as cst.Paren).expr
+    end
+    if inner == nil or inner.kind ~= "number" then
+        local _ = expression(program, body, node, I32)
+        return "seq_cst"
+    end
+    local order = tonumber(((inner as cst.NumberLit).token as lexer.Token).text)
+    if order == nil or not allowed[order as integer] then
+        refuse(node, "memory order " .. tostring(order) .. " is not valid for this atomic operation")
+    end
+
+    return ATOMIC_ORDERS[(order as integer) + 1]
+end
+
+local function atomicCall(program: Program, body: Body, target: Callee, written: {any}): Value
+    local operation = target.atomic as string
+    local width = target.width as integer
+    local w = "i" .. tostring(width)
+    local align = tostring(width // 8)
+    local argument = function(index: integer): string
+        return convert(
+            body,
+            expression(program, body, written[index], target.params[index]),
+            target.params[index],
+            written[index]
+        ).text
+    end
+    local address = argument(1)
+    if operation == "load" then
+        local ordering = memoryOrder(program, body, written[2], LOAD_ORDERS)
+        local loaded = value(body, ("load atomic %s, ptr %s %s, align %s"):format(w, address, ordering, align))
+        return Value(text = loaded, kind = target.result)
+    elseif operation == "store" then
+        local stored = argument(2)
+        local ordering = memoryOrder(program, body, written[3], STORE_ORDERS)
+        builder.emit(body.f, ("store atomic %s %s, ptr %s %s, align %s"):format(w, stored, address, ordering, align))
+        return Value(text = "", kind = VOID)
+    elseif operation == "cmpxchg" then
+        -- `expected` receives what was there, which is what it held already
+        -- when the exchange succeeded.
+        local expected = argument(2)
+        local desired = argument(3)
+        local success = memoryOrder(program, body, written[4], ANY_ORDER)
+        local failure = memoryOrder(program, body, written[5], LOAD_ORDERS)
+        local old = value(body, ("load %s, ptr %s"):format(w, expected))
+        local pair = value(
+            body,
+            (
+                "cmpxchg ptr %s, %s %s, %s %s %s %s, align %s"
+            ):format(address, w, old, w, desired, success, failure, align)
+        )
+        builder.emit(
+            body.f,
+            ("store %s %s, ptr %s"):format(w, value(body, ("extractvalue { %s, i1 } %s, 0"):format(w, pair)), expected)
+        )
+        return Value(text = value(body, ("extractvalue { %s, i1 } %s, 1"):format(w, pair)), kind = BOOL)
+    end
+    local operand = argument(2)
+    local ordering = memoryOrder(program, body, written[3], ANY_ORDER)
+    local old = value(
+        body,
+        ("atomicrmw %s ptr %s, %s %s %s, align %s"):format(operation, address, w, operand, ordering, align)
+    )
+
+    return Value(text = old, kind = target.result)
+end
+
 --- A standard-library call lowered in place, by its resolved identity, or nil.
 local intrinsic: function(Program, Body, cst.Call): Value?
 
@@ -369,6 +528,9 @@ local function call(program: Program, body: Body, node: cst.Call): Value
     end
     if #written < #target.params or #written > #target.params and not target.varargs then
         refuse(node, ("%s takes %d arguments, not %d"):format(target.symbol, #target.params, #written))
+    end
+    if target.atomic ~= nil then
+        return atomicCall(program, body, target, written)
     end
     local arguments: {string} = {}
     for index, argument in ipairs(written) do
@@ -685,6 +847,9 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
         end
         local callee = program.callees[name]
         if callee ~= nil then
+            if (callee as Callee).atomic ~= nil then
+                refuse(node, name .. " is lowered in place, so it has no address")
+            end
             -- A function as a value is its address: what C takes as a callback.
             return Value(text = "@" .. (callee as Callee).symbol, kind = PTR)
         end
@@ -1106,7 +1271,11 @@ local function foreign(stat: cst.CdefFunc): Callee
         result = kind as Kind
     end
 
-    return Callee(symbol = name, params = params, result = result, varargs = stat.varargs or false, foreign = true)
+    return atomicCallee(
+        stat,
+        name,
+        Callee(symbol = name, params = params, result = result, varargs = stat.varargs or false, foreign = true)
+    )
 end
 
 --- Whether `node` is a literal, or a negated number, which a `const` may name.
@@ -1213,7 +1382,7 @@ function native.module(tree: cst.Chunk, functionAttributes: string): (string?, n
             refuse(tree, "a native program defines main")
         end
         for _, callee in pairs(program.callees) do
-            if callee.foreign then
+            if callee.foreign and callee.atomic == nil then
                 local params: {string} = {}
                 for index, kind in ipairs(callee.params) do
                     params[index] = kind.llvm .. extension(kind)
