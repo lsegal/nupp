@@ -539,16 +539,14 @@ local function kernel(unit: llvmProgram.Unit, program: scalarIR.Program, oracle:
     -- A C export is the kernel under a second name: an alias, so C callers
     -- reach the same code the Lua wrapper does, with nothing in between.
     if program.exportName ~= nil and unit.exports == true and not oracle then
-        local returned = #results ~= 1 and "void" or entryValueType(module, program, tostring(results[1]), types.require)
+        local returned = #results ~= 1 and "void"
+            or entryValueType(module, program, tostring(results[1]), types.require)
         builder.once(
             module,
             "@" .. tostring(program.exportName),
-            ("@%s = alias %s (%s), ptr @%s"):format(
-                tostring(program.exportName),
-                returned,
-                table.concat(signature, ", "),
-                symbol
-            )
+            (
+                "@%s = alias %s (%s), ptr @%s"
+            ):format(tostring(program.exportName), returned, table.concat(signature, ", "), symbol)
         )
     end
     -- A kernel frees nothing and synchronizes with nothing; what it reads and

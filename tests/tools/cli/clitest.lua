@@ -741,7 +741,8 @@ end
 function M.exportCDeclaresAnAotExportedFunction()
     -- The prototype is the AOT entry's ABI, not cdef's: an `integer` crosses an
     -- entry as the double Lua holds it in.
-    local dir = exportProject([[
+    local dir = exportProject(
+        [[
 local game = {}
 @aot(export = "game_add")
 local function add(a: int32, b: int32): int32
@@ -759,7 +760,8 @@ local function reset(): nil
 end
 game.add, game.scale, game.reset = add, scale, reset
 return game
-]])
+]]
+    )
     local output, code = captureStatusAt(dir, "export-c -o game.h src/game.nupp game.add game.scale game.reset")
     assert(code == 0, output)
     local header = assert(io.open(dir .. "/game.h", "rb")):read("*a")
@@ -775,7 +777,8 @@ return game
 end
 
 function M.exportCRefusesAnAotExportWithoutAScalarSignature()
-    local dir = exportProject([[
+    local dir = exportProject(
+        [[
 local span = require("bytes.span")
 local game = {}
 @aot(export = "game_total")
@@ -788,19 +791,18 @@ local function total(borrows values: span.Span<float>): number
 end
 game.total = total
 return game
-]])
+]]
+    )
     local output, code = captureStatusAt(dir, "export-c -o game.h src/game.nupp game.total")
     assert(code ~= 0, "a span parameter has no C prototype yet: " .. output)
-    assert(
-        output:find("NUPP2203", 1, true) and output:find('parameter "values" is not a number', 1, true),
-        output
-    )
+    assert(output:find("NUPP2203", 1, true) and output:find('parameter "values" is not a number', 1, true), output)
     assert(not io.open(dir .. "/game.h", "rb"), "no header is written")
     os.execute("rm -rf '" .. dir .. "'")
 end
 
 function M.anAotExportMustBeACIdentifier()
-    local dir = exportProject([[
+    local dir = exportProject(
+        [[
 local game = {}
 @aot(export = "game-add")
 local function add(a: int32, b: int32): int32
@@ -808,7 +810,8 @@ local function add(a: int32, b: int32): int32
 end
 game.add = add
 return game
-]])
+]]
+    )
     local output, code = captureStatusAt(dir, "export-c -o game.h src/game.nupp game.add")
     assert(code ~= 0, output)
     assert(output:find("@aot export must be a literal C identifier", 1, true), output)

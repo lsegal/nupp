@@ -35,7 +35,9 @@ end
 -- The C type an `@aot` entry passes a value of this type as. Spelled from the
 -- AOT entry ABI rather than from cdef's: an `integer` crosses an entry as the
 -- double Lua holds it in, not as the `int32_t` a C field would declare.
-local ENTRY_SCALARS: {[string]: string} = {
+local ENTRY_SCALARS: {
+    [string]: string
+} = {
     number = "number",
     integer = "number",
     float = "float",

@@ -55,10 +55,9 @@ local function library(linkage)
     )
     testAssert.eq(project.build(dir), 0)
     local nupp = require("helpers.paths").root .. "/bin/nupp"
-    local code, text = process.capture(
-        {nupp, "export-c", "-o", "game.h", "src/main.nupp", "main.add", "main.scale"},
-        {cwd = dir}
-    )
+    local code, text = process.capture({nupp, "export-c", "-o", "game.h", "src/main.nupp", "main.add", "main.scale"}, {
+        cwd = dir
+    })
     testAssert.eq(code, 0, text)
     assert(exists(dir .. "/game.h"), "export-c writes the header: " .. text)
 
@@ -79,13 +78,9 @@ function M.cCallsAotExportsFromTheStaticArchive()
     local archive = dir .. "/out/lib/libdefault_aot.a"
     assert(exists(archive), "the static library is the target's AOT archive")
     local program = dir .. "/main" .. (jit.os == "Windows" and ".exe" or "")
-    local command = ("cd '%s' && %s -std=c11 -o '%s' main.c '%s'%s"):format(
-        dir,
-        compiler(),
-        program,
-        archive,
-        jit.os == "Windows" and "" or " -lm"
-    )
+    local command = (
+        "cd '%s' && %s -std=c11 -o '%s' main.c '%s'%s"
+    ):format(dir, compiler(), program, archive, jit.os == "Windows" and "" or " -lm")
     testAssert.eq(os.execute(command), 0, command)
     run(dir, program)
 end
@@ -106,13 +101,9 @@ function M.cCallsAotExportsFromTheSharedLibrary()
         command = ("cd '%s' && %s -std=c11 -o '%s' main.c '%s'"):format(dir, compiler(), program, shared)
     else
         program = dir .. "/main"
-        command = ("cd '%s' && %s -std=c11 -o '%s' main.c -L'%s' -ldefault_aot -Wl,-rpath,'%s'"):format(
-            dir,
-            compiler(),
-            program,
-            lib,
-            lib
-        )
+        command = (
+            "cd '%s' && %s -std=c11 -o '%s' main.c -L'%s' -ldefault_aot -Wl,-rpath,'%s'"
+        ):format(dir, compiler(), program, lib, lib)
     end
     testAssert.eq(os.execute(command), 0, command)
     run(dir, program)
