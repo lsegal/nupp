@@ -634,6 +634,7 @@ export function checkstructure(words: any, count: integer): nil
     local depths: {[integer]: integer} = {}
     local mergers: {[integer]: boolean} = {}
     local depth: integer = 0
+
     -- A branch from the current block opening a block one deeper. naga keeps
     -- a switch case's earlier depth, but not a conditional branch's.
     local function enter(label: integer, at: integer, keep: boolean): nil
@@ -642,6 +643,7 @@ export function checkstructure(words: any, count: integer): nil
             depths[label] = depth + 1
         end
     end
+
     for _, instruction in ipairs(spirvInstructions(words, count)) do
         local op, first, last = instruction[1], instruction[2], instruction[3]
         local operands = last - first + 1

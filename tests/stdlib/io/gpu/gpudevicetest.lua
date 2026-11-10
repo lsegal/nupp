@@ -229,7 +229,8 @@ end
 -- %11. Ids: %1 void, %2 its function type, %3 int, %4 uint, %5 float, %6 bool,
 -- %7 int vec2, %8 uint vec4, %9 struct {int, float}, %20 int 7, %21 uint 0,
 -- %22 float 1.0, %23 uint 1, %24 true. `parts.modes`, `parts.annotations` and
--- `parts.declarations` go in their sections.
+-- `parts.declarations` go in their sections; `parts.bound` raises the id bound
+-- from 200.
 local function kernel(parts)
     local sections = {
         {op(17, 1), op(14, 0, 1), op(15, 5, 10, 0x6e69616d, 0), op(16, 10, 17, 1, 1, 1)},
@@ -245,7 +246,7 @@ local function kernel(parts)
         parts.body or {},
         {op(253), op(56)},
     }
-    local module = {0x07230203, 0x00010300, 0, 200, 0}
+    local module = {0x07230203, 0x00010300, 0, parts.bound or 200, 0}
     for _, section in ipairs(sections) do
         for _, instruction in ipairs(section) do
             for _, word in ipairs(instruction) do
@@ -438,6 +439,108 @@ function M.callsNameFunctions()
     fails(function() structureOf(kernel({body = {op(57, 1, 30, 20)}})) end, "names %20, which is no function")
 end
 
+-- The entry point with `depth` selections nested inside one another, ids from
+-- %1000. Without `merged`, the conditional branches have no OpSelectionMerge,
+-- and each one's second target returns at once; naga nests them all the same.
+local function nestedSelections(depth, merged)
+    local body = {}
+    for level = 1, depth do
+        local yes, no = 1000 + 2 * level, 1001 + 2 * level
+        if merged then
+            body[#body + 1] = op(247, no, 0)
+        end
+        body[#body + 1] = op(250, 24, yes, no)
+        if not merged then
+            body[#body + 1] = op(248, no)
+            body[#body + 1] = op(253)
+        end
+        body[#body + 1] = op(248, yes)
+    end
+    for level = merged and depth or 0, 1, -1 do
+        body[#body + 1] = op(249, 1001 + 2 * level)
+        body[#body + 1] = op(248, 1001 + 2 * level)
+    end
+    return kernel({body = body, bound = 1100 + 2 * depth})
+end
+
+-- `count` selections one after another, each merging before the next.
+local function consecutiveSelections(count)
+    local body = {}
+    for index = 1, count do
+        local yes, merge = 1000 + 2 * index, 1001 + 2 * index
+        body[#body + 1] = op(247, merge, 0)
+        body[#body + 1] = op(250, 24, yes, merge)
+        body[#body + 1] = op(248, yes)
+        body[#body + 1] = op(249, merge)
+        body[#body + 1] = op(248, merge)
+    end
+    return kernel({body = body, bound = 1100 + 2 * count})
+end
+
+-- The entry point with `depth` loops nested inside one another, each leaving
+-- through its merge block on its first pass. Loop n's header, body, continue
+-- and merge blocks are %(1000 + 4n) to %(1003 + 4n).
+local function nestedLoops(depth)
+    local function label(level, part)
+        return 1000 + 4 * level + part
+    end
+    local body = {op(249, label(1, 0))}
+    for level = 1, depth do
+        body[#body + 1] = op(248, label(level, 0))
+        body[#body + 1] = op(246, label(level, 3), label(level, 2), 0)
+        body[#body + 1] = op(249, label(level, 1))
+        body[#body + 1] = op(248, label(level, 1))
+        body[#body + 1] = op(249, level < depth and label(level + 1, 0) or label(level, 3))
+    end
+    for level = depth, 1, -1 do
+        body[#body + 1] = op(248, label(level, 2))
+        body[#body + 1] = op(249, label(level, 0))
+        body[#body + 1] = op(248, label(level, 3))
+        if level > 1 then
+            body[#body + 1] = op(249, label(level - 1, 3))
+        end
+    end
+    return kernel({body = body, bound = 1100 + 4 * depth})
+end
+
+-- A private variable whose type is an int inside `depth` structs (or arrays
+-- of one element), from %1001, loaded in the entry point. Its pointer type
+-- adds no level.
+local function nestedTypes(depth, array)
+    local declarations = {}
+    for level = 1, depth do
+        local inner = level == 1 and 3 or 999 + level
+        declarations[level] = array and op(28, 1000 + level, inner, 23) or op(30, 1000 + level, inner)
+    end
+    local outer = 1000 + depth
+    declarations[#declarations + 1] = op(32, outer + 1, 6, outer)
+    declarations[#declarations + 1] = op(59, outer + 1, outer + 2, 6)
+    return kernel({declarations = declarations, body = {op(61, outer, 30, outer + 2)}, bound = 1100 + depth})
+end
+
+-- Modules at the nesting bound, and one level past it.
+local NESTING = {
+    selections = {nestedSelections(128, true), nestedSelections(129, true), "SPIR-V control flow at word"},
+    loops = {nestedLoops(128), nestedLoops(129), "SPIR-V control flow at word"},
+    structs = {nestedTypes(128), nestedTypes(129), "SPIR-V type %1129"},
+    arrays = {nestedTypes(128, true), nestedTypes(129, true), "SPIR-V type %1129"},
+}
+local PAST_THE_BOUND = " nests 129 deep; at most 128 levels are supported"
+
+function M.blocksAndTypesNestedPastTheBoundAreRefused()
+    for name, case in pairs(NESTING) do
+        local ok, problem = pcall(structureOf, case[1])
+        assert(ok, name .. ": " .. tostring(type(problem) == "table" and problem.message or problem))
+        fails(function() structureOf(case[2]) end, case[3])
+        fails(function() structureOf(case[2]) end, PAST_THE_BOUND)
+    end
+    -- naga nests a conditional branch's targets whether or not it merges.
+    structureOf(nestedSelections(128, false))
+    fails(function() structureOf(nestedSelections(129, false)) end, PAST_THE_BOUND)
+    -- Constructs one after another do not nest.
+    structureOf(consecutiveSelections(1000))
+end
+
 function M.closingAfterAWriteErrorPreservesTheErrorAndResetsTheSink()
     local path = temporary("close")
     assert(costs.configure(path) == nil)
@@ -590,6 +693,27 @@ function M.aModuleNagaRefusesFailsWithoutEndingTheProcessWhenAvailable()
     assert(problem and problem:find("^gpu: GPU validation: "), tostring(problem))
     local buffer = check(device.createbuffer(gpu, 16))
     check(device.releasebuffer(gpu, buffer))
+    check(device.close(gpu))
+end
+
+-- naga's validator overflows the stack at about 1360 nested selections on a
+-- 2 MiB stack, and an NVIDIA Vulkan driver at about 14000 nested structs. Both
+-- ended the process with no message.
+function M.modulesAtTheNestingBoundCompileWithoutEndingTheProcessWhenAvailable()
+    local gpu = open()
+    for index, module in ipairs({nestedSelections(2000, true), nestedLoops(2000), nestedTypes(20000)}) do
+        local _, refused = device.createkernel(gpu, words(module), "main", 0, 1, 0, {1, 1, 1})
+        assert(refused and refused:find("^gpu: ") and refused:find(PAST_THE_BOUND, 1, true),
+            index .. ": " .. tostring(refused))
+    end
+    for name, case in pairs(NESTING) do
+        local kernel, problem = device.createkernel(gpu, words(case[1]), "main", 0, 1, 0, {1, 1, 1})
+        assert(kernel, name .. ": " .. tostring(problem))
+        check(device.releasekernel(gpu, kernel))
+        local _, refused = device.createkernel(gpu, words(case[2]), "main", 0, 1, 0, {1, 1, 1})
+        assert(refused and refused:find("^gpu: ") and refused:find(PAST_THE_BOUND, 1, true),
+            name .. ": " .. tostring(refused))
+    end
     check(device.close(gpu))
 end
 
