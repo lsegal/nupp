@@ -431,6 +431,14 @@ pub unsafe extern "C" fn nuppNativeUuid7(output: *mut u8, capacity: usize) -> i3
     boundary(|| unsafe { write_uuid(nupp_native_platform::uuid7, output, capacity) })
 }
 
+#[cfg(feature = "panic-probe")]
+#[unsafe(no_mangle)]
+/// Panics inside the export boundary, for tests that cross a provider panic
+/// from a host. Only a build with the `panic-probe` feature defines it.
+pub extern "C" fn nuppNativePanicProbe() -> i32 {
+    boundary(|| panic!("the panic probe tripped"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

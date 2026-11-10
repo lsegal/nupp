@@ -26,6 +26,8 @@ tls = ["net", "dep:nupp-native-tls"]
 filesystem = ["base", "dep:nupp-native-files"]
 files = ["filesystem", "nupp-native-files/lane"]
 compression = ["base", "dep:nupp-native-compression"]
+# A test-only export that panics inside the boundary: nuppNativePanicProbe.
+panic-probe = ["base"]
 # The AOT code generator: LLVM and lld, linked in (NUPP_LLVM_PREFIX).
 codegen = ["base", "dep:nupp-native-codegen", "nupp-native-codegen/llvm"]
 
