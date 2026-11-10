@@ -2514,7 +2514,8 @@ Commands:
   run              Compile and run a Nupp or Lua program.
   import-c         Generate typed Nupp bindings from a C header.
   migrate          Migrates annotated Lua or retired serialization APIs.
-  export-c         Export canonical C declarations for Nupp structs.
+  export-c         Export canonical C declarations for Nupp structs and C
+                   functions.
   rock             Package and check typed LuaRocks libraries.
   lsp              Language-server and semantic source operations.
   version          Print the compiler version.
