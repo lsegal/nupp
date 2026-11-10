@@ -37,20 +37,20 @@ end
 
 --- A C value as LLVM holds it: its type, whether integer conversions extend it
 --- as signed, and, for a pointer that can be indexed, what it points at.
-record Kind
+local record Kind
     llvm: string
     signed: boolean
     elem: Kind?
 end
 
-const VOID = Kind(llvm = "void", signed = false)
-const BOOL = Kind(llvm = "i1", signed = false)
-const F64 = Kind(llvm = "double", signed = true)
-const F32 = Kind(llvm = "float", signed = true)
-const I32 = Kind(llvm = "i32", signed = true)
-const PTR = Kind(llvm = "ptr", signed = false)
+local VOID = Kind(llvm = "void", signed = false)
+local BOOL = Kind(llvm = "i1", signed = false)
+local F64 = Kind(llvm = "double", signed = true)
+local F32 = Kind(llvm = "float", signed = true)
+local I32 = Kind(llvm = "i32", signed = true)
+local PTR = Kind(llvm = "ptr", signed = false)
 
-const INTEGERS: {
+local INTEGERS: {
     [string]: Kind
 } = {
     integer = I32,
@@ -75,7 +75,7 @@ local function isFloat(kind: Kind): boolean
 end
 
 --- Raised to stop lowering at the first refusal; caught by `module`.
-record Refusal
+local record Refusal
     problem: native.Problem
 end
 
@@ -163,7 +163,7 @@ local function extension(kind: Kind): string
 end
 
 --- A function the program can call: one it defines, or a C one it declares.
-record Callee
+local record Callee
     symbol: string
     params: {Kind}
     result: Kind
@@ -172,19 +172,19 @@ record Callee
 end
 
 --- A name a body can read: a local's stack slot.
-record Local
+local record Local
     slot: string
     kind: Kind
 end
 
 --- The lexical scopes of one body, innermost last.
-record Scope
+local record Scope
     names: {[string]: Local}
     parent: Scope?
 end
 
 --- The function being filled.
-record Body
+local record Body
     f: builder.Function
     scope: Scope
     result: Kind
@@ -194,15 +194,18 @@ record Body
 end
 
 --- A lowered value.
-record Value
+local record Value
     text: string
     kind: Kind
 end
 
 --- One program's lowering.
-record Program
+local record Program
     module: builder.Module
     callees: {[string]: Callee}
+
+    --- Top-level `const` literals, by name, lowered where they are read.
+    constants: {[string]: any}
 end
 
 local function lookup(scope: Scope?, name: string): Local?
@@ -561,14 +564,13 @@ local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?
     local function operand(v: Value): Kind?
         return (v.kind.llvm ~= "ptr" and v.kind.llvm ~= "void") and v.kind or nil
     end
-    local left, right: Value, Value
     if (node.lhs as any).kind == "number" and (node.rhs as any).kind ~= "number" then
-        right = expression(program, body, node.rhs, nil)
-        left = expression(program, body, node.lhs, operand(right))
-    else
-        left = expression(program, body, node.lhs, ORDERS[op] == nil and want or nil)
-        right = expression(program, body, node.rhs, operand(left))
+        local right = expression(program, body, node.rhs, nil)
+        local left = expression(program, body, node.lhs, operand(right))
+        return binaryValues(program, body, node, op, left, right, node.lhs, node.rhs)
     end
+    local left = expression(program, body, node.lhs, ORDERS[op] == nil and want or nil)
+    local right = expression(program, body, node.rhs, operand(left))
 
     return binaryValues(program, body, node, op, left, right, node.lhs, node.rhs)
 end
@@ -634,6 +636,10 @@ local function expressionRaw(program: Program, body: Body, node: any, want: Kind
         if found ~= nil then
             local entry = found as Local
             return Value(text = value(body, ("load %s, ptr %s"):format(entry.kind.llvm, entry.slot)), kind = entry.kind)
+        end
+        local constant = program.constants[name]
+        if constant ~= nil then
+            return expression(program, body, constant, want)
         end
         local callee = program.callees[name]
         if callee ~= nil then
@@ -837,17 +843,14 @@ local function fornumStmt(program: Program, body: Body, stat: cst.FornumStmt): n
     builder.start(body.f, head)
     local current = value(body, ("load %s, ptr %s"):format(kind.llvm, counter.slot))
     -- The direction is the step's sign, decided when the loop runs.
-    local up, within, down: string, string, string
-    if isFloat(kind) then
-        up = value(body, ("fcmp oge %s %s, 0.0"):format(kind.llvm, stepValue.text))
-        within = value(body, ("fcmp ole %s %s, %s"):format(kind.llvm, current, stopValue.text))
-        down = value(body, ("fcmp oge %s %s, %s"):format(kind.llvm, current, stopValue.text))
-    else
-        local s = kind.signed and "s" or "u"
-        up = kind.signed and value(body, ("icmp sge %s %s, 0"):format(kind.llvm, stepValue.text)) or "true"
-        within = value(body, ("icmp %sle %s %s, %s"):format(s, kind.llvm, current, stopValue.text))
-        down = value(body, ("icmp %sge %s %s, %s"):format(s, kind.llvm, current, stopValue.text))
-    end
+    local float = isFloat(kind)
+    local compare = float and "fcmp" or "icmp"
+    local s = kind.signed and "s" or "u"
+    local up = float and value(body, ("fcmp oge %s %s, 0.0"):format(kind.llvm, stepValue.text))
+        or kind.signed and value(body, ("icmp sge %s %s, 0"):format(kind.llvm, stepValue.text))
+        or "true"
+    local within = value(body, ("%s %s %s %s, %s"):format(compare, float and "ole" or s .. "le", kind.llvm, current, stopValue.text))
+    local down = value(body, ("%s %s %s %s, %s"):format(compare, float and "oge" or s .. "ge", kind.llvm, current, stopValue.text))
     local test = value(body, ("select i1 %s, i1 %s, i1 %s"):format(up, within, down))
     builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(test, loop, done))
     builder.start(body.f, loop)
@@ -939,7 +942,7 @@ block = function(program: Program, body: Body, node: any): nil
 end
 
 --- A function the program defines: its name, body, and C signature.
-record Definition
+local record Definition
     name: string
     node: any
     funcbody: cst.Funcbody
@@ -1035,6 +1038,29 @@ local function foreign(stat: cst.CdefFunc): Callee
     return Callee(symbol = name, params = params, result = result, varargs = stat.varargs or false, foreign = true)
 end
 
+--- Whether `node` is a literal, or a negated number, which a `const` may name.
+local function literal(node: any): boolean
+    local kind = node ~= nil and node.kind or nil
+    if kind == "paren" then
+        return literal((node as cst.Paren).expr)
+    elseif kind == "unop" then
+        return ((node as cst.Unop).op as lexer.Token).text == "-" and ((node as cst.Unop).operand as any).kind == "number"
+    end
+
+    return kind == "number" or kind == "string" or kind == "trueExpr" or kind == "falseExpr"
+end
+
+--- Records a top-level `const` of literals, read wherever its name is.
+local function constant(program: Program, stat: cst.LocalStmt): nil
+    local exprs = stat.exprs or {}
+    for index, name in ipairs(stat.names) do
+        if not literal(exprs[index]) then
+            refuse(exprs[index] or stat, "a native program's top-level const binds a literal")
+        end
+        program.constants[name.text] = exprs[index]
+    end
+end
+
 local function lowerDefinition(program: Program, attributes: string, item: Definition): nil
     local callee = item.callee
     local params: {string} = {}
@@ -1074,8 +1100,10 @@ end
 
 --- The program in `tree` as one LLVM IR module, or nil and what it does that
 --- a native program cannot. `functionAttributes` are the target profile's.
+--- @raises string when lowering fails for a reason other than the program: a
+---   defect here, which must not be reported as something the program did
 function native.module(tree: cst.Chunk, functionAttributes: string): (string?, native.Problem?)
-    local program = Program(module = builder.module(), callees = {})
+    local program = Program(module = builder.module(), callees = {}, constants = {})
     local definitions: {Definition} = {}
     local ok, err = pcall(function(): nil
         local hasMain = false
@@ -1100,6 +1128,8 @@ function native.module(tree: cst.Chunk, functionAttributes: string): (string?, n
                     definitions[#definitions + 1] = item
                     program.callees[name as string] = item.callee
                     hasMain = hasMain or name == "main"
+                elseif kind == "localStmt" and (stat as cst.LocalStmt).isConst then
+                    constant(program, stat as cst.LocalStmt)
                 elseif kind ~= "emptyStmt" and kind ~= "moduleStmt" and kind ~= "cdefStruct" then
                     refuse(stat, "a native program's top level holds only cdef declarations and functions")
                 end

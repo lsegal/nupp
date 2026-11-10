@@ -1746,7 +1746,8 @@ build_kit() {
     {
         printf '{\n  "schemaVersion": 1,\n  "platform": "macos",\n  "target": "%s",\n' "$(kit_target)"
         printf '  "minimum": "%s",\n' "$(kit_minimum)"
-        printf '  "features": "%s",\n  "runtime": "libnupp-runtime.a",\n  "syslibroot": "sdk",\n' "$features"
+        printf '  "features": "%s",\n  "runtime": "libnupp-runtime.a",\n  "luajit": "libluajit-5.1.a",\n' "$features"
+        printf '  "syslibroot": "sdk",\n'
         printf '  "libraries": ['
         awk '{ printf "%s\"%s\"", (NR > 1 ? ", " : ""), $0 }' "$out/flags"
         printf ']\n}\n'
@@ -1841,6 +1842,7 @@ EOF
     {
         printf '{\n  "schemaVersion": 1,\n  "platform": "windows",\n  "target": "%s",\n' "$(kit_target)"
         printf '  "features": "%s",\n  "runtime": "libnupp-runtime.a",\n' "$features"
+        printf '  "luajit": "libluajit-5.1.a",\n'
         printf '  "argv": ['
         awk '{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); printf "%s\"%s\"", (NR > 1 ? ", " : ""), $0 }' "$out/argv"
         printf ']\n}\n'
@@ -1930,6 +1932,7 @@ build_kit_linux() {
     {
         printf '{\n  "schemaVersion": 1,\n  "platform": "linux",\n  "target": "%s",\n' "$(kit_target)"
         printf '  "features": "%s",\n  "runtime": "libnupp-runtime.a",\n' "$features"
+        printf '  "luajit": "libluajit-5.1.a",\n'
         printf '  "interpreter": "%s",\n' "$interpreter"
         printf '  "startup": ["lib/Scrt1.o", "lib/crti.o", "lib/crtbeginS.o"],\n'
         printf '  "finish": ["lib/libgcc.a", "lib/crtendS.o", "lib/crtn.o"],\n'

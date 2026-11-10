@@ -644,6 +644,10 @@ end
 --- execution. Select verified IR, LLVM IR, native GPU SPIR-V, browser GPU WGSL,
 --- native assembly, or the generated Nupp binding with `--emit`.
 ---
+--- `--emit executable` instead links the file as a native program: its `main` is
+--- the executable's own, and it reaches LuaJIT and other C libraries through
+--- its `cdef function` declarations. The program is written to `--output`.
+---
 --- Examples:
 ---
 ---     nupp aot bench/kernel-subset-spike/mandelbrot.nupp
@@ -656,8 +660,7 @@ end
 @cli("aot")
 @derive(cliModule.command)
 local record Aot
-    --- Artifact to print: ir, llvm, spirv, wgsl, asm, or binding; or
-    --- executable, which links the file as a native program into --output.
+    --- Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or executable.
     @cli(value = "ARTIFACT", choices = {"ir", "llvm", "spirv", "wgsl", "asm", "binding", "executable"})
     emit: string?
 
