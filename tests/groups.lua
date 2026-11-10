@@ -237,7 +237,7 @@ clitest duplicateclitest coveragereporttest coveragetest clidoctest
 diagnosticgoldentest doctest examplestest explaintest homesampletest
 referencetest fmtclitest fmtcorpustest fmtimportstest fmttreetest
 associatedtoolingtest lspclitest lsptest constructionmigrationtest repositoryscriptstest
-runnertest testtimingstest buildprogresstest buildtest nativethreadstest
+runnertest testtimingstest buildprogresstest buildtest
 ]]
 ):gmatch("%S+") do
     scopes[name] = "integration"
@@ -431,6 +431,8 @@ scopes.projectlayoutcachetest = "integration"
 scopes.projectaotlinktest = "integration"
 
 scopes.nativeprogramtest = "integration"
+
+scopes.nativethreadstest = "integration"
 
 scopes.projectaottest = "integration"
 
