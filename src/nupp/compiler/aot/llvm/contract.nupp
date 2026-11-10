@@ -1,0 +1,178 @@
+--[[
+The numeric contract, checked on what LLVM actually produced.
+
+Nupp's floating point is binary64 with no contraction and no reassociation,
+except where the source asked: `@relax("fp-contract")` functions may fuse, and
+algebraic reducers may reassociate their sums. The emitter marks such functions
+with the string attributes `"nupp-fp-contract"` and `"nupp-algebraic"`. These
+checks read the optimized IR and the assembly the code generator returns and
+report anything outside those licences. They do not trust the emitter: they are
+how a wrong emitter or a surprising pass is caught.
+
+Flags LLVM may infer from facts it proves (`nnan`, `ninf`, `nsz`, from
+InstCombine's FP-class analysis) change no result and are not licences, so they
+are never reported.
+]]
+module nupp.compiler.aot.llvm.contract
+
+local contract = {}
+
+--- The fast-math flags that are licences: each needs one to appear.
+const LICENCES: {[string]: boolean} = {fast = true, contract = true, arcp = true, afn = true, reassoc = true}
+
+--- Fused multiply-add mnemonics, AArch64 and x86 alike.
+const FUSED: {[string]: boolean} = {fmadd = true, fmsub = true, fnmadd = true, fnmsub = true, fmla = true, fmls = true}
+
+--- Mnemonic prefixes of the x86 and Wasm fused multiply-add families.
+const FUSED_PREFIXES: {string} = {"vfmadd", "vfmsub", "vfnmadd", "vfnmsub", "f64x2.relaxed_madd"}
+
+--- Functions (by IR name) carrying each licence, read from attribute groups.
+local type Licences = {
+    contract: {[string]: boolean},
+    algebraic: {[string]: boolean}
+}
+
+--- The lines of `text`, each without its line ending.
+local function lines(text: string): {string}
+    local out: {string} = {}
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        out[#out + 1] = (line:gsub("\r$", ""))
+    end
+
+    return out
+end
+
+local function trim(text: string): string
+    return (text:match("^%s*(.-)%s*$")) as string
+end
+
+local function startsWith(text: string, prefix: string): boolean
+    return text:sub(1, #prefix) == prefix
+end
+
+--- The IR name a `define` line declares.
+local function functionName(define: string): string?
+    local at = define:find("@", 1, true)
+    if at == nil then
+        return nil
+    end
+    local rest = define:sub(at + 1)
+    if rest:sub(1, 1) == "\"" then
+        rest = rest:sub(2)
+    end
+    local finish = rest:find("[(\"]")
+
+    return finish ~= nil and rest:sub(1, finish - 1) or rest
+end
+
+local function licences(ir: string): Licences
+    local all = lines(ir)
+    local groups: {[string]: string} = {}
+    for _, line in ipairs(all) do
+        local number, body = line:match("^attributes #(.-) = (.*)$")
+        if number ~= nil then
+            groups[trim(number as string)] = body as string
+        end
+    end
+    local result: Licences = {contract = {}, algebraic = {}}
+    for _, line in ipairs(all) do
+        local name = startsWith(line, "define ") and functionName(line) or nil
+        if name ~= nil then
+            local tail = line:sub(line:find(")", 1, true) or 1)
+            local text = tail
+            for word in tail:gmatch("%S+") do
+                local body = word:sub(1, 1) == "#" and groups[word:sub(2)] or nil
+                if body ~= nil then
+                    text = text .. body
+                end
+            end
+            if text:find("\"nupp-fp-contract\"", 1, true) then
+                result.contract[name as string] = true
+            end
+            if text:find("\"nupp-algebraic\"", 1, true) then
+                result.algebraic[name as string] = true
+            end
+        end
+    end
+
+    return result
+end
+
+--- Violations of the numeric contract in optimized IR text.
+function contract.ir(ir: string): {string}
+    local allowed = licences(ir)
+    local current = ""
+    local bad: {string} = {}
+    for _, line in ipairs(lines(ir)) do
+        if startsWith(line, "define ") then
+            current = functionName(line) or ""
+        elseif startsWith(line, "}") then
+            current = ""
+        elseif current ~= "" then
+            local contracting = allowed.contract[current] == true
+            local words: {string} = {}
+            local present: {[string]: boolean} = {}
+            for word in line:gmatch("%S+") do
+                words[#words + 1] = word
+                present[word] = true
+            end
+            local fused = line:find("@llvm.fmuladd", 1, true) ~= nil or line:find("@llvm.fma.", 1, true) ~= nil
+            if fused and not contracting then
+                bad[
+                    #bad + 1
+                ] = ("%s: fused multiply-add outside an fp-contract function: %s"):format(current, trim(line))
+            end
+            for _, flag in ipairs(words) do
+                if LICENCES[flag] then
+                    local ok = false
+                    if flag == "contract" then
+                        ok = contracting
+                    elseif flag == "reassoc" then
+                        ok = allowed.algebraic[current] == true
+                            and (line:find("@llvm.vector.reduce.fadd", 1, true) ~= nil or present.fadd == true)
+                    end
+                    if not ok then
+                        bad[#bad + 1] = ("%s: `%s` outside its licence: %s"):format(current, flag, trim(line))
+                    end
+                end
+            end
+        end
+    end
+
+    return bad
+end
+
+local function isFused(op: string): boolean
+    if FUSED[op] then
+        return true
+    end
+    for _, prefix in ipairs(FUSED_PREFIXES) do
+        if startsWith(op, prefix) then
+            return true
+        end
+    end
+
+    return false
+end
+
+--- Fused multiply-add instructions in an assembly listing, outside the
+--- functions `ir` licenses to contract. Covers AArch64 and x86 spellings.
+function contract.fusedInstructions(assembly: string, ir: string): {string}
+    local allowed = licences(ir).contract
+    local current = ""
+    local bad: {string} = {}
+    for _, line in ipairs(lines(assembly)) do
+        if line:match("^%s") == nil and line:sub(-1) == ":" then
+            local label = (line:gsub(":+$", ""))
+            if not startsWith(label, "L") and not startsWith(label, ".") and not startsWith(label, "ltmp") then
+                current = (label:gsub("^_+", ""))
+            end
+        elseif isFused(line:match("%S+") or "") and not allowed[current] then
+            bad[#bad + 1] = current .. ": " .. trim(line)
+        end
+    end
+
+    return bad
+end
+
+export = contract

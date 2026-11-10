@@ -1,0 +1,191 @@
+--[[
+Link kit archives: gzip-compressed POSIX tar files, checked against the size and
+SHA-256 the caller's catalog holds and unpacked into a directory the caller then
+moves into place. Nothing here decides where kits live or which one a build
+needs; [](nupp.tools.build.kits) does.
+
+The tar reader understands ustar prefixes, pax `path` records and GNU long
+names, and nothing a kit does not carry: a link, a device or any other member
+that is not a regular file or a directory is refused, as is a path that would
+land outside the directory being unpacked into.
+]]
+module nupp.tools.build.kitarchive
+
+const bytes = require("bytes")
+local fs = require("nupp.compiler.fs")
+local hash = require("nupp.compiler.hash")
+
+local kitarchive = {}
+
+--- The largest archive this unpacks, compressed or not.
+const LIMIT = 1073741824
+
+--- Checks `data` against the catalog's size and lowercase SHA-256.
+--- @return nil, or why the archive is not the one the catalog names
+function kitarchive.verify(data: string, size: integer, sha256: string): string?
+    if #data ~= size then
+        return ("the kit archive is %d bytes; its catalog record says %d"):format(#data, size)
+    end
+    local digest = hash.sha256(data)
+    if digest ~= sha256 then
+        return ("the kit archive's SHA-256 is %s; its catalog record says %s"):format(digest, sha256)
+    end
+
+    return nil
+end
+
+--- A tar header's octal number field.
+local function octal(field: string): (integer?, string?)
+    local digits = (field:gsub("^[%z ]+", ""):gsub("[%z ]+$", ""))
+    if digits == "" then
+        return 0, nil
+    end
+    if not digits:match("^[0-7]+$") then
+        return nil, ("a tar header number is not octal: %q"):format(digits)
+    end
+
+    return tonumber(digits, 8) as integer, nil
+end
+
+--- A NUL-terminated tar header text field.
+local function text(field: string): string
+    local finish = field:find("%z")
+
+    return finish ~= nil and field:sub(1, finish - 1) or field
+end
+
+--- A member path under `root`, refused when it is absolute or climbs out.
+local function contained(root: string, name: string): (string?, string?)
+    local outside = "the kit archive names a path outside itself: " .. name
+    if name:match("^[/\\]") or name:match("^%a:") then
+        return nil, outside
+    end
+    local path = root
+    for piece in name:gmatch("[^/\\]+") do
+        if piece == ".." then
+            return nil, outside
+        end
+        if piece ~= "." then
+            path = fs.join(path, piece)
+        end
+    end
+
+    return path, nil
+end
+
+--- A pax extended header's `path` record, when it has one.
+local function paxPath(data: string): string?
+    local rest = data
+    while rest ~= "" do
+        local space = rest:find(" ", 1, true)
+        if space == nil then
+            return nil
+        end
+        local digits = rest:sub(1, space - 1)
+        local length = digits:match("^%d+$") and tonumber(digits) or nil
+        if length == nil or length <= space - 1 or length > #rest then
+            return nil
+        end
+        local record = rest:sub(space + 1, length - 1)
+        if record:sub(1, 5) == "path=" then
+            return record:sub(6)
+        end
+        rest = rest:sub(length + 1)
+    end
+
+    return nil
+end
+
+--- Inflates the gzip archive `data`, refusing one that unpacks past the limit.
+local function inflate(data: string): (string?, string?)
+    local ok, result = pcall(function(): string
+        return bytes.compress("gzip"):decompress(data, {maxoutputbytes = LIMIT})
+    end)
+    if ok then
+        return result as string, nil
+    end
+    if tostring(result):find("maxoutputbytes", 1, true) then
+        return nil, "the kit archive unpacks to more than a gigabyte"
+    end
+
+    return nil, "the kit archive is not gzip: " .. tostring(result)
+end
+
+--- Unpacks the gzip-compressed tar `data` into `root`, which must exist.
+--- Regular files and directories only: a kit carries nothing else.
+--- @return nil, or why the archive could not be unpacked
+function kitarchive.unpack(data: string, root: string): string?
+    local tar, inflateErr = inflate(data)
+    if tar == nil then
+        return inflateErr
+    end
+    local archive = tar as string
+    local at = 0
+    local longName: string? = nil
+    while at + 512 <= #archive do
+        local header = archive:sub(at + 1, at + 512)
+        if not header:find("[^%z]") then
+            return nil
+        end
+        local size, sizeErr = octal(header:sub(125, 136))
+        if size == nil then
+            return sizeErr
+        end
+        local kind = header:byte(157)
+        local start = at + 512
+        if start + (size as integer) > #archive then
+            return "the kit archive is truncated"
+        end
+        local data = archive:sub(start + 1, start + (size as integer))
+        at = start + math.ceil((size as integer) / 512) * 512
+        local name = longName
+        longName = nil
+        if name == nil then
+            local base = text(header:sub(1, 100))
+            local prefix = header:sub(258, 262) == "ustar" and text(header:sub(346, 500)) or ""
+            name = prefix == "" and base or prefix .. "/" .. base
+        end
+        local member = name as string
+        if kind == 120 then -- 'x': a pax extended header for the next member
+            longName = paxPath(data)
+        elseif kind == 76 then -- 'L': a GNU long name for the next member
+            longName = text(data)
+        elseif kind == 103 then -- 'g': pax global records, which name no path
+        elseif kind == 53 or kind == 48 or kind == 0 then -- '5' directory, '0' or NUL file
+            local path, pathErr = contained(root, member)
+            if path == nil then
+                return pathErr
+            end
+            if kind == 53 then
+                if not fs.mkdir(path as string) then
+                    return "cannot create " .. tostring(path)
+                end
+            else
+                local written, writeErr = fs.writeFile(path as string, data)
+                if not written then
+                    return ("cannot write %s: %s"):format(tostring(path), tostring(writeErr))
+                end
+            end
+        else
+            return (
+                "the kit archive holds %s, of tar type '%s', which a kit never carries"
+            ):format(member, string.char(kind))
+        end
+    end
+
+    return "the kit archive ends without its closing blocks"
+end
+
+--- Checks the link kit archive at `archive` against `size` and `sha256`, then
+--- unpacks it into the existing directory `root`.
+--- @return nil, or why it could not be unpacked
+function kitarchive.unpackFile(archive: string, sha256: string, size: integer, root: string): string?
+    local data, readErr = fs.readFile(archive)
+    if data == nil then
+        return ("cannot read %s: %s"):format(archive, tostring(readErr))
+    end
+
+    return kitarchive.verify(data as string, size, sha256) or kitarchive.unpack(data as string, root)
+end
+
+export = kitarchive

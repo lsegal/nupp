@@ -1,7 +1,7 @@
 //! The implementation over the LLVM C API, plus the few C++ entry points in
 //! `glue.cpp`.
 
-use crate::{CODEGEN_VERSION, CompileOptions, Compiled, Timings, contract};
+use crate::{CODEGEN_VERSION, CompileOptions, Compiled, Timings};
 use llvm_sys::core::*;
 use llvm_sys::error::*;
 use llvm_sys::ir_reader::LLVMParseIRInContext2;
@@ -225,7 +225,7 @@ pub fn compile(ir: &str, name: &str, options: &CompileOptions) -> Result<Compile
     let t = Instant::now();
     optimize(&module, &tm, options.opt)?;
     let optimize_us = micros(t);
-    let optimized = if options.verify || options.optimized_ir {
+    let optimized_ir = if options.optimized_ir {
         Some(unsafe { take(LLVMPrintModuleToString(module.m)) })
     } else {
         None
@@ -238,19 +238,10 @@ pub fn compile(ir: &str, name: &str, options: &CompileOptions) -> Result<Compile
     } else {
         None
     };
-    let mut violations = Vec::new();
-    if options.verify {
-        let ir = optimized.as_deref().unwrap_or_default();
-        violations.extend(contract::ir_contract(ir));
-        if let Some(asm) = &assembly {
-            violations.extend(contract::fused_instructions(asm, ir));
-        }
-    }
     Ok(Compiled {
         object,
         assembly,
-        optimized_ir: optimized.filter(|_| options.optimized_ir),
-        violations,
+        optimized_ir,
         timings: Timings { parse: parse_us, optimize: optimize_us, codegen: codegen_us },
     })
 }
@@ -351,11 +342,11 @@ attributes #0 = { nounwind }
 "#;
 
     fn options(triple: &str) -> CompileOptions {
-        CompileOptions { triple: triple.into(), opt: 3, verify: true, assembly: true, ..CompileOptions::default() }
+        CompileOptions { triple: triple.into(), opt: 3, assembly: true, ..CompileOptions::default() }
     }
 
     #[test]
-    fn compiles_for_every_target_without_fusing() {
+    fn compiles_for_every_target() {
         for triple in ["arm64-apple-macosx11.0.0", "x86_64-unknown-linux-gnu", "x86_64-w64-windows-gnu", "wasm32-unknown-unknown"] {
             let mut o = options(triple);
             if triple.starts_with("x86_64") {
@@ -363,7 +354,7 @@ attributes #0 = { nounwind }
             }
             let c = compile(KERNEL, "scale", &o).unwrap_or_else(|e| panic!("{triple}: {e}"));
             assert!(!c.object.is_empty(), "{triple}");
-            assert!(c.violations.is_empty(), "{triple}: {:?}", c.violations);
+            assert!(c.assembly.is_some_and(|a| !a.is_empty()), "{triple}");
         }
     }
 

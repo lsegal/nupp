@@ -166,7 +166,7 @@ end
 
 --- Unpacks the verified archive at `archive` as the cache entry `entry`.
 local function unpack(record: kits.Record, archive: string, entry: string): string?
-    local codegen = require("nupp.compiler.aot.llvm.codegen")
+    local kitarchive = require("nupp.tools.build.kitarchive")
     local nonce = hash.sha256(entry .. tostring({}) .. tostring(os.clock())):sub(1, 16)
     local staging = entry .. ".tmp-" .. nonce
     fs.mkdir(staging)
@@ -181,7 +181,7 @@ local function unpack(record: kits.Record, archive: string, entry: string): stri
         return why
     end
 
-    local err = codegen.unpackKit(archive, record.sha256, record.size, staging)
+    local err = kitarchive.unpackFile(archive, record.sha256, record.size, staging)
     if err ~= nil then
         return abandon("cannot unpack the link kit " .. record.artifact .. ": " .. err)
     end
@@ -219,7 +219,7 @@ function kits.install(record: kits.Record): (string?, string?)
         end
         archive = directory .. ".download"
         local codegen = require("nupp.compiler.aot.llvm.codegen")
-        local fetchErr = codegen.fetchKit(record.url as string, archive as string, record.sha256, record.size)
+        local fetchErr = codegen.fetchKit(record.url as string, archive as string, record.size)
         if fetchErr ~= nil then
             return nil, "cannot fetch the link kit for " .. record.platform .. ": " .. fetchErr
         end

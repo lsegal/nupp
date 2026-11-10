@@ -2,21 +2,19 @@
 //!
 //! The compiler (written in Nupp) lowers its AOT IR to LLVM IR text. This crate
 //! knows nothing about Nupp: it parses that text, verifies it, runs LLVM's
-//! optimization pipeline, generates an object for the requested target, checks
-//! the numeric contract, and links with lld. Built without the `llvm` feature it
-//! compiles anywhere and every entry point reports that it carries no code
-//! generator.
+//! optimization pipeline, generates an object for the requested target, and links
+//! with lld. Option parsing, the numeric-contract checks over the optimized IR
+//! and assembly, the report and link-kit unpacking are the compiler's, in
+//! Nupp. Built without the `llvm` feature it compiles anywhere and every entry
+//! point reports that it carries no code generator.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-mod contract;
 mod isolated;
 pub mod kit;
 pub use isolated::{Job, compile_files};
 #[cfg(nupp_llvm)]
 mod llvm;
-
-pub use contract::{fused_instructions, ir_contract};
 
 /// The code generator's identity: part of every AOT cache key.
 pub const CODEGEN_VERSION: u32 = 1;
@@ -37,37 +35,6 @@ pub struct CompileOptions {
     pub assembly: bool,
     /// Also return the optimized IR.
     pub optimized_ir: bool,
-    /// Run the numeric-contract checks over the optimized IR (and over the
-    /// assembly when it is produced).
-    pub verify: bool,
-}
-
-impl CompileOptions {
-    /// Reads `key=value` lines: triple, cpu, features, opt, assembly,
-    /// optimized-ir, verify. Unknown keys are refused.
-    pub fn parse(text: &str) -> Result<CompileOptions, String> {
-        let mut options = CompileOptions { opt: 3, ..CompileOptions::default() };
-        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let (key, value) = line.split_once('=').ok_or_else(|| format!("codegen option `{line}` has no `=`"))?;
-            let flag = || value == "1" || value == "true";
-            match key {
-                "triple" => options.triple = value.to_string(),
-                "cpu" => options.cpu = value.to_string(),
-                "features" => options.features = value.to_string(),
-                "opt" => {
-                    options.opt = value.parse().ok().filter(|l: &u8| *l <= 3).ok_or_else(|| format!("codegen opt `{value}` is not 0-3"))?
-                }
-                "assembly" => options.assembly = flag(),
-                "optimized-ir" => options.optimized_ir = flag(),
-                "verify" => options.verify = flag(),
-                _ => return Err(format!("unknown codegen option `{key}`")),
-            }
-        }
-        if options.triple.is_empty() {
-            return Err("codegen options name no triple".into());
-        }
-        Ok(options)
-    }
 }
 
 /// Microseconds spent in each phase of one compile.
@@ -78,33 +45,20 @@ pub struct Timings {
     pub codegen: f64,
 }
 
+impl Timings {
+    /// The three phases in microseconds, space-separated, for the compiler to
+    /// report.
+    pub fn text(&self) -> String {
+        format!("{} {} {}", self.parse, self.optimize, self.codegen)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Compiled {
     pub object: Vec<u8>,
     pub assembly: Option<String>,
     pub optimized_ir: Option<String>,
-    /// Contract violations; empty when `verify` found none (or did not run).
-    pub violations: Vec<String>,
     pub timings: Timings,
-}
-
-impl Compiled {
-    /// A plain-text report: timings, then one violation per line.
-    pub fn report(&self) -> String {
-        let mut text = format!(
-            "parse-us={:.0}\noptimize-us={:.0}\ncodegen-us={:.0}\nobject-bytes={}\n",
-            self.timings.parse,
-            self.timings.optimize,
-            self.timings.codegen,
-            self.object.len()
-        );
-        for v in &self.violations {
-            text.push_str("violation=");
-            text.push_str(&v.replace('\n', " "));
-            text.push('\n');
-        }
-        text
-    }
 }
 
 /// Whether this build carries LLVM.
