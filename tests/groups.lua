@@ -206,7 +206,7 @@ quaterniontest soatest standardostest spiinterfacetest serdetest
 stringbuffernamespacetest reflectionnamestest storetest warntest bytecodelistingtest
 docheadingstest doclinkstest overloaddoctest duplicatestest fmtfuzztest
 fmttest fmtwidthtest moduleexportstest spinavigationtest cichangeclassifiertest
-toollayeringtest testrunnertest
+toollayeringtest testrunnertest llvmcontracttest kitarchivetest
 ]]
 ):gmatch("%S+") do
     scopes[name] = "component"

@@ -11,6 +11,7 @@ land outside the directory being unpacked into.
 ]]
 module nupp.tools.build.kitarchive
 
+const bytes = require("bytes")
 local fs = require("nupp.compiler.fs")
 local hash = require("nupp.compiler.hash")
 
@@ -19,13 +20,13 @@ local kitarchive = {}
 --- The largest archive this unpacks, compressed or not.
 const LIMIT = 1073741824
 
---- Checks `bytes` against the catalog's size and lowercase SHA-256.
+--- Checks `data` against the catalog's size and lowercase SHA-256.
 --- @return nil, or why the archive is not the one the catalog names
-function kitarchive.verify(bytes: string, size: integer, sha256: string): string?
-    if #bytes ~= size then
-        return ("the kit archive is %d bytes; its catalog record says %d"):format(#bytes, size)
+function kitarchive.verify(data: string, size: integer, sha256: string): string?
+    if #data ~= size then
+        return ("the kit archive is %d bytes; its catalog record says %d"):format(#data, size)
     end
-    local digest = hash.sha256(bytes)
+    local digest = hash.sha256(data)
     if digest ~= sha256 then
         return ("the kit archive's SHA-256 is %s; its catalog record says %s"):format(digest, sha256)
     end
@@ -95,11 +96,10 @@ local function paxPath(data: string): string?
     return nil
 end
 
---- Inflates the gzip archive `bytes`, refusing one that unpacks past the limit.
-local function inflate(bytes: string): (string?, string?)
+--- Inflates the gzip archive `data`, refusing one that unpacks past the limit.
+local function inflate(data: string): (string?, string?)
     local ok, result = pcall(function(): string
-        local gzip: any = require("bytes").compress("gzip")
-        return gzip:decompress(bytes, {maxoutputbytes = LIMIT}) as string
+        return bytes.compress("gzip"):decompress(data, {maxoutputbytes = LIMIT})
     end)
     if ok then
         return result as string, nil
@@ -111,11 +111,11 @@ local function inflate(bytes: string): (string?, string?)
     return nil, "the kit archive is not gzip: " .. tostring(result)
 end
 
---- Unpacks the gzip-compressed tar `bytes` into `root`, which must exist.
+--- Unpacks the gzip-compressed tar `data` into `root`, which must exist.
 --- Regular files and directories only: a kit carries nothing else.
 --- @return nil, or why the archive could not be unpacked
-function kitarchive.unpack(bytes: string, root: string): string?
-    local tar, inflateErr = inflate(bytes)
+function kitarchive.unpack(data: string, root: string): string?
+    local tar, inflateErr = inflate(data)
     if tar == nil then
         return inflateErr
     end
@@ -180,12 +180,12 @@ end
 --- unpacks it into the existing directory `root`.
 --- @return nil, or why it could not be unpacked
 function kitarchive.unpackFile(archive: string, sha256: string, size: integer, root: string): string?
-    local bytes, readErr = fs.readFile(archive)
-    if bytes == nil then
+    local data, readErr = fs.readFile(archive)
+    if data == nil then
         return ("cannot read %s: %s"):format(archive, tostring(readErr))
     end
 
-    return kitarchive.verify(bytes as string, size, sha256) or kitarchive.unpack(bytes as string, root)
+    return kitarchive.verify(data as string, size, sha256) or kitarchive.unpack(data as string, root)
 end
 
 export = kitarchive

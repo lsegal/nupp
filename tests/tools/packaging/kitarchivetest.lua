@@ -46,8 +46,51 @@ local function tar(members)
     return table.concat(blocks)
 end
 
+local function crc32(text)
+    local crc = 0xffffffff
+    for position = 1, #text do
+        crc = bit.bxor(crc, text:byte(position))
+        for _ = 1, 8 do
+            crc = bit.band(crc, 1) ~= 0 and bit.bxor(bit.rshift(crc, 1), 0xedb88320) or bit.rshift(crc, 1)
+        end
+    end
+
+    return bit.bnot(crc)
+end
+
+local function le32(value)
+    return string.char(
+        bit.band(value, 0xff),
+        bit.band(bit.rshift(value, 8), 0xff),
+        bit.band(bit.rshift(value, 16), 0xff),
+        bit.band(bit.rshift(value, 24), 0xff)
+    )
+end
+
+-- `text` as a gzip member of stored DEFLATE blocks: what any inflater reads,
+-- built here so the fixtures need no compressor.
+local function gzip(text)
+    local parts = {"\31\139\8\0\0\0\0\0\0\255"}
+    local at = 1
+    repeat
+        local chunk = text:sub(at, at + 65534)
+        at = at + #chunk
+        local final = at > #text and 1 or 0
+        parts[
+            #parts + 1
+        ] = string.char(
+            final,
+            #chunk % 256,
+            math.floor(#chunk / 256)
+        ) .. string.char(255 - #chunk % 256, 255 - math.floor(#chunk / 256)) .. chunk
+    until at > #text
+    parts[#parts + 1] = le32(crc32(text)) .. le32(#text)
+
+    return table.concat(parts)
+end
+
 local function archive(members)
-    return require("bytes").compress("gzip"):compress(tar(members))
+    return gzip(tar(members))
 end
 
 local function scratch(name)
@@ -128,7 +171,7 @@ function M.followsGnuLongNamesAndUstarPrefixes()
     prefixed = prefixed:sub(1, 148) .. ("%06o\0 "):format(sum) .. prefixed:sub(157)
     local body = tar({{"././@LongLink", "L", "gnu/long/name\0"}, {"short", "0", "gnu"}})
     body = body:sub(1, -1025) .. prefixed .. pad("abc", 512) .. ("\0"):rep(1024)
-    local bytes = require("bytes").compress("gzip"):compress(body)
+    local bytes = gzip(body)
     assert(kitarchive.unpack(bytes, dir) == nil)
     assert(read(fs.join(dir, "gnu/long/name")) == "gnu")
     assert(read(fs.join(dir, "deep/prefix/file.txt")) == "abc")
@@ -138,14 +181,14 @@ end
 function M.refusesBrokenArchives()
     local dir = scratch("broken")
     assert(tostring(kitarchive.unpack("not gzip", dir)):find("^the kit archive is not gzip"))
-    local gzip = require("bytes").compress("gzip")
+
     local whole = tar({{"kit.json", "0", "{}"}})
-    local unclosed = gzip:compress(whole:sub(1, 1024))
+    local unclosed = gzip(whole:sub(1, 1024))
     assert(kitarchive.unpack(unclosed, dir) == "the kit archive ends without its closing blocks")
-    local truncated = gzip:compress(header("kit.json", "0", 4096))
+    local truncated = gzip(header("kit.json", "0", 4096))
     assert(kitarchive.unpack(truncated, dir) == "the kit archive is truncated")
     local badSize = header("kit.json", "0", 0):sub(1, 124) .. pad("9z", 12) .. header("kit.json", "0", 0):sub(137)
-    local err = kitarchive.unpack(gzip:compress(badSize .. ("\0"):rep(1024)), dir)
+    local err = kitarchive.unpack(gzip(badSize .. ("\0"):rep(1024)), dir)
     assert(err == 'a tar header number is not octal: "9z"', tostring(err))
     fileops.remove(dir, true)
 end
