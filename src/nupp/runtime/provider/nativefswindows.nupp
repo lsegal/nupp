@@ -60,7 +60,7 @@ int32_t nupp_fs_find_close(void *) __asm__("FindClose");
 void *nupp_fs_create(const uint16_t *, uint32_t, uint32_t, void *, uint32_t, uint32_t, void *)
     __asm__("CreateFileW");
 int32_t nupp_fs_close(void *) __asm__("CloseHandle");
-int32_t nupp_fs_handle_info(void *, nupp_fs_handle_info *) __asm__("GetFileInformationByHandle");
+int32_t nupp_fs_by_handle(void *, nupp_fs_handle_info *) __asm__("GetFileInformationByHandle");
 int32_t nupp_fs_read(void *, void *, uint32_t, uint32_t *, void *) __asm__("ReadFile");
 int32_t nupp_fs_write(void *, const void *, uint32_t, uint32_t *, void *) __asm__("WriteFile");
 int32_t nupp_fs_seek(void *, int64_t, int64_t *, uint32_t) __asm__("SetFilePointerEx");
@@ -95,7 +95,7 @@ local GENERIC_WRITE: integer = 0x40000000
 local FILE_READ_ATTRIBUTES: integer = 0x80
 -- What append mode asks for: the right to add at the end, without the right to
 -- write anywhere else.
-local FILE_APPEND_ACCESS: integer = 0x120116
+local FILE_APPEND_ACCESS: integer = 0x120114
 local FILE_SHARE_ALL: integer = 0x7
 local CREATE_NEW: integer = 1
 local CREATE_ALWAYS: integer = 2
@@ -312,7 +312,7 @@ export function info(path: string, follow: boolean): (integer?, integer?, number
         local _, reason = failure()
         return nil, nil, nil, nil, reason
     end
-    local got = C.nupp_fs_handle_info(handle, handleBuffer)
+    local got = C.nupp_fs_by_handle(handle, handleBuffer)
     local code = lastError()
     C.nupp_fs_close(handle)
     if got == 0 then
