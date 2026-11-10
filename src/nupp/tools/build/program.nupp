@@ -95,7 +95,7 @@ function program.build(
         checking[key] = value
     end
     checking.aot = "inspect"
-    config._target = checking
+    config._target = checking as any
     local envMod = require("nupp.compiler.project.env")
     local environment = envMod.new(root, {config = config})
     -- A module name or a `.nupp` path, as a bundle's entries are.
@@ -128,7 +128,7 @@ function program.build(
         end
         local position = at as {line: integer, column: integer}
 
-        return nil, "NUPP0004", ("%s:%d:%d: native: %s"):format(path, position.line, position.column, lowerErr)
+        return nil, "NUPP0004", ("%s:%d:%d: native: %s"):format(path as string, position.line, position.column, tostring(lowerErr))
     end
     local aotllvm = require("nupp.tools.build.aotllvm")
     local available, availableErr = aotllvm.selected()
