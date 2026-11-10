@@ -210,6 +210,67 @@ end
     test.eq(status, 0, ran)
 end
 
+-- The operands every bit-operator case reads, as the native program binds them
+-- and as plain LuaJIT does: negative, fractional and out-of-range numbers, an
+-- established `int32`, and 64-bit integers of both signs.
+local BIT_LOCALS_NATIVE = [[
+    local a = -6
+    local b = 10
+    local f = 2.5
+    local g = 3.5
+    local big = 4294967298
+    local huge = 13835058055282163712
+    local i: int32 = math.i32.wrap(-5)
+    local w: int64 = -3LL
+    local u: uint64 = 9223372036854775808ULL
+]]
+local BIT_LOCALS_LUA = "local a, b, f, g, big, huge = -6, 10, 2.5, 3.5, 4294967298, 13835058055282163712 "
+    .. "local i, w, u = -5, -3LL, 9223372036854775808ULL "
+
+local BIT_EXPRESSIONS = {
+    "a & b", "a | b", "a ~ b", "~a", "~0", "a << 3", "a >> 3", "a ~>> 3",
+    "1 << 31", "1 << 32", "1 << -1", "a >> 33", "b << 37", "-1 >> 0",
+    "f & 7", "g | 0", "big | 0", "~f", "b ~>> 1.5",
+    "i & 255", "i >> 28", "i ~>> 1", "~i", "i << b",
+    "w & 255", "w | 1", "w ~ -1", "~w", "w << 63", "w << 64", "w << -1",
+    "w >> 1", "w ~>> 1", "w >> 65", "w & a", "a & w", "w & f", "w << b",
+    "u & -1", "u & a", "u | w", "w ~ u", "u ~>> 4", "u >> 4", "~u", "u & huge", "w << u",
+}
+
+-- Each bit operator lowered natively gives what the same expression gives under
+-- LuaJIT: numbers meet as 32-bit words, shift counts outside 0..31 or 0..63 are
+-- masked, a fraction rounds, and an `int64` or `uint64` operand makes the
+-- operation 64-bit. The program exits with the first case that disagrees.
+function M.bitOperatorsAgreeWithLuaJIT()
+    requireCodegen()
+    local lines = {}
+    for index, expression in ipairs(BIT_EXPRESSIONS) do
+        local result = assert(load(BIT_LOCALS_LUA .. "return " .. expression, "=" .. expression))()
+        local expected = type(result) == "number" and ("%d"):format(result) or tostring(result)
+        lines[#lines + 1] = ("    if (%s) ~= %s then\n        return %d\n    end\n"):format(expression, expected, index)
+    end
+    local executable, output = link(
+        "local function main(): int32\n" .. BIT_LOCALS_NATIVE .. table.concat(lines) .. "    return 0\nend\n"
+    )
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ("%s: %s"):format(tostring(BIT_EXPRESSIONS[status]), ran))
+end
+
+-- LuaJIT shifts a number by an `int64` count as a 32-bit number, which is not
+-- the `int64` the checker gives the expression, so lowering refuses it.
+function M.aNumberShiftedByA64BitCountIsRefused()
+    local executable, output = link([[
+local function main(): int32
+    local count: int64 = 3LL
+    local shifted = 1 << count
+    return 0
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("host.nupp:3:21: native: LuaJIT shifts a number by a 64-bit count", 1, true), output)
+end
+
 -- What lowering refuses is reported where it was written, before anything is
 -- compiled, so this needs no code generator.
 function M.aTopLevelStatementIsRefusedWhereItIsWritten()
