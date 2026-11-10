@@ -84,11 +84,12 @@ function M.boxedSixtyFourBitArithmeticAllocates()
                 "@noalloc do local m = -1LL end",
                 "local s = 1LL",
                 "@noalloc do s <<= 2 end",
+                "@noalloc do s += 2 end",
             },
             "\n"
         )
     )
-    testAssert.eq(#found, 5, "each boxed result is an allocation: " .. tostring(found[1] and found[1].msg))
+    testAssert.eq(#found, 6, "each boxed result is an allocation: " .. tostring(found[1] and found[1].msg))
     for _, diag in ipairs(found) do
         testAssert.eq(diag.code, "NUPP2710", "allocation diagnostic")
     end
