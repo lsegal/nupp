@@ -221,6 +221,10 @@ local RESOURCES = {
         output = "nupp/compiler/nupp/runtime/provider/nativetime.nupp"
     },
     {
+        source = "src/nupp/runtime/provider/nativeplatform.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativeplatform.nupp"
+    },
+    {
         source = "src/nupp/runtime/provider/nativestorage.nupp",
         output = "nupp/compiler/nupp/runtime/provider/nativestorage.nupp"
     },
@@ -484,13 +488,11 @@ local RESOURCES = {
         output = "nupp/compiler/nupp/digest/internal/checksumprovider.nupp"
     },
     {source = "src/nupp/checksum/internal/builtin.nupp", output = "nupp/compiler/nupp/checksum/internal/builtin.nupp"},
-    {
-        source = "src/nupp/runtime/provider/nativecrc.nupp",
-        output = "nupp/compiler/nupp/runtime/provider/nativecrc.nupp"
-    },
-    {source = "src/nupp/runtime/browser/crc.nupp", output = "nupp/compiler/nupp/runtime/browser/crc.nupp"},
+    {source = "src/nupp/checksum/internal/crc.nupp", output = "nupp/compiler/nupp/checksum/internal/crc.nupp"},
     {source = "src/nupp/compression.nupp", output = "nupp/compiler/nupp/compression.nupp"},
     {source = "src/nupp/compression/contracts.nupp", output = "nupp/compiler/nupp/compression/contracts.nupp"},
+    {source = "src/nupp/compression/deflate.nupp", output = "nupp/compiler/nupp/compression/deflate.nupp"},
+    {source = "src/nupp/compression/inflate.nupp", output = "nupp/compiler/nupp/compression/inflate.nupp"},
     {
         source = "src/nupp/runtime/provider/nativecompression.nupp",
         output = "nupp/compiler/nupp/runtime/provider/nativecompression.nupp"

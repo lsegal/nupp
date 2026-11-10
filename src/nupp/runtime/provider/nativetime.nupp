@@ -18,18 +18,9 @@ clock support and [](coroutine) must be available before it resolves.
 ]]
 module nupp.runtime.provider.nativetime
 
-local native = require("nupp.runtime.native")
+local platform = require("nupp.runtime.provider.nativeplatform")
 local suspension = require("nupp.suspension")
 
-native.ffi.cdef(
-    dedent[[
-    uint64_t nuppNativeMonotonicNs(void);
-    uint64_t nuppNativeWallMs(void);
-    int32_t nuppNativeSleepMs(double);
-    ]]
-)
-
-const C = native.C
 local time = {}
 
 --- How many waits may be pending at once.
@@ -67,7 +58,7 @@ end
 ---
 --- @return milliseconds since this process's clock origin
 function time.now(): number
-    return assert(tonumber(C.nuppNativeMonotonicNs())) / 1.0e6
+    return assert(tonumber(platform.monotonic())) / 1.0e6
 end
 
 --- Returns the number of milliseconds since the Unix epoch,
@@ -75,7 +66,7 @@ end
 ---
 --- @return milliseconds since the Unix epoch
 function time.walltime(): number
-    return assert(tonumber(C.nuppNativeWallMs()))
+    return assert(tonumber(platform.walltime()))
 end
 
 ----------------------------------------------------------------------------
@@ -155,7 +146,7 @@ const function sleepUntilDue(maxMs: integer): integer
         slice = remaining
     end
     if slice > 0 then
-        native.succeeded(C.nuppNativeSleepMs(slice), 3)
+        platform.sleep(slice)
     end
 
     return fireDue()

@@ -1,0 +1,131 @@
+@!internal
+
+--[[Table-driven CRC-32 and CRC-64, written in Nupp.
+
+Each algorithm is the one `crc-fast` named before this module replaced it, with
+the same catalogue parameters: CRC-32/ISO-HDLC, CRC-32/ISCSI, CRC-64/ECMA-182
+and CRC-64/NVME. A register is the resumable state; `finish` applies the output
+XOR without consuming it, so a snapshot can be taken between chunks and the
+register carried on.
+
+Every register is a `uint64`, whose shifts and XORs LuaJIT compiles without
+allocation inside a trace; a 32-bit register simply leaves the high half zero.
+]]
+module nupp.checksum.internal.crc
+
+const span = require("bytes.span")
+
+--- One CRC parameter set and its byte-at-a-time lookup table.
+export record Algorithm
+    @readonly id: integer
+    @readonly reflected: boolean
+    @readonly initial: uint64
+    @readonly outputXor: uint64
+    @private entries: {uint64}
+end
+
+local function lookupTable(polynomial: uint64, reflected: boolean): {uint64}
+    local entries: {uint64} = {}
+    for index = 0, 255 do
+        local value: uint64 = 0ULL + index
+        if reflected then
+            for _ = 1, 8 do
+                if (value & 1ULL) ~= 0ULL then
+                    value = (value >> 1) ~ polynomial
+                else
+                    value = value >> 1
+                end
+            end
+        else
+            value = value << 56
+            for _ = 1, 8 do
+                if (value & 0x8000000000000000ULL) ~= 0ULL then
+                    value = (value << 1) ~ polynomial
+                else
+                    value = value << 1
+                end
+            end
+        end
+        entries[index + 1] = value
+    end
+
+    return entries
+end
+
+local function algorithm(
+    id: integer,
+    polynomial: uint64,
+    reflected: boolean,
+    initial: uint64,
+    outputXor: uint64
+): Algorithm
+    return Algorithm(
+        id = id,
+        reflected = reflected,
+        initial = initial,
+        outputXor = outputXor,
+        entries = lookupTable(polynomial, reflected)
+    )
+end
+
+const ALGORITHMS: {
+    Algorithm
+} = {
+    algorithm(1, 0xEDB88320ULL, true, 0xFFFFFFFFULL, 0xFFFFFFFFULL),
+    algorithm(2, 0x82F63B78ULL, true, 0xFFFFFFFFULL, 0xFFFFFFFFULL),
+    algorithm(3, 0x42F0E1EBA9EA3693ULL, false, 0ULL, 0ULL),
+    algorithm(4, 0x9A6C9329AC4BC9B5ULL, true, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL),
+}
+
+--- The algorithm numbered `id` (1 through 4), or nil.
+export function lookup(id: integer): Algorithm?
+    return ALGORITHMS[id]
+end
+
+--- The register a fresh computation starts from.
+export function initial(algorithm: Algorithm): uint64
+    return algorithm.initial
+end
+
+--- Advances `register` over every byte of `bytes` and returns the new register.
+export function update(algorithm: Algorithm, register: uint64, borrows bytes: span.Span<uint8>): uint64
+    local count = #bytes
+    if count == 0 then
+        return register
+    end
+    local entries = algorithm.entries
+    local value = register
+    if algorithm.reflected then
+        for index = 1, count do
+            value = (value >> 8) ~ entries[(tonumber((value ~ bytes[index]) & 0xFFULL) as integer) + 1]
+        end
+    else
+        for index = 1, count do
+            value = (value << 8) ~ entries[(tonumber((value >> 56) ~ bytes[index]) as integer) + 1]
+        end
+    end
+
+    return value
+end
+
+--- The checksum `register` stands for, without consuming it.
+export function finish(algorithm: Algorithm, register: uint64): uint64
+    return register ~ algorithm.outputXor
+end
+
+--- Advances `register` over `count` bytes at a C pointer, from offset zero.
+export function updatebytes(algorithm: Algorithm, register: uint64, bytes: any, count: number): uint64
+    local entries = algorithm.entries
+    local value = register
+    if algorithm.reflected then
+        for index = 0, count - 1 do
+            value = (value >> 8) ~ entries[(tonumber((value ~ bytes[index]) & 0xFFULL) as integer) + 1]
+        end
+    else
+        for index = 0, count - 1 do
+            value = (value << 8) ~ entries[(tonumber((value >> 56) ~ bytes[index]) as integer) + 1]
+        end
+    end
+
+    return value
+end

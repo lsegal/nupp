@@ -45,21 +45,15 @@
 /* A call that copies bytes into caller-owned storage writes the byte count to
  * its length output first, then returns BUFFER_TOO_SMALL when the capacity is
  * short. A zero-capacity call therefore asks the size of a nonempty value, and
- * no copied output carries a trailing NUL. The UUID and digest calls, whose
- * outputs have a fixed size and no length output, are the exceptions, and a
- * UUID does end in a NUL. */
+ * no copied output carries a trailing NUL. */
 
 #define NUPP_NATIVE_FEATURE_BASE (UINT64_C(1) << 0)
-#define NUPP_NATIVE_FEATURE_UUID (UINT64_C(1) << 1)
-/* Bit 2 was the GPU provider, which is Nupp over wgpu-native now. */
+/* Bit 1 was UUIDs, bit 2 the GPU provider, and bits 5 to 7 processes, files
+ * and the file-transfer lane. Nupp provides all of them now. */
 #define NUPP_NATIVE_FEATURE_URI (UINT64_C(1) << 3)
 #define NUPP_NATIVE_FEATURE_HTTP (UINT64_C(1) << 4)
-#define NUPP_NATIVE_FEATURE_PROCESS (UINT64_C(1) << 5)
-#define NUPP_NATIVE_FEATURE_FILESYSTEM (UINT64_C(1) << 6)
-#define NUPP_NATIVE_FEATURE_FILE_TRANSFER (UINT64_C(1) << 7)
 #define NUPP_NATIVE_FEATURE_NET (UINT64_C(1) << 8)
 #define NUPP_NATIVE_FEATURE_TLS (UINT64_C(1) << 9)
-#define NUPP_NATIVE_FEATURE_COMPRESSION (UINT64_C(1) << 10)
 /* The code generator. Its exports belong to the compiler, which declares
  * them itself; this header does not. */
 #define NUPP_NATIVE_FEATURE_CODEGEN (UINT64_C(1) << 11)
@@ -81,15 +75,6 @@ typedef struct {
     size_t length;
 } NuppNativeSlice;
 
-/* crc-fast: words[0] is resumable state and words[1] is its numeric checksum.
- * Algorithm IDs are 1=CRC32, 2=CRC32C, 3=CRC64/ECMA-182, 4=CRC64/NVME.
- * reset is 0 or 1; reset=1 starts fresh. Input and state ranges do not overlap.
- * Empty input permits a null pointer. No range is retained after the call. */
-NUPP_NATIVE_EXPORT int32_t nuppCrcUpdate(
-    uint32_t algorithm, int32_t reset, uint64_t *words,
-    const uint8_t *data, size_t length);
-NUPP_NATIVE_EXPORT const char *nuppCrcLastError(void);
-
 NUPP_NATIVE_EXPORT uint32_t nuppNativeAbiVersion(void);
 NUPP_NATIVE_EXPORT uint64_t nuppNativeFeatures(void);
 /* The message of the last call on this thread that failed. A call that
@@ -105,14 +90,7 @@ NUPP_NATIVE_EXPORT int32_t nuppNativeBytesCopy(
     uint64_t handle, uint8_t *data, size_t capacity, size_t *length);
 NUPP_NATIVE_EXPORT int32_t nuppNativeBytesRelease(uint64_t handle);
 
-NUPP_NATIVE_EXPORT uint64_t nuppNativeMonotonicNs(void);
-NUPP_NATIVE_EXPORT uint64_t nuppNativeWallMs(void);
-NUPP_NATIVE_EXPORT int32_t nuppNativeSleepMs(double milliseconds);
-
 NUPP_NATIVE_EXPORT size_t nuppNativeAvailableParallelism(void);
-NUPP_NATIVE_EXPORT int32_t nuppNativeRandomBytes(uint8_t *output, size_t length);
-NUPP_NATIVE_EXPORT int32_t nuppNativeXxh64Digest(
-    const uint8_t *data, size_t length, uint8_t *output, size_t capacity);
 
 /* Test-only: defined only by a provider built with its panic-probe feature,
  * which no release selects. It panics inside the export boundary, so it
@@ -121,9 +99,8 @@ NUPP_NATIVE_EXPORT int32_t nuppNativePanicProbe(void);
 
 /* Present when NUPP_NATIVE_FEATURE_READINESS is set. One process-wide
  * generation that every family advances when something a caller could be
- * waiting for changes: a socket or TLS session moves, a file transfer
- * settles, an HTTP client has events, or a child exits or a pipe moves. A
- * caller waiting on any mix of them sleeps here once.
+ * waiting for changes: a socket or TLS session moves, or an HTTP client has
+ * events. A caller waiting on any mix of them sleeps here once.
  *
  * Poll the generation first, then check the resources you are waiting for
  * with their non-blocking calls, and wait from the generation you polled:
@@ -143,178 +120,6 @@ NUPP_NATIVE_EXPORT int32_t nuppNativeWait(
  * signalling the handle and closes it. */
 NUPP_NATIVE_EXPORT int32_t nuppNativeWakeOpen(uint64_t *handle);
 NUPP_NATIVE_EXPORT int32_t nuppNativeWakeClose(uint64_t handle);
-
-/* Present when NUPP_NATIVE_FEATURE_COMPRESSION is set. Input and output
- * ranges are borrowed only for one call. */
-#define NUPP_NATIVE_COMPRESSION_GZIP 1u
-#define NUPP_NATIVE_COMPRESSION_ZLIB 2u
-#define NUPP_NATIVE_COMPRESSION_DEFLATE_RAW 3u
-#define NUPP_NATIVE_COMPRESSION_NEED_INPUT 1u
-#define NUPP_NATIVE_COMPRESSION_NEED_OUTPUT 2u
-#define NUPP_NATIVE_COMPRESSION_FINISHED 3u
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderCreate(
-    uint32_t format, uint32_t level, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderWrite(
-    uint64_t encoder, const uint8_t *input, size_t input_length,
-    uint8_t *output, size_t output_capacity, size_t *consumed,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderFlush(
-    uint64_t encoder, uint8_t *output, size_t output_capacity,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderFinish(
-    uint64_t encoder, uint8_t *output, size_t output_capacity,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionEncoderRelease(
-    uint64_t encoder);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionDecoderCreate(
-    uint32_t format, int32_t concatenated_members, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionDecoderRead(
-    uint64_t decoder, const uint8_t *input, size_t input_length,
-    uint8_t *output, size_t output_capacity, size_t *consumed,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionDecoderFinishInput(
-    uint64_t decoder, uint8_t *output, size_t output_capacity,
-    size_t *written, uint32_t *state);
-NUPP_NATIVE_EXPORT int32_t nuppNativeCompressionDecoderRelease(
-    uint64_t decoder);
-
-/* Present when NUPP_NATIVE_FEATURE_FILESYSTEM is set. Path values are
- * length-delimited platform-native bytes and variable outputs are owned byte
- * handles. NUPP_NATIVE_FEATURE_FILE_TRANSFER adds the bounded shared whole-file
- * transfer lane. */
-typedef NuppNativeSlice NuppNativeFilesSlice;
-
-typedef struct {
-    uint32_t kind;
-    int32_t read_only;
-    uint64_t size;
-    double modified;
-} NuppNativeFilesInfo;
-
-/* NuppNativeFilesInfo.kind. A listing marks each entry with the byte 'f',
- * 'd', 'l' or 'o' for the same four kinds. */
-#define NUPP_NATIVE_FILES_KIND_FILE 1u
-#define NUPP_NATIVE_FILES_KIND_DIRECTORY 2u
-#define NUPP_NATIVE_FILES_KIND_OTHER 3u
-#define NUPP_NATIVE_FILES_KIND_SYMLINK 4u
-#define NUPP_NATIVE_FILES_ABSENT (-1)
-
-/* nuppNativeFilesApplicationBase kinds. */
-#define NUPP_NATIVE_FILES_BASE_CONFIG 0u
-#define NUPP_NATIVE_FILES_BASE_DATA 1u
-#define NUPP_NATIVE_FILES_BASE_CACHE 2u
-
-/* nuppNativeFilesUserFolder kinds. */
-#define NUPP_NATIVE_FILES_FOLDER_HOME 0u
-#define NUPP_NATIVE_FILES_FOLDER_DOCUMENTS 1u
-#define NUPP_NATIVE_FILES_FOLDER_DOWNLOADS 2u
-#define NUPP_NATIVE_FILES_FOLDER_DESKTOP 3u
-#define NUPP_NATIVE_FILES_FOLDER_PICTURES 4u
-#define NUPP_NATIVE_FILES_FOLDER_MUSIC 5u
-#define NUPP_NATIVE_FILES_FOLDER_VIDEOS 6u
-
-/* nuppNativeFileOpen modes and nuppNativeFileSeek origins. */
-#define NUPP_NATIVE_FILE_OPEN_READ 0u
-#define NUPP_NATIVE_FILE_OPEN_WRITE 1u
-#define NUPP_NATIVE_FILE_OPEN_APPEND 2u
-#define NUPP_NATIVE_FILE_OPEN_READ_WRITE 3u
-#define NUPP_NATIVE_FILE_OPEN_READ_WRITE_TRUNCATE 4u
-#define NUPP_NATIVE_FILE_OPEN_READ_APPEND 5u
-#define NUPP_NATIVE_FILE_SEEK_START 0u
-#define NUPP_NATIVE_FILE_SEEK_CURRENT 1u
-#define NUPP_NATIVE_FILE_SEEK_END 2u
-
-/* nuppNativeFilesTransferSubmitWrite modes and nuppNativeFilesTransferStatus
- * states. */
-#define NUPP_NATIVE_FILES_WRITE_REPLACE 0u
-#define NUPP_NATIVE_FILES_WRITE_APPEND 1u
-#define NUPP_NATIVE_FILES_WRITE_ATOMIC 2u
-#define NUPP_NATIVE_FILES_TRANSFER_PENDING 0u
-#define NUPP_NATIVE_FILES_TRANSFER_READY 1u
-#define NUPP_NATIVE_FILES_TRANSFER_FAILED 2u
-#define NUPP_NATIVE_FILES_TRANSFER_CANCELED 3u
-
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesInfo(
-    NuppNativeFilesSlice path, int32_t follow,
-    NuppNativeFilesInfo *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesReadLink(
-    NuppNativeFilesSlice path, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesList(
-    NuppNativeFilesSlice path, uint64_t *output);
-/* Zero when the path resolves, NUPP_NATIVE_FILES_ABSENT when it does not,
- * and a failure status when the lookup cannot tell. */
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesExists(NuppNativeFilesSlice path);
-/* Batched directory reading: each next call writes a byte handle holding up
- * to 256 entries encoded as a listing is, and an empty batch ends it. */
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesListOpen(
-    NuppNativeFilesSlice path, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesListNext(
-    uint64_t listing, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesListClose(uint64_t listing);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesGlob(
-    NuppNativeFilesSlice pattern, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesCreateTemporary(
-    NuppNativeFilesSlice directory, NuppNativeFilesSlice prefix,
-    NuppNativeFilesSlice suffix, int32_t as_directory, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesCurrentDirectory(
-    uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesApplicationBase(
-    uint32_t kind, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesExecutablePath(
-    uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesCanonicalize(
-    NuppNativeFilesSlice path, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesUserFolder(
-    uint32_t kind, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesCreateSymlink(
-    NuppNativeFilesSlice target, NuppNativeFilesSlice link,
-    int32_t directory);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesSetReadOnly(
-    NuppNativeFilesSlice path, int32_t read_only);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesCreateDirectory(
-    NuppNativeFilesSlice path);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesRemove(
-    NuppNativeFilesSlice path, int32_t recursive);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesRename(
-    NuppNativeFilesSlice from, NuppNativeFilesSlice to);
-
-NUPP_NATIVE_EXPORT int32_t nuppNativeFileOpen(
-    NuppNativeFilesSlice path, uint32_t mode, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFileRead(
-    uint64_t file, uint8_t *output, size_t capacity, size_t *length);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFileWrite(
-    uint64_t file, const uint8_t *data, size_t length, size_t *written);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFileSeek(
-    uint64_t file, int64_t offset, uint32_t origin, int64_t *position);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFileSize(
-    uint64_t file, int64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFileFlush(uint64_t file);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFileRelease(uint64_t file);
-
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferSubmitRead(
-    NuppNativeFilesSlice path, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferSubmitWrite(
-    NuppNativeFilesSlice path, NuppNativeFilesSlice data,
-    uint32_t mode, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferSubmitCopy(
-    NuppNativeFilesSlice from, NuppNativeFilesSlice to,
-    uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferStatus(
-    uint64_t transfer, uint32_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferTakeBytes(
-    uint64_t transfer, uint64_t *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferCancel(
-    uint64_t transfer);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferRelease(
-    uint64_t transfer);
-/* Superseded by nuppNativePoll and nuppNativeWait with
- * nuppNativeFilesTransferStatus: a settled transfer advances the process
- * readiness generation. */
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferPoll(size_t *ready);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferWait(
-    uint64_t timeout_ms, size_t *ready);
-NUPP_NATIVE_EXPORT int32_t nuppNativeFilesTransferPending(
-    size_t *pending);
 
 /* Present when NUPP_NATIVE_FEATURE_NET is set. Rust owns the resolver,
  * sockets and worker tasks. Host names and write bytes are copied during the
@@ -553,11 +358,6 @@ NUPP_NATIVE_EXPORT int32_t nuppNativeTlsProtocol(
     size_t *length, int32_t *present);
 NUPP_NATIVE_EXPORT int32_t nuppNativeTlsRelease(uint64_t session);
 
-/* Present when NUPP_NATIVE_FEATURE_UUID is set. Both outputs require a
- * capacity of at least 37 bytes and include their trailing NUL. */
-NUPP_NATIVE_EXPORT int32_t nuppNativeUuid4(uint8_t *output, size_t capacity);
-NUPP_NATIVE_EXPORT int32_t nuppNativeUuid7(uint8_t *output, size_t capacity);
-
 /* Present when NUPP_NATIVE_FEATURE_URI is set. URI values are immutable
  * generational handles. Text and components are copied into caller-owned
  * storage. */
@@ -690,81 +490,6 @@ NUPP_NATIVE_EXPORT int32_t nuppNativeHttpClientWait(
     uint64_t client, uint64_t timeout_ms,
     NuppNativeHttpReady *output, size_t capacity,
     size_t *count, int32_t *more);
-
-/* Present when NUPP_NATIVE_FEATURE_PROCESS is set. The complete spawn
- * descriptor is copied synchronously. Child and stream values are opaque
- * generational handles; absent streams are zero. */
-typedef NuppNativeSlice NuppNativeProcessSlice;
-
-typedef struct {
-    NuppNativeProcessSlice name;
-    NuppNativeProcessSlice value;
-} NuppNativeProcessEnv;
-
-typedef struct {
-    const NuppNativeProcessSlice *args;
-    size_t arg_count;
-    const NuppNativeProcessEnv *env;
-    size_t env_count;
-    NuppNativeProcessSlice cwd;
-    int32_t cwd_present;
-    int32_t clear_env;
-    uint8_t stdin_mode;
-    uint8_t stdout_mode;
-    uint8_t stderr_mode;
-} NuppNativeProcessSpawn;
-
-typedef struct {
-    uint64_t process;
-    uint64_t stdin_stream;
-    uint64_t stdout_stream;
-    uint64_t stderr_stream;
-    uint32_t pid;
-} NuppNativeProcessStarted;
-
-typedef struct {
-    int32_t ready;
-    int32_t code;
-    int32_t killed;
-} NuppNativeProcessExit;
-
-/* NuppNativeProcessSpawn stdio modes. Only stderr may join stdout. */
-#define NUPP_NATIVE_PROCESS_STDIO_PIPE 0u
-#define NUPP_NATIVE_PROCESS_STDIO_INHERIT 1u
-#define NUPP_NATIVE_PROCESS_STDIO_NULL 2u
-#define NUPP_NATIVE_PROCESS_STDIO_STDOUT 3u
-
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessSpawn(
-    const NuppNativeProcessSpawn *spawn, NuppNativeProcessStarted *output);
-/* Additive status/error outputs; zero denotes an unavailable code or signal. */
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessSpawnWithError(
-    const NuppNativeProcessSpawn *spawn, NuppNativeProcessStarted *output,
-    int32_t *os_error);
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessPollExitWithSignal(
-    uint64_t process, NuppNativeProcessExit *output, int32_t *signal);
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessPollExit(
-    uint64_t process, NuppNativeProcessExit *output);
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessKill(
-    uint64_t process, int32_t force);
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessRelease(uint64_t process);
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessStreamRead(
-    uint64_t stream, uint8_t *output, size_t capacity,
-    uint32_t *state, size_t *length);
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessStreamWrite(
-    uint64_t stream, const uint8_t *data, size_t length,
-    uint32_t *state, size_t *accepted);
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessStreamRelease(uint64_t stream);
-/* Returns how many of the child and the listed streams are ready. The child
- * counts until nuppNativeProcessPollExit has reported its exit; after that a
- * wait is left to its streams, which a descendant may hold open. A zero
- * timeout is the readiness probe; its sleeping form is superseded by
- * nuppNativeWait, since every child and stream change advances the process
- * readiness generation. */
-NUPP_NATIVE_EXPORT int32_t nuppNativeProcessWait(
-    uint64_t process,
-    const uint64_t *readable, size_t readable_count,
-    const uint64_t *writable, size_t writable_count,
-    uint64_t timeout_ms, size_t *ready);
 
 #ifdef __cplusplus
 }

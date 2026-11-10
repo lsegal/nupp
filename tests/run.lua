@@ -311,6 +311,15 @@ end
 -- launched by Git Bash. Keep one shell dialect for the tests, and keep native
 -- paths for the Windows programs those commands start.
 if package.config:sub(1, 1) == "\\" then
+    -- Loading the runtime's I/O module assigns its own `io.popen` over the one
+    -- installed below. A process worker reaches its first suite before anything
+    -- has loaded it, so the first compiler module a suite required replaced the
+    -- Bash route and later pipes went to cmd.exe. Load it now, so the route
+    -- wraps it instead. A shared worker lane refuses pipes anyway: leave its
+    -- refusal in place rather than loading a working popen over it.
+    if not package.loaded["nupp.runtime.standardio"] and not rawget(_G, "__NUPP_TEST_EMBEDDED") then
+        pcall(require, "nupp.runtime.standardio")
+    end
     local rawExecute, rawPopen = os.execute, io.popen
     local standardIO = package.loaded["nupp.runtime.standardio"]
     local nativePopen = standardIO and rawPopen == standardIO.popen

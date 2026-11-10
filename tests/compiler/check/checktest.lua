@@ -1301,6 +1301,47 @@ function M.cleanPrograms()
     assertClean("local big: int64 = 10LL\nlocal same: int64 = big")
 end
 
+function M.compoundBitAssignmentsKeepSixtyFourBitTargets()
+    -- A compound bit assignment stores what the binary operator gives: a shift
+    -- keeps its target's width, the other operators widen with either side.
+    for _, target in ipairs({{"int64", "-3LL", "7LL"}, {"uint64", "3ULL", "7ULL"}}) do
+        local name, init, wide = target[1], target[2], target[3]
+        for _, op in ipairs({"&=", "|=", "<<=", ">>=", "~>>="}) do
+            for _, value in ipairs({"2", wide}) do
+                assertClean(("local w: %s = %s\nw %s %s"):format(name, init, op, value))
+            end
+        end
+    end
+    -- A 64-bit value widens `&` and `|` past a plain integer target, as
+    -- `x & 7LL` does, but a 64-bit shift count leaves the target's width.
+    testAssert.eq(diagsOf("local x = 12\nx &= 7LL"), "NUPP2001:2")
+    testAssert.eq(diagsOf("local x = 12\nx |= 7ULL"), "NUPP2001:2")
+    assertClean("local x = 12\nx <<= 3LL")
+    assertClean("local x = 12\nx >>= 3ULL")
+end
+
+function M.compoundArithmeticAssignmentsKeepSixtyFourBitTargets()
+    -- A compound arithmetic assignment stores what the binary operator gives:
+    -- the 64-bit box, unsigned when either side is.
+    for _, target in ipairs({{"int64", "5LL", "2LL"}, {"uint64", "5ULL", "2ULL"}}) do
+        local name, init, wide = target[1], target[2], target[3]
+        for _, op in ipairs({"+", "-", "*", "/", "//", "%"}) do
+            for _, value in ipairs({"2", wide}) do
+                local compound = ("local w: %s = %s\nw %s= %s"):format(name, init, op, value)
+                local plain = ("local w: %s = %s\nw = w %s %s"):format(name, init, op, value)
+                assertClean(compound)
+                testAssert.eq(diagsOf(compound), diagsOf(plain), compound)
+            end
+        end
+    end
+    -- An unsigned value makes the result unsigned, which a signed target refuses,
+    -- and a 64-bit value widens past a plain integer target, as `x + 7LL` does.
+    testAssert.eq(diagsOf("local w: int64 = 5LL\nw += 2ULL"), "NUPP2001:2")
+    testAssert.eq(diagsOf("local w: int64 = 5LL\nw = w + 2ULL"), "NUPP2001:2")
+    testAssert.eq(diagsOf("local x = 12\nx += 7LL"), "NUPP2001:2")
+    testAssert.eq(diagsOf("local x = 12\nx *= 7ULL"), "NUPP2001:2")
+end
+
 function M.inheritedContractsBoundsAndSelf()
     local src = table.concat(
         {

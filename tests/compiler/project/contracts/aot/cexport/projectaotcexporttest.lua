@@ -203,10 +203,14 @@ end
 --- its entry point or its stack probe.
 local function publishesOnlyItsCNamesAndWrapperSymbols(shared)
     local names, text = exported(shared)
-    assert(names.game_add and names.game_scale, "the C names are published:\n" .. text)
+    local cNames = {}
+    for _, name in ipairs({"game_add", "game_scale", "game_saxpy", "game_bounds", "game_weigh"}) do
+        assert(names[name], name .. " is published:\n" .. text)
+        cNames[name] = true
+    end
     for name in pairs(names) do
         assert(
-            name == "game_add" or name == "game_scale" or name:sub(1, 3) == "ks_",
+            cNames[name] or name:sub(1, 3) == "ks_",
             name .. " is published, which neither C nor a Lua wrapper resolves:\n" .. text
         )
     end
