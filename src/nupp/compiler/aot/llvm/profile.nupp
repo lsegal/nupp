@@ -188,12 +188,18 @@ end
 --- of a Mach-O library writes object paths without. ld64 records each object's
 --- absolute path there, which made two checkouts of one project build two
 --- different libraries.
+---
+--- `exports` is the file `exportList` wrote for the library: what it
+--- publishes, and all it publishes. Without one ld.lld and ld64.lld would
+--- publish every definition the objects did not mark local, and lld-link
+--- every symbol of every object, the Lua API binding's included.
 export function sharedLink(
     selected: Profile,
     output: string,
     objects: {string},
     soname: string,
-    strip: string?
+    strip: string?,
+    exports: string?
 ): {string}
     local argv: {string}
     if selected.format == "macho" then
@@ -217,6 +223,10 @@ export function sharedLink(
             argv[#argv + 1] = "-oso_prefix"
             argv[#argv + 1] = strip as string
         end
+        if exports ~= nil then
+            argv[#argv + 1] = "-exported_symbols_list"
+            argv[#argv + 1] = exports as string
+        end
     elseif selected.format == "elf" then
         argv = {
             "ld.lld",
@@ -235,6 +245,9 @@ export function sharedLink(
             "-o",
             output,
         }
+        if exports ~= nil then
+            argv[#argv + 1] = "--version-script=" .. (exports as string)
+        end
     else
         argv = {
             "lld-link",
@@ -245,10 +258,86 @@ export function sharedLink(
             "/nodefaultlib",
             "/out:" .. output
         }
+        if exports ~= nil then
+            argv[#argv + 1] = "/def:" .. (exports as string)
+        end
     end
     for _, object in ipairs(objects) do
         argv[#argv + 1] = object
     end
 
     return argv
+end
+
+--- The linkages and visibilities that keep a definition out of the library's
+--- export table whatever list the linker is given.
+const UNPUBLISHED: {[string]: boolean} = {["private"] = true, ["internal"] = true, ["hidden"] = true}
+
+--- The names a unit's IR defines for other images to resolve: every function
+--- and alias it neither gives a local linkage nor hides. That is each kernel,
+--- layout reporter, registrar and detector a generated wrapper declares, and
+--- each `@aot(export)` C name; every helper is `internal`.
+export function publicSymbols(ir: string): {string}
+    local names: {string} = {}
+    for line in ir:gmatch("[^\n]+") do
+        local head: string? = nil
+        local name: string? = nil
+        if line:sub(1, 7) == "define " then
+            head, name = line:match("^define%s+(.-)@([%w_%.%$]+)%(")
+        else
+            name, head = line:match("^@([%w_%.%$]+)%s*=%s*(.-)alias%s")
+        end
+        if name ~= nil then
+            local published = true
+            for word in (head as string):gmatch("%S+") do
+                if UNPUBLISHED[word] then
+                    published = false
+                end
+            end
+            if published then
+                names[#names + 1] = name as string
+            end
+        end
+    end
+
+    return names
+end
+
+--- The export list of a shared library publishing exactly `names`, in the form
+--- `selected`'s linker reads: a version script for ld.lld, an exported-symbols
+--- list for ld64.lld, a module definition file for lld-link.
+export function exportList(selected: Profile, names: {string}): string
+    local sorted: {string} = {}
+    local seen: {[string]: boolean} = {}
+    for _, name in ipairs(names) do
+        if not seen[name] then
+            seen[name] = true
+            sorted[#sorted + 1] = name
+        end
+    end
+    table.sort(sorted)
+    local lines: {string} = {}
+    if selected.format == "macho" then
+        for _, name in ipairs(sorted) do
+            lines[#lines + 1] = "_" .. name
+        end
+    elseif selected.format == "elf" then
+        lines[#lines + 1] = "{"
+        if #sorted > 0 then
+            lines[#lines + 1] = "  global:"
+            for _, name in ipairs(sorted) do
+                lines[#lines + 1] = "    " .. name .. ";"
+            end
+        end
+        lines[#lines + 1] = "  local:"
+        lines[#lines + 1] = "    *;"
+        lines[#lines + 1] = "};"
+    else
+        lines[#lines + 1] = "EXPORTS"
+        for _, name in ipairs(sorted) do
+            lines[#lines + 1] = "    " .. name
+        end
+    end
+
+    return table.concat(lines, "\n") .. "\n"
 end

@@ -109,4 +109,78 @@ function M.cCallsAotExportsFromTheSharedLibrary()
     run(dir, program)
 end
 
+--- The names `shared`'s export table publishes, as the platform's own tools
+--- read it: `nm -D` on ELF, `nm -gU` on Mach-O and `objdump -p` on PE.
+local function exported(shared)
+    local command
+    if jit.os == "Windows" then
+        command = ("objdump -p '%s'"):format(shared)
+    elseif jit.os == "OSX" then
+        command = ("nm -gU '%s'"):format(shared)
+    else
+        command = ("nm -D --defined-only '%s'"):format(shared)
+    end
+    local pipe = assert(io.popen(command .. " 2>&1"))
+    local text = pipe:read("*a")
+    pipe:close()
+    local names = {}
+    if jit.os == "Windows" then
+        local listing = text:match("%[Ordinal/Name Pointer%] Table\r?\n(.-)\r?\n\r?\n")
+        assert(listing ~= nil, command .. " lists no export table:\n" .. text)
+        for name in listing:gmatch("%]%s+([%w_%.%$@]+)") do
+            names[name] = true
+        end
+    else
+        for line in text:gmatch("[^\r\n]+") do
+            local name = line:match("%s[A-Za-z]%s+(%S+)$")
+            if name ~= nil then
+                names[jit.os == "OSX" and name:gsub("^_", "") or name] = true
+            end
+        end
+    end
+
+    return names, text
+end
+
+--- A shared library publishes its C names and the `ks_` symbols its Lua
+--- wrappers resolve, and nothing else: not the Windows binding's Lua API jump
+--- stubs, its entry point or its stack probe.
+function M.theSharedLibraryPublishesOnlyItsCNamesAndWrapperSymbols()
+    local dir = library("shared")
+    local shared = dir .. "/out/lib/" .. libraryName("default_aot")
+    local names, text = exported(shared)
+    assert(names.game_add and names.game_scale, "the C names are published:\n" .. text)
+    for name in pairs(names) do
+        assert(
+            name == "game_add" or name == "game_scale" or name:sub(1, 3) == "ks_",
+            name .. " is published, which neither C nor a Lua wrapper resolves:\n" .. text
+        )
+    end
+    for _, internal in ipairs({"ks_dll_main", "lua_gettop", "___chkstk_ms", "ks_lua_slot_lua_gettop"}) do
+        assert(not names[internal], internal .. " is internal to the library:\n" .. text)
+    end
+    remove(dir)
+end
+
+--- The link publishes what it is told to and hides every other global
+--- definition, which a linker given no list would publish too.
+function M.theLinkHidesAGlobalDefinitionItsListLeavesOut()
+    local aotllvm = require("nupp.tools.build.aotllvm")
+    local suffix = jit.os == "Windows" and ".dll" or jit.os == "OSX" and ".dylib" or ".so"
+    local triple = assert(require("nupp.compiler.aot.target").hostTriple())
+    local dir = tempProject({})
+    local ir = dir .. "/unit.ll"
+    write(ir, "define i32 @listed_entry() {\n  ret i32 1\n}\n\ndefine i32 @ks_internal_helper() {\n  ret i32 2\n}\n")
+    local object = dir .. "/unit.o"
+    local compileErr = aotllvm.compileMany({aotllvm.Unit(ir = ir, triple = triple, tier = "baseline", object = object)})
+    assert(compileErr == nil, compileErr)
+    local shared = dir .. "/listed" .. suffix
+    local linkErr = aotllvm.link(triple, {object}, shared, dir, {"listed_entry"})
+    assert(linkErr == nil, linkErr)
+    local names, text = exported(shared)
+    assert(names.listed_entry, "the listed entry is published:\n" .. text)
+    assert(not names.ks_internal_helper, "a global definition the list leaves out is hidden:\n" .. text)
+    remove(dir)
+end
+
 return M
