@@ -714,10 +714,9 @@ local function layoutOf(program: Program, t: any, node: any): any
                 if entry.kind == "fieldDecl" and field.bitWidth ~= nil and field.name ~= nil then
                     refuse(
                         node,
-                        ("field %s of cdef struct %s is a bitfield, which a native program does not lay out"):format(
-                            (field.name as lexer.Token).text,
-                            name
-                        )
+                        (
+                            "field %s of cdef struct %s is a bitfield, which a native program does not lay out"
+                        ):format((field.name as lexer.Token).text, name)
                     )
                 end
             end
@@ -734,7 +733,10 @@ local function layoutOf(program: Program, t: any, node: any): any
     end
     local layout, why = targetLayout.of(t, program.triple)
     if layout == nil then
-        refuse(node, ("cdef struct %s has no layout on %s: %s"):format(tostring(t.cdefName), program.triple, tostring(why)))
+        refuse(
+            node,
+            ("cdef struct %s has no layout on %s: %s"):format(tostring(t.cdefName), program.triple, tostring(why))
+        )
     end
     program.layouts[t] = layout
 
@@ -770,9 +772,12 @@ local function fieldKinds(t: any, field: string, owner: string, node: any): (Kin
         local nested = Kind(llvm = "struct", signed = false, aggregate = raw)
         return nested, nested
     elseif raw.tag == "carray" then
-        refuse(node, ("field %s of cdef struct %s is a C array, which a native program does not index"):format(field, owner))
+        refuse(
+            node,
+            ("field %s of cdef struct %s is a C array, which a native program does not index"):format(field, owner)
+        )
     elseif raw.tag == "boolean" then
-        return INTEGERS.uint8, BOOL
+        return INTEGERS.uint8 as Kind, BOOL
     elseif raw.tag == "integer" then
         return I32, F64
     end
@@ -780,7 +785,9 @@ local function fieldKinds(t: any, field: string, owner: string, node: any): (Kin
     if kind == nil or (kind as Kind).llvm == "void" then
         refuse(
             node,
-            ("field %s of cdef struct %s has type %s, which a native program cannot read"):format(field, owner, T.tostring(t))
+            (
+                "field %s of cdef struct %s has type %s, which a native program cannot read"
+            ):format(field, owner, T.tostring(t))
         )
     end
 
