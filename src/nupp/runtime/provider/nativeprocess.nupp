@@ -116,7 +116,12 @@ local function overrides(options: shared.SpawnOptions): {any}
     for key, value in pairs(options.env or {}) do
         local name = textual(key, "an environment name")
         if name == "" or name:find("=", 1, true) then
-            error(("nupp: could not start process: environment variable name %q must be non-empty and contain no '='"):format(name), 0)
+            error(
+                (
+                    "nupp: could not start process: environment variable name %q must be non-empty and contain no '='"
+                ):format(name),
+                0
+            )
         end
         entries[#entries + 1] = {name = name, value = textual(value, "an environment value")}
     end
@@ -502,11 +507,9 @@ if windows then
         for _ = 1, 8 do
             pipeSerial = pipeSerial + 1
             name = wide(
-                ("\\\\.\\pipe\\nupp-process-%d-%d-%d"):format(
-                    C.GetCurrentProcessId(),
-                    pipeSerial,
-                    math.random(0, 0x7FFFFFFF)
-                )
+                (
+                    "\\\\.\\pipe\\nupp-process-%d-%d-%d"
+                ):format(C.GetCurrentProcessId(), pipeSerial, math.random(0, 0x7FFFFFFF))
             )
             server = C.CreateNamedPipeW(
                 name,
@@ -518,7 +521,9 @@ if windows then
                 0,
                 nil
             )
-            if server ~= INVALID_HANDLE or C.GetLastError() ~= ERROR_ACCESS_DENIED and C.GetLastError() ~= ERROR_PIPE_BUSY then
+            if server ~= INVALID_HANDLE
+                or C.GetLastError() ~= ERROR_ACCESS_DENIED and C.GetLastError() ~= ERROR_PIPE_BUSY
+            then
                 break
             end
         end
@@ -603,7 +608,13 @@ if windows then
             if pipe.offset < pipe.filled then
                 -- A pipe write completes whole, but a short one is resumed rather
                 -- than lost.
-                local ok = C.WriteFile(pipe.handle, pipe.buffer + pipe.offset, pipe.filled - pipe.offset, nil, pipe.overlapped)
+                local ok = C.WriteFile(
+                    pipe.handle,
+                    pipe.buffer + pipe.offset,
+                    pipe.filled - pipe.offset,
+                    nil,
+                    pipe.overlapped
+                )
                 if ok == 0 and C.GetLastError() ~= ERROR_IO_PENDING then
                     pipe.pending = 0
                     pipe.failed = C.GetLastError()
@@ -696,6 +707,7 @@ if windows then
         local childHandles: {any} = {}
         local opened: {any} = {}
         local problem: string? = nil
+
         local function own(handle: any): any
             if handle ~= nil then
                 opened[#opened + 1] = handle
@@ -703,6 +715,7 @@ if windows then
 
             return handle
         end
+
         local function prepare(index: integer, mode: string): nil
             if problem ~= nil then
                 return
@@ -725,6 +738,7 @@ if windows then
                 childHandles[index] = own(handle)
             end
         end
+
         prepare(1, inputMode)
         prepare(2, outputMode)
         if errorMode == "stdout" then
@@ -747,6 +761,7 @@ if windows then
                 closeHandle(handle)
             end
         end
+
         local function abandon(reason: string, code: integer?): (any?, any?, any?, any?, integer, string?, integer?)
             cleanup()
             for index = 1, 3 do
@@ -757,6 +772,7 @@ if windows then
 
             return nil, nil, nil, nil, 0, reason, code
         end
+
         if problem ~= nil then
             return abandon(problem as string, nil)
         end
@@ -886,7 +902,10 @@ if windows then
             local code = C.GetLastError()
             -- A child already on its way out refuses termination; it has ended
             -- once its exit code is set, which is all a kill asks for.
-            if code ~= ERROR_ACCESS_DENIED or C.GetExitCodeProcess(process, exitCode) == 0 or exitCode[0] == STILL_ACTIVE then
+            if code ~= ERROR_ACCESS_DENIED
+                or C.GetExitCodeProcess(process, exitCode) == 0
+                or exitCode[0] == STILL_ACTIVE
+            then
                 error(failure("kill process", describe(code), code), 0)
             end
         end
@@ -999,12 +1018,14 @@ if windows then
 
     sleepOn = function(interest: shared.Interest, timeout: integer): nil
         local count: integer = 0
+
         local function add(handle: any): nil
             if handle ~= nil and count < MAXIMUM_WAIT_OBJECTS then
                 waitHandles[count] = handle
                 count = count + 1
             end
         end
+
         local wake = native.wake()
         if wake ~= nil then
             local event: any = ffi.cast("void *", wake)
@@ -1375,6 +1396,7 @@ else
         local toClose: {integer} = {}
         local problem: integer? = nil
         local nullDescriptor: integer = -1
+
         local function null(): integer
             if nullDescriptor < 0 then
                 nullDescriptor = tonumber(C.open("/dev/null", O_RDWR | O_CLOEXEC)) as integer
@@ -1387,6 +1409,7 @@ else
 
             return nullDescriptor
         end
+
         local function prepare(index: integer, mode: string): nil
             if problem ~= nil then
                 return
@@ -1411,6 +1434,7 @@ else
                 childEnds[index] = null()
             end
         end
+
         prepare(1, inputMode)
         prepare(2, outputMode)
         if errorMode == "stdout" then
@@ -1437,6 +1461,7 @@ else
 
             return nil, nil, nil, nil, 0, failure("start process", describe(code), code), code
         end
+
         if problem ~= nil then
             return abandon(problem as integer)
         end
@@ -1631,6 +1656,7 @@ else
             descriptors = ffi.new("NuppProcessPollFd[?]", capacity)
         end
         local count: integer = 0
+
         local function add(descriptor: integer, events: integer): nil
             if descriptor >= 0 then
                 descriptors[count].fd = descriptor
@@ -1639,6 +1665,7 @@ else
                 count = count + 1
             end
         end
+
         local wake = native.wake()
         if wake ~= nil then
             local descriptor = tonumber(wake) as integer
@@ -1783,6 +1810,7 @@ local function create(): contract.Provider
         end,
         waitready = function(self: contract.Provider, interest: shared.Interest, timeoutMs: number): integer
             local timeout = clamp(whole(timeoutMs), 0, INT32_MAX)
+
             local function probe(): integer
                 local count: integer = 0
                 local owner: any = interest.child

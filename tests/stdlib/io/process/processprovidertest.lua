@@ -36,10 +36,13 @@ end
 local processorSeconds = os.clock
 if WINDOWS then
     local ffi = require("ffi")
-    pcall(ffi.cdef, [[
+    pcall(
+        ffi.cdef,
+        [[
     int32_t GetProcessTimes(void *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
     void *GetCurrentProcess(void);
-    ]])
+    ]]
+    )
     local times = ffi.new("uint64_t[4]")
     processorSeconds = function()
         assert(ffi.C.GetProcessTimes(ffi.C.GetCurrentProcess(), times, times + 1, times + 2, times + 3) ~= 0)
@@ -341,10 +344,12 @@ end
 
 function M.descriptorsThatCouldNeverStartAChildRaise()
     ready()
+
     local function rejects(options, expected)
         local ok, problem = pcall(provider.spawn, provider, options)
         assert(not ok and tostring(problem):find(expected, 1, true), tostring(problem))
     end
+
     rejects({args = {}}, "needs a program")
     for _, name in ipairs({"A=B", "=A", ""}) do
         rejects({args = {"true"}, env = {[name] = "C"}}, "environment variable name")
@@ -440,10 +445,10 @@ function M.socketActivityWakesAProcessWait()
         test.suite.skip(port)
     end
     local quiet = spawn(longRunning(), {stdout = "null", stderr = "null"})
-    local client = spawn(
-        {BASH, "-c", ("sleep 0.5; exec 3<>/dev/tcp/127.0.0.1/%d; sleep 1"):format(port)},
-        {stdout = "null", stderr = "null"}
-    )
+    local client = spawn({BASH, "-c", ("sleep 0.5; exec 3<>/dev/tcp/127.0.0.1/%d; sleep 1"):format(port)}, {
+        stdout = "null",
+        stderr = "null"
+    })
     -- The client's own exit is not in this wait, so only the socket can end it
     -- early. A return before the client can have connected answers some older
     -- edge, and the next wait starts from a fresh snapshot.
