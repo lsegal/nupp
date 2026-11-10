@@ -1,22 +1,41 @@
 #!/bin/sh
-# Refreshes or verifies the committed notice for all locked Cargo packages.
+# Refreshes or verifies a committed notice for all locked Cargo packages.
+#
+# `nupp` (the default) covers this workspace's Cargo.lock. `wgpu-native` covers
+# the lock file of the wgpu-native release pinned as WGPU_VERSION, whose
+# prebuilt library statically carries that graph beside GPU programs.
 
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 CARGO_ABOUT=${CARGO_ABOUT:-cargo-about}
 CARGO=${CARGO:-cargo}
-OUTPUT=$ROOT/host/notices/Rust-dependencies.html
 EXPECTED_CARGO_ABOUT='cargo-about 0.9.2'
+
+usage() {
+    printf '%s\n' 'usage: scripts/rust-dependency-notices --write|--check [nupp|wgpu-native]' >&2
+    exit 2
+}
 
 case "${1:-}" in
     --write) mode=write ;;
     --check) mode=check ;;
-    *)
-        printf '%s\n' 'usage: scripts/rust-dependency-notices --write|--check' >&2
-        exit 2
-        ;;
+    *) usage ;;
 esac
+
+target=${2:-nupp}
+case "$target" in
+    nupp)
+        notice=Rust-dependencies.html
+        command='scripts/rust-dependency-notices --write'
+        ;;
+    wgpu-native)
+        notice=wgpu-native-Rust-dependencies.html
+        command='scripts/rust-dependency-notices --write wgpu-native'
+        ;;
+    *) usage ;;
+esac
+OUTPUT=$ROOT/host/notices/$notice
 
 actual_cargo_about=$("$CARGO_ABOUT" --version 2>/dev/null || true)
 [ "$actual_cargo_about" = "$EXPECTED_CARGO_ABOUT" ] || {
@@ -31,18 +50,43 @@ report=$temporary/report.html
 inventory=$temporary/inventory.html
 generated=$temporary/generated.html
 
+if [ "$target" = nupp ]; then
+    manifest=$ROOT/Cargo.toml
+    config=$ROOT/about.toml
+    template=$ROOT/scripts/rust-dependency-notices.hbs
+else
+    # The release is a prebuilt library, so its lock file is only in the source
+    # archive of the same tag. The notice names that tag, and the test suite
+    # holds it to the pin, so a bump without a refresh fails there.
+    version=$(sed -n 's/^WGPU_VERSION=//p' "$ROOT/scripts/toolchain.pins")
+    [ -n "$version" ] || {
+        printf '%s\n' 'rust-dependency-notices: scripts/toolchain.pins has no WGPU_VERSION' >&2
+        exit 1
+    }
+    curl -fsSL "https://github.com/gfx-rs/wgpu-native/archive/refs/tags/$version.tar.gz" \
+        -o "$temporary/wgpu-native.tar.gz"
+    mkdir "$temporary/wgpu-native"
+    tar -xzf "$temporary/wgpu-native.tar.gz" -C "$temporary/wgpu-native" --strip-components=1
+    manifest=$temporary/wgpu-native/Cargo.toml
+    config=$ROOT/scripts/rust-dependency-notices-wgpu-native.toml
+    "$CARGO" fetch --manifest-path "$manifest" --locked >/dev/null
+    template=$temporary/template.hbs
+    sed "s/@@WGPU_VERSION@@/$version/g" \
+        "$ROOT/scripts/rust-dependency-notices-wgpu-native.hbs" > "$template"
+fi
+
 "$CARGO_ABOUT" generate \
-    --manifest-path "$ROOT/Cargo.toml" \
-    --config "$ROOT/about.toml" \
+    --manifest-path "$manifest" \
+    --config "$config" \
     --workspace \
     --all-features \
     --frozen \
     --fail \
     --output-file "$report" \
-    "$ROOT/scripts/rust-dependency-notices.hbs"
+    "$template"
 
 RUSTC=${RUSTC:-rustc} "$CARGO" vendor \
-    --manifest-path "$ROOT/Cargo.toml" \
+    --manifest-path "$manifest" \
     --locked \
     --offline \
     "$temporary/vendor" >/dev/null
@@ -84,6 +128,6 @@ if [ "$mode" = write ]; then
     cp "$generated" "$OUTPUT"
 elif ! cmp -s "$generated" "$OUTPUT"; then
     printf '%s\n' \
-        'host/notices/Rust-dependencies.html is stale; run scripts/rust-dependency-notices --write' >&2
+        "host/notices/$notice is stale; run $command" >&2
     exit 1
 fi

@@ -46,7 +46,9 @@ LPEG_MIRRORS='https://deb.debian.org/debian/pool/main/l/lua-lpeg/lua-lpeg_${LPEG
 # inside is staged beside a program that opens a GPU context. Each archive has
 # its own digest, named by the platform `scripts/toolchain wgpu` selects. Like
 # LLVM it has its own cache key, so a bump fetches one archive and rebuilds
-# nothing else. Its MIT and Apache-2.0 licences travel in host/notices.
+# nothing else. Its MIT and Apache-2.0 licences travel in host/notices. So does a
+# notice for the Rust crates its library contains: after a bump, refresh it with
+# `scripts/rust-dependency-notices --write wgpu-native`, or the tests refuse it.
 WGPU_VERSION=v29.0.1.1
 WGPU_URL='https://github.com/gfx-rs/wgpu-native/releases/download/${WGPU_VERSION}/wgpu-${WGPU_TARGET}-release.zip'
 WGPU_SHA256_LINUX_X86_64=95a4d90c071005a98d03eab348beaa6b07e16eb00d1dcdb9f8348f75eb97ec5a

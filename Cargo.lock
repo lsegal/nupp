@@ -751,7 +751,9 @@ dependencies = [
 name = "nupp-native-runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
