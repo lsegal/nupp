@@ -39,6 +39,10 @@ local system: string = ffi.os
 local windows = system == "Windows"
 local darwin = system == "OSX"
 
+-- The calls a borrowed span pointer reaches, typed so the borrow is checked.
+local copyOut = ffi.copy as function(borrows destination: uint8[?], source: any, count: integer): nil
+local copyIn = ffi.copy as function(destination: any, borrows source: const uint8[?], count: integer): nil
+
 const MODE: {[string]: integer} = {pipe = 0, inherit = 1, ["null"] = 2, stdout = 3}
 const READ_DATA = 0
 const READ_PENDING = 1
@@ -145,8 +149,8 @@ local spawnChild: function(options: shared.SpawnOptions): (any?, any?, any?, any
 local reapExit: function(owner: any): nil
 local signalChild: function(owner: any, force: boolean): nil
 local releaseChild: function(owner: any): nil
-local readInto: function(stream: any, pointer: any, wanted: integer): (integer, integer)
-local writeFrom: function(stream: any, pointer: any, count: integer): (integer, integer)
+local readInto: function(stream: any, borrows pointer: uint8[?], wanted: integer): (integer, integer)
+local writeFrom: function(stream: any, borrows pointer: const uint8[?], count: integer): (integer, integer)
 local releaseStream: function(stream: any): nil
 local streamReady: function(stream: any): boolean
 local sleepOn: function(interest: shared.Interest, timeout: integer): nil
@@ -240,49 +244,48 @@ if windows then
         ]]
     end
 
-    local GENERIC_READ = 0x80000000
-    local GENERIC_WRITE = 0x40000000
-    local FILE_READ_ATTRIBUTES = 0x80
-    local FILE_WRITE_ATTRIBUTES = 0x100
-    local FILE_SHARE_READ = 1
-    local FILE_SHARE_WRITE = 2
-    local OPEN_EXISTING = 3
-    local PIPE_ACCESS_INBOUND = 1
-    local PIPE_ACCESS_OUTBOUND = 2
-    local FILE_FLAG_OVERLAPPED = 0x40000000
-    local FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
-    local PIPE_REJECT_REMOTE_CLIENTS = 8
-    local ERROR_FILE_NOT_FOUND = 2
-    local ERROR_ACCESS_DENIED = 5
-    local ERROR_HANDLE_EOF = 38
-    local ERROR_BROKEN_PIPE = 109
-    local ERROR_NO_DATA = 232
-    local ERROR_PIPE_NOT_CONNECTED = 233
-    local ERROR_PIPE_BUSY = 231
-    local ERROR_IO_INCOMPLETE = 996
-    local ERROR_IO_PENDING = 997
-    local WAIT_OBJECT_0 = 0
-    local WAIT_TIMEOUT = 0x102
-    local STARTF_USESTDHANDLES = 0x100
-    local CREATE_UNICODE_ENVIRONMENT = 0x400
-    local EXTENDED_STARTUPINFO_PRESENT = 0x80000
-    local PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002
+    local GENERIC_READ: integer = 0x80000000
+    local GENERIC_WRITE: integer = 0x40000000
+    local FILE_READ_ATTRIBUTES: integer = 0x80
+    local FILE_WRITE_ATTRIBUTES: integer = 0x100
+    local FILE_SHARE_READ: integer = 1
+    local FILE_SHARE_WRITE: integer = 2
+    local OPEN_EXISTING: integer = 3
+    local PIPE_ACCESS_INBOUND: integer = 1
+    local PIPE_ACCESS_OUTBOUND: integer = 2
+    local FILE_FLAG_OVERLAPPED: integer = 0x40000000
+    local FILE_FLAG_FIRST_PIPE_INSTANCE: integer = 0x00080000
+    local PIPE_REJECT_REMOTE_CLIENTS: integer = 8
+    local ERROR_ACCESS_DENIED: integer = 5
+    local ERROR_HANDLE_EOF: integer = 38
+    local ERROR_BROKEN_PIPE: integer = 109
+    local ERROR_NO_DATA: integer = 232
+    local ERROR_PIPE_NOT_CONNECTED: integer = 233
+    local ERROR_PIPE_BUSY: integer = 231
+    local ERROR_IO_INCOMPLETE: integer = 996
+    local ERROR_IO_PENDING: integer = 997
+    local WAIT_OBJECT_0: integer = 0
+    local WAIT_TIMEOUT: integer = 0x102
+    local STARTF_USESTDHANDLES: integer = 0x100
+    local CREATE_UNICODE_ENVIRONMENT: integer = 0x400
+    local EXTENDED_STARTUPINFO_PRESENT: integer = 0x80000
+    local PROC_THREAD_ATTRIBUTE_HANDLE_LIST: integer = 0x20002
     local STD_HANDLE = {0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4}
-    local DUPLICATE_SAME_ACCESS = 2
-    local CP_UTF8 = 65001
-    local MB_ERR_INVALID_CHARS = 8
-    local FORMAT_MESSAGE_FROM_SYSTEM = 0x1000
-    local FORMAT_MESSAGE_IGNORE_INSERTS = 0x200
-    local INVALID_ATTRIBUTES = 0xFFFFFFFF
-    local FILE_ATTRIBUTE_DIRECTORY = 0x10
-    local MAXIMUM_WAIT_OBJECTS = 64
+    local DUPLICATE_SAME_ACCESS: integer = 2
+    local CP_UTF8: integer = 65001
+    local MB_ERR_INVALID_CHARS: integer = 8
+    local FORMAT_MESSAGE_FROM_SYSTEM: integer = 0x1000
+    local FORMAT_MESSAGE_IGNORE_INSERTS: integer = 0x200
+    local INVALID_ATTRIBUTES: integer = 0xFFFFFFFF
+    local FILE_ATTRIBUTE_DIRECTORY: integer = 0x10
+    local MAXIMUM_WAIT_OBJECTS: integer = 64
     local INVALID_HANDLE: any = ffi.cast("void *", -1)
 
     local transferred: any = ffi.new("uint32_t[1]")
     local exitCode: any = ffi.new("uint32_t[1]")
 
     local function wide(text: string): any
-        local count = 0
+        local count: integer = 0
         if #text > 0 then
             count = C.MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, #text, nil, 0)
             if count == 0 then
@@ -380,9 +383,9 @@ if windows then
         if block == nil then
             return entries
         end
-        local position = 0
+        local position: integer = 0
         while block[position] ~= 0 do
-            local length = 0
+            local length: integer = 0
             while block[position + length] ~= 0 do
                 length = length + 1
             end
@@ -617,7 +620,7 @@ if windows then
     end
 
     local function serviceLingering(): nil
-        local index = 1
+        local index: integer = 1
         while index <= #lingering do
             local entry = lingering[index]
             finishWrite(entry.pipe)
@@ -884,7 +887,7 @@ if windows then
     end
 
     releaseChild = function(owner: any): nil
-        local index = 1
+        local index: integer = 1
         while index <= #lingering do
             if lingering[index].owner == owner then
                 settlePipe(lingering[index].pipe)
@@ -896,7 +899,7 @@ if windows then
         closeChild(owner.child)
     end
 
-    readInto = function(stream: any, pointer: any, wanted: integer): (integer, integer)
+    readInto = function(stream: any, borrows pointer: uint8[?], wanted: integer): (integer, integer)
         local pipe = stream.pipe
         finishRead(pipe)
         if pipe.filled <= pipe.offset then
@@ -904,7 +907,7 @@ if windows then
         end
         if pipe.filled > pipe.offset then
             local count = math.min(wanted, pipe.filled - pipe.offset) as integer
-            ffi.copy(pointer, pipe.buffer + pipe.offset, count)
+            copyOut(pointer, pipe.buffer + pipe.offset, count)
             pipe.offset = pipe.offset + count
             if pipe.offset >= pipe.filled then
                 pipe.offset = 0
@@ -928,7 +931,7 @@ if windows then
         return code == ERROR_BROKEN_PIPE or code == ERROR_NO_DATA or code == ERROR_PIPE_NOT_CONNECTED
     end
 
-    writeFrom = function(stream: any, pointer: any, count: integer): (integer, integer)
+    writeFrom = function(stream: any, borrows pointer: const uint8[?], count: integer): (integer, integer)
         local pipe = stream.pipe
         finishWrite(pipe)
         if pipe.failed ~= 0 then
@@ -944,7 +947,7 @@ if windows then
             return WRITE_PENDING, 0
         end
         local taken = math.min(count, WRITE_SIZE) as integer
-        ffi.copy(pipe.buffer, pointer, taken)
+        copyIn(pipe.buffer, pointer, taken)
         pipe.offset = 0
         pipe.filled = taken
         if C.WriteFile(pipe.handle, pipe.buffer, taken, nil, pipe.overlapped) == 0 then
@@ -989,7 +992,7 @@ if windows then
     local waitHandles: any = ffi.new("void *[?]", MAXIMUM_WAIT_OBJECTS)
 
     sleepOn = function(interest: shared.Interest, timeout: integer): nil
-        local count = 0
+        local count: integer = 0
         local function add(handle: any): nil
             if handle ~= nil and count < MAXIMUM_WAIT_OBJECTS then
                 waitHandles[count] = handle
@@ -1108,37 +1111,37 @@ else
         ]]
     end
 
-    local F_GETFL = 3
-    local F_SETFL = 4
-    local F_SETFD = 2
-    local FD_CLOEXEC = 1
-    local F_SETNOSIGPIPE = 73
-    local O_RDWR = 2
-    local O_NONBLOCK = darwin and 0x4 or 0x800
-    local O_CLOEXEC = darwin and 0x1000000 or 0x80000
-    local POLLIN = 0x1
-    local POLLOUT = 0x4
-    local EINTR = 4
-    local ESRCH = 3
-    local ENOENT = 2
-    local EPIPE = 32
-    local EAGAIN = darwin and 35 or 11
-    local SIGKILL = 9
-    local SIGPIPE = 13
-    local SIGTERM = 15
-    local SIG_BLOCK = darwin and 1 or 0
-    local SIG_SETMASK = darwin and 3 or 2
-    local WNOHANG = 1
-    local X_OK = 1
-    local POSIX_SPAWN_SETSIGDEF = 0x04
-    local POSIX_SPAWN_SETSIGMASK = 0x08
-    local SYS_PIDFD_OPEN = 434
-    local EVFILT_PROC = -5
-    local EV_ADD = 0x1
-    local EV_ONESHOT = 0x10
-    local NOTE_EXIT = 0x80000000
+    local F_GETFL: integer = 3
+    local F_SETFL: integer = 4
+    local F_SETFD: integer = 2
+    local FD_CLOEXEC: integer = 1
+    local F_SETNOSIGPIPE: integer = 73
+    local O_RDWR: integer = 2
+    local O_NONBLOCK: integer = darwin and 0x4 or 0x800
+    local O_CLOEXEC: integer = darwin and 0x1000000 or 0x80000
+    local POLLIN: integer = 0x1
+    local POLLOUT: integer = 0x4
+    local EINTR: integer = 4
+    local ESRCH: integer = 3
+    local ENOENT: integer = 2
+    local EPIPE: integer = 32
+    local EAGAIN: integer = darwin and 35 or 11
+    local SIGKILL: integer = 9
+    local SIGPIPE: integer = 13
+    local SIGTERM: integer = 15
+    local SIG_BLOCK: integer = darwin and 1 or 0
+    local SIG_SETMASK: integer = darwin and 3 or 2
+    local WNOHANG: integer = 1
+    local X_OK: integer = 1
+    local POSIX_SPAWN_SETSIGDEF: integer = 0x04
+    local POSIX_SPAWN_SETSIGMASK: integer = 0x08
+    local SYS_PIDFD_OPEN: integer = 434
+    local EVFILT_PROC: integer = -5
+    local EV_ADD: integer = 0x1
+    local EV_ONESHOT: integer = 0x10
+    local NOTE_EXIT: integer = 0x80000000
     -- Generous for every libc's opaque spawn records and signal sets.
-    local OPAQUE_SIZE = 1024
+    local OPAQUE_SIZE: integer = 1024
 
     local status: any = ffi.new("int[1]")
     local pidOut: any = ffi.new("int[1]")
@@ -1149,6 +1152,9 @@ else
     local noTime: any = ffi.new("NuppProcessTimespec")
     C.sigemptyset(blocked)
     C.sigaddset(blocked, SIGPIPE)
+
+    local readCall = C.read as function(descriptor: integer, borrows pointer: uint8[?], count: integer): any
+    local writeCall = C.write as function(descriptor: integer, borrows pointer: const uint8[?], count: integer): any
 
     local function describe(code: integer): string
         return ffi.string(C.strerror(code))
@@ -1249,7 +1255,7 @@ else
         local strings: {string} = {}
         local array = ffi.new("char *[?]", #order + 1)
         for index, name in ipairs(order) do
-            strings[index] = name .. "=" .. merged[name]
+            strings[index] = name .. "=" .. (merged[name] as string)
             array[index - 1] = ffi.cast("char *", strings[index])
         end
 
@@ -1279,7 +1285,7 @@ else
     local orphans: {integer} = {}
 
     local function reapOrphans(): nil
-        local index = 1
+        local index: integer = 1
         while index <= #orphans do
             local result = C.waitpid(orphans[index], status, WNOHANG)
             if result ~= 0 then
@@ -1329,7 +1335,7 @@ else
         local ok, descriptor = pcall(function(): any
             return C.syscall(SYS_PIDFD_OPEN, ffi.new("int", pid), ffi.new("unsigned int", 0))
         end)
-        if not ok or tonumber(descriptor) as integer < 0 then
+        if not ok or (tonumber(descriptor) as integer) < 0 then
             return -1
         end
 
@@ -1362,10 +1368,10 @@ else
         local childEnds: {integer} = {}
         local toClose: {integer} = {}
         local problem: integer? = nil
-        local nullDescriptor = -1
+        local nullDescriptor: integer = -1
         local function null(): integer
             if nullDescriptor < 0 then
-                nullDescriptor = C.open("/dev/null", O_RDWR | O_CLOEXEC)
+                nullDescriptor = tonumber(C.open("/dev/null", O_RDWR | O_CLOEXEC)) as integer
                 if nullDescriptor < 0 then
                     problem = ffi.errno()
                 else
@@ -1533,9 +1539,9 @@ else
         closeChild(owner.child)
     end
 
-    readInto = function(stream: any, pointer: any, wanted: integer): (integer, integer)
+    readInto = function(stream: any, borrows pointer: uint8[?], wanted: integer): (integer, integer)
         while true do
-            local count = tonumber(C.read(stream.pipe.descriptor, pointer, wanted)) as integer
+            local count = tonumber(readCall(stream.pipe.descriptor, pointer, wanted)) as integer
             if count > 0 then
                 return READ_DATA, count
             elseif count == 0 then
@@ -1553,16 +1559,16 @@ else
     -- A write to a pipe the child has closed raises SIGPIPE, which would end
     -- this whole process. macOS refuses it per descriptor; elsewhere it is
     -- blocked across the one write, and consumed if that write raised it.
-    local function quietWrite(descriptor: integer, pointer: any, count: integer): (integer, integer)
+    local function quietWrite(descriptor: integer, borrows pointer: const uint8[?], count: integer): (integer, integer)
         if darwin then
-            local wrote = tonumber(C.write(descriptor, pointer, count)) as integer
+            local wrote = tonumber(writeCall(descriptor, pointer, count)) as integer
             return wrote, wrote < 0 and ffi.errno() or 0
         end
         C.pthread_sigmask(SIG_BLOCK, blocked, previous)
         C.sigemptyset(pendingSignals)
         C.sigpending(pendingSignals)
         local already = C.sigismember(pendingSignals, SIGPIPE) == 1
-        local wrote = tonumber(C.write(descriptor, pointer, count)) as integer
+        local wrote = tonumber(writeCall(descriptor, pointer, count)) as integer
         local code = wrote < 0 and ffi.errno() or 0
         if code == EPIPE and not already then
             C.sigtimedwait(blocked, nil, noTime)
@@ -1572,7 +1578,7 @@ else
         return wrote, code
     end
 
-    writeFrom = function(stream: any, pointer: any, count: integer): (integer, integer)
+    writeFrom = function(stream: any, borrows pointer: const uint8[?], count: integer): (integer, integer)
         if count == 0 then
             return WRITE_ACCEPTED, 0
         end
@@ -1618,7 +1624,7 @@ else
             capacity = wanted
             descriptors = ffi.new("NuppProcessPollFd[?]", capacity)
         end
-        local count = 0
+        local count: integer = 0
         local function add(descriptor: integer, events: integer): nil
             if descriptor >= 0 then
                 descriptors[count].fd = descriptor
@@ -1732,7 +1738,7 @@ local function create(): contract.Provider
         end,
         write = function(self: contract.Provider, stream: any, bytes: string): (integer, boolean)
             released(stream, "write process stream")
-            local state, count = writeFrom(stream, bytes, #bytes)
+            local state, count = writeFrom(stream, bytes as any, #bytes)
 
             return count, state == WRITE_GONE
         end,
@@ -1772,7 +1778,7 @@ local function create(): contract.Provider
         waitready = function(self: contract.Provider, interest: shared.Interest, timeoutMs: number): integer
             local timeout = clamp(whole(timeoutMs), 0, INT32_MAX)
             local function probe(): integer
-                local count = 0
+                local count: integer = 0
                 local owner: any = interest.child
                 if owner ~= nil and not owner.released then
                     reapExit(owner)
