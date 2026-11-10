@@ -20,7 +20,7 @@ local function run(command)
     pipe:close()
     local status = tonumber(output:match("__status__:(%d+)%s*$"))
 
-    return status, (output:gsub("\r?\n__status__:%d+%s*$", ""))
+    return status, (output:gsub("%s*__status__:%d+%s*$", ""))
 end
 
 local function project(source)
