@@ -735,7 +735,15 @@ local function floorDivision(body: Body, left: Value, right: Value, a: string, b
 end
 
 --- `left op right` over 64-bit integers, which wrap as LuaJIT's do.
-local function integerArithmetic(body: Body, op: string, left: Value, right: Value, a: string, b: string, kind: Kind): string
+local function integerArithmetic(
+    body: Body,
+    op: string,
+    left: Value,
+    right: Value,
+    a: string,
+    b: string,
+    kind: Kind
+): string
     if op == "/" or op == "%" then
         return integerDivision(body, op, a, b, kind)
     elseif op == "//" then
