@@ -35,6 +35,11 @@ The program links LuaJIT statically from the platform's link kit, so it needs no
 LuaJIT shared library at run time, and it exports the Lua C API the way a
 standalone host does.
 
+A project builds the same program from a `kind = "program"` target in
+`nupp.lua`, which `nupp build` places under the target's `outDir` and does not
+relink while the program is unchanged; see
+[Native programs](../../projects/build.md#native-programs) in the build guide.
+
 ## The shape of a program
 
 The top level holds only `cdef function` and `cdef struct` declarations,
