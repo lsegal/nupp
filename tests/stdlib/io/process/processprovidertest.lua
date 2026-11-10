@@ -7,14 +7,18 @@
 -- another native family -- a socket accepting a connection -- still wakes it.
 local test = require("assert")
 local nativeStage = require("nupp.tools.build.native")
+-- Loaded first, as `netnativetest` loads it, so that the network provider and
+-- the process provider share the one native library and its readiness state.
+local netLoaded, netValue = pcall(require, "io.net")
 
 local M = {}
 
-local provider, net, root, unavailable, priorPreload, priorLoaded
+local provider, root, unavailable, priorPreload, priorLoaded
 
 local WINDOWS = package.config:sub(1, 1) == "\\"
 local SHELL = os.getenv("NUPP_TEST_SH") or "/bin/sh"
-local BASH = os.getenv("NUPP_TEST_BASH") or "bash"
+-- Git Bash is the Windows test shell; elsewhere `sh` may lack `/dev/tcp`.
+local BASH = WINDOWS and SHELL or "bash"
 
 local function shell(script)
     return {SHELL, "-c", script}
@@ -28,6 +32,22 @@ local function longRunning()
     end
 
     return {"sleep", "30"}
+end
+
+-- Processor seconds this process has used. `os.clock` measures that on POSIX,
+-- but the Microsoft C runtime answers wall time since start.
+local processorSeconds = os.clock
+if WINDOWS then
+    local ffi = require("ffi")
+    pcall(ffi.cdef, [[
+    int32_t GetProcessTimes(void *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+    void *GetCurrentProcess(void);
+    ]])
+    local times = ffi.new("uint64_t[4]")
+    processorSeconds = function()
+        assert(ffi.C.GetProcessTimes(ffi.C.GetCurrentProcess(), times, times + 1, times + 2, times + 3) ~= 0)
+        return tonumber(times[2] + times[3]) / 1e7
+    end
 end
 
 local function temporaryRoot()
@@ -65,15 +85,11 @@ function M.beforeAll()
     priorLoaded = package.loaded["nupp.runtime.native"]
     preloadNative(libraryPath)
     package.loaded["nupp.runtime.provider.nativeprocess"] = nil
-    package.loaded["nupp.runtime.provider.nativenet"] = nil
     provider = require("nupp.runtime.provider.nativeprocess")
-    local loaded, value = pcall(require, "nupp.runtime.provider.nativenet")
-    net = loaded and value or nil
 end
 
 function M.afterAll()
     package.loaded["nupp.runtime.provider.nativeprocess"] = nil
-    package.loaded["nupp.runtime.provider.nativenet"] = nil
     package.preload["nupp.runtime.native"] = priorPreload
     package.loaded["nupp.runtime.native"] = priorLoaded
     if root then
@@ -374,9 +390,9 @@ end
 function M.aQuietWaitParksInsteadOfSpinning()
     ready()
     local child = spawn(longRunning(), {stdout = "null", stderr = "null"})
-    local started, cpu = os.monotonic(), os.clock()
+    local started, cpu = os.monotonic(), processorSeconds()
     test.eq(provider:waitready(interest(child.owner, {}, {}), 400), 0)
-    local elapsed, used = os.monotonic() - started, os.clock() - cpu
+    local elapsed, used = os.monotonic() - started, processorSeconds() - cpu
     assert(elapsed >= 300, "the wait returned early after " .. elapsed .. "ms")
     assert(used < 0.2, "the wait spent " .. used .. "s of processor time")
     provider:kill(child.owner, true)
@@ -389,11 +405,12 @@ end
 -- it rather than sleeping out its timeout.
 function M.socketActivityWakesAProcessWait()
     ready()
-    if net == nil then
-        test.suite.skip("the native network provider is unavailable")
+    if not netLoaded then
+        test.suite.skip("the native network provider is unavailable: " .. tostring(netValue))
     end
-    local listener = assert(net:listen("127.0.0.1", 0, 16, false))
-    local port = net:listenerport(listener)
+    local net = netValue
+    local listener = assert(net.listen({host = "127.0.0.1", port = 0}))
+    local port = listener:port()
     assert(port > 0)
     local quiet = spawn(longRunning(), {stdout = "null", stderr = "null"})
     local client = spawn(
@@ -414,7 +431,7 @@ function M.socketActivityWakesAProcessWait()
     finish(quiet)
     waitExit(client)
     finish(client)
-    net:closelistener(listener)
+    listener:close()
 end
 
 return M

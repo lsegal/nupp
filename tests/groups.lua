@@ -41,6 +41,7 @@ local groups = {
         "nativefoundationstest",
         "netnativetest",
         "processnativetest",
+        "processprovidertest",
         "rustabitest",
         "tlstest",
     },
@@ -174,7 +175,7 @@ for name in (
 asserttest base64test bitsettest bufferapitest compressionprovidertest
 digestprovidertest digesttest sustest taskfailuretest taskstest
 workerstartuptest workersupporttest boundedcachetest clifacadetest portablefiletest
-processfiletest processprovidertest processtest scalaradapterstest jsonfuseddifferentialtest
+processfiletest processtest scalaradapterstest jsonfuseddifferentialtest
 jsonpolicytest valuebuildertest standardtabletest typefactoriestest
 ]]
 ):gmatch("%S+") do
@@ -229,7 +230,7 @@ simdfleetequivalencetest simdlanetest simdmapinventorytest simdmatrixreporttest 
 simdobligationtest simdpackbudgettest simdprimitivedifferentialtest simdreducerdifferentialtest simdreducertest
 simdruntimeboundarytest simdruntimeidentitytest simdwasmalgorithmdifferentialtest simdwasmbrowsersmoketest simdwasmtimeconformancetest
 hostfacadestest stdlibtest templatetest publicclitest filecomponenttest
-httpnativetest netnativetest tlstest pathtest processnativetest
+httpnativetest netnativetest tlstest pathtest processnativetest processprovidertest
 uritest filestest hostchanneltest jsonfacadedefaulttest jsonschematest
 serdecontracttest benchprojectstest benchrunnertest bctest absoluteentrytest
 clitest duplicateclitest coveragereporttest coveragetest clidoctest
