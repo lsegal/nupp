@@ -3444,8 +3444,8 @@ return {ones = ones, twice = twice}
     assert(out:find("ones, kernel, explicit simd, native-only", 1, true), out)
     assert(out:find("twice, kernel, explicit simd, native-only", 1, true), out)
     local llvm = run(dir, "--triple aarch64-apple-darwin --features neon --emit llvm vectors.nupp")
-    assert(llvm:find("\ndefine <4 x float> @ks_twice__neon%(<4 x float> %%p_value%)"), llvm)
-    assert(llvm:find("\ndefine <4 x float> @ks_ones__neon%(%)"), llvm)
+    assert(llvm:find("\ndefine hidden <4 x float> @ks_twice__neon%(<4 x float> %%p_value%)"), llvm)
+    assert(llvm:find("\ndefine hidden <4 x float> @ks_ones__neon%(%)"), llvm)
     local binding = run(dir, "--triple aarch64-apple-darwin --features neon --emit binding vectors.nupp")
     assert(not binding:find("cdef function ks_twice", 1, true), "no foreign declaration: " .. binding)
     assert(

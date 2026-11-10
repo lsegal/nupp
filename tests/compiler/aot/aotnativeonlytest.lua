@@ -281,7 +281,7 @@ function M.nativeOnlyAggregatesAreValuesAcrossEntriesUnderBothPolicies()
     assert(llvm:find("%aggregate.KaOrbit = type { %aggregate.KaPair, <4 x i1> }", 1, true), llvm)
     assert(
         llvm:find(
-            "define %%aggregate.KaOrbit @ks_%x+_advance__neon%(%%aggregate.KaOrbit %%p_orbit, %%aggregate.KaPair %%p_c%)"
+            "define hidden %%aggregate.KaOrbit @ks_%x+_advance__neon%(%%aggregate.KaOrbit %%p_orbit, %%aggregate.KaPair %%p_c%)"
         ),
         llvm
     )
