@@ -243,15 +243,9 @@ function stage.linkHost(
     return output, nil
 end
 
---- Compiles a native program's LLVM IR `ir` for `triple` and links it into
---- the executable `output` against the static LuaJIT of that platform's link
---- kit. A source checkout builds its own platform's kit when it has none.
-function stage.linkProgram(triple: string, output: string, ir: string): (string?, string?)
-    local aotllvm = require("nupp.tools.build.aotllvm")
-    local available, availableErr = aotllvm.selected()
-    if available ~= true then
-        return nil, tostring(availableErr)
-    end
+--- The link kit a native program for `triple` links against, or nil and why
+--- not. A source checkout builds its own platform's kit when it has none.
+function stage.programKit(triple: string): (string?, string?)
     local host = require("nupp.tools.build.platform").hostKey()
     local compilerRoot = envMod.compilerRoot()
     local build: (function(): (string?, string?))? = nil
@@ -260,7 +254,20 @@ function stage.linkProgram(triple: string, output: string, ir: string): (string?
             return driven(compilerRoot as string, "kit", {})
         end
     end
-    local kit, kitErr = require("nupp.tools.build.kits").resolve(triple, {}, build)
+
+    return require("nupp.tools.build.kits").resolve(triple, {}, build)
+end
+
+--- Compiles a native program's LLVM IR `ir` for `triple` and links it into
+--- the executable `output` against the static LuaJIT of that platform's link
+--- kit.
+function stage.linkProgram(triple: string, output: string, ir: string): (string?, string?)
+    local aotllvm = require("nupp.tools.build.aotllvm")
+    local available, availableErr = aotllvm.selected()
+    if available ~= true then
+        return nil, tostring(availableErr)
+    end
+    local kit, kitErr = stage.programKit(triple)
     if kit == nil then
         return nil, kitErr
     end

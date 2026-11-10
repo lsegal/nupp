@@ -24,8 +24,10 @@ Declarations arrive by one of four routes:
 - `bindings.bridge` in `nupp.lua`, when the header holds `static inline`
   functions or typed function-like macros.
 
-Going the other way, `nupp export-c` publishes ordinary Nupp struct layouts for
-C to consume.
+Going the other way, `nupp export-c` publishes ordinary Nupp struct layouts and
+`@aot` functions for C to consume. A whole program can also be native: see
+[native programs](../../performance/ahead-of-time/native-programs.md) for an
+executable whose `main` is written in Nupp.
 
 ## Hand-write a small binding
 
@@ -897,8 +899,42 @@ void game_saxpy(double *out, const double *xs, double a, size_t count);
 void game_bounds(const double *values, size_t count_values, struct game_bounds_result *result);
 ```
 
-A span of structs has no declaration yet, and `export-c` refuses it with
-NUPP2203.
+A span of structs points at a struct `export-c` declares from the lowered
+layout the kernel indexes, named `<c_name>_<Struct>`. A scalar field sits
+where C places it. A `simd.Vector<T, simd.Fixed<N>>` field is an array aligned
+and padded as the target layout model lays it out, and the padding is spelled
+as `nupp_padding_<n>` byte arrays. The header asserts the struct's size and
+alignment and every field's offset, the same way it does for an exported
+struct:
+
+```nupp
+local struct Particle
+   mass: float
+   velocity: simd.Vector<float, simd.Fixed<3>>
+end
+
+@aot(export = "game_energy")
+local function energy(borrows particles: span.Span<Particle>): number
+   local total = 0.0
+   for i = 1, #particles do
+      local p = particles[i]
+      total = total + p.mass * simd.horizontal.orderedsum(p.velocity * p.velocity)
+   end
+   return total
+end
+```
+
+```c
+struct game_energy_Particle {
+    float mass;
+    uint8_t nupp_padding_1[12];
+    GAME_H_ALIGNAS(16) float velocity[3];
+    uint8_t nupp_padding_2[4];
+};
+GAME_H_STATIC_ASSERT(sizeof(game_energy_Particle) == 32, "game_energy_Particle size");
+
+double game_energy(const struct game_energy_Particle *particles, size_t count_particles);
+```
 
 The build refuses a few more cases. The name must be a literal C identifier.
 A GPU kernel, a function that holds Lua values, and a function with const

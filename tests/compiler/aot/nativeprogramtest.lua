@@ -210,6 +210,254 @@ end
     test.eq(status, 0, ran)
 end
 
+-- The operands every bit-operator case reads, as the native program binds them
+-- and as plain LuaJIT does: negative, fractional and out-of-range numbers, an
+-- established `int32`, and 64-bit integers of both signs.
+local BIT_LOCALS_NATIVE = [[
+    local a = -6
+    local b = 10
+    local f = 2.5
+    local g = 3.5
+    local big = 4294967298
+    local huge = 13835058055282163712
+    local i: int32 = math.i32.wrap(-5)
+    local w: int64 = -3LL
+    local u: uint64 = 9223372036854775808ULL
+]]
+local BIT_LOCALS_LUA = "local a, b, f, g, big, huge = -6, 10, 2.5, 3.5, 4294967298, 13835058055282163712 "
+    .. "local i, w, u = -5, -3LL, 9223372036854775808ULL "
+
+local BIT_EXPRESSIONS = {
+    "a & b", "a | b", "a ~ b", "~a", "~0", "a << 3", "a >> 3", "a ~>> 3",
+    "1 << 31", "1 << 32", "1 << -1", "a >> 33", "b << 37", "-1 >> 0",
+    "f & 7", "g | 0", "big | 0", "~f", "b ~>> 1.5",
+    "i & 255", "i >> 28", "i ~>> 1", "~i", "i << b",
+    "w & 255", "w | 1", "w ~ -1", "~w", "w << 63", "w << 64", "w << -1",
+    "w >> 1", "w ~>> 1", "w >> 65", "w & a", "a & w", "w & f", "w << b",
+    "u & -1", "u & a", "u | w", "w ~ u", "u ~>> 4", "u >> 4", "~u", "u & huge", "w << u",
+    "-2.5 | 0", "1e300 | 0", "w & 2.5", "w << 64.7", "9007199254740993 & w",
+    "w & 1e300", "w | (0/0)", "w | (1/0)", "u & -1e30", "u | (0/0)", "u & (2^64 + 2^63)",
+}
+
+-- Each bit operator lowered natively gives what the same expression gives under
+-- LuaJIT: numbers meet as 32-bit words, shift counts outside 0..31 or 0..63 are
+-- masked, a fraction rounds, and an `int64` or `uint64` operand makes the
+-- operation 64-bit, truncating a number beside it. A number out of 64-bit range,
+-- NaN or an infinity converts as this machine's LuaJIT converts it. The program
+-- exits with the first case that disagrees.
+function M.bitOperatorsAgreeWithLuaJIT()
+    requireCodegen()
+    local lines = {}
+    for index, expression in ipairs(BIT_EXPRESSIONS) do
+        local result = assert(load(BIT_LOCALS_LUA .. "return " .. expression, "=" .. expression))()
+        local expected = type(result) == "number" and ("%d"):format(result) or tostring(result)
+        lines[#lines + 1] = ("    if (%s) ~= %s then\n        return %d\n    end\n"):format(expression, expected, index)
+    end
+    local executable, output = link(
+        "local function main(): int32\n" .. BIT_LOCALS_NATIVE .. table.concat(lines) .. "    return 0\nend\n"
+    )
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ("%s: %s"):format(tostring(BIT_EXPRESSIONS[status]), ran))
+end
+
+-- LuaJIT shifts a number by an `int64` count as a 32-bit number, which is not
+-- the `int64` the checker gives the expression, so lowering refuses it.
+function M.aNumberShiftedByA64BitCountIsRefused()
+    local executable, output = link([[
+local function main(): int32
+    local count: int64 = 3LL
+    local shifted = 1 << count
+    return 0
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("host.nupp:3:21: native: LuaJIT shifts a number by a 64-bit count", 1, true), output)
+end
+
+-- A compound bit assignment stores what the operator gives, as LuaJIT does.
+function M.bitCompoundAssignmentsAgreeWithLuaJIT()
+    requireCodegen()
+    local expected = assert(load("local x = 12 x = x & 10 x = x | 1 x = x << 2 x = x >> 1 x = x ~>> 33 return x"))()
+    local executable, output = link([[
+local function main(): int32
+    local x = 12
+    x &= 10
+    x |= 1
+    x <<= 2
+    x >>= 1
+    x ~>>= 33
+    return math.i32.wrap(x)
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, expected, ran)
+end
+
+local INT64_MIN = "(-9223372036854775807LL - 1LL)"
+local INT64_MAX = "9223372036854775807LL"
+local UINT64_MAX = "(0ULL - 1ULL)"
+
+-- Each case is a call `main` reports, as `name value`, through `printf`.
+local DIVISION_CASES = {}
+for _, pair in ipairs({
+    {"7LL", "2LL"},
+    {"-7LL", "2LL"},
+    {"7LL", "-2LL"},
+    {"-7LL", "-2LL"},
+    {"-6LL", "3LL"},
+    {"7LL", "0LL"},
+    {"-7LL", "0LL"},
+    {"0LL", "0LL"},
+    {INT64_MIN, "-1LL"},
+    {INT64_MIN, "1LL"},
+    {INT64_MIN, "-2LL"},
+    {INT64_MAX, "-1LL"},
+    {INT64_MIN, INT64_MIN},
+    {"-5LL", INT64_MIN},
+}) do
+    for _, op in ipairs({"div", "mod", "floor"}) do
+        DIVISION_CASES[#DIVISION_CASES + 1] = ("signed(%q, %s(%s, %s))"):format(op, op, pair[1], pair[2])
+    end
+end
+for _, pair in ipairs({
+    {"7ULL", "2ULL"},
+    {"(0ULL - 7ULL)", "2ULL"},
+    {"7ULL", "0ULL"},
+    {UINT64_MAX, UINT64_MAX},
+    {"5ULL", UINT64_MAX},
+    {UINT64_MAX, "3ULL"},
+}) do
+    for _, op in ipairs({"udiv", "umod", "ufloor"}) do
+        DIVISION_CASES[#DIVISION_CASES + 1] = ("unsigned(%q, %s(%s, %s))"):format(op, op, pair[1], pair[2])
+    end
+end
+for _, call in ipairs({
+    -- `//` tests the operands' signs as written, before they meet as `uint64`.
+    "unsigned('mixedfloor', mixedfloor(-7LL, 2ULL))",
+    "unsigned('mixedfloor', mixedfloor(7LL, 2ULL))",
+    -- A number converts to `int64` by truncation; `//` still reads its sign.
+    "signed('numberfloor', numberfloor(-7LL, 2.5))",
+    "signed('numberfloor', numberfloor(7LL, -2.5))",
+    "signed('numberfloor', numberfloor(7LL, -0.5))",
+    "signed('numberdiv', numberdiv(7LL, -0.5))",
+    "signed('numbermod', numbermod(-7LL, 2.5))",
+}) do
+    DIVISION_CASES[#DIVISION_CASES + 1] = call
+end
+
+local DIVISION = [[
+cdef function printf(borrows format: cstring, ...): int32
+
+local function signed(name: cstring, result: int64): int32
+    return printf("%s %lld\n", name, result)
+end
+
+local function unsigned(name: cstring, result: uint64): int32
+    return printf("%s %llu\n", name, result)
+end
+
+local function div(a: int64, b: int64): int64
+    return a / b
+end
+
+local function mod(a: int64, b: int64): int64
+    return a % b
+end
+
+local function floor(a: int64, b: int64): int64
+    return a // b
+end
+
+local function udiv(a: uint64, b: uint64): uint64
+    return a / b
+end
+
+local function umod(a: uint64, b: uint64): uint64
+    return a % b
+end
+
+local function ufloor(a: uint64, b: uint64): uint64
+    return a // b
+end
+
+local function mixedfloor(a: int64, b: uint64): uint64
+    return a // b
+end
+
+local function numberfloor(a: int64, b: number): int64
+    return a // b
+end
+
+local function numberdiv(a: int64, b: number): int64
+    return a / b
+end
+
+local function numbermod(a: int64, b: number): int64
+    return a % b
+end
+
+local function main(): int32
+    ]] .. table.concat(DIVISION_CASES, "\n    ") .. [[
+
+    return 0
+end
+]]
+
+-- `/`, `%` and `//` over `int64` and `uint64` answer what the same program does
+-- under LuaJIT, compiled to Lua by the same `nupp`: dividing by zero gives
+-- INT64_MIN, as does INT64_MIN / -1, and `%` takes the dividend's sign.
+function M.wideDivisionAgreesWithLuaJIT()
+    requireCodegen()
+    local executable, output = link(DIVISION)
+    assert(executable ~= nil, output)
+    local status, native = run(quote(executable))
+    test.eq(status, 0, native)
+
+    local dir = executable:match("^(.*)/[^/]*$")
+    local lua
+    status, lua = run(("cd %s && NO_COLOR= %s lsp artifact --kind lua host.nupp"):format(quote(dir), quote(NUPP)))
+    test.eq(status, 0, lua)
+    local chunk = assert(io.open(dir .. "/host.lua", "wb"))
+    chunk:write(lua, "\nos.exit(main())\n")
+    chunk:close()
+    local reference
+    status, reference = run(
+        ("cd %s && LUA_PATH=%s luajit -joff host.lua"):format(quote(dir), quote(HERE .. "/../build/?.lua;;"))
+    )
+    test.eq(status, 0, reference)
+
+    test.eq(select(2, native:gsub("\n", "")) + 1, #DIVISION_CASES, native)
+    test.eq(native, reference)
+    -- Anchors that do not rest on the Lua backend: INT64_MIN / -1, its
+    -- remainder, a division by zero, and a negative dividend's remainder.
+    local lines = {}
+    for line in native:gmatch("[^\n]+") do
+        lines[#lines + 1] = line
+    end
+    test.eq(lines[1], "div 3")
+    test.eq(lines[5], "mod -1")
+    test.eq(lines[6], "floor -4")
+    test.eq(lines[16], "div -9223372036854775808")
+    test.eq(lines[25], "div -9223372036854775808")
+    test.eq(lines[26], "mod 0")
+    test.eq(lines[27], "floor -9223372036854775808")
+end
+
+function M.wideExponentiationIsRefused()
+    local executable, output = link([[
+local function main(): int32
+    local wide: int64 = 3LL
+    local squared: int64 = wide ^ 2LL
+    return 0
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("host.nupp:3:", 1, true), output)
+    assert(output:find("native: a native program does not lower ^ over 64-bit integers", 1, true), output)
+end
+
 local ffi = require("ffi")
 
 -- The structs the field cases declare, as LuaJIT lays them out.

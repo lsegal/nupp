@@ -2235,6 +2235,66 @@ function M.windowsShellUsesArgumentVectorsForNativePipes()
     end
 end
 
+function M.windowsShellSurvivesLaterStandardIOLoad()
+    local source = read(ROOT .. "/tests/run.lua")
+    local first = assert(source:find("-- The suites predate Windows support", 1, true))
+    first = assert(source:find('if package.config:sub(1, 1)', first, true))
+    local last = assert(source:find("local caseDefinitions", first, true))
+    local setup = source:sub(first, last - 1)
+    local received, path
+    local crtPopen = function(command)
+        received = {command}
+    end
+    local function nativePopen(command, mode)
+        received = {command, mode}
+        return {close = function() return true end}
+    end
+    local environment
+    local loaded = {}
+    -- Like the runtime module, requiring it assigns its popen over the global.
+    local function require(name)
+        if loaded[name] == nil then
+            test.eq(name, "nupp.runtime.standardio")
+            environment.io.popen = nativePopen
+            loaded[name] = {popen = nativePopen}
+        end
+
+        return loaded[name]
+    end
+    environment = setmetatable(
+        {
+            package = {config = "\\", loaded = loaded},
+            require = require,
+            io = {open = io.open, popen = crtPopen},
+            os = {
+                execute = function()
+                end,
+                getenv = function(name)
+                    if name == "NUPP_TEST_BASH" then
+                        return "C:/Program Files/Git/bin/bash.exe"
+                    end
+                end,
+                tmpname = function()
+                    path = os.tmpname() .. ".sh";
+                    return path:sub(1, -4)
+                end,
+                remove = os.remove,
+            },
+        },
+        {__index = _G}
+    )
+    environment._G = environment
+    assert(setfenv(assert(loadstring(setup, "@nupp:test-runner")), environment))()
+    -- A suite's first compiler module loads the runtime after the runner has.
+    require("nupp.runtime.standardio")
+    local pipe = environment.io.popen("echo hi; printf '%s' $?", "r")
+    test.eq(type(received[1]), "table", "a suite pipe still starts Bash")
+    test.eq(received[1][1], "C:/Program Files/Git/bin/bash.exe")
+    test.eq(received[1][2], path)
+    test.eq(read(path), "echo hi; printf '%s' $?\n")
+    test.eq(pipe:close(), true)
+end
+
 function M.windowsTemporaryNamesLeaveTheDriveRoot()
     local source = read(ROOT .. "/tests/run.lua")
     local first = assert(source:find("local rawTmpname, rawExit", 1, true))
