@@ -27,9 +27,9 @@ local function lower(source)
     end
     local diagnostics = check.check(tree, "host.nupp", sharedEnv)
     if #diagnostics > 0 then
-        error("check: " .. diagnostics[1].code .. " " .. tostring(diagnostics[1].message), 2)
+        error("check: " .. diagnostics[1].code .. " " .. tostring(diagnostics[1].msg), 2)
     end
-    local ir, problem = native.module(tree, "")
+    local ir, problem = native.module(tree.root, "")
     if ir == nil then
         return nil, problem.message
     end
@@ -42,12 +42,12 @@ local function contains(ir, fragment)
 end
 
 local ATOMICS = [[
-cdef function __atomic_load_8(p: int64*, order: int32): int64
-cdef function __atomic_store_8(p: int64*, v: int64, order: int32): nil
-cdef function __atomic_fetch_add_8(p: int64*, v: int64, order: int32): int64
-cdef function __atomic_fetch_sub_4(p: int32*, v: int32, order: int32): int32
-cdef function __atomic_exchange_8(p: int64*, v: int64, order: int32): int64
-cdef function __atomic_compare_exchange_8(p: int64*, expected: int64*, desired: int64, success: int32, failure: int32): boolean
+cdef function __atomic_load_8(borrows p: int64*, order: int32): int64
+cdef function __atomic_store_8(borrows p: int64*, v: int64, order: int32)
+cdef function __atomic_fetch_add_8(borrows p: int64*, v: int64, order: int32): int64
+cdef function __atomic_fetch_sub_4(borrows p: int32*, v: int32, order: int32): int32
+cdef function __atomic_exchange_8(borrows p: int64*, v: int64, order: int32): int64
+cdef function __atomic_compare_exchange_8(borrows p: int64*, borrows expected: int64*, desired: int64, success: int32, failure: int32): boolean
 ]]
 
 function M.atomicsLowerInPlaceWithTheirOrders()
@@ -96,7 +96,7 @@ end
 
 function M.anAtomicDeclaredWithTheWrongShapeIsRefused()
     local ir, message = lower([[
-cdef function __atomic_load_8(p: int64*, order: int32): int32
+cdef function __atomic_load_8(borrows p: int64*, order: int32): int32
 
 local function main(): int32
     return 0
@@ -120,7 +120,7 @@ end
 
 function M.anUnknownAtomicIsRefused()
     local ir, message = lower([[
-cdef function __atomic_fetch_min_8(p: int64*, v: int64, order: int32): int64
+cdef function __atomic_fetch_min_8(borrows p: int64*, v: int64, order: int32): int64
 
 local function main(): int32
     return 0
@@ -183,8 +183,8 @@ local WINDOWS = [[
 cdef function CreateThread(attributes: voidptr, stack: uint64, start: function(arg: voidptr): uint32, arg: voidptr, flags: uint32, id: voidptr): voidptr
 cdef function WaitForSingleObject(handle: voidptr, milliseconds: uint32): uint32
 cdef function CloseHandle(handle: voidptr): int32
-cdef function AcquireSRWLockExclusive(lock: voidptr): nil
-cdef function ReleaseSRWLockExclusive(lock: voidptr): nil
+cdef function AcquireSRWLockExclusive(lock: voidptr)
+cdef function ReleaseSRWLockExclusive(lock: voidptr)
 
 local function entry(context: voidptr): uint32
     work(context as voidptr*)
@@ -221,7 +221,7 @@ end
 -- status says which counter, if any, lost an update.
 local THREADS = ATOMICS .. [[
 cdef function calloc(count: uint64, size: uint64): voidptr
-cdef function free(p: voidptr): nil
+cdef function free(p: voidptr)
 
 local function work(context: voidptr*): nil
     local added = context[0] as int64*
