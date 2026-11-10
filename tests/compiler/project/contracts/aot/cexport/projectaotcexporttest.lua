@@ -85,30 +85,6 @@ function M.cCallsAotExportsFromTheStaticArchive()
     run(dir, program)
 end
 
---- The same functions, from the shared library: a C program links it and
---- the loader resolves the exports. On Windows the DLL loads into a process
---- that carries no Lua at all.
-function M.cCallsAotExportsFromTheSharedLibrary()
-    local dir = library("shared")
-    local lib = dir .. "/out/lib"
-    local shared = lib .. "/" .. libraryName("default_aot")
-    assert(exists(shared), "the shared library is the target's AOT library")
-    local command
-    local program
-    if jit.os == "Windows" then
-        -- Beside the DLL, which is where Windows looks first.
-        program = lib .. "/main.exe"
-        command = ("cd '%s' && %s -std=c11 -o '%s' main.c '%s'"):format(dir, compiler(), program, shared)
-    else
-        program = dir .. "/main"
-        command = (
-            "cd '%s' && %s -std=c11 -o '%s' main.c -L'%s' -ldefault_aot -Wl,-rpath,'%s'"
-        ):format(dir, compiler(), program, lib, lib)
-    end
-    testAssert.eq(os.execute(command), 0, command)
-    run(dir, program)
-end
-
 --- The names `shared`'s export table publishes, as the platform's own tools
 --- read it: `nm -D` on ELF, `nm -gU` on Mach-O and `objdump -p` on PE.
 local function exported(shared)
@@ -142,12 +118,10 @@ local function exported(shared)
     return names, text
 end
 
---- A shared library publishes its C names and the `ks_` symbols its Lua
---- wrappers resolve, and nothing else: not the Windows binding's Lua API jump
---- stubs, its entry point or its stack probe.
-function M.theSharedLibraryPublishesOnlyItsCNamesAndWrapperSymbols()
-    local dir = library("shared")
-    local shared = dir .. "/out/lib/" .. libraryName("default_aot")
+--- `shared` publishes its C names and the `ks_` symbols its Lua wrappers
+--- resolve, and nothing else: not the Windows binding's Lua API jump stubs,
+--- its entry point or its stack probe.
+local function publishesOnlyItsCNamesAndWrapperSymbols(shared)
     local names, text = exported(shared)
     assert(names.game_add and names.game_scale, "the C names are published:\n" .. text)
     for name in pairs(names) do
@@ -159,7 +133,32 @@ function M.theSharedLibraryPublishesOnlyItsCNamesAndWrapperSymbols()
     for _, internal in ipairs({"ks_dll_main", "lua_gettop", "___chkstk_ms", "ks_lua_slot_lua_gettop"}) do
         assert(not names[internal], internal .. " is internal to the library:\n" .. text)
     end
-    remove(dir)
+end
+
+--- The same functions, from the shared library: a C program links it and
+--- the loader resolves the exports. On Windows the DLL loads into a process
+--- that carries no Lua at all. The library publishes those exports and what
+--- its wrappers resolve, and nothing more.
+function M.cCallsAotExportsFromTheSharedLibrary()
+    local dir = library("shared")
+    local lib = dir .. "/out/lib"
+    local shared = lib .. "/" .. libraryName("default_aot")
+    assert(exists(shared), "the shared library is the target's AOT library")
+    publishesOnlyItsCNamesAndWrapperSymbols(shared)
+    local command
+    local program
+    if jit.os == "Windows" then
+        -- Beside the DLL, which is where Windows looks first.
+        program = lib .. "/main.exe"
+        command = ("cd '%s' && %s -std=c11 -o '%s' main.c '%s'"):format(dir, compiler(), program, shared)
+    else
+        program = dir .. "/main"
+        command = (
+            "cd '%s' && %s -std=c11 -o '%s' main.c -L'%s' -ldefault_aot -Wl,-rpath,'%s'"
+        ):format(dir, compiler(), program, lib, lib)
+    end
+    testAssert.eq(os.execute(command), 0, command)
+    run(dir, program)
 end
 
 --- The link publishes what it is told to and hides every other global
