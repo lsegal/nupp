@@ -396,6 +396,8 @@ local RESULT_TYPED = opcodes({
 local RESULT_ONLY = opcodes({{7}, {11}, {19, 30}, {32, 33}, {248}})
 local TYPES = opcodes({{19, 24}, {28, 30}, {32, 33}})
 local NUMERIC_TYPES = opcodes({{20, 24}})
+-- Vectors, matrices, arrays, structs and pointers.
+local COMPOSITE_TYPES = opcodes({{23, 24}, {28, 30}, {32}})
 -- Conversions, arithmetic, relational, logical and bit instructions: naga
 -- takes the scalar kind of their result and operand types without checking
 -- there is one.
@@ -437,6 +439,18 @@ const NON_SEMANTIC_DEBUG_INFO = "NonSemantic.Shader.DebugInfo.100"
 -- naga builds one expression per element of an array `OpCompositeInsert`
 -- indexes, whichever element it selects.
 const MAX_INSERT_ELEMENTS = 65536
+-- naga, wgpu-native and the driver recurse once per nested block and per type
+-- level, on the caller's stack. On a 2 MiB stack naga's validator overflows at
+-- about 1360 nested selections and an NVIDIA Vulkan driver at about 14000
+-- nested structs.
+const MAX_NESTING = 128
+
+-- Refuses nesting past `MAX_NESTING` levels.
+local function checknesting(what: string, depth: integer): nil
+    if depth > MAX_NESTING then
+        fail(("SPIR-V %s nests %d deep; at most %d levels are supported"):format(what, depth, MAX_NESTING))
+    end
+end
 
 -- Whether a SPIR-V literal string starting at word `from` ends in word `last`.
 local function stringEndsAt(words: any, from: integer, last: integer): boolean
@@ -593,6 +607,11 @@ end
 ---   which is where every branch and merge goes; a call names a function.
 --- - An atomic's pointer reaches an integer or float through structs and
 ---   arrays alone.
+--- - Blocks and types nest at most `MAX_NESTING` deep, so that nothing that
+---   recurses over them overflows the stack. naga gives every branch of an
+---   `OpBranchConditional` and every switch case its own nested block, merge
+---   instruction or not, and a loop's body one more; a merge block continues
+---   its header's.
 export function checkstructure(words: any, count: integer): nil
     if count < 5 then
         return
@@ -608,6 +627,21 @@ export function checkstructure(words: any, count: integer): nil
     local labels: {[integer]: boolean} = {}
     local targets: {{integer}} = {}
     local phis: {{integer}} = {}
+    -- How deep each type nests, and how deep naga nests each label's block,
+    -- with the merge and continue targets naga reads branches to as leaving a
+    -- construct rather than entering a block.
+    local typeDepths: {[integer]: integer} = {}
+    local depths: {[integer]: integer} = {}
+    local mergers: {[integer]: boolean} = {}
+    local depth: integer = 0
+    -- A branch from the current block opening a block one deeper. naga keeps
+    -- a switch case's earlier depth, but not a conditional branch's.
+    local function enter(label: integer, at: integer, keep: boolean): nil
+        checknesting(("control flow at word %d"):format(at), depth + 1)
+        if not mergers[label] and not (keep and depths[label] ~= nil) then
+            depths[label] = depth + 1
+        end
+    end
     for _, instruction in ipairs(spirvInstructions(words, count)) do
         local op, first, last = instruction[1], instruction[2], instruction[3]
         local operands = last - first + 1
@@ -648,6 +682,20 @@ export function checkstructure(words: any, count: integer): nil
                 fail(("SPIR-V id %%%d is defined twice"):format(result))
             end
             defs[result] = {op = op, type = resultType, scope = scope, at = at, first = first, last = last}
+            if COMPOSITE_TYPES[op] and operands >= 2 then
+                -- A pointer adds no level to what it points at; a vector,
+                -- matrix, array or struct adds one to what it holds.
+                local nested: integer = 0
+                if op == OP_TYPE_POINTER then
+                    nested = operands >= 3 and typeDepths[words[first + 2]] or 0
+                else
+                    for index = first + 1, op == OP_TYPE_STRUCT and last or first + 1 do
+                        nested = math.max(nested, (typeDepths[words[index]] or 0) + 1) as integer
+                    end
+                end
+                checknesting(("type %%%d"):format(result), nested)
+                typeDepths[result] = nested
+            end
         end
 
         if op == OP_STRING or op == OP_SOURCE_EXTENSION then
@@ -709,10 +757,13 @@ export function checkstructure(words: any, count: integer): nil
             functions += 1
             scope = functions
             labels, targets, phis = {}, {}, {}
+            depths, mergers, depth = {}, {}, 0
         elseif op == OP_FUNCTION_CALL and operands >= 3 then
             calls[#calls + 1] = {words[first + 2], at}
         elseif op == OP_LABEL and operands >= 1 then
             labels[words[first]] = true
+            -- naga puts a block no branch has named yet at the top.
+            depth = depths[words[first]] or 0
         elseif op == OP_PHI then
             if operands < 4 or operands % 2 ~= 0 then
                 wordCount(op, at)
@@ -735,17 +786,42 @@ export function checkstructure(words: any, count: integer): nil
                 )
             end
             targets[#targets + 1] = {words[first + 1], at}
+            enter(words[first + 1], at, true)
             for index = first + 3, last, 2 do
                 targets[#targets + 1] = {words[index], at}
+                enter(words[index], at, true)
             end
         elseif op == OP_BRANCH or op == OP_SELECTION_MERGE then
-            targets[#targets + 1] = {words[first], at}
+            local target: integer = words[first]
+            targets[#targets + 1] = {target, at}
+            if op == OP_SELECTION_MERGE then
+                depths[target] = depths[target] or depth
+                mergers[target] = true
+            elseif not mergers[target] then
+                depths[target] = depths[target] or depth
+            end
         elseif op == OP_BRANCH_CONDITIONAL and operands >= 3 then
-            targets[#targets + 1] = {words[first + 1], at}
-            targets[#targets + 1] = {words[first + 2], at}
+            local yes: integer, no: integer = words[first + 1], words[first + 2]
+            targets[#targets + 1] = {yes, at}
+            targets[#targets + 1] = {no, at}
+            if yes ~= no then
+                enter(yes, at, false)
+                enter(no, at, false)
+            elseif not mergers[yes] then
+                depths[yes] = depth
+            end
         elseif op == OP_LOOP_MERGE and operands >= 2 then
-            targets[#targets + 1] = {words[first], at}
-            targets[#targets + 1] = {words[first + 1], at}
+            local merge: integer, continuing: integer = words[first], words[first + 1]
+            targets[#targets + 1] = {merge, at}
+            targets[#targets + 1] = {continuing, at}
+            depths[merge] = depths[merge] or depth
+            mergers[merge] = true
+            -- The rest of the header, and the continuing block beside the
+            -- body, sit in the loop.
+            depth += 1
+            checknesting(("control flow at word %d"):format(at), depth)
+            depths[continuing] = depths[continuing] or depth
+            mergers[continuing] = true
         elseif op == OP_FUNCTION_END then
             for _, target in ipairs(targets) do
                 if not labels[target[1]] then
