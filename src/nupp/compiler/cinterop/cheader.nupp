@@ -477,7 +477,7 @@ local function dependencyPaths(text, sourcePath)
 end
 
 local function preprocessHeader(path, opts)
-    local depPath = os.tmpname()
+    local depPath = hostService("process").tmpname()
     local argv = compilerArgv(opts, "-E", "-MD", "-MF", depPath, "-MT", "nupp_header", "-xc", path)
     local code, expanded = hostService("process").capture(argv)
     local depText = hostService("fs").readFile(depPath)

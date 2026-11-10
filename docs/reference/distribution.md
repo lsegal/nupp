@@ -302,7 +302,10 @@ in the tree carries their notices. `scripts/toolchain` compares each committed
 copy against the source it has just verified by digest and fails the build when
 they differ. `scripts/rust-dependency-notices --write` refreshes the Cargo
 aggregate; the test suite refuses a lockfile whose third-party package inventory
-is not represented there.
+is not represented there. The prebuilt wgpu-native library staged beside GPU
+programs carries its own Rust graph, so `scripts/rust-dependency-notices --write
+wgpu-native` generates a second notice from the lock file of the pinned
+`WGPU_VERSION`, and the suite refuses a pin that notice was not generated from.
 
 ## Signing for macOS
 

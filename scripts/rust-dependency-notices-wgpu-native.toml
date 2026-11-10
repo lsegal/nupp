@@ -1,0 +1,19 @@
+# cargo-about's policy for wgpu-native's lock file. It is wgpu's graph rather
+# than Nupp's, so it accepts what that release ships rather than widening the
+# policy in about.toml.
+accepted = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+ignore-build-dependencies = false
+ignore-dev-dependencies = false
+ignore-transitive-dependencies = false
+
+[private]
+ignore = true
