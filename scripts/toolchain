@@ -39,6 +39,7 @@ usage: scripts/toolchain COMPONENT...
        scripts/toolchain --prefix
 
 Components: luajit luarocks lpeg lpeg-source stage0 migration-stage0 llvm wgpu
+            wgpu-static [PLATFORM]
             browser-sources browser-emulator browser-guest
             native-rust FEATURES
             rust-vendor OUTPUT
@@ -2123,21 +2124,28 @@ build_wgpu() {
     fi
     case "$wgpu_platform" in
         x86_64-unknown-linux-gnu)
-            WGPU_TARGET=linux-x86_64; wgpu_digest=$WGPU_SHA256_LINUX_X86_64; wgpu_file=libwgpu_native.so ;;
+            WGPU_TARGET=linux-x86_64; wgpu_digest=$WGPU_SHA256_LINUX_X86_64; wgpu_file=libwgpu_native.so
+            wgpu_static_file=libwgpu_native.a ;;
         aarch64-unknown-linux-gnu)
-            WGPU_TARGET=linux-aarch64; wgpu_digest=$WGPU_SHA256_LINUX_AARCH64; wgpu_file=libwgpu_native.so ;;
+            WGPU_TARGET=linux-aarch64; wgpu_digest=$WGPU_SHA256_LINUX_AARCH64; wgpu_file=libwgpu_native.so
+            wgpu_static_file=libwgpu_native.a ;;
         aarch64-apple-darwin)
-            WGPU_TARGET=macos-aarch64; wgpu_digest=$WGPU_SHA256_MACOS_AARCH64; wgpu_file=libwgpu_native.dylib ;;
+            WGPU_TARGET=macos-aarch64; wgpu_digest=$WGPU_SHA256_MACOS_AARCH64; wgpu_file=libwgpu_native.dylib
+            wgpu_static_file=libwgpu_native.a ;;
         x86_64-apple-darwin)
-            WGPU_TARGET=macos-x86_64; wgpu_digest=$WGPU_SHA256_MACOS_X86_64; wgpu_file=libwgpu_native.dylib ;;
+            WGPU_TARGET=macos-x86_64; wgpu_digest=$WGPU_SHA256_MACOS_X86_64; wgpu_file=libwgpu_native.dylib
+            wgpu_static_file=libwgpu_native.a ;;
         x86_64-pc-windows-msvc|x86_64-pc-windows-gnu)
-            WGPU_TARGET=windows-x86_64-gnu; wgpu_digest=$WGPU_SHA256_WINDOWS_X86_64_GNU; wgpu_file=wgpu_native.dll ;;
+            WGPU_TARGET=windows-x86_64-gnu; wgpu_digest=$WGPU_SHA256_WINDOWS_X86_64_GNU; wgpu_file=wgpu_native.dll
+            wgpu_static_file=libwgpu_native.a ;;
         aarch64-pc-windows-msvc)
-            WGPU_TARGET=windows-aarch64-msvc; wgpu_digest=$WGPU_SHA256_WINDOWS_AARCH64_MSVC; wgpu_file=wgpu_native.dll ;;
+            WGPU_TARGET=windows-aarch64-msvc; wgpu_digest=$WGPU_SHA256_WINDOWS_AARCH64_MSVC; wgpu_file=wgpu_native.dll
+            wgpu_static_file=wgpu_native.lib ;;
         *) die "wgpu-native $WGPU_VERSION publishes no library for $wgpu_platform" ;;
     esac
     out="$CACHE/wgpu/$wgpu_digest"
     WGPU_LIBRARY="$out/$wgpu_file"
+    wgpu_name="wgpu-$WGPU_TARGET-$WGPU_VERSION"
     [ -f "$out/.complete" ] && [ -f "$WGPU_LIBRARY" ] && return 0
     take_lock "wgpu-$wgpu_digest" "$out/.complete" || return 0
     if [ -f "$out/.complete" ] && [ -f "$WGPU_LIBRARY" ]; then
@@ -2145,7 +2153,7 @@ build_wgpu() {
         return 0
     fi
     command -v unzip >/dev/null 2>&1 || die "unpacking wgpu-native needs unzip"
-    name="wgpu-$WGPU_TARGET-$WGPU_VERSION"
+    name=$wgpu_name
     file=$(archive "$name" "$(expand_pin "$WGPU_URL")" "$wgpu_digest" .zip)
     staging="$out.$$"
     rm -rf "$staging"
@@ -2157,6 +2165,48 @@ build_wgpu() {
     mv "$staging/lib/$wgpu_file" "$WGPU_LIBRARY"
     rm -rf "$staging"
     printf 'wgpu-native %s %s\n' "$WGPU_VERSION" "$WGPU_TARGET" > "$out/.complete"
+    release_lock
+}
+
+# The same release's static library, which a standalone program links in
+# rather than loading the shared one. It carries its own copy of Rust's
+# standard library, whose symbols are hashed apart from the runtime's except
+# for one: the unwinder's personality routine, which both define unmangled. The
+# staged copy has that name replaced everywhere it appears, byte for byte at
+# the same length, so wgpu-native unwinds through its own routine and the link
+# sees one definition of each.
+WGPU_STATIC=""
+build_wgpu_static() {
+    build_wgpu "${1:-}"
+    wgpu_out=$out
+    WGPU_STATIC="$wgpu_out/$wgpu_static_file"
+    [ -f "$wgpu_out/.static-complete" ] && [ -f "$WGPU_STATIC" ] && return 0
+    # Before the lock: a run holds one lock at a time.
+    build_luajit
+    take_lock "wgpu-static-$wgpu_digest" "$wgpu_out/.static-complete" || return 0
+    if [ -f "$wgpu_out/.static-complete" ] && [ -f "$WGPU_STATIC" ]; then
+        release_lock
+        return 0
+    fi
+    file=$(archive "$wgpu_name" "$(expand_pin "$WGPU_URL")" "$wgpu_digest" .zip)
+    staging="$wgpu_out.static.$$"
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    unzip -q -o "$file" "lib/$wgpu_static_file" -d "$staging" \
+        || die "$wgpu_name.zip did not contain lib/$wgpu_static_file"
+    WGPU_STATIC_IN=$(native_path "$staging/lib/$wgpu_static_file") \
+        WGPU_STATIC_OUT=$(native_path "$staging/$wgpu_static_file") \
+        "$PREFIX/luajit/bin/luajit" -e '
+            local input = assert(io.open(os.getenv("WGPU_STATIC_IN"), "rb"))
+            local bytes = input:read("*a")
+            input:close()
+            local output = assert(io.open(os.getenv("WGPU_STATIC_OUT"), "wb"))
+            assert(output:write((bytes:gsub("rust_eh_personality", "nupp_wgpu_eh_person"))))
+            assert(output:close())
+        ' || die "cannot stage the static library from $wgpu_name.zip"
+    mv "$staging/$wgpu_static_file" "$WGPU_STATIC"
+    rm -rf "$staging"
+    printf 'wgpu-native %s %s static\n' "$WGPU_VERSION" "$WGPU_TARGET" > "$wgpu_out/.static-complete"
     release_lock
 }
 
@@ -2184,6 +2234,14 @@ case "$1" in
             *)   build_wgpu ;;
         esac
         native_path "$WGPU_LIBRARY"
+        exit 0
+        ;;
+    wgpu-static)
+        case "${2:-}" in
+            *-*) build_wgpu_static "$2" ;;
+            *)   build_wgpu_static ;;
+        esac
+        native_path "$WGPU_STATIC"
         exit 0
         ;;
     native-rust)
