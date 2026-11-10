@@ -172,7 +172,7 @@ function M.theLinkHidesAGlobalDefinitionItsListLeavesOut()
     local ir = dir .. "/unit.ll"
     write(ir, "define i32 @listed_entry() {\n  ret i32 1\n}\n\ndefine i32 @ks_internal_helper() {\n  ret i32 2\n}\n")
     local object = dir .. "/unit.o"
-    local compileErr = aotllvm.compileMany({aotllvm.Unit(ir = ir, triple = triple, tier = "baseline", object = object)})
+    local compileErr = aotllvm.compileMany({{ir = ir, triple = triple, tier = "baseline", object = object}})
     assert(compileErr == nil, compileErr)
     local shared = dir .. "/listed" .. suffix
     local linkErr = aotllvm.link(triple, {object}, shared, dir, {"listed_entry"})
