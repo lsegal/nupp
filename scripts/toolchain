@@ -894,6 +894,9 @@ select_host_features() {
             native-compression|compression)
                 host_cargo_features="$host_cargo_features,native-compression"
                 ;;
+            native-panic-probe)
+                host_cargo_features="$host_cargo_features,native-panic-probe"
+                ;;
             native-codegen|codegen)
                 if codegen_wanted; then
                     host_cargo_features="$host_cargo_features,native-codegen"

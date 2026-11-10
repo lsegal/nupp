@@ -33,4 +33,6 @@ native-tls = ["nupp-native/tls"]
 native-checksum = []
 native-compression = ["nupp-native/compression"]
 native-codegen = ["nupp-native/codegen"]
+# The provider's test-only panic probe; no release build selects it.
+native-panic-probe = ["nupp-native/panic-probe"]
 workers = []

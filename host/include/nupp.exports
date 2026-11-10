@@ -338,6 +338,10 @@ nuppNativeProcessStreamWrite
 nuppNativeProcessStreamRelease
 nuppNativeProcessWait
 
+[native-panic-probe]
+# The provider's test-only panic probe, which no release build selects.
+nuppNativePanicProbe
+
 [native-codegen]
 # The code generator, declared by the compiler rather than a header.
 nuppCodegenArchive

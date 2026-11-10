@@ -114,6 +114,11 @@ NUPP_NATIVE_EXPORT int32_t nuppNativeRandomBytes(uint8_t *output, size_t length)
 NUPP_NATIVE_EXPORT int32_t nuppNativeXxh64Digest(
     const uint8_t *data, size_t length, uint8_t *output, size_t capacity);
 
+/* Test-only: defined only by a provider built with its panic-probe feature,
+ * which no release selects. It panics inside the export boundary, so it
+ * returns NUPP_NATIVE_INTERNAL with the panic as the last error. */
+NUPP_NATIVE_EXPORT int32_t nuppNativePanicProbe(void);
+
 /* Present when NUPP_NATIVE_FEATURE_READINESS is set. One process-wide
  * generation that every family advances when something a caller could be
  * waiting for changes: a socket or TLS session moves, a file transfer
