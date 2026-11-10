@@ -1,6 +1,7 @@
 module nupp.tools.cli.exportc
 
--- `nupp export-c`: canonical C declarations for ordinary Nupp structs.
+-- `nupp export-c`: canonical C declarations for ordinary Nupp structs, and
+-- prototypes for the C functions a Nupp library imports or exports.
 
 local usageError = require("nupp.tools.cli.error").forCommand("export-c")
 local cliModule = require("io.cli")
@@ -29,6 +30,67 @@ local function walk(node: any, visit: function(any, any): nil, context: any)
     for _, child in ipairs(node) do
         walk(child, visit, context)
     end
+end
+
+-- The C type an `@aot` entry passes a value of this type as. Spelled from the
+-- AOT entry ABI rather than from cdef's: an `integer` crosses an entry as the
+-- double Lua holds it in, not as the `int32_t` a C field would declare.
+local ENTRY_SCALARS: {
+    [string]: string
+} = {
+    number = "number",
+    integer = "number",
+    float = "float",
+    int32 = "int32",
+    uint32 = "uint32",
+    int64 = "int64",
+    uint64 = "uint64",
+    boolean = "boolean",
+}
+
+local function entryScalar(t: any): any?
+    while t and (t.tag == "affine" or t.tag == "borrowed" or t.tag == "literal") do
+        t = t.tag == "literal" and t.base or t.inner
+    end
+    local tag = t and ENTRY_SCALARS[t.tag] or nil
+
+    return tag and {tag = tag} or nil
+end
+
+-- The C signature an `@aot(export = ...)` function is published with, or nil and
+-- why it has none. Scalars only: a span crosses the entry as a pointer and a
+-- count that lowering lays out, and several results as a struct it fills.
+local function exportedSignature(node: any): (any?, string?)
+    local body = node.body
+    local signature = body and body.signatureType or nil
+    if not signature then
+        return nil, "the checker did not resolve its signature"
+    end
+    local params: {any} = {}
+    for index, parameter in ipairs(body.params or {}) do
+        local name = parameter.name and parameter.name.text or ("arg" .. tostring(index))
+        local t = entryScalar((signature.params or {})[index])
+        if not t then
+            return nil, ("parameter %q is not a number, float, boolean or fixed-width integer"):format(name)
+        end
+        params[#params + 1] = {name = name, type = t, mode = "plain"}
+    end
+    local rets = signature.rets or {}
+    if #rets == 1 and rets[1] and rets[1].tag == "nil" then
+        rets = {}
+    end
+    if #rets > 1 then
+        return nil, "it returns several values"
+    end
+    local result = nil
+    if #rets == 1 then
+        result = entryScalar(rets[1])
+        if not result then
+            return nil, "its result is not a number, float, boolean or fixed-width integer"
+        end
+    end
+
+    return require("nupp.compiler.cinterop.cabi").functionRecord(body.aotExport, params, result, false, "c"), nil
 end
 
 local function diagnostic(path: string, node: any, code: string, message: string, help: string?): any
@@ -100,6 +162,9 @@ local function run(options: any): integer
     local checker = require("nupp.compiler.check")
     local allDiagnostics: {any} = {}
     local types, functions, sites = {}, {}, {}
+    -- Selection -> why that `@aot(export)` function has no C signature.
+    local unexportable: {[string]: string} = {}
+    local unexportableFiles: {[string]: string} = {}
 
     -- A struct type does not say which of its fields are bitfields, but the field's
     -- declaration does, and the checker names each field by that declaration's token.
@@ -111,6 +176,15 @@ local function run(options: any): integer
         if node.kind == "cdefFunc" and node.name and node.cAbiSignature then
             local qualified = (moduleName and moduleName .. "." or "") .. node.name.text
             functions[qualified], sites[qualified] = node.cAbiSignature, node
+        elseif node.kind == "localFuncStmt" and node.name and node.body and node.body.aotExport then
+            local qualified = (moduleName and moduleName .. "." or "") .. node.name.text
+            local signature, why = exportedSignature(node)
+            sites[qualified] = node
+            if signature then
+                functions[qualified] = signature
+            else
+                unexportable[qualified], unexportableFiles[qualified] = tostring(why), context.path
+            end
         elseif node.kind == "fieldDecl" and node.name and node.bitWidth then
             bitfields[node.name] = node.bitWidth
             bitfieldFiles[node.name] = context.path
@@ -245,6 +319,17 @@ local function run(options: any): integer
             if t and t.tag == "nominal" and t.declKind == "struct" and not t.cdefName then
                 describe(t, cabi.identity(t))
             end
+        elseif unexportable[selection] then
+            allDiagnostics[
+                #allDiagnostics + 1
+            ] = diagnostic(
+                unexportableFiles[selection] as string,
+                sites[selection],
+                "NUPP2203",
+                ("cannot export %s to C: %s"):format(selection, unexportable[selection] as string),
+                "export a function whose parameters and result are scalars"
+            )
+            failed = true
         else
             allDiagnostics[
                 #allDiagnostics + 1
@@ -253,7 +338,7 @@ local function run(options: any): integer
                 nil,
                 "NUPP2101",
                 "selected C export does not exist: " .. selection,
-                "select a module-qualified exported struct or cdef function from the named sources"
+                "select a module-qualified exported struct, cdef function or @aot(export) function from the named sources"
             )
             failed = true
         end
@@ -299,11 +384,12 @@ local function run(options: any): integer
     return failed and 1 or 0
 end
 
---- Export canonical C declarations for Nupp structs.
+--- Export canonical C declarations for Nupp structs and C functions.
 ---
 --- Examples:
 ---
 ---     nupp export-c -o include/game.h src/game.nupp game.Position
+---     nupp export-c -o include/game.h src/game.nupp game.add
 ---     nupp export-c --target library -o include/library.h src/library.nupp library.Widget
 ---     nupp export-c --json -o include/game.h src/game.nupp game.Position
 @cli("export-c")
