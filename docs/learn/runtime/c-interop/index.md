@@ -24,8 +24,10 @@ Declarations arrive by one of four routes:
 - `bindings.bridge` in `nupp.lua`, when the header holds `static inline`
   functions or typed function-like macros.
 
-Going the other way, `nupp export-c` publishes ordinary Nupp struct layouts for
-C to consume.
+Going the other way, `nupp export-c` publishes ordinary Nupp struct layouts and
+`@aot` functions for C to consume. A whole program can also be native: see
+[native programs](../../performance/ahead-of-time/native-programs.md) for an
+executable whose `main` is written in Nupp.
 
 ## Hand-write a small binding
 

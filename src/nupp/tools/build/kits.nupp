@@ -78,6 +78,22 @@ function kits.identity(directory: string): string
     return hash.digest(directory .. "\0" .. text .. "\0" .. hash.digest(archive or ""))
 end
 
+--- The system libraries the kit at `directory` stubs for a provider `driver`
+--- that a standalone program links statically, as linker arguments, or nil
+--- when the kit has no stubs for it.
+function kits.providerLibraries(directory: string, driver: string): {string}?
+    local value = manifest(directory)
+    if value == nil or type(value.providers) ~= "table" or type(value.providers[driver]) ~= "table" then
+        return nil
+    end
+    local libraries: {string} = {}
+    for _, library in ipairs(value.providers[driver]) do
+        libraries[#libraries + 1] = tostring(library)
+    end
+
+    return libraries
+end
+
 --- The features a kit's runtime carries.
 local function features(directory: string): {[string]: boolean}
     local carried: {[string]: boolean} = {}
