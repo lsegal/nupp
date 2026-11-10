@@ -27,6 +27,7 @@ record placement.Slot
 
     --- A stored vector's lane count and IR element, `f32`, `u8`, ...
     lanes: integer?
+
     element: string?
 end
 
@@ -36,6 +37,7 @@ record placement.Placement
 
     --- Each field's offset and alignment, by name.
     offset: {[string]: integer}
+
     fieldAlignment: {[string]: integer}
 
     --- Where the last slot ends.
@@ -43,6 +45,7 @@ record placement.Placement
 
     --- The struct's size and alignment.
     size: integer
+
     alignment: integer
 
     --- The largest element width of any field, which is the alignment a

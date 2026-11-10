@@ -870,7 +870,7 @@ return game
     assert(
         header:find(
             "struct game_first_Pair {\n    float x;\n    uint8_t nupp_padding_1[12];\n"
-                .. "    GAME_H_ALIGNAS(16) float v[3];\n    uint8_t nupp_padding_2[4];\n    int16_t n;\n};",
+            .. "    GAME_H_ALIGNAS(16) float v[3];\n    uint8_t nupp_padding_2[4];\n    int16_t n;\n};",
             1,
             true
         ),

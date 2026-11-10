@@ -127,7 +127,9 @@ local function elementStruct(program: any, layoutName: string, key: string): (an
                 name = name .. "_"
             end
             taken[name] = true
-            fields[#fields + 1] = {
+            fields[
+                #fields + 1
+            ] = {
                 name = name,
                 cType = cabi.declaration({tag = "carray", elem = {tag = "uint8"}, count = slot.bytes}, name),
                 offset = slot.offset,
@@ -135,7 +137,7 @@ local function elementStruct(program: any, layoutName: string, key: string): (an
         else
             local t = nil
             if slot.lanes ~= nil then
-                t = {tag = "carray", elem = {tag = VECTOR_ELEMENTS[slot.element]}, count = slot.lanes}
+                t = {tag = "carray", elem = {tag = VECTOR_ELEMENTS[slot.element as string]}, count = slot.lanes}
             elseif field.sourceType and SPAN_STORAGE[field.sourceType] then
                 t = {tag = field.sourceType}
             else
@@ -145,7 +147,9 @@ local function elementStruct(program: any, layoutName: string, key: string): (an
             if not cType then
                 return nil, ("field %s.%s has no C spelling"):format(layoutName, field.name)
             end
-            fields[#fields + 1] = {
+            fields[
+                #fields + 1
+            ] = {
                 name = field.name,
                 cType = cType,
                 offset = slot.offset,
@@ -446,7 +450,12 @@ local function run(options: any): integer
                     fatal = fatal or require("nupp.compiler.diagnostics").isFatal(one)
                 end
                 if #context.exports > 0 and not fatal then
-                    local signatures, refusals, why = exportedSignatures(source as string, path, result, layoutKey as string)
+                    local signatures, refusals, why = exportedSignatures(
+                        source as string,
+                        path,
+                        result,
+                        layoutKey as string
+                    )
                     for _, entry in ipairs(context.exports) do
                         local signature = signatures and signatures[entry.cName] or nil
                         if signature then
