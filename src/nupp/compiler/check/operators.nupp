@@ -762,12 +762,17 @@ export function install(c: state.Checker): state.ExprHandlers
                 c.diag("NUPP2003", node, "explicit SIMD bitwise operands need the vector or mask on the left")
                 return T.any
             end
+            -- A shift takes its width from its left operand alone: LuaJIT reads
+            -- a 64-bit count beside a number as a 32-bit word, so `1 << 3LL` is
+            -- a number. The other operators widen when either side is 64-bit.
+            local shift = op == "<<" or op == ">>" or op == "~>>"
+            local wideCount = shift and (rt.tag == "int64" or rt.tag == "uint64")
             local wide = lt.tag == "int64" and lt
                 or lt.tag == "uint64" and lt
-                or rt.tag == "int64" and rt
-                or rt.tag == "uint64" and rt
+                or not shift and rt.tag == "int64" and rt
+                or not shift and rt.tag == "uint64" and rt
                 or nil
-            capabilities.require(c, wide and "int64" or "bitops", opTok)
+            capabilities.require(c, (wide or wideCount) and "int64" or "bitops", opTok)
             if wide then
                 node.wideArithmetic = true
             end

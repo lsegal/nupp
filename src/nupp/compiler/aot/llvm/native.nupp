@@ -913,13 +913,8 @@ local function bitwise(
     local shift = op == "<<" or op == ">>" or op == "~>>"
     local wide = left.kind.llvm == "i64" or not shift and right.kind.llvm == "i64"
     if not wide then
-        if right.kind.llvm == "i64" then
-            refuse(
-                node,
-                "LuaJIT shifts a number by a 64-bit count as a 32-bit number, not the "
-                .. "64-bit integer this expression is checked as"
-            )
-        end
+        -- A number shifted by a 64-bit count reads the count's low word, as
+        -- `lj_carith_check64`'s result truncated to 32 bits.
         local a = word(body, left, lhs)
         local b = word(body, right, rhs)
         if shift then
