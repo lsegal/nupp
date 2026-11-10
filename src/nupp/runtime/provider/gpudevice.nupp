@@ -50,6 +50,23 @@ const OP_ENTRY_POINT = 15
 const OP_EXECUTION_MODE = 16
 const EXECUTION_MODEL_GL_COMPUTE = 5
 const EXECUTION_MODE_LOCAL_SIZE = 17
+const OP_TYPE_BOOL = 20
+const OP_TYPE_INT = 21
+const OP_TYPE_FLOAT = 22
+const OP_TYPE_VECTOR = 23
+const OP_TYPE_MATRIX = 24
+const OP_TYPE_ARRAY = 28
+const OP_TYPE_RUNTIME_ARRAY = 29
+const OP_TYPE_STRUCT = 30
+const OP_TYPE_POINTER = 32
+const OP_CONSTANT = 43
+const OP_SPEC_CONSTANT = 50
+const OP_DECORATE = 71
+const OP_MEMBER_DECORATE = 72
+const DECORATION_ARRAY_STRIDE = 6
+const DECORATION_OFFSET = 35
+-- The largest type naga lays out; its `MAX_TYPE_SIZE`.
+const MAX_TYPE_BYTES = 0x40000000
 
 local function array(values: {any}): {any}
     return require("serde.json").asarray(values)
@@ -191,11 +208,8 @@ local function spirvString(words: any, first: integer, last: integer): string
     return table.concat(bytes)
 end
 
---- Refuses a declared workgroup size that is not the one the entry point's
---- `LocalSize` execution mode compiles in. Dispatch geometry is computed from
---- the declared size, so a wrong one silently covers the wrong elements.
-export function checkworkgroupsize(words: any, count: integer, entryPoint: string, declared: {integer}): nil
-    -- The instructions after the five-word header, as opcode and operand span.
+-- The instructions after the five-word header, as opcode and operand span.
+local function spirvInstructions(words: any, count: integer): {{integer}}
     local instructions: {{integer}} = {}
     local at = math.min(5, count)
     while at < count do
@@ -206,6 +220,15 @@ export function checkworkgroupsize(words: any, count: integer, entryPoint: strin
         instructions[#instructions + 1] = {words[at] & 0xffff, at + 1, at + length - 1}
         at += length
     end
+
+    return instructions
+end
+
+--- Refuses a declared workgroup size that is not the one the entry point's
+--- `LocalSize` execution mode compiles in. Dispatch geometry is computed from
+--- the declared size, so a wrong one silently covers the wrong elements.
+export function checkworkgroupsize(words: any, count: integer, entryPoint: string, declared: {integer}): nil
+    local instructions = spirvInstructions(words, count)
     local entry: integer? = nil
     for _, instruction in ipairs(instructions) do
         local first, last = instruction[2], instruction[3]
@@ -237,6 +260,84 @@ export function checkworkgroupsize(words: any, count: integer, entryPoint: strin
                 )
             end
             return
+        end
+    end
+end
+
+-- `alignUp` over sizes taken from SPIR-V words, which may pass 2^32.
+local function roundUp(value: number, alignment: number): number
+    return math.ceil(value / alignment) * alignment
+end
+
+--- Refuses a type naga cannot lay out. wgpu-native compiles SPIR-V with naga,
+--- whose front end lays out every type read so far each time it reaches an
+--- array or a struct, and panics, aborting the process, on a scalar that is
+--- not a power-of-two number of bytes or an array larger than 1 GiB. Sizes and
+--- alignments follow naga's layouter.
+export function checklayout(words: any, count: integer): nil
+    local strides: {[integer]: number} = {}
+    local offsets: {[integer]: {[integer]: number}} = {}
+    local constants: {[integer]: number} = {}
+    -- Each type's size and alignment. A type naga refuses on its own has none.
+    local layouts: {[integer]: {number}} = {}
+    for _, instruction in ipairs(spirvInstructions(words, count)) do
+        local op, first, last = instruction[1], instruction[2], instruction[3]
+        local operands = last - first + 1
+        local id: integer = words[first]
+        if op == OP_DECORATE and operands >= 3 and words[first + 1] == DECORATION_ARRAY_STRIDE then
+            strides[id] = words[first + 2]
+        elseif op == OP_MEMBER_DECORATE and operands >= 4 and words[first + 2] == DECORATION_OFFSET then
+            local members = offsets[id] or {}
+            members[words[first + 1]] = words[first + 3]
+            offsets[id] = members
+        elseif (op == OP_CONSTANT or op == OP_SPEC_CONSTANT) and operands >= 3 then
+            local value: number = words[first + 2]
+            if operands >= 4 then
+                value += words[first + 3] * 0x100000000
+            end
+            constants[words[first + 1]] = value
+        elseif op == OP_TYPE_BOOL and operands >= 1 then
+            layouts[id] = {1, 1}
+        elseif (op == OP_TYPE_INT or op == OP_TYPE_FLOAT) and operands >= 2 then
+            local bits: integer = words[first + 1]
+            if bits ~= 8 and bits ~= 16 and bits ~= 32 and bits ~= 64 then
+                fail(("SPIR-V type %%%d has an unsupported %d-bit width"):format(id, bits))
+            end
+            layouts[id] = {bits / 8, bits / 8}
+        elseif op == OP_TYPE_VECTOR and operands >= 3 then
+            local component, size = layouts[words[first + 1]], words[first + 2]
+            if component and size >= 2 and size <= 4 then
+                layouts[id] = {size * component[1], (size == 3 and 4 or size) * component[2]}
+            end
+        elseif op == OP_TYPE_MATRIX and operands >= 3 then
+            local column, columns = layouts[words[first + 1]], words[first + 2]
+            if column and columns >= 2 and columns <= 4 then
+                layouts[id] = {columns * column[2], column[2]}
+            end
+        elseif op == OP_TYPE_POINTER and operands >= 1 then
+            layouts[id] = {4, 1}
+        elseif (op == OP_TYPE_ARRAY and operands >= 3) or (op == OP_TYPE_RUNTIME_ARRAY and operands >= 2) then
+            -- An array of images or samplers is a binding array, which has
+            -- no layout to check.
+            local element = layouts[words[first + 1]]
+            if element then
+                local length = op == OP_TYPE_ARRAY and (constants[words[first + 2]] or 0) or 1
+                local stride = strides[id] or roundUp(element[1], element[2])
+                if length > MAX_TYPE_BYTES or length * stride > MAX_TYPE_BYTES then
+                    fail(("SPIR-V array type %%%d is larger than the %d-byte type limit"):format(id, MAX_TYPE_BYTES))
+                end
+                layouts[id] = {length * stride, element[2]}
+            end
+        elseif op == OP_TYPE_STRUCT and operands >= 1 then
+            local placed = offsets[id] or {}
+            local span: number, alignment: number = 0, 1
+            for index = first + 1, last do
+                local member = layouts[words[index]] or {0, 1}
+                span = placed[index - first - 1] or roundUp(span, member[2])
+                span += member[1]
+                alignment = math.max(alignment, member[2])
+            end
+            layouts[id] = {roundUp(span, alignment), alignment}
         end
     end
 end
@@ -671,6 +772,9 @@ local function createKernel(context: any, descriptor: any): integer
     validateKernelDescriptor(context, descriptor)
     local words, count = spirvwords(descriptor.spirv)
     checkworkgroupsize(words, count, descriptor.entryPoint, descriptor.workgroupSize)
+    -- Nothing catches a panic inside wgpu-native, so a module naga's front end
+    -- would panic on is refused before it gets there.
+    checklayout(words, count)
     local library = context.lib
     library.wgpuDevicePushErrorScope(context.device, wgpu.ERROR_FILTER_VALIDATION)
     local entry: any = {
