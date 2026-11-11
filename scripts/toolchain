@@ -566,7 +566,8 @@ build_prebuilt() {
     staging="$out.$$"
     rm -rf "$staging"
     mkdir -p "$staging"
-    tar xzf "$file" -C "$staging" \
+    # From standard input: tar reads a drive-letter path as a remote host.
+    tar xzf - -C "$staging" < "$file" \
         || { rm -rf "$staging"; die "the $PREBUILT_TAG $prebuilt_label for $PREBUILT_TARGET did not unpack"; }
     [ -f "$staging/$prebuilt_marker" ] \
         || { rm -rf "$staging"; die "the $PREBUILT_TAG $prebuilt_label for $PREBUILT_TARGET has no $prebuilt_marker"; }
