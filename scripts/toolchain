@@ -609,9 +609,9 @@ codegen_archive() {
 # The compiler's own native provider, for a checkout that cannot run Cargo:
 # the pinned prebuilt code generator, which is a whole provider built with
 # PREBUILT_PROVIDER_FEATURES. `native-rust` answers with it when Cargo is not
-# there (NUPP_CARGO naming nothing, or no `cargo` on PATH) and a code
-# generator is pinned for this machine, or whenever NUPP_PREBUILT_PROVIDER=1
-# asks for it. That is how bin/nupp and the stage-zero compiler both start
+# there (NUPP_CARGO naming nothing, or neither `cargo` nor `rustup` on PATH)
+# and a code generator is pinned for this machine, or whenever
+# NUPP_PREBUILT_PROVIDER=1 asks for it. That is how bin/nupp and the stage-zero compiler both start
 # without Cargo: each asks `native-rust` for this provider, and neither knows
 # where the answer came from.
 #
@@ -623,7 +623,14 @@ codegen_archive() {
 prebuilt_provider_wanted() {
     [ "${NUPP_PREBUILT_PROVIDER:-}" = 1 ] && return 0
     [ "${NUPP_PREBUILT_PROVIDER:-}" = 0 ] && return 1
-    command -v "${NUPP_CARGO:-cargo}" >/dev/null 2>&1 && return 1
+    # Unnamed, Cargo is whatever select_rust_tools would find: rustup's exact
+    # binary when rustup is there, or `cargo` on PATH.
+    if [ -n "${NUPP_CARGO:-}" ]; then
+        command -v "$NUPP_CARGO" >/dev/null 2>&1 && return 1
+    else
+        command -v cargo >/dev/null 2>&1 && return 1
+        command -v rustup >/dev/null 2>&1 && return 1
+    fi
     prebuilt_pins
     [ -n "${PREBUILT_TAG:-}" ] && [ -n "$prebuilt_codegen_digest" ]
 }

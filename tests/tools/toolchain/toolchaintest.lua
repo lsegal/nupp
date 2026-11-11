@@ -1092,8 +1092,14 @@ function M.gpuIsAPinnedPrebuiltLibraryRatherThanAHostFeature()
     assert(not cargo:find("native-gpu", 1, true), "the host crate still has a GPU feature")
     assert(not runtime:find("native-gpu", 1, true), "the packaged host still advertises a GPU capability")
     assert(driver:find("build_wgpu", 1, true), "the toolchain cannot provision wgpu-native")
-    for _, platform in ipairs({"LINUX_X86_64", "LINUX_AARCH64", "MACOS_AARCH64", "MACOS_X86_64",
-        "WINDOWS_X86_64_GNU", "WINDOWS_AARCH64_MSVC"}) do
+    for _, platform in ipairs({
+        "LINUX_X86_64",
+        "LINUX_AARCH64",
+        "MACOS_AARCH64",
+        "MACOS_X86_64",
+        "WINDOWS_X86_64_GNU",
+        "WINDOWS_AARCH64_MSVC"
+    }) do
         assert(pins:find("\nWGPU_SHA256_" .. platform .. "=%x+\n"), "wgpu-native has no digest for " .. platform)
     end
     assert(driver:find("-e '^WGPU_'", 1, true), "a wgpu-native bump rebuilds the native toolchain")
@@ -1105,8 +1111,10 @@ function M.everyListedCodegenExportIsARustDefinition()
     -- A Windows checkout may translate the list's line endings.
     local list = read(ROOT .. "/host/include/nupp.exports"):gsub("\r\n", "\n")
     local codegen = read(ROOT .. "/native/crates/native/src/codegen.rs")
-    local section = assert(list:match("%[native%-codegen%]\n(.-)\n%[") or list:match("%[native%-codegen%]\n(.*)$"),
-        "the export list has no native-codegen section")
+    local section = assert(
+        list:match("%[native%-codegen%]\n(.-)\n%[") or list:match("%[native%-codegen%]\n(.*)$"),
+        "the export list has no native-codegen section"
+    )
     local stale = {}
     for line in section:gmatch("[^\n]+") do
         local name = line:match("^%s*(nupp[%w_]+)%s*$")
@@ -1582,8 +1590,9 @@ end
 -- suite made for Linux x86-64, fetched by a `curl` that answers from a table of
 -- hosts and logs each URL it was asked for. What the release host serves is the
 -- case's to say: "codegen" and "kit" are the archives, anything else is served
--- as is. Each archive's digest is pinned unless `pinned` replaces it.
-local function prebuiltFixture(serves, pinned)
+-- as is. Each archive's digest is pinned unless `pinned` replaces it. A
+-- code generator built as a whole provider lists its `features`.
+local function prebuiltFixture(serves, pinned, features)
     local directory = temporary()
     local root = directory .. "/root"
     local bin = directory .. "/bin"
@@ -1598,6 +1607,9 @@ local function prebuiltFixture(serves, pinned)
         assert(os.execute("mkdir -p " .. quote(path)) == 0)
     end
     write(directory .. "/codegen/libnupp_native.so", "a provider with the code generator\n")
+    if features then
+        write(directory .. "/codegen/features", features .. "\n")
+    end
     write(directory .. "/kit/kit.json", '{"target": "x86_64-unknown-linux-gnu"}\n')
     write(directory .. "/kit/libluajit-5.1.a", "a static LuaJIT\n")
     local digests = {}
@@ -1622,10 +1634,14 @@ local function prebuiltFixture(serves, pinned)
             "\nPREBUILT_KIT_URL=[^\n]*",
             "\nPREBUILT_KIT_URL='https://release.invalid/${PREBUILT_TAG}/nupp-kit-${PREBUILT_TARGET}.tar.gz'"
         )
-        :gsub("\nPREBUILT_CODEGEN_SHA256_LINUX_X86_64=[^\n]*", "\nPREBUILT_CODEGEN_SHA256_LINUX_X86_64="
-            .. (pinned.codegen or digests.codegen))
-        :gsub("\nPREBUILT_KIT_SHA256_LINUX_X86_64=[^\n]*", "\nPREBUILT_KIT_SHA256_LINUX_X86_64="
-            .. (pinned.kit or digests.kit))
+        :gsub(
+            "\nPREBUILT_CODEGEN_SHA256_LINUX_X86_64=[^\n]*",
+            "\nPREBUILT_CODEGEN_SHA256_LINUX_X86_64=" .. (pinned.codegen or digests.codegen)
+        )
+        :gsub(
+            "\nPREBUILT_KIT_SHA256_LINUX_X86_64=[^\n]*",
+            "\nPREBUILT_KIT_SHA256_LINUX_X86_64=" .. (pinned.kit or digests.kit)
+        )
     local driver = root .. "/scripts/toolchain"
     write(driver, read(DRIVER))
     write(root .. "/scripts/toolchain.pins", pinsText)
@@ -1694,8 +1710,12 @@ function M.thePrebuiltCodeGeneratorIsFetchedVerifiedAndCached()
         library:find("/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so", 1, true),
         "the code generator was not installed under its digest:\n" .. output
     )
-    assert(read(fixture.directory .. "/cache/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so")
-        == "a provider with the code generator\n", "the unpacked library is not the published one")
+    assert(
+        read(
+            fixture.directory .. "/cache/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so"
+        ) == "a provider with the code generator\n",
+        "the unpacked library is not the published one"
+    )
     assert(
         served(fixture) == "https://release.invalid/v9.9.9/nupp-codegen-x86_64-unknown-linux-gnu.tar.gz\n",
         "the code generator was not fetched from its pin:\n" .. served(fixture)
@@ -1712,19 +1732,27 @@ end
 -- by, and it is held to the same digest as a download.
 function M.thePrebuiltKitComesFromTheSourceDirectoryOffline()
     local fixture = prebuiltFixture({})
-    assert(os.execute(("cp %s %s"):format(
-        quote(fixture.directory .. "/nupp-kit-x86_64-unknown-linux-gnu.tar.gz"),
-        quote(fixture.directory .. "/supplied/")
-    )) == 0)
+    assert(
+        os.execute(
+            (
+                "cp %s %s"
+            ):format(
+                quote(fixture.directory .. "/nupp-kit-x86_64-unknown-linux-gnu.tar.gz"),
+                quote(fixture.directory .. "/supplied/")
+            )
+        ) == 0
+    )
     fixture.environment.NUPP_HOST_SOURCE_DIR = fixture.directory .. "/supplied"
     fixture.environment.NUPP_HOST_OFFLINE = "1"
     local status, output = run(fixture.environment, "prebuilt-kit x86_64-unknown-linux-gnu", fixture.driver)
     assert(status == 0, "the supplied kit was not used:\n" .. output)
     local kit = assert(output:match("([^\n]+)%s*$"))
     assert(kit:find("/prebuilt/kit/" .. fixture.digests.kit .. "$"), "the kit directory was not printed:\n" .. output)
-    assert(read(fixture.directory .. "/cache/prebuilt/kit/" .. fixture.digests.kit .. "/kit.json"):find(
-        "x86_64-unknown-linux-gnu", 1, true
-    ), "the kit was not unpacked")
+    assert(
+        read(fixture.directory .. "/cache/prebuilt/kit/" .. fixture.digests.kit .. "/kit.json")
+            :find("x86_64-unknown-linux-gnu", 1, true),
+        "the kit was not unpacked"
+    )
     assert(served(fixture) == "", "an offline build reached the network:\n" .. served(fixture))
     os.execute("rm -rf " .. quote(fixture.directory))
 end
@@ -1733,17 +1761,20 @@ end
 -- of it is cached for a later command to trust.
 function M.aPrebuiltCodeGeneratorWithAnotherDigestIsRefused()
     local expected = string.rep("0", 64)
-    local fixture = prebuiltFixture(
-        {["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"},
-        {codegen = expected}
-    )
+    local fixture = prebuiltFixture({["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"}, {
+        codegen = expected
+    })
     local status, output = run(fixture.environment, "prebuilt-codegen x86_64-unknown-linux-gnu", fixture.driver)
     assert(status ~= 0, "a code generator with another digest was used:\n" .. output)
     assert(output:find("expected " .. expected .. "; refusing", 1, true), "the refusal does not say why:\n" .. output)
-    assert(io.open(fixture.directory .. "/cache/prebuilt/codegen/" .. expected, "rb") == nil,
-        "a refused code generator was installed")
-    assert(io.open(fixture.directory .. "/cache/archives/nupp-codegen-x86_64-unknown-linux-gnu.tar.gz", "rb") == nil,
-        "a refused code generator was left in the archive cache")
+    assert(
+        io.open(fixture.directory .. "/cache/prebuilt/codegen/" .. expected, "rb") == nil,
+        "a refused code generator was installed"
+    )
+    assert(
+        io.open(fixture.directory .. "/cache/archives/nupp-codegen-x86_64-unknown-linux-gnu.tar.gz", "rb") == nil,
+        "a refused code generator was left in the archive cache"
+    )
     os.execute("rm -rf " .. quote(fixture.directory))
 end
 
@@ -1758,6 +1789,74 @@ function M.anUnpinnedPrebuiltIsRefusedWithoutAFetch()
     assert(served(fixture) == "", "an unpinned kit was fetched:\n" .. served(fixture))
     os.execute("rm -rf " .. quote(fixture.directory))
     assert(read(DRIVER):find("-e '^PREBUILT_'", 1, true), "a prebuilt pin bump rebuilds the native toolchain")
+end
+
+-- A fixture for `native-rust` on a machine with no Cargo: the code generator
+-- is this machine's prebuilt provider, so the driver is told it runs on Linux
+-- x86-64, the platform the fixture pins, whatever the suite runs on.
+local function cargolessFixture(features)
+    local fixture = prebuiltFixture({["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"}, nil, features)
+    write(
+        fixture.directory .. "/bin/uname",
+        [[#!/bin/sh
+case "${1:-}" in
+    -m) echo x86_64 ;;
+    *) echo Linux ;;
+esac
+]]
+    )
+    assert(os.execute("chmod +x " .. quote(fixture.directory .. "/bin/uname")) == 0)
+    fixture.environment.NUPP_CARGO = "/nonexistent"
+    fixture.environment.NUPP_RUSTC = "/nonexistent"
+
+    return fixture
+end
+
+-- With Cargo unusable, the compiler's own provider is the pinned prebuilt code
+-- generator, which a release builds as a whole provider. bin/nupp and stage
+-- zero both ask `native-rust` for it, so neither builds Rust (#172).
+function M.nativeRustWithoutCargoAnswersThePrebuiltProvider()
+    local fixture = cargolessFixture("base,codegen,uri")
+    for _, features in ipairs({"base,uri", "base,uri,codegen", "base,gpu,uri"}) do
+        local status, output = run(fixture.environment, "native-rust " .. features, fixture.driver)
+        assert(status == 0, "native-rust " .. features .. " needed Cargo:\n" .. output)
+        local library = assert(output:match("([^\n]+)%s*$"))
+        assert(
+            library:find("/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so", 1, true),
+            "native-rust did not answer the prebuilt provider:\n" .. output
+        )
+        assert(output:find("prebuilt native provider instead of Cargo", 1, true), "the choice is not said:\n" .. output)
+    end
+    assert(select(2, served(fixture):gsub("\n", "")) == 1, "the prebuilt provider was not fetched once")
+
+    local status, output = run(fixture.environment, "native-rust base,panic-probe", fixture.driver)
+    assert(status ~= 0, "a feature the prebuilt provider lacks was handed out:\n" .. output)
+    assert(output:find("has no panic-probe feature", 1, true), "the refusal does not say why:\n" .. output)
+    os.execute("rm -rf " .. quote(fixture.directory))
+end
+
+-- A code generator built with `codegen` alone, as releases before #172 were,
+-- has no `uri` and no features file. It is refused as a provider rather than
+-- handed to a compiler that fails on its first URI.
+function M.aCodeGeneratorWithoutProviderFeaturesIsNotAProvider()
+    local fixture = cargolessFixture(nil)
+    local status, output = run(fixture.environment, "native-rust base,uri", fixture.driver)
+    assert(status ~= 0, "a code-generator-only library was handed out as the provider:\n" .. output)
+    assert(output:find("carries no provider features", 1, true), "the refusal does not say why:\n" .. output)
+    os.execute("rm -rf " .. quote(fixture.directory))
+end
+
+-- NUPP_PREBUILT_PROVIDER=0 keeps the prebuilt provider out even without Cargo:
+-- the build asks for Cargo and fetches nothing.
+function M.thePrebuiltProviderCanBeDeclined()
+    local fixture = cargolessFixture("base,codegen,uri")
+    fixture.environment.NUPP_PREBUILT_PROVIDER = "0"
+    write(fixture.directory .. "/root/rust-toolchain.toml", read(ROOT .. "/rust-toolchain.toml"))
+    local status, output = run(fixture.environment, "native-rust base,uri", fixture.driver)
+    assert(status ~= 0, "a declined prebuilt provider was used:\n" .. output)
+    assert(output:find("no Cargo found", 1, true), "the build did not ask for Cargo:\n" .. output)
+    assert(served(fixture) == "", "a declined prebuilt provider was fetched:\n" .. served(fixture))
+    os.execute("rm -rf " .. quote(fixture.directory))
 end
 
 return M
