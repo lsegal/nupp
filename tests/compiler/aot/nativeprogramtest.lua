@@ -1265,17 +1265,25 @@ end
 local TARGETED = [[
 cdef function GetCurrentProcessId(): uint32
 cdef function getpid(): int32
-cdef function printf(borrows format: cstring, ...): int32
+cdef function puts(borrows s: cstring): int32
 
 local function main(): int32
+    puts(jit.os)
+    puts(jit.arch)
     if jit.os == "Windows" then
-        printf("%s %s %u\n", jit.os, jit.arch, GetCurrentProcessId())
+        if GetCurrentProcessId() == 0 then
+            return 1
+        end
         return 7
     elseif jit.os ~= "OSX" and not (jit.arch == "x64") then
-        printf("%s %s %d\n", jit.os, jit.arch, getpid())
+        if getpid() <= 0 then
+            return 1
+        end
         return 8
     else
-        printf("%s %s %d\n", jit.os, jit.arch, getpid())
+        if getpid() <= 0 then
+            return 1
+        end
         return 9
     end
 end
@@ -1340,7 +1348,7 @@ function M.aTargetedProgramRunsTheBranchForThisMachine()
         expected = 8
     end
     test.eq(status, expected, ran)
-    assert(ran:match("^" .. jit.os .. " " .. jit.arch .. " %d+$"), ran)
+    test.eq((ran:gsub("\r", "")), jit.os .. "\n" .. jit.arch)
 end
 
 -- An `and` whose left side the target settles leaves the right side

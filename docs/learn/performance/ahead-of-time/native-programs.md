@@ -309,15 +309,18 @@ targets' programs never refer to it:
 ```nupp
 cdef function GetCurrentProcessId(): uint32
 cdef function getpid(): int32
-cdef function printf(borrows format: cstring, ...): int32
+cdef function puts(borrows s: cstring): int32
 
 local function main(): int32
+    puts(jit.os)
     if jit.os == "Windows" then
-        printf("%s on %s, process %u\n", jit.os, jit.arch, GetCurrentProcessId())
+        if GetCurrentProcessId() == 0 then
+            return 1
+        end
     elseif jit.arch == "arm64" then
-        printf("%s on arm64, process %d\n", jit.os, getpid())
-    else
-        printf("%s on %s, process %d\n", jit.os, jit.arch, getpid())
+        puts("an arm64 POSIX system")
+    elseif getpid() <= 0 then
+        return 1
     end
     return 0
 end

@@ -611,13 +611,12 @@ local function targetQuery(program: Program, body: Body, node: any): string?
         return nil
     end
     local name = ((obj as cst.NameExpr).token as lexer.Token).text
-    if
-        name ~= "jit"
-            or variable(program, body, name) ~= nil
-            or program.imports[name] ~= nil
-            or program.aliases[name] ~= nil
-            or program.constants[name] ~= nil
-            or program.callees[name] ~= nil
+    if name ~= "jit"
+        or variable(program, body, name) ~= nil
+        or program.imports[name] ~= nil
+        or program.aliases[name] ~= nil
+        or program.constants[name] ~= nil
+        or program.callees[name] ~= nil
     then
         return nil
     end
@@ -654,7 +653,7 @@ local function targetTest(program: Program, body: Body, node: any): boolean?
         if (unop.op as lexer.Token).text ~= "not" then
             return nil
         end
-        local inner = targetTest(program, body, unop.expr)
+        local inner = targetTest(program, body, unop.operand)
         if inner == nil then
             return nil
         end
