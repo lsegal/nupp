@@ -737,14 +737,14 @@ end
 --- A standard-library call lowered in place, by its resolved identity, or nil.
 local intrinsic: function(Program, Body, cst.Call): Value?
 
---- Whether `node` reads a value of the program's own: a local, a parameter or
---- module state, or a field or element reached from one, rather than a name
---- the program does not define.
 --- The source `node` was written as, without the whitespace around it.
 local function spelled(node: any): string
     return (cst.textOf(node as cst.Child):match("^%s*(.-)%s*$")) as string
 end
 
+--- Whether `node` reads a value of the program's own: a local, a parameter or
+--- module state, or a field or element reached from one, rather than a name
+--- the program does not define.
 local function own(program: Program, body: Body, node: any): boolean
     local root = node
     while root ~= nil and (root.kind == "paren" or root.kind == "dotIndex" or root.kind == "bracketIndex") do
