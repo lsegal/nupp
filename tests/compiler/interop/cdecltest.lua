@@ -163,7 +163,7 @@ function M.membersWithoutANameAreCountedNotDropped()
     end
     testAssert.eq(byName.NuppCdeclAnonMember.anonymous, 1, "anonymous members")
     testAssert.eq(#byName.NuppCdeclAnonMember.fields, 2, "named fields")
-    testAssert.eq(byName.NuppCdeclAnonMember.size, ffi.sizeof("struct NuppCdeclAnonMember"))
+    testAssert.eq(byName.NuppCdeclAnonMember.size, ffi.sizeof(cdecl.checked("struct NuppCdeclAnonMember")))
     testAssert.eq(byName.NuppCdeclPadding.unnamed, 2, "unnamed bitfields")
     testAssert.eq(byName.NuppCdeclPadding.fields[2].bitPos, 0, "b starts the unit the zero-width field opened")
     testAssert.eq(byName.NuppCdeclPadding.fields[2].offset, 4)
@@ -281,6 +281,66 @@ function M.everyNameACheckedBlockDeclaresIsItsOwn()
     testAssert.eq(ffi.sizeof("NuppCdeclOwnCallback"), 8)
     testAssert.eq(ffi.sizeof("struct NuppCdeclOwnInner"), 8)
     testAssert.eq(ffi.C.NUPP_CDECL_OWN_A, 9)
+end
+
+-- A pinned header and its prelude declare under checked names too, so a runtime module
+-- that declares one of the same names afterwards gets the shape it wrote (#153).
+function M.aHeaderTypedefLeavesTheRuntimeItsOwnShape()
+    local parsed = assert(cdecl.inspect(
+        table.concat({
+            "typedef struct { int32_t header; } NuppCdeclHeaderShadowed;",
+            "void nupp_cdecl_header_use(NuppCdeclHeaderShadowed *p, NuppCdeclPreludeShadowed q);",
+        }, "\n"),
+        "typedef int8_t NuppCdeclPreludeShadowed;"
+    ))
+    -- the header still reads under the names it spelled
+    testAssert.eq(#parsed.structs, 1)
+    testAssert.eq(parsed.structs[1].name, "NuppCdeclHeaderShadowed")
+    testAssert.eq(parsed.structs[1].fields[1].name, "header")
+    testAssert.eq(#parsed.functions, 1)
+    testAssert.eq(parsed.functions[1].name, "nupp_cdecl_header_use")
+    testAssert.eq(parsed.functions[1].params[2].type.bits, 8)
+    ffi.cdef("typedef struct { int64_t pid; int32_t status; } NuppCdeclHeaderShadowed;")
+    ffi.cdef("typedef double NuppCdeclPreludeShadowed;")
+    local value = ffi.new("NuppCdeclHeaderShadowed")
+    value.pid = 7
+    testAssert.eq(tonumber(value.pid), 7)
+    testAssert.eq(ffi.sizeof("NuppCdeclHeaderShadowed"), 16)
+    testAssert.eq(ffi.sizeof("NuppCdeclPreludeShadowed"), 8)
+    -- and a checked program still reads the header's
+    local model = assert(cdecl.typeFromString(cdecl.checked("NuppCdeclHeaderShadowed")))
+    testAssert.eq(assert(cdecl.structById(model.id)).fields[1].name, "header")
+    testAssert.eq(cdecl.sizeof(cdecl.checked("NuppCdeclPreludeShadowed")), 1)
+end
+
+function M.aHeaderTagLeavesTheRuntimeFreeToDefineIt()
+    local parsed = assert(cdecl.inspect({"struct NuppCdeclHeaderTag { int32_t header; };"}))
+    testAssert.eq(#parsed.rejected, 0)
+    testAssert.eq(parsed.structs[1].name, "NuppCdeclHeaderTag")
+    -- redefining a tag LuaJIT holds raises, so this used to fail outright
+    ffi.cdef("struct NuppCdeclHeaderTag { double runtime; };")
+    testAssert.eq(ffi.sizeof("struct NuppCdeclHeaderTag"), 8)
+    local layout = assert(cdecl.layout("struct", "struct NuppCdeclHeaderTag inner;"))
+    testAssert.eq(layout.size, 4, "a layout check reads the header's tag")
+end
+
+-- Importing a header that was already pinned meets its own declarations under the
+-- checked names, and claims them back rather than the runtime's.
+function M.aHeaderMetTwiceIsStillItsOwn()
+    local text = table.concat({
+        "struct NuppCdeclTwice { int16_t header; };",
+        "int nupp_cdecl_twice(struct NuppCdeclTwice *p);",
+    }, "\n")
+    assert(cdecl.inspect(text))
+    ffi.cdef("struct NuppCdeclTwice { double runtime; }; int nupp_cdecl_twice(double x);")
+    local parsed = assert(cdecl.inspect({
+        "struct NuppCdeclTwice { int16_t header; };",
+        "int nupp_cdecl_twice(struct NuppCdeclTwice *p);",
+    }))
+    testAssert.eq(#parsed.structs, 1)
+    testAssert.eq(parsed.structs[1].fields[1].name, "header")
+    testAssert.eq(#parsed.functions, 1)
+    testAssert.eq(parsed.functions[1].params[1].type.kind, "pointer")
 end
 
 return M

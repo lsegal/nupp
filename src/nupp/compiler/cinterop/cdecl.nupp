@@ -1022,9 +1022,10 @@ export function inspect(text: string | {string}, prelude: (string | {string})?):
     local anonymousStructs = {}
     for id, entry in ctypes() do
         local kind = kindOf(entry.info)
-        -- A name is claimed back as the target meant it. One the renaming above gave the
-        -- checked suffix means the checked entry, so the process's own entry of that
-        -- name is the runtime's and not this header's; any other means the process's.
+        -- A name is claimed back as the target meant it. One the renaming above gave
+        -- the checked suffix means the checked entry, so the process's own entry of
+        -- that name is the runtime's and not this header's; any other means the
+        -- process's.
         local renamed = (kind == CT_STRUCT or kind == CT_ENUM) and tags or names
         if before[id] ~= entryFingerprint(entry)
             or (entry.name ~= nil and spelled[entry.name] and (entry.cname ~= nil) == (renamed[entry.name] == true))
