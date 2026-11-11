@@ -223,6 +223,13 @@ function M.aStoredPreludeIsNotRestoredOverAnotherIdentity()
     for name, value in pairs(package.loaded) do
         saved[name] = value
     end
+    -- Loading `nupp.runtime.standardio` again assigns its own functions over
+    -- `io`, and on Windows that took `io.popen` from the runner's Git Bash route
+    -- back to cmd.exe for every later case in the process.
+    local savedIO = {}
+    for name, value in pairs(io) do
+        savedIO[name] = value
+    end
 
     -- What a lane does between suites: every compiler module is loaded afresh,
     -- except the one that owns type identity.
@@ -242,6 +249,14 @@ function M.aStoredPreludeIsNotRestoredOverAnotherIdentity()
         end
         for name, value in pairs(saved) do
             package.loaded[name] = value
+        end
+        for name in pairs(io) do
+            if savedIO[name] == nil then
+                io[name] = nil
+            end
+        end
+        for name, value in pairs(savedIO) do
+            io[name] = value
         end
     end
 
