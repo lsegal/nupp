@@ -343,6 +343,42 @@ exported-symbols list on macOS, and a module definition file on Windows.
 Without one, a shared library exports everything it defines, and an executable
 what a standalone host does.
 
+## Choosing code by target
+
+A program reads `jit.os` and `jit.arch` as LuaJIT spells them (`"Windows"`,
+`"Linux"`, `"OSX"`, `"BSD"`; `"x64"`, `"x86"`, `"arm64"`), but for the target
+being compiled, so a cross-compiled program sees its target, not the machine
+building it. A test that compares one of them with a string literal is decided
+while compiling. An `if` clause it rules out is not lowered at all, so a branch
+can call a C function that exists only on its own platform, and the other
+targets' programs never refer to it:
+
+```nupp
+cdef function GetCurrentProcessId(): uint32
+cdef function getpid(): int32
+cdef function puts(borrows s: cstring): int32
+
+local function main(): int32
+    puts(jit.os)
+    if jit.os == "Windows" then
+        if GetCurrentProcessId() == 0 then
+            return 1
+        end
+    elseif jit.arch == "arm64" then
+        puts("an arm64 POSIX system")
+    elseif getpid() <= 0 then
+        return 1
+    end
+    return 0
+end
+```
+
+`not`, `and` and `or` over such tests are decided too, and so is a run-time
+test after an `and` whose left side is already false, or an `or` whose left side
+is already true, because that right side never runs. Read elsewhere, `jit.os`
+and `jit.arch` are C strings. Compared with anything but a string literal they
+are refused, because C strings compare by address.
+
 ## Threads and atomics
 
 A native program starts OS threads with its platform's own functions, passing
