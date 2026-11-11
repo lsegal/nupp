@@ -163,6 +163,27 @@ Because the compiler's own sources are compiled by that release, they may only
 use language features it already understands. A feature reaches them a release
 later, once a tag carrying it is published and the pin moves to it.
 
+### Prebuilt code generator
+
+Linking a native program -- `nupp aot --emit executable`, or a `kind =
+"program"` target -- needs the LLVM code generator and a link kit. A checkout
+that has built neither gets both from a stage-zero release too: the `PREBUILT_*`
+pins in `scripts/toolchain.pins` name, per platform, the release's native
+provider built with the code generator (`nupp-codegen-<platform>.tar.gz`) and
+its link kit (`nupp-kit-<platform>.tar.gz`). The first link fetches them with
+`scripts/toolchain prebuilt-codegen` and `prebuilt-kit`, checks each against its
+digest, and caches it once per machine, so it does not wait on
+`scripts/toolchain llvm` or Cargo. A provider this tree built with LLVM is used
+instead whenever there is one, and `NUPP_CODEGEN_LIBRARY` names a provider
+library outright.
+
+The pins are empty for a platform no release has published assets for yet, and
+a checkout there still needs `scripts/toolchain llvm`. To publish them, run the
+`stage0-assets.yml` workflow on the stage-zero tag. It builds both assets on
+each platform, adds them to that release, appends their digests to its notes,
+and prints the pin lines to commit. An offline builder supplies the assets
+through `NUPP_HOST_SOURCE_DIR` under those same names.
+
 ## Optional libraries
 
 Nothing to run: lunamark and Scintillua are declared in `nupp.lua` as

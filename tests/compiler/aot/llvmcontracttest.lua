@@ -128,6 +128,16 @@ function M.compileRefusesBadOptionsBeforeTheProvider()
     assert(tostring(err):find("codegen opt `9` is not 0-3", 1, true), tostring(err))
 end
 
+-- A prebuilt provider that cannot be opened is refused with its path, and is
+-- not taken up in place of the process's own.
+function M.aPrebuiltCodeGeneratorThatCannotBeLoadedIsRefused()
+    local available = codegen.available()
+    local missing = "/nonexistent/nupp-prebuilt/libnupp_native.so"
+    local err = codegen.useLibrary(missing)
+    assert(err and err:find("cannot load the prebuilt code generator " .. missing, 1, true), tostring(err))
+    assert(codegen.available() == available, "a refused prebuilt changed whether the code generator is available")
+end
+
 function M.reportListsTimingsThenViolations()
     local report = codegen.report({12.4, 3.6, 1000}, 42, {"plain: one", "two\nlines"})
     assert(
