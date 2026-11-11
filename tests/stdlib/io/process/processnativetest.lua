@@ -377,7 +377,10 @@ end
 function M.writeModeAcceptsStringsNumbersAndLuaBuffering()
     local public = ready()
     local windows = package.config:sub(1, 1) == "\\"
-    local command = windows and 'findstr /x "written42" > NUL' or 'IFS= read -r line; test "$line" = written42'
+    -- The runner sends a suite's string commands to Git Bash on Windows; its
+    -- marker keeps this one on cmd.exe, the shell a string names there.
+    local native = rawget(_G, "__NUPP_TEST_CMD_MARKER") or ""
+    local command = windows and native .. 'findstr /x "written42" > NUL' or 'IFS= read -r line; test "$line" = written42'
     local child = assert(public.popen(command, "w"))
     assert(child:setvbuf("full", 64))
     test.eq(child:write("written", 42, "\n"), child)
@@ -392,7 +395,10 @@ end
 
 function M.defaultOutputWritesFlushesAndClosesAProcess()
     local public = ready()
-    local child = assert(public.popen(shell('IFS= read -r line; test "$line" = output42'), "w"))
+    -- "w" translates text on Windows, so the line arrives with a carriage return.
+    local child = assert(
+        public.popen(shell('IFS= read -r line; test "${line%"$(printf "\\r")"}" = output42'), "w")
+    )
     local previous = io.output()
     local result
     local ok, reason = pcall(function()

@@ -375,8 +375,20 @@ if windows then
             error("nupp: could not start process: a program name cannot contain a quote", 0)
         end
         local parts: {string} = {quoted(program, true)}
+        -- cmd.exe does not split its command line with C runtime rules: after
+        -- /c or /k it strips one pair of quotes and runs the rest verbatim, so
+        -- an escaped quote reached the command as `\"`. Hand it the command as
+        -- written.
+        local shell = (program:match("[^\\/]+$") or program):lower()
+        local verbatim = shell == "cmd" or shell == "cmd.exe"
         for index = 2, #arguments do
-            parts[#parts + 1] = quoted(arguments[index], false)
+            local argument = arguments[index]
+            if verbatim and (argument:lower() == "/c" or argument:lower() == "/k") and index < #arguments then
+                parts[#parts + 1] = argument
+                parts[#parts + 1] = "\"" .. table.concat(arguments, " ", index + 1) .. "\""
+                break
+            end
+            parts[#parts + 1] = quoted(argument, false)
         end
 
         return table.concat(parts, " ")

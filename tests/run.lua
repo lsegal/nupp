@@ -434,8 +434,15 @@ if package.config:sub(1, 1) == "\\" then
         local path = script(command)
         -- The public process API takes argv directly. Sending its Bash launch
         -- through cmd.exe quotes it a second time and fails before Bash starts.
+        -- Hand its process back whole: a table proxy hid `io.type`, `write`,
+        -- `setvbuf` and the close status from the suites that test them. The
+        -- script outlives the call, so it goes with the reserved names at exit.
+        if nativePopen then
+            reservedTempNames[#reservedTempNames + 1] = path
+            return rawPopen({bash, path}, mode)
+        end
         -- A copied runner on plain LuaJIT still uses the CRT string interface.
-        local pipe = assert(rawPopen(nativePopen and {bash, path} or invocation(path), mode))
+        local pipe = assert(rawPopen(invocation(path), mode))
         local proxy = {}
         function proxy:read(...)
             return pipe:read(...)
