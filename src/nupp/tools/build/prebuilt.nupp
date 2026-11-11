@@ -1,0 +1,51 @@
+--[[
+The prebuilt code generator and link kit a source checkout links native
+programs with before it has built LLVM: the previous release's, pinned beside
+its stage zero in `scripts/toolchain.pins` and fetched and verified by
+`scripts/toolchain prebuilt-codegen` and `prebuilt-kit`.
+]]
+module nupp.tools.build.prebuilt
+
+local envMod = require("nupp.compiler.project.env")
+local fs = require("nupp.compiler.fs")
+local process = require("nupp.compiler.process")
+
+local prebuilt = {}
+
+local windows = package.config:sub(1, 1) == "\\"
+
+--- The pinned prebuilt `what` -- `codegen`, the provider library, or `kit`,
+--- the link kit directory -- for `platform`, or this machine's when nil, as
+--- the toolchain driver of the source checkout running this compiler fetched
+--- it. Nil and why not when there is no checkout, nothing is pinned for the
+--- platform, or the asset cannot be had.
+function prebuilt.fetch(what: string, platform: string?): (string?, string?)
+    local compilerRoot = envMod.compilerRoot()
+    if not compilerRoot then
+        return nil, "the prebuilt " .. what .. " is fetched by a source checkout"
+    end
+    local driver = fs.join(compilerRoot as string, "scripts/toolchain")
+    -- os.execute reaches cmd.exe on Windows, which does not interpret a
+    -- shebang, so the driver's shell is named there.
+    local argv = windows and {"sh.exe", driver, "prebuilt-" .. what, platform or ""}
+        or {driver, "prebuilt-" .. what, platform or ""}
+    local code, text = process.capture(argv)
+    -- Progress goes to standard error and the answer to standard output; the
+    -- capture merges them, so either is the last line that says anything.
+    local last: string? = nil
+    for line in text:gmatch("[^\r\n]+") do
+        if line:match("%S") then
+            last = line
+        end
+    end
+    if code ~= 0 then
+        return nil, last and ((last as string):gsub("^toolchain: ", "")) or text
+    end
+    if last == nil then
+        return nil, "the toolchain driver fetched the prebuilt " .. what .. " but named no file"
+    end
+
+    return last, nil
+end
+
+export = prebuilt

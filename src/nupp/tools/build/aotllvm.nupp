@@ -20,11 +20,44 @@ local aotllvm = {}
 --- version, and the lowering's.
 const aotllvm.BACKEND = "llvm"
 
+--- Whether the pinned prebuilt code generator has been asked for yet, and
+--- why it could not be had when that is worth saying.
+local askedPrebuilt = false
+
+local prebuiltProblem: string? = nil
+
+--- A source checkout whose provider was built without LLVM links with the
+--- prebuilt code generator `scripts/toolchain.pins` names, fetched and
+--- verified once per machine. Asked once per process, and only by a build
+--- that needs the code generator.
+local function prebuilt(): nil
+    if askedPrebuilt or codegen.available() then
+        return
+    end
+    askedPrebuilt = true
+    local path, problem = require("nupp.tools.build.prebuilt").fetch("codegen")
+    if path == nil then
+        -- Nothing pinned for this platform is the ordinary state of a
+        -- checkout, not a failure to report.
+        if problem ~= nil and not tostring(problem):find("is pinned for", 1, true) then
+            prebuiltProblem = problem
+        end
+
+        return
+    end
+    prebuiltProblem = codegen.useLibrary(path as string)
+end
+
 --- Whether this nupp can compile AOT code: true, or nil and why not (it was
 --- built without the code generator, or NUPP_AOT_FACTS is malformed).
 function aotllvm.selected(): (boolean?, string?)
+    prebuilt()
     local available, why = codegen.available()
     if not available then
+        if prebuiltProblem ~= nil then
+            return nil, tostring(why) .. "; the prebuilt code generator is unavailable: " .. tostring(prebuiltProblem)
+        end
+
         return nil, tostring(why)
     end
     local _, factsErr = aotllvm.facts()
@@ -67,6 +100,7 @@ end
 --- `unavailable` in a nupp built without it: a build that compiles nothing on
 --- the CPU needs none, and one that does says so where it would compile.
 function aotllvm.version(): string
+    prebuilt()
     if not codegen.available() then
         return "unavailable"
     end
