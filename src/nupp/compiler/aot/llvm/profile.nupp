@@ -315,7 +315,12 @@ export function publicData(ir: string): {[string]: boolean}
             local data = false
             for word in (rest as string):gmatch("%S+") do
                 if not data then
-                    if UNPUBLISHED[word] or word == "external" or word == "extern_weak" or word == "alias" or word == "ifunc" then
+                    if UNPUBLISHED[word]
+                        or word == "external"
+                        or word == "extern_weak"
+                        or word == "alias"
+                        or word == "ifunc"
+                    then
                         published = false
                     elseif word == "global" or word == "constant" then
                         data = true
