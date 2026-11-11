@@ -36,7 +36,8 @@ module nupp.tools.jitlimits
 --- The limits, each as its own `jit.opt.start` argument.
 ---
 --- The native host applies the same list to every state it creates, in
---- `native/crates/host/c/lua_shim.c`; `clitest` holds the two to one account.
+--- `host/program/common/nupphost/state.nupp`, and so does the embedding SDK, in
+--- `native/crates/host/c/lua_shim.c`; `clitest` holds all three to one account.
 export const FLAGS = {"maxtrace=20000", "maxside=1000", "sizemcode=16384", "maxmcode=16384"}
 
 --- Raises the limits, unless `NUPP_JIT_DEFAULT` asks for LuaJIT's own.

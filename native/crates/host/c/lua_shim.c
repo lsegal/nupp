@@ -29,8 +29,7 @@
  *
  * Callbacks: lua_CFunction values supplied by an embedder use the C callback
  * ABI, must not unwind, and must obey Lua's stack-result convention. They are
- * always installed or invoked below the protected C frame; worker openers are
- * C functions in worker_shim.c and never enter Lua from Rust.
+ * always installed or invoked below the protected C frame.
  *
  * Thread affinity: a lua_State and every registry reference are confined to
  * the creating/attaching thread. Rust's Lua wrapper is !Send + !Sync and owns
@@ -100,23 +99,11 @@ typedef struct ResourceCall {
     size_t length;
 } ResourceCall;
 
-typedef struct WorkerModulesCall {
-    ProtectedCall call;
-    const void *host;
-} WorkerModulesCall;
-
 typedef struct HostChannelCall {
     ProtectedCall call;
     const void *channel;
     int installed;
 } HostChannelCall;
-
-typedef struct WorkerContextCall {
-    ProtectedCall call;
-    const void *inbox;
-    const void *outbox;
-    const void *tasks;
-} WorkerContextCall;
 
 typedef struct WorkerHostQuery {
     ProtectedCall call;
@@ -494,9 +481,7 @@ static int add_resource(lua_State *state) {
     return 0;
 }
 
-extern int nupp_luaopen_workers(lua_State *state);
 extern int nupp_luaopen_host_channel(lua_State *state);
-extern int nupp_luaopen_sharedbytes(lua_State *state);
 
 static void preload_opener(lua_State *state, const char *name,
     lua_CFunction opener) {
@@ -505,15 +490,6 @@ static void preload_opener(lua_State *state, const char *name,
     lua_pushcclosure(state, opener, 0);
     lua_setfield(state, -2, name);
     lua_pop(state, 2);
-}
-
-static int install_worker_modules(lua_State *state) {
-    WorkerModulesCall *context = (WorkerModulesCall *)lua_touserdata(state, 1);
-    preload_opener(state, "nupp.workers.native", nupp_luaopen_workers);
-    preload_opener(state, "nupp.mem.sharedbytes.native", nupp_luaopen_sharedbytes);
-    lua_pushlightuserdata(state, (void *)context->host);
-    lua_setfield(state, LUA_GLOBALSINDEX, "__nuppWorkerHost");
-    return 0;
 }
 
 /* Gives `os.host` requests in this state to an embedding application. A state
@@ -552,49 +528,15 @@ static int clear_host_channel(lua_State *state) {
     return 0;
 }
 
-/* Whether the worker adapter has been installed in this state, by this runtime
- * or by whatever else built the state. Raw, so a globals metatable cannot
- * answer for a marker that is not there. */
+/* Whether the worker adapter has been installed in this state, by the stamped
+ * Nupp host that built it or by whatever else did. Raw, so a globals
+ * metatable cannot answer for a marker that is not there. */
 static int worker_host_installed(lua_State *state) {
     WorkerHostQuery *context = (WorkerHostQuery *)lua_touserdata(state, 1);
     lua_pushliteral(state, "__nuppWorkerHost");
     lua_rawget(state, LUA_GLOBALSINDEX);
     context->installed = lua_isnil(state, -1) ? 0 : 1;
     lua_pop(state, 1);
-    return 0;
-}
-
-static int set_worker_context(lua_State *state) {
-    WorkerContextCall *context = (WorkerContextCall *)lua_touserdata(state, 1);
-    lua_pushlightuserdata(state, (void *)context->inbox);
-    lua_setfield(state, LUA_GLOBALSINDEX, "__nuppWorkerIn");
-    lua_pushlightuserdata(state, (void *)context->outbox);
-    lua_setfield(state, LUA_GLOBALSINDEX, "__nuppWorkerOut");
-    lua_pushlightuserdata(state, (void *)context->tasks);
-    lua_setfield(state, LUA_GLOBALSINDEX, "__nuppWorkerTasks");
-    lua_pushliteral(state, "nupp.workers");
-    lua_setfield(state, LUA_GLOBALSINDEX, "__nuppWorkerEntry");
-    return 0;
-}
-
-static int clear_worker_context(lua_State *state) {
-    /* Raw writes make teardown independent of a hostile globals metatable. All
-     * names are copied/interned while the outer protected frame is live. */
-    lua_pushliteral(state, "__nuppWorkerHost");
-    lua_pushnil(state);
-    lua_rawset(state, LUA_GLOBALSINDEX);
-    lua_pushliteral(state, "__nuppWorkerIn");
-    lua_pushnil(state);
-    lua_rawset(state, LUA_GLOBALSINDEX);
-    lua_pushliteral(state, "__nuppWorkerOut");
-    lua_pushnil(state);
-    lua_rawset(state, LUA_GLOBALSINDEX);
-    lua_pushliteral(state, "__nuppWorkerTasks");
-    lua_pushnil(state);
-    lua_rawset(state, LUA_GLOBALSINDEX);
-    lua_pushliteral(state, "__nuppWorkerEntry");
-    lua_pushnil(state);
-    lua_rawset(state, LUA_GLOBALSINDEX);
     return 0;
 }
 
@@ -985,12 +927,6 @@ int nupp_lua_add_resource(lua_State *state, const char *path,
     return protect(state, add_resource, &context.call);
 }
 
-int nupp_lua_install_worker_modules(lua_State *state, const void *host,
-    NuppLuaError *error) {
-    WorkerModulesCall context = {{error, 0}, host};
-    return protect(state, install_worker_modules, &context.call);
-}
-
 int nupp_lua_install_host_channel(lua_State *state, const void *channel,
     int *installed, NuppLuaError *error) {
     HostChannelCall context = {{error, 0}, channel, 0};
@@ -1011,19 +947,6 @@ int nupp_lua_worker_host_installed(lua_State *state, int *installed,
     int status = protect(state, worker_host_installed, &context.call);
     if (status == 0) *installed = context.installed;
     return status;
-}
-
-int nupp_lua_set_worker_context(lua_State *state, const void *inbox,
-    const void *outbox, const void *tasks, NuppLuaError *error) {
-    WorkerContextCall context = {
-        {error, 0}, inbox, outbox, tasks
-    };
-    return protect(state, set_worker_context, &context.call);
-}
-
-int nupp_lua_clear_worker_context(lua_State *state, NuppLuaError *error) {
-    ProtectedCall call = {error, 0};
-    return protect(state, clear_worker_context, &call);
 }
 
 int nupp_lua_install_component(lua_State *state, const char *chunk,

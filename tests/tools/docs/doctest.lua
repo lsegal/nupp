@@ -7425,7 +7425,7 @@ local VERSION_SOURCES = {
     ["Native provider ABI"] = {"native/include/nupp_native.h", "#define NUPP_NATIVE_ABI_VERSION (%d+)u"},
     ["Embedding ABI"] = {"native/crates/host/src/embed.rs", "const EMBED_ABI_VERSION: u32 = (%d+);"},
     ["Compiler host ABI"] = {"src/nupp/tools/build/package.nupp", "local hostAbiVersion = (%d+)"},
-    ["Payload trailer"] = {"native/crates/host/src/payload.rs", "const FORMAT_VERSION: u32 = (%d+);"},
+    ["Payload trailer"] = {"host/program/common/nupphost/payload.nupp", "const FORMAT_VERSION = (%d+)ULL"},
     ["AOT runtime ABI"] = {"native/crates/native/c/ks_rt.c", "#define KS_RT_ABI_VERSION (%d+)u"},
     ["Browser application manifest"] = {"runtime/luajit/app-runtime.mjs", "manifest%.schema !== (%d+)"},
     ["AOT units manifest"] = {"src/nupp/tools/build/aot.nupp", "aot%.UNITS_SCHEMA_VERSION = (%d+)"},

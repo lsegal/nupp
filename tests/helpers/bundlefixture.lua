@@ -69,34 +69,36 @@ local function run(dir, argv)
     return out, status == 0
 end
 
-local RUST_HOST
+local NATIVE_HOST
 
-local function rustHost()
-    if RUST_HOST then
-        return RUST_HOST
+-- The host stub a binary is stamped onto, built with workers as the toolchain
+-- builds it, for a test that stamps a payload onto it directly.
+local function nativeHost()
+    if NATIVE_HOST then
+        return NATIVE_HOST
     end
     local root = HERE .. "/.."
-    local output, ok = run(root, "'" .. root .. "/scripts/toolchain' host-rust workers")
-    assert(ok, "the Rust host builds: " .. output)
-    RUST_HOST = output:match("([^\n]+)\n?$")
-    assert(RUST_HOST and readFile(RUST_HOST), "the Rust host path is reported: " .. output)
+    local output, ok = run(root, "'" .. root .. "/scripts/toolchain' host workers")
+    assert(ok, "the host builds: " .. output)
+    NATIVE_HOST = output:match("([^\n]+)\n?$")
+    assert(NATIVE_HOST and readFile(NATIVE_HOST), "the host path is reported: " .. output)
 
-    return RUST_HOST
+    return NATIVE_HOST
 end
 
-local function stampRustHost(dir, payload)
+local function stampNativeHost(dir, payload)
     local suffix = package.config:sub(1, 1) == "\\" and ".exe" or ""
-    local output = dir .. "/build/app-rust" .. suffix
+    local output = dir .. "/build/app-host" .. suffix
     local written, problem = packaging.stampFile(
         output,
-        assert(readFile(rustHost())),
+        assert(readFile(nativeHost())),
         assert(readFile(payload)),
         nil,
         0
     )
-    assert(written, "the Rust host accepts the Nupp payload: " .. tostring(problem))
+    assert(written, "the host accepts the Nupp payload: " .. tostring(problem))
 
-    return "./build/app-rust" .. suffix
+    return "./build/app-host" .. suffix
 end
 
 local MANIFEST = [[
@@ -253,8 +255,8 @@ return {
     LAUNCHER_NOTICES = LAUNCHER_NOTICES,
     run = run,
     RUST_HOST = RUST_HOST,
-    rustHost = rustHost,
-    stampRustHost = stampRustHost,
+    nativeHost = nativeHost,
+    stampNativeHost = stampNativeHost,
     MANIFEST = MANIFEST,
     MAIN = MAIN,
     GREET = GREET,

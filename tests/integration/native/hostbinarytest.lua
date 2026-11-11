@@ -1,9 +1,9 @@
 -- Integration test: the artifact somebody is actually handed.
 --
--- The container's reader is tested in host/src/payload.rs and framed stdio in
--- tests/tools/lsp/lsptest.lua, but both stop one step short of a stamped executable:
--- the first reads files a Rust test wrote, the second drives bin/nupp, which is a shell
--- script in front of an interpreter. Neither says what happens when a binary somebody
+-- The container's reader is tested in tests/integration/native/nupphosttest.lua and
+-- framed stdio in tests/tools/lsp/lsptest.lua, but both stop one step short of a
+-- stamped compiler: the first stamps small payloads by hand, the second drives bin/nupp,
+-- which is a shell script in front of an interpreter. Neither says what happens when a binary somebody
 -- downloaded arrives damaged, or when the thing on the other end of its stdin is not a
 -- language client.
 --

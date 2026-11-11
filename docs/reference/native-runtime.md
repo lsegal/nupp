@@ -157,9 +157,10 @@ claim that every executable byte is Rust. Native builds still retain:
 
 - pinned LuaJIT, its allocator, garbage collector, JIT, stack, and C API;
 - LPeg 1.1 for `lpeg` compatibility and compiler documentation parsing;
-- `native/crates/host/c/lua_shim.c` and `worker_shim.c`, which contain the
-  protected LuaJIT stack, userdata, callback, and longjmp boundary while Rust
-  owns every persistent host and worker resource;
+- `native/crates/host/c/lua_shim.c` and `host_shim.c`, which contain the
+  embedding SDK's protected LuaJIT stack, callback, and longjmp boundary while
+  Rust owns every persistent SDK resource. The host executable, its workers,
+  channels and shared bytes are a native Nupp program, `host/program`;
 - `ring`'s bounded C and assembly implementation under its Rust API, which the
   code generator's link-kit download still uses;
 - compiled AOT code, and the AOT runtime (`native/crates/native/c/ks_rt.c`) a

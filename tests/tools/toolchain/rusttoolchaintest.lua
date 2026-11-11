@@ -97,13 +97,13 @@ end
 
 local function artifactNames()
     if package.config:sub(1, 1) == "\\" then
-        return "nupp_native.dll", "nupp-host-rust.exe"
+        return "nupp_native.dll"
     end
     if jit.os == "OSX" then
-        return "libnupp_native.dylib", "nupp-host-rust"
+        return "libnupp_native.dylib"
     end
 
-    return "libnupp_native.so", "nupp-host-rust"
+    return "libnupp_native.so"
 end
 
 local function fakeRustTools(directory, version, identity, identityMarker)
@@ -139,12 +139,10 @@ fi
 arguments="$*"
 target=
 package=
-binary=
 while [ "$#" -gt 0 ]; do
    case "$1" in
       --target-dir) shift; target=${1:-} ;;
       --package) shift; package=${1:-} ;;
-      --bin) shift; binary=${1:-} ;;
    esac
    shift
 done
@@ -154,16 +152,13 @@ case "$package" in
    nupp-native)
       artifact=$NUPP_TEST_RUST_LIBRARY
       printf '%%s\n' built > "$target/release/libnupp_native.a"
-      ;;
-   nupp-native-host)
-      [ "$binary" = nupp-host-rust ] || exit 4
-      artifact=$NUPP_TEST_RUST_HOST
+      printf '%%s\n' 'note: native-static-libs: -lfake -lother' >&2
       ;;
    *) exit 5 ;;
 esac
 printf '%%s\n' built > "$target/release/$artifact"
 printf '%%s\n' "$arguments" > "$NUPP_TEST_CARGO_RECORD"
-printf '%%s\n' "${NUPP_CC:-}" > "$NUPP_TEST_CARGO_CC_RECORD"
+printf '%%s\n' "${NUPP_CC:-${CC:-}}" > "$NUPP_TEST_CARGO_CC_RECORD"
 printf '%%s\n' "${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER:-}" > "$NUPP_TEST_CARGO_LINKER_RECORD"
 printf '%%s\n' "${CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER:-}" > "$NUPP_TEST_CARGO_GNULLVM_LINKER_RECORD"
 ]]
@@ -182,7 +177,7 @@ local function environment(directory, version, identity, identityMarker)
         identity or defaultIdentity,
         identityMarker or "fake-llvm-1"
     )
-    local library, host = artifactNames()
+    local library = artifactNames()
     assert(os.execute("mkdir -p " .. quote(directory .. "/vendor")) == 0)
     assert(os.execute("mkdir -p " .. quote(directory .. "/rust-sysroot/lib")) == 0)
 
@@ -200,9 +195,8 @@ local function environment(directory, version, identity, identityMarker)
         NUPP_TEST_CARGO_GNULLVM_LINKER_RECORD = directory .. "/cargo-gnullvm-linker",
         NUPP_TEST_RUST_SYSROOT = directory .. "/rust-sysroot",
         NUPP_TEST_RUST_LIBRARY = library,
-        NUPP_TEST_RUST_HOST = host,
         PATH = "$PATH",
-    }, library, host
+    }, library
 end
 
 local function answer(output)
@@ -262,37 +256,22 @@ function M.implicitCargoTargetCannotPoisonTheHostArtifactCache()
     assert(io.open(env.NUPP_TEST_CARGO_RECORD, "rb") == nil, "Cargo ran with an implicit target")
 end
 
-function M.hostBuildSelectsThePinnedWorkspaceBinary()
+function M.providerBuildRecordsTheNativeLibrariesItsArchiveNeeds()
     local directory = temporary()
-    local shellDirectory = shellPath(directory)
-    local env, _, host = environment(directory)
-    local status, output = run(env, "host-rust")
+    local env = environment(directory)
+    local status, output = run(env, "native-rust")
 
     assert(status == 0, output)
     local arguments = read(env.NUPP_TEST_CARGO_RECORD)
-    assert(arguments:find("--package nupp-native-host", 1, true), arguments)
-    assert(arguments:find("--bin nupp-host-rust", 1, true), arguments)
-    assert(arguments:find("--locked", 1, true), arguments)
-    assert(not arguments:find("--offline", 1, true), arguments)
-    assert(arguments:find(shellDirectory .. "/build/rust/host-binary/", 1, true), arguments)
-    -- A binary host strips dead code rooted at its exports, except on Windows.
-    local windows = arguments:find("-Wl,--export-all-symbols", 1, true) ~= nil
-    assert((arguments:find("-C link-dead-code", 1, true) ~= nil) == windows, arguments)
-    -- The exports themselves: Linux exports dynamically, and macOS takes the
-    -- committed host/include/nupp.exports list through the host crate's build
-    -- script, so its command line only strips local symbols.
-    assert(arguments:find("-Wl,-E", 1, true) or arguments:find("-Wl,-x", 1, true) or windows, arguments)
-    -- Linux hides LLVM, C++ and Rust symbols from those exports by pattern,
-    -- or a dlopen()ed library's own LLVM resolves to the host's.
-    if arguments:find("-Wl,-E", 1, true) then
-        local map = arguments:match("%-Wl,%-%-version%-script=(%S+)")
-        assert(map, arguments)
-        local script = read(map)
-        for _, pattern in ipairs({"_Z*;", "_R*;", "LLVM*;", "llvm_*;"}) do
-            assert(script:find(pattern, 1, true), script)
-        end
-    end
-    assert(output:find(host, 1, true), output)
+    assert(arguments:find("rustc", 1, true), arguments)
+    assert(arguments:find("--lib", 1, true), arguments)
+    -- The Nupp host links the static archive, so it is told what rustc would
+    -- have linked beside it.
+    assert(arguments:find("--print native-static-libs", 1, true), arguments)
+    local libraries = read(answer(output):match("^(.*)/target/") .. "/native-static-libs")
+    assert(libraries == "-lfake
+-lother
+", libraries)
 end
 
 -- The GPU provider is Nupp over wgpu-native, which no host links, so a host
@@ -301,7 +280,7 @@ function M.gpuIsNotAHostFeature()
     local directory = temporary()
     local env = environment(directory)
     for _, name in ipairs({"native-gpu", "gpu"}) do
-        local status, output = run(env, "host-rust " .. name)
+        local status, output = run(env, "host " .. name)
         assert(status ~= 0, output)
         assert(output:find("unknown host feature " .. name, 1, true), output)
     end
@@ -598,7 +577,7 @@ function M.rustSourcePathsAreRemappedOutOfTheBuildingUsersHome()
     local env = environment(directory)
     env.CARGO_HOME = directory .. "/first-home/.cargo"
     local windows = package.config:sub(1, 1) == "\\"
-    for _, command in ipairs({"native-rust alpha", "host-rust"}) do
+    for _, command in ipairs({"native-rust alpha"}) do
         local status, output = run(env, command)
         assert(status == 0, output)
         local arguments = read(env.NUPP_TEST_CARGO_RECORD)
@@ -630,24 +609,11 @@ function M.legacyProviderUpgradeBridgeIsGone()
     assert(not driver:match("\n    native%)"), "the ABI-v1 provider command remains in the toolchain")
 end
 
-function M.hostArtifactFollowsTheLuaJitCompilerIdentity()
-    local directory = temporary()
-    local env = environment(directory)
-    local firstStatus, firstOutput = run(env, "host-rust")
-    assert(firstStatus == 0, firstOutput)
-
-    local second = fakeCompiler(directory, "second-cc", "fake-cc-2")
-    env.NUPP_CC = second
-    env.NUPP_CXX = second
-    local secondStatus, secondOutput = run(env, "host-rust")
-    assert(secondStatus == 0, secondOutput)
-    assert(answer(firstOutput) ~= answer(secondOutput), "two LuaJIT compiler identities shared one Rust host")
-end
-
 -- With NUPP_CC unset the driver selects its compiler by probing PATH. Cargo
 -- does not inherit the driver's private shell variable, so pass the resolved
--- answer explicitly to the host crate's C-shim build script.
-function M.hostShimUsesTheResolvedLuaJitCompiler()
+-- answer explicitly: to the provider's build scripts, and to the embedding
+-- crate's C-shim build script.
+function M.rustBuildsUseTheResolvedLuaJitCompiler()
     local directory = temporary()
     local env = environment(directory)
     local probed = package.config:sub(1, 1) == "\\" and "gcc" or "clang"
@@ -656,16 +622,16 @@ function M.hostShimUsesTheResolvedLuaJitCompiler()
     fakeCompiler(bin, probed)
     env.NUPP_CC = nil
     env.PATH = shellPath(bin) .. ":$PATH"
-    local status, output = run(env, "host-rust")
+    local status, output = run(env, "native-rust")
 
     assert(status == 0, output)
     assert(
         readLines(env.NUPP_TEST_CARGO_CC_RECORD) == probed .. "\n",
-        "the Rust host build did not receive the compiler selected for LuaJIT"
+        "the provider build did not receive the compiler selected for LuaJIT"
     )
     local driver = read(DRIVER)
     local forwards = countOccurrences(driver, 'NUPP_CC="$CC"')
-    assert(forwards == 2, "the application and embedding host builds do not both forward NUPP_CC")
+    assert(forwards == 1, "the embedding host build does not forward NUPP_CC")
 end
 
 -- The hosted Windows default is the MSVC Rust toolchain, while LuaJIT and the
@@ -694,11 +660,10 @@ esac
     )
     env.NUPP_CARGO = nil
     env.NUPP_RUSTC = nil
-    env.NUPP_TEST_RUST_HOST = "nupp-host-rust.exe"
     env.CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER = "poison-gnullvm-linker"
     env.PATH = directory .. ":$PATH"
 
-    local status, output = run(env, "host-rust")
+    local status, output = run(env, "native-rust")
 
     assert(status == 0, output)
     local selected = readLines(rustupRecord)
@@ -741,11 +706,10 @@ esac
     env.NUPP_CARGO = nil
     env.NUPP_RUSTC = nil
     env.NUPP_RUST_WINDOWS_ABI = "gnullvm"
-    env.NUPP_TEST_RUST_HOST = "nupp-host-rust.exe"
     env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "poison-gnu-linker"
     env.PATH = directory .. ":$PATH"
 
-    local status, output = run(env, "host-rust")
+    local status, output = run(env, "native-rust")
 
     assert(status == 0, output)
     local selected = readLines(rustupRecord)
@@ -766,7 +730,7 @@ printf '%s\n' Linux
 ]])
     env.NUPP_RUST_WINDOWS_ABI = "gnullvm"
     env.PATH = directory .. ":$PATH"
-    local status, output = run(env, "host-rust")
+    local status, output = run(env, "native-rust")
     assert(status ~= 0, output)
     assert(output:find("NUPP_RUST_WINDOWS_ABI=gnullvm is only supported on Windows", 1, true), output)
 end

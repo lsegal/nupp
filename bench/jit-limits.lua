@@ -126,5 +126,5 @@ for _, configuration in ipairs(CONFIGURATIONS) do
    io.write((" %-12s %8.2fs %9d %10d\n"):format(configuration.name, median(row.seconds),
       median(row.flushes), median(row.traces)))
 end
-io.write("\n the shipped limits are in src/nupp/tools/jitlimits.nupp and\n")
-io.write(" native/crates/host/c/lua_shim.c\n\n")
+io.write("\n the shipped limits are in src/nupp/tools/jitlimits.nupp,\n")
+io.write(" host/program/common/nupphost/state.nupp and native/crates/host/c/lua_shim.c\n\n")

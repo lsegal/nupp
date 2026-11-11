@@ -1611,17 +1611,33 @@ function M.theEntryRaisesLuaJITsCapacityLimits()
     assert(not empty and nothing == "", "an empty NUPP_JIT_LIMITS applies none: " .. nothing)
 end
 
+local function readText(path)
+    local file = assert(io.open(HERE .. "/../" .. path, "rb"))
+    local text = file:read("*a")
+    file:close()
+
+    return text
+end
+
 function M.theNativeHostRaisesTheSameLimits()
-    local shim = assert(io.open(HERE .. "/../native/crates/host/c/lua_shim.c", "rb"))
-    local text = shim:read("*a")
-    shim:close()
-    local list = assert(text:match("jit_limits%[%] = {(.-)}"), "the host carries a limit list")
+    local want = table.concat(jitlimits.FLAGS, ",")
+    -- The host executable's state and the embedding SDK's each raise them.
+    local nupp = readText("host/program/common/nupphost/state.nupp")
+    local raised = assert(nupp:match("local function raiseJitLimits%b()(.-)\nend"), "the host raises limits")
     local flags = {}
+    for flag in raised:gmatch('lua_pushstring%(L, "([^"]+)"%)') do
+        flags[#flags + 1] = flag
+    end
+    local got = table.concat(flags, ",")
+    assert(got == want, ("the host and the entry raise the same limits\n  want: %q\n  got:  %q"):format(want, got))
+
+    local list = assert(readText("native/crates/host/c/lua_shim.c"):match("jit_limits%[%] = {(.-)}"))
+    flags = {}
     for flag in list:gmatch('"([^"]+)"') do
         flags[#flags + 1] = flag
     end
-    local want, got = table.concat(jitlimits.FLAGS, ","), table.concat(flags, ",")
-    assert(got == want, ("the host and the entry raise the same limits\n  want: %q\n  got:  %q"):format(want, got))
+    got = table.concat(flags, ",")
+    assert(got == want, ("the SDK and the entry raise the same limits\n  want: %q\n  got:  %q"):format(want, got))
 end
 
 -- The cli module's header example, checked from a directory outside the repository.
