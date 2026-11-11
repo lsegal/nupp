@@ -265,6 +265,66 @@ end
     assert(ran:find("failed with 7 and more", 1, true), ran)
 end
 
+-- A function-typed field of a `cdef struct` holds a C function pointer: one
+-- written from a program function, from a C function and from a pointer a C
+-- function returns, and each called back through the field.
+function M.aFunctionPointerFieldIsWrittenAndCalledThrough()
+    requireCodegen()
+    local executable, output = link(LUA_API .. [[
+cdef function lua_atpanic(borrows L: voidptr, panicf: function(L: voidptr): int32): function(L: voidptr): int32
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+
+cdef struct Handlers
+    tag: int8
+    panic: function(L: voidptr): int32
+    fallback: function(L: voidptr): int32?
+    after: int8
+end
+
+local function seven(L: voidptr): int32
+    return 7
+end
+
+local function nine(L: voidptr): int32
+    return 9
+end
+
+local function main(): int32
+    local L = luaL_newstate()
+    local handlers = calloc(1, 64) as Handlers*
+    local failed: integer = 0
+    @unsafe do
+        handlers.tag = 3
+        handlers.after = 5
+        handlers.panic = seven
+        lua_atpanic(L, nine)
+        handlers.fallback = lua_atpanic(L, seven)
+        if handlers.panic(L) ~= 7 then
+            failed += 1
+        end
+        if handlers.fallback(L) ~= 9 then
+            failed += 2
+        end
+        handlers.panic = handlers.fallback
+        local copied = handlers.panic
+        if copied(L) ~= 9 then
+            failed += 4
+        end
+        if handlers.tag ~= 3 or handlers.after ~= 5 then
+            failed += 8
+        end
+        free(handlers)
+    end
+    lua_close(L)
+    return math.i32.wrap(failed)
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+end
+
 -- `integer` and `number` are binary64, so `//` and `%` floor and `/` divides
 -- exactly; `int64` wraps; refinements enter through the establishing calls.
 function M.arithmeticKeepsTheLanguagesMeaning()
