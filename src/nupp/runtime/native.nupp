@@ -54,11 +54,13 @@ local function pin(loaded: any): any
             -- GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN
             C.GetModuleHandleExA(5, address, library.new("void *[1]"))
         else
-            library.cdef([[
+            library.cdef(
+                [[
             struct nupp_native_dl_info { const char *fname; void *fbase; const char *sname; void *saddr; };
             int dladdr(const void *, struct nupp_native_dl_info *);
             void *dlopen(const char *, int);
-            ]])
+            ]]
+            )
             local info: any = library.new("struct nupp_native_dl_info")
             if C.dladdr(address, info) ~= 0 and info.fname ~= nil then
                 -- RTLD_NOW. The handle is never closed, which is the point.
