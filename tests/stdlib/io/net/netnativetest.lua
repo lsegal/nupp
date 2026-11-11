@@ -822,45 +822,54 @@ function M.aLinkLocalPeerCanBeAnswered()
     a:close()
 end
 
-function M.aHostSleepingOnTheReadinessGenerationIsWokenByTheNetwork()
-    -- The embedding shape: snapshot the one native readiness generation, drive the
-    -- sources, and when nothing moved, wait from the snapshot. A wait that ran to its
-    -- timeout means the network never advanced the generation the host sleeps on.
-    local ffi = require("ffi")
-    local suspension = require("nupp.runtime.standardcoroutine").value
+-- The embedding shape over the reactor: drive the sources, and when nothing moved,
+-- pump the reactor with a long timeout. The reactor sleeps on its sockets, so a
+-- peer arriving ends the sleep; a pump that ran to its timeout means the network
+-- never reached it. The peer is another process, connecting after a pause, so the
+-- host has to sleep at least once.
+function M.aHostPumpingTheReactorIsWokenByTheNetwork()
+    local windows = package.config:sub(1, 1) == "\\"
+    local bash = windows and (os.getenv("NUPP_TEST_SH") or "/bin/sh") or "bash"
     local suspensionHost = require("coroutine.host")
-    local C = require("nupp.runtime.native").C
-    local seen, found = ffi.new("uint64_t[1]"), ffi.new("uint64_t[1]")
-    local sleeps = 0
+    local sleeps, longest = 0, 0
     local host = {
+        canpark = function()
+            return true
+        end,
+        shutdown = function()
+        end,
         park = function(_self, waiting, cancel)
             while not waiting:ready() do
-                assert(C.nuppNativePoll(seen) == 0)
                 if suspensionHost.poll() == 0 and not waiting:ready() then
                     sleeps = sleeps + 1
-                    assert(C.nuppNativeWait(seen[0], 10000, found) == 0)
-                    if found[0] == seen[0] or sleeps > 1000 then
+                    local before = os.monotonic()
+                    net.pump(10000)
+                    local took = os.monotonic() - before
+                    longest = math.max(longest, took)
+                    if took >= 9000 or sleeps > 100000 then
                         cancel()
-                        error(waiting.operation .. " never advanced the readiness generation", 0)
+                        error(waiting.operation .. " never woke the reactor's sleep", 0)
                     end
                 end
             end
         end,
     }
+    local listener = assert(net.listen({host = "127.0.0.1", port = 0}))
+    local script = ("sleep 0.5; exec 3<>/dev/tcp/127.0.0.1/%d; printf ping >&3; sleep 1"):format(listener:port())
+    local peer = assert(io_.popen({bash, "-c", script}, {stdin = "null", stdout = "null", stderr = "null"}))
     local installation = suspensionHost.install(host)
     local ok, problem = pcall(function()
-        local listener, client, served = pair()
-        assert(client:write("ping"), "the client writes")
-        testAssert.eq(assert(served:read(4)), "ping", "and the server reads it")
-        client:close()
+        local served = assert(listener:accept())
+        testAssert.eq(assert(served:read(4)), "ping", "the peer's bytes arrive")
         served:close()
-        listener:close()
     end)
     installation:close()
+    peer:wait()
+    peer:close()
+    listener:close()
     assert(ok, problem)
-    -- A loopback connect completes on the provider's executor, never inside the
-    -- call, so the host always sleeps at least once and the network wakes it.
-    assert(sleeps > 0, "the host slept on the generation")
+    assert(sleeps > 0, "the host slept on the reactor")
+    assert(longest >= 200, "one pump slept until the peer arrived: the longest took " .. longest .. "ms")
 end
 
 function M.streamSpansPreservePayloadAndEndOfStream()

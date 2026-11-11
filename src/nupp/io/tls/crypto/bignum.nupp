@@ -374,10 +374,10 @@ export function modexp(context: Montgomery, base: Int, exponent: Int): Int
         for _ = 1, 4 do
             result = montmul(context, result, result)
         end
-        local window = bit(exponent, index) * 8
-            + bit(exponent, index - 1) * 4
-            + bit(exponent, index - 2) * 2
-            + bit(exponent, index - 3)
+        local window = bit(
+            exponent,
+            index
+        ) * 8 + bit(exponent, index - 1) * 4 + bit(exponent, index - 2) * 2 + bit(exponent, index - 3)
         if window ~= 0 then
             result = montmul(context, result, table[window + 1])
         end

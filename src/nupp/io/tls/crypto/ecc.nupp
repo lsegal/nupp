@@ -101,15 +101,19 @@ local function double(c: Curve, point: Point): Point
     end
     local f = c.field
     local p = c.p
+
     local function mul(a: Int, b: Int): Int
         return bn.montmul(f, a, b)
     end
+
     local function add(a: Int, b: Int): Int
         return bn.modadd(p, a, b)
     end
+
     local function sub(a: Int, b: Int): Int
         return bn.modsub(p, a, b)
     end
+
     local delta = mul(point.z, point.z)
     local gamma = mul(point.y, point.y)
     local beta = mul(point.x, gamma)
@@ -139,15 +143,19 @@ local function addPoints(c: Curve, a: Point, b: Point): Point
     end
     local f = c.field
     local p = c.p
+
     local function mul(x: Int, y: Int): Int
         return bn.montmul(f, x, y)
     end
+
     local function add(x: Int, y: Int): Int
         return bn.modadd(p, x, y)
     end
+
     local function sub(x: Int, y: Int): Int
         return bn.modsub(p, x, y)
     end
+
     local z1z1 = mul(a.z, a.z)
     local z2z2 = mul(b.z, b.z)
     local u1 = mul(a.x, z2z2)
@@ -190,10 +198,10 @@ local function multiply(c: Curve, scalar: Int, point: Point): Point
         for _ = 1, 4 do
             result = double(c, result)
         end
-        local window = bn.bit(scalar, index) * 8
-            + bn.bit(scalar, index - 1) * 4
-            + bn.bit(scalar, index - 2) * 2
-            + bn.bit(scalar, index - 3)
+        local window = bn.bit(
+            scalar,
+            index
+        ) * 8 + bn.bit(scalar, index - 1) * 4 + bn.bit(scalar, index - 2) * 2 + bn.bit(scalar, index - 3)
         if window ~= 0 then
             result = addPoints(c, result, table[window])
         end

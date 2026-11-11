@@ -131,7 +131,11 @@ local function keysMatch(private: keys.PrivateKey, public: keys.PublicKey): bool
     return curve25519.edpublic(private.seed as string) == public.point
 end
 
-local function serverConfig(certificate: string, privateKey: string, protocols: {string}): (engine.ServerConfig?, string?)
+local function serverConfig(
+    certificate: string,
+    privateKey: string,
+    protocols: {string}
+): (engine.ServerConfig?, string?)
     local blocks, why = der.pem(certificate)
     if blocks == nil then
         return nil, "the certificate is not valid PEM: " .. tostring(why)

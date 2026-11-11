@@ -62,16 +62,18 @@ local function configured(): ({x509.Certificate}?, string?)
     if file ~= nil then
         local text, why = readFile(file as string)
         if text == nil then
-            return nil, "the configured certificate file " .. (file as string) .. " could not be read: " .. tostring(why)
+            return nil, "the configured certificate file " .. (
+                file as string
+            ) .. " could not be read: " .. tostring(why)
         end
         addPem(anchors, text as string)
     end
     if directory ~= nil then
         local entries, why = files.list(directory as string)
         if entries == nil then
-            return nil,
-                "the configured certificate directory " .. (directory as string) .. " could not be read: "
-                    .. tostring(why)
+            return nil, "the configured certificate directory " .. (
+                directory as string
+            ) .. " could not be read: " .. tostring(why)
         end
         local names: {string} = {}
         for name, kind in entries as files.Entries do
@@ -91,7 +93,9 @@ local function configured(): ({x509.Certificate}?, string?)
     return anchors, nil
 end
 
-const BUNDLES: {string} = {
+const BUNDLES: {
+    string
+} = {
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/ca-bundle.pem",
@@ -105,7 +109,9 @@ const BUNDLES: {string} = {
 local function windowsStore(): {x509.Certificate}
     -- Guarded: a second copy of this module (or another binding of crypt32)
     -- may already have declared these.
-    pcall(ffi.cdef, [[
+    pcall(
+        ffi.cdef,
+        [[
     typedef struct NuppTlsCertContext {
         uint32_t encodingType;
         const uint8_t *encoded;
@@ -117,7 +123,8 @@ local function windowsStore(): {x509.Certificate}
     const NuppTlsCertContext *nupp_tls_next_cert(void *store, const NuppTlsCertContext *previous)
         __asm__("CertEnumCertificatesInStore");
     int nupp_tls_close_store(void *store, uint32_t flags) __asm__("CertCloseStore");
-    ]])
+    ]]
+    )
     local anchors: {x509.Certificate} = {}
     local loaded, library: any = pcall(ffi.load, "crypt32")
     if not loaded then
@@ -197,7 +204,9 @@ end
 -- own chain engine asks for one. Discovery asks that engine for the root of a
 -- peer's chain; validation then runs here as for any anchor.
 local function windowsDiscover(chain: {string}): x509.Certificate?
-    pcall(ffi.cdef, [[
+    pcall(
+        ffi.cdef,
+        [[
     typedef struct NuppTlsTrustStatus { uint32_t error; uint32_t info; } NuppTlsTrustStatus;
     typedef struct NuppTlsChainElement {
         uint32_t size;
@@ -230,7 +239,8 @@ local function windowsDiscover(chain: {string}): x509.Certificate?
         const NuppTlsChainPara *para, uint32_t flags, void *reserved, const NuppTlsChainContext **chain)
         __asm__("CertGetCertificateChain");
     void nupp_tls_chain_free(const NuppTlsChainContext *chain) __asm__("CertFreeCertificateChain");
-    ]])
+    ]]
+    )
     local loaded, library: any = pcall(ffi.load, "crypt32")
     if not loaded or #chain == 0 then
         return nil

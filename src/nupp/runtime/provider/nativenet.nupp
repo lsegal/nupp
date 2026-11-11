@@ -59,10 +59,13 @@ const WINDOWS_SLICE_MS = 5
 const windows = socket.WINSOCK
 
 if windows then
-    pcall(ffi.cdef, [[
+    pcall(
+        ffi.cdef,
+        [[
     int32_t nupp_net_reset_event(void *) __asm__("ResetEvent");
     uint32_t nupp_net_wait_one(void *, uint32_t) __asm__("WaitForSingleObject");
-    ]])
+    ]]
+    )
 else
     pcall(ffi.cdef, [[
     intptr_t nupp_net_read(int, void *, size_t) __asm__("read");
@@ -75,6 +78,7 @@ local function nowMs(): number
 end
 
 local scratch: any = nil
+
 local function buffer(): any
     if scratch == nil then
         scratch = ffi.new("uint8_t[?]", DATAGRAM_MAX + 1)
@@ -287,7 +291,11 @@ local function lingering(stream: Stream, now: number): boolean
     if stream.lingerUntil == nil then
         return false
     end
-    if stream.readEof or stream.readError ~= nil or stream.writeError ~= nil or now >= (stream.lingerUntil as number) then
+    if stream.readEof
+        or stream.readError ~= nil
+        or stream.writeError ~= nil
+        or now >= (stream.lingerUntil as number)
+    then
         closeStreamNow(stream)
     end
 
@@ -302,12 +310,14 @@ local entryOwners: {any} = {}
 
 local function pass(timeoutms: integer, wakeDescriptor: integer?): boolean
     local count: integer = 0
+
     local function ensure(size: integer): nil
         if size > entryCapacity then
             entryCapacity = math.max(size, entryCapacity * 2, 16)
             entries = socket.pollset(entryCapacity)
         end
     end
+
     local wanted: integer = 1
     for _ in pairs(streams) do
         wanted = wanted + 1
@@ -322,6 +332,7 @@ local function pass(timeoutms: integer, wakeDescriptor: integer?): boolean
         wanted = wanted + 1
     end
     ensure(wanted)
+
     local function add(fd: number, events: integer, owner: any): nil
         entries[count].fd = fd
         entries[count].events = events
@@ -329,6 +340,7 @@ local function pass(timeoutms: integer, wakeDescriptor: integer?): boolean
         count = count + 1
         entryOwners[count] = owner
     end
+
     for stream in pairs(streams) do
         local events: integer = 0
         if not stream.readEof and stream.readError == nil and stream.inboundBytes < RECEIVE_HIGH_WATER then

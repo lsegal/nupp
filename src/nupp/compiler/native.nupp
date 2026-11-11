@@ -335,9 +335,7 @@ local FEATURES: {[string]: native.Feature} = {
         portableRuntime = true,
         requires = {"runtime.io_internal_bytes"}
     },
-    [
-        "runtime.io_http_internal_transport"
-    ] = {
+    ["runtime.io_http_internal_transport"] = {
         name = "io_http_internal_transport",
         runtimeModule = "nupp.io.http.internal.transport",
         -- HTTP/1.1 in Nupp over the network and TLS providers; a file body is

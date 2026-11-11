@@ -24,6 +24,7 @@ local linux = not windows and not darwin
 
 --- Address families as this module names them.
 export const INET = 4
+
 export const INET6 = 6
 export const UNIX = 1
 
@@ -61,6 +62,7 @@ local O_NONBLOCK: integer = linux and 2048 or 4
 
 --- Poll event bits, which all three platforms share for these values.
 export const POLLIN = windows and 0x0300 or 1
+
 export const POLLOUT = windows and 0x0010 or 4
 export const POLLERR = windows and 0x0001 or 8
 export const POLLHUP = windows and 0x0002 or 16
@@ -73,73 +75,77 @@ local EINPROGRESS: integer = windows and 10036 or linux and 115 or 36
 local EALREADY: integer = windows and 10037 or linux and 114 or 37
 local EMSGSIZE: integer = windows and 10040 or linux and 90 or 40
 
-const MESSAGES: {[integer]: string} = windows and {
-    [10013] = "permission denied",
-    [10022] = "invalid argument",
-    [10024] = "too many open sockets",
-    [10040] = "message too long",
-    [10047] = "address family not supported",
-    [10048] = "address in use",
-    [10049] = "address not available",
-    [10050] = "network is down",
-    [10051] = "network is unreachable",
-    [10052] = "network dropped connection on reset",
-    [10053] = "connection aborted",
-    [10054] = "connection reset by peer",
-    [10055] = "no buffer space available",
-    [10056] = "already connected",
-    [10057] = "not connected",
-    [10058] = "the connection was shut down",
-    [10060] = "connection timed out",
-    [10061] = "connection refused",
-    [10064] = "host is down",
-    [10065] = "no route to host",
-    [10093] = "the socket library is not initialized",
-} or linux and {
-    [1] = "operation not permitted",
-    [2] = "no such file or directory",
-    [13] = "permission denied",
-    [22] = "invalid argument",
-    [24] = "too many open files",
-    [32] = "broken pipe",
-    [90] = "message too long",
-    [97] = "address family not supported",
-    [98] = "address in use",
-    [99] = "address not available",
-    [100] = "network is down",
-    [101] = "network is unreachable",
-    [103] = "connection aborted",
-    [104] = "connection reset by peer",
-    [105] = "no buffer space available",
-    [106] = "already connected",
-    [107] = "not connected",
-    [110] = "connection timed out",
-    [111] = "connection refused",
-    [112] = "host is down",
-    [113] = "no route to host",
-} or {
-    [1] = "operation not permitted",
-    [2] = "no such file or directory",
-    [13] = "permission denied",
-    [22] = "invalid argument",
-    [24] = "too many open files",
-    [32] = "broken pipe",
-    [40] = "message too long",
-    [47] = "address family not supported",
-    [48] = "address in use",
-    [49] = "address not available",
-    [50] = "network is down",
-    [51] = "network is unreachable",
-    [53] = "connection aborted",
-    [54] = "connection reset by peer",
-    [55] = "no buffer space available",
-    [56] = "already connected",
-    [57] = "not connected",
-    [60] = "connection timed out",
-    [61] = "connection refused",
-    [64] = "host is down",
-    [65] = "no route to host",
-}
+const MESSAGES: {[integer]: string} = windows
+    and {
+        [10013] = "permission denied",
+        [10022] = "invalid argument",
+        [10024] = "too many open sockets",
+        [10040] = "message too long",
+        [10047] = "address family not supported",
+        [10048] = "address in use",
+        [10049] = "address not available",
+        [10050] = "network is down",
+        [10051] = "network is unreachable",
+        [10052] = "network dropped connection on reset",
+        [10053] = "connection aborted",
+        [10054] = "connection reset by peer",
+        [10055] = "no buffer space available",
+        [10056] = "already connected",
+        [10057] = "not connected",
+        [10058] = "the connection was shut down",
+        [10060] = "connection timed out",
+        [10061] = "connection refused",
+        [10064] = "host is down",
+        [10065] = "no route to host",
+        [10093] = "the socket library is not initialized",
+    }
+    or linux
+    and {
+        [1] = "operation not permitted",
+        [2] = "no such file or directory",
+        [13] = "permission denied",
+        [22] = "invalid argument",
+        [24] = "too many open files",
+        [32] = "broken pipe",
+        [90] = "message too long",
+        [97] = "address family not supported",
+        [98] = "address in use",
+        [99] = "address not available",
+        [100] = "network is down",
+        [101] = "network is unreachable",
+        [103] = "connection aborted",
+        [104] = "connection reset by peer",
+        [105] = "no buffer space available",
+        [106] = "already connected",
+        [107] = "not connected",
+        [110] = "connection timed out",
+        [111] = "connection refused",
+        [112] = "host is down",
+        [113] = "no route to host",
+    }
+    or {
+        [1] = "operation not permitted",
+        [2] = "no such file or directory",
+        [13] = "permission denied",
+        [22] = "invalid argument",
+        [24] = "too many open files",
+        [32] = "broken pipe",
+        [40] = "message too long",
+        [47] = "address family not supported",
+        [48] = "address in use",
+        [49] = "address not available",
+        [50] = "network is down",
+        [51] = "network is unreachable",
+        [53] = "connection aborted",
+        [54] = "connection reset by peer",
+        [55] = "no buffer space available",
+        [56] = "already connected",
+        [57] = "not connected",
+        [60] = "connection timed out",
+        [61] = "connection refused",
+        [64] = "host is down",
+        [65] = "no route to host",
+    }
 
 --- The words for an error code, with the code appended.
 export function message(code: integer): string
@@ -148,7 +154,9 @@ end
 
 -- Structures. Darwin's carry a length byte before an 8-bit family.
 if darwin then
-    pcall(ffi.cdef, [[
+    pcall(
+        ffi.cdef,
+        [[
     typedef struct NuppNetSockaddrIn {
         uint8_t len; uint8_t family; uint16_t port; uint8_t address[4]; uint8_t zero[8];
     } NuppNetSockaddrIn;
@@ -161,9 +169,12 @@ if darwin then
         int flags; int family; int socktype; int protocol; uint32_t addrlen;
         char *canonname; void *addr; struct NuppNetAddrinfo *next;
     } NuppNetAddrinfo;
-    ]])
+    ]]
+    )
 else
-    pcall(ffi.cdef, [[
+    pcall(
+        ffi.cdef,
+        [[
     typedef struct NuppNetSockaddrIn {
         uint16_t family; uint16_t port; uint8_t address[4]; uint8_t zero[8];
     } NuppNetSockaddrIn;
@@ -172,34 +183,46 @@ else
     } NuppNetSockaddrIn6;
     typedef struct NuppNetSockaddrUn { uint16_t family; char path[108]; } NuppNetSockaddrUn;
     typedef struct NuppNetSockaddrHead { uint16_t family; } NuppNetSockaddrHead;
-    ]])
+    ]]
+    )
     if windows then
-        pcall(ffi.cdef, [[
+        pcall(
+            ffi.cdef,
+            [[
         typedef struct NuppNetAddrinfo {
             int flags; int family; int socktype; int protocol; size_t addrlen;
             char *canonname; void *addr; struct NuppNetAddrinfo *next;
         } NuppNetAddrinfo;
-        ]])
+        ]]
+        )
     else
-        pcall(ffi.cdef, [[
+        pcall(
+            ffi.cdef,
+            [[
         typedef struct NuppNetAddrinfo {
             int flags; int family; int socktype; int protocol; uint32_t addrlen;
             void *addr; char *canonname; struct NuppNetAddrinfo *next;
         } NuppNetAddrinfo;
-        ]])
+        ]]
+        )
     end
 end
 
-pcall(ffi.cdef, [[
+pcall(
+    ffi.cdef,
+    [[
 typedef struct NuppNetStorage { uint8_t bytes[128]; uint64_t align; } NuppNetStorage;
 typedef struct NuppNetMreq { uint8_t group[4]; uint8_t interface[4]; } NuppNetMreq;
 typedef struct NuppNetMreq6 { uint8_t group[16]; uint32_t interface; } NuppNetMreq6;
-]])
+]]
+)
 
 local lib: any
 local ws: any = nil
 if windows then
-    pcall(ffi.cdef, [[
+    pcall(
+        ffi.cdef,
+        [[
     typedef struct NuppNetPollFd { uint64_t fd; int16_t events; int16_t revents; } NuppNetPollFd;
     typedef struct NuppNetWsaData { uint8_t bytes[512]; } NuppNetWsaData;
     typedef struct NuppNetKeepalive { uint32_t enabled; uint32_t time; uint32_t interval; } NuppNetKeepalive;
@@ -229,13 +252,16 @@ if windows then
     void nupp_net_freeaddrinfo(NuppNetAddrinfo *) __asm__("freeaddrinfo");
     int nupp_net_inet_pton(int, const char *, void *) __asm__("inet_pton");
     const char *nupp_net_inet_ntop(int, const void *, char *, size_t) __asm__("inet_ntop");
-    ]])
+    ]]
+    )
     ws = ffi.load("ws2_32")
     lib = ws as any
     local data: any = ffi.new("NuppNetWsaData")
     ws.nupp_net_startup(0x0202, data)
 else
-    pcall(ffi.cdef, [[
+    pcall(
+        ffi.cdef,
+        [[
     typedef struct NuppNetPollFd { int fd; int16_t events; int16_t revents; } NuppNetPollFd;
     int nupp_net_socket(int, int, int) __asm__("socket");
     int nupp_net_close(int) __asm__("close");
@@ -261,7 +287,8 @@ else
     int nupp_net_inet_pton(int, const char *, void *) __asm__("inet_pton");
     const char *nupp_net_inet_ntop(int, const void *, char *, uint32_t) __asm__("inet_ntop");
     unsigned int nupp_net_if_nametoindex(const char *) __asm__("if_nametoindex");
-    ]])
+    ]]
+    )
     lib = ffi.C as any
 end
 
@@ -694,7 +721,8 @@ end
 export function address(fd: number, peer: boolean): (string?, integer?)
     local storage: any = ffi.new("NuppNetStorage")
     local length: any = ffi.new(windows and "int[1]" or "uint32_t[1]", 128)
-    local status = peer and lib.nupp_net_getpeername(fd, storage, length) or lib.nupp_net_getsockname(fd, storage, length)
+    local status = peer and lib.nupp_net_getpeername(fd, storage, length)
+        or lib.nupp_net_getsockname(fd, storage, length)
     if status ~= 0 then
         return nil, nil
     end
@@ -726,7 +754,17 @@ export function keepalive(fd: number, enable: boolean, delayms: integer): (boole
         values.time = delayms
         values.interval = 1000
         local returned: any = ffi.new("uint32_t[1]")
-        if ws.nupp_net_wsaioctl(fd, 0x98000004, values, ffi.sizeof("NuppNetKeepalive"), nil, 0, returned, nil, nil) ~= 0 then
+        if ws.nupp_net_wsaioctl(
+            fd,
+            0x98000004,
+            values,
+            ffi.sizeof("NuppNetKeepalive"),
+            nil,
+            0,
+            returned,
+            nil,
+            nil
+        ) ~= 0 then
             return false, message(lastError())
         end
 
@@ -807,7 +845,13 @@ export function membership(fd: number, group: string, interfaceAddress: string, 
             local source: any = ffi.cast("NuppNetSockaddrIn *", local_.storage)
             ffi.copy(request.interface, source.address, 4)
         end
-        if lib.nupp_net_setsockopt(fd, IPPROTO_IP, join and IP_ADD_MEMBERSHIP or IP_DROP_MEMBERSHIP, request, ffi.sizeof("NuppNetMreq")) ~= 0 then
+        if lib.nupp_net_setsockopt(
+            fd,
+            IPPROTO_IP,
+            join and IP_ADD_MEMBERSHIP or IP_DROP_MEMBERSHIP,
+            request,
+            ffi.sizeof("NuppNetMreq")
+        ) ~= 0 then
             return false, message(lastError())
         end
 
@@ -820,7 +864,13 @@ export function membership(fd: number, group: string, interfaceAddress: string, 
     local group6: any = ffi.cast("NuppNetSockaddrIn6 *", target.storage)
     ffi.copy(request.group, group6.address, 16)
     request.interface = group6.scope
-    if lib.nupp_net_setsockopt(fd, IPPROTO_IPV6, join and IPV6_JOIN_GROUP or IPV6_LEAVE_GROUP, request, ffi.sizeof("NuppNetMreq6")) ~= 0 then
+    if lib.nupp_net_setsockopt(
+        fd,
+        IPPROTO_IPV6,
+        join and IPV6_JOIN_GROUP or IPV6_LEAVE_GROUP,
+        request,
+        ffi.sizeof("NuppNetMreq6")
+    ) ~= 0 then
         return false, message(lastError())
     end
 

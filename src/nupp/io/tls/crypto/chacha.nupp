@@ -285,7 +285,9 @@ local function oneTimeKey(key: {integer}, nonce: {integer}): string
     local bytes: {string} = {}
     for index = 1, 8 do
         local value = stream[index]
-        bytes[index] = string.char(
+        bytes[
+            index
+        ] = string.char(
             band(value, 0xff),
             band(rshift(value, 8), 0xff),
             band(rshift(value, 16), 0xff),

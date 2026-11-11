@@ -42,10 +42,13 @@ local vector = wire.vector
 export interface Transport
     --- Returns bytes that are ready, "" when none are, or nil and an error.
     read: function(self: Transport, wanted: integer): (string?, string?)
+
     --- Reports that the peer will send nothing more.
     ended: function(self: Transport): boolean
+
     --- Queues bytes and answers how many it took, or nil and an error.
     write: function(self: Transport, bytes: string): (integer?, string?)
+
     --- Bytes queued but not yet sent.
     pending: function(self: Transport): integer
 end
@@ -58,6 +61,7 @@ export record ClientConfig
     @readonly verify: boolean
     @readonly protocols: {string}
     @readonly cachekey: string
+
     --- Asks the platform for a missing root of a chain; true when one was
     --- added to `anchors`. Only set for the default anchors.
     @readonly discover: (function(chain: {string}): boolean)?
@@ -124,7 +128,9 @@ const ALERT_INTERNAL_ERROR = 80
 const ALERT_MISSING_EXTENSION = 109
 const ALERT_NO_APPLICATION_PROTOCOL = 120
 
-const ALERT_NAMES: {[integer]: string} = {
+const ALERT_NAMES: {
+    [integer]: string
+} = {
     [0] = "close_notify",
     [10] = "unexpected_message",
     [20] = "bad_record_mac",
@@ -173,7 +179,9 @@ local record Suite
     @readonly signature: "ecdsa" | "rsa" | "any"
 end
 
-const SUITES: {Suite} = {
+const SUITES: {
+    Suite
+} = {
     Suite(code = 0x1301, tls13 = true, hash = "sha256", aead = "aesgcm", keylength = 16, signature = "any"),
     Suite(code = 0x1302, tls13 = true, hash = "sha384", aead = "aesgcm", keylength = 32, signature = "any"),
     Suite(code = 0x1303, tls13 = true, hash = "sha256", aead = "chacha", keylength = 32, signature = "any"),
@@ -661,8 +669,10 @@ local function clientHello(self: Session): nil
     end
     extensions[#extensions + 1] = extension(EXT_PSK_MODES, vector("\1", 1))
     local ticket = self.offeredTicket
-    local body = uint(0x0303, 2) .. self.clientRandom .. vector(self.sessionId, 1) .. vector(table.concat(suites), 2)
-        .. vector("\0", 1)
+    local body = uint(
+        0x0303,
+        2
+    ) .. self.clientRandom .. vector(self.sessionId, 1) .. vector(table.concat(suites), 2) .. vector("\0", 1)
     if ticket == nil then
         sendHandshake(self, CLIENT_HELLO, body .. vector(table.concat(extensions), 2))
 
@@ -677,8 +687,9 @@ local function clientHello(self: Session): nil
     local binderSize = binderLength(suite)
     local bindersLength = 2 + 1 + binderSize
     local pskExtensionLength = #identities + bindersLength
-    local partialExtensions = table.concat(extensions) .. uint(EXT_PRE_SHARED_KEY, 2) .. uint(pskExtensionLength, 2)
-        .. identities
+    local partialExtensions = table.concat(
+        extensions
+    ) .. uint(EXT_PRE_SHARED_KEY, 2) .. uint(pskExtensionLength, 2) .. identities
     local fullExtensionsLength = #partialExtensions + bindersLength
     local partialBody = body .. uint(fullExtensionsLength, 2) .. partialExtensions
     local partialMessage = string.char(CLIENT_HELLO) .. uint(#partialBody + bindersLength, 3) .. partialBody
@@ -840,7 +851,10 @@ local function onServerHello(self: Session, body: string): nil
     local psk = extensions[EXT_PRE_SHARED_KEY]
     if psk ~= nil then
         local ticket = self.offeredTicket
-        if ticket == nil or wire.touint(psk as string) ~= 0 or (suiteByCode(ticket.suite) as Suite).hash ~= suite.hash then
+        if ticket == nil
+            or wire.touint(psk as string) ~= 0
+            or (suiteByCode(ticket.suite) as Suite).hash ~= suite.hash
+        then
             fatal(ALERT_ILLEGAL_PARAMETER, "the server selected a pre-shared key that was not offered")
         end
         self.resumedSession = true
@@ -1033,7 +1047,9 @@ local function onServerKeyExchange(self: Session, body: string): nil
     local key = self.peerKey as keys.PublicKey
     local suite = self.suite as Suite
     local family = (key.kind as string) == "rsa" and "rsa" or "ecdsa"
-    if (suite.signature as string) ~= family and not ((key.kind as string) == "ed25519" and suite.signature == "ecdsa") then
+    if (suite.signature as string) ~= family
+        and not ((key.kind as string) == "ed25519" and suite.signature == "ecdsa")
+    then
         fatal(ALERT_ILLEGAL_PARAMETER, "the server's key does not match its suite")
     end
     if not keys.verifyscheme(key, scheme, content, signature, false) then
@@ -1141,7 +1157,14 @@ local function parseClientHello(body: string): Hello
     local extensions = parseExtensions(reader)
     reader:finish()
 
-    return Hello(version = version, random = random, sessionId = sessionId, suites = suites, extensions = extensions, raw = body)
+    return Hello(
+        version = version,
+        random = random,
+        sessionId = sessionId,
+        suites = suites,
+        extensions = extensions,
+        raw = body
+    )
 end
 
 local function offeredVersions(hello: Hello): (boolean, boolean)
@@ -1305,8 +1328,10 @@ local function sendTicket(self: Session): nil
     local nonce = self.random(8)
     local psk = expandLabel(suite.hash, self.resumptionSecret as string, "resumption", nonce, hash.size(suite.hash))
     local ageSalt = wire.touint(self.random(4))
-    local plaintext = uint(suite.code, 2) .. uint(now(), 6) .. uint(ageSalt, 4) .. vector(self.negotiated or "", 1)
-        .. vector(psk, 1)
+    local plaintext = uint(
+        suite.code,
+        2
+    ) .. uint(now(), 6) .. uint(ageSalt, 4) .. vector(self.negotiated or "", 1) .. vector(psk, 1)
     local ticket = sealTicket(self, plaintext)
     local body = uint(TICKET_LIFETIME, 4) .. uint(ageSalt, 4) .. vector(nonce, 1) .. vector(ticket, 2) .. vector("", 2)
     emit(self, HANDSHAKE, handshakeMessage(NEW_SESSION_TICKET, body))
@@ -1357,9 +1382,14 @@ local function serverHello13(self: Session, hello: Hello): nil
         self.offeredRetry = true
         self.transcript = self.transcript .. handshakeMessage(CLIENT_HELLO, hello.raw)
         retryTranscript(self)
-        local extensions = extension(EXT_SUPPORTED_VERSIONS, uint(0x0304, 2)) .. extension(EXT_KEY_SHARE, uint(wanted as integer, 2))
-        local body = uint(0x0303, 2) .. RETRY_RANDOM .. vector(hello.sessionId, 1) .. uint(suite.code, 2) .. "\0"
-            .. vector(extensions, 2)
+        local extensions = extension(
+            EXT_SUPPORTED_VERSIONS,
+            uint(0x0304, 2)
+        ) .. extension(EXT_KEY_SHARE, uint(wanted as integer, 2))
+        local body = uint(
+            0x0303,
+            2
+        ) .. RETRY_RANDOM .. vector(hello.sessionId, 1) .. uint(suite.code, 2) .. "\0" .. vector(extensions, 2)
         sendHandshake(self, SERVER_HELLO, body)
         self.group = wanted as integer
         self.phase = "wait_client_hello"
@@ -1380,16 +1410,20 @@ local function serverHello13(self: Session, hello: Hello): nil
     self.transcript = self.transcript .. handshakeMessage(CLIENT_HELLO, hello.raw)
     local public, shared = serverShare(self, group as integer, shares[group as integer] as string)
     self.serverRandom = self.random(32)
-    local extensions = extension(EXT_SUPPORTED_VERSIONS, uint(0x0304, 2))
-        .. extension(EXT_KEY_SHARE, uint(group as integer, 2) .. vector(public, 2))
+    local extensions = extension(
+        EXT_SUPPORTED_VERSIONS,
+        uint(0x0304, 2)
+    ) .. extension(EXT_KEY_SHARE, uint(group as integer, 2) .. vector(public, 2))
     if psk ~= nil then
         extensions = extensions .. extension(EXT_PRE_SHARED_KEY, uint(0, 2))
         self.resumedSession = true
     else
         self.earlySecret = nil
     end
-    local body = uint(0x0303, 2) .. self.serverRandom .. vector(hello.sessionId, 1) .. uint(suite.code, 2) .. "\0"
-        .. vector(extensions, 2)
+    local body = uint(
+        0x0303,
+        2
+    ) .. self.serverRandom .. vector(hello.sessionId, 1) .. uint(suite.code, 2) .. "\0" .. vector(extensions, 2)
     sendHandshake(self, SERVER_HELLO, body)
     computeHandshakeSecrets(self, shared)
     self.writeProtection = trafficProtection(suite, self.serverHandshakeSecret as string)
@@ -1534,9 +1568,11 @@ local function onKeyUpdate(self: Session, body: string): nil
         fatal(ALERT_ILLEGAL_PARAMETER, "a malformed KeyUpdate")
     end
     local suite = self.suite as Suite
+
     local function next(secret: string): string
         return expandLabel(suite.hash, secret, "traffic upd", "", hash.size(suite.hash))
     end
+
     if self.server then
         self.clientTrafficSecret = next(self.clientTrafficSecret as string)
         self.readProtection = trafficProtection(suite, self.clientTrafficSecret as string)
@@ -1558,11 +1594,13 @@ end
 
 local function onHandshakeMessage(self: Session, kind: integer, body: string): nil
     local phase = self.phase
+
     local function expect(wanted: integer): nil
         if kind ~= wanted then
             fatal(ALERT_UNEXPECTED_MESSAGE, "unexpected handshake message " .. kind .. " in " .. phase)
         end
     end
+
     if phase == "connected" then
         if self.version == 0x0304 and not self.server and kind == NEW_SESSION_TICKET then
             onNewSessionTicket(self, body)
@@ -1663,7 +1701,10 @@ local function onAlert(self: Session, fragment: string): nil
     if description == 90 and fragment:byte(1) == 1 then
         return
     end
-    error({alert = -1, message = "the peer sent a fatal alert: " .. (ALERT_NAMES[description] or tostring(description))}, 0)
+    error(
+        {alert = -1, message = "the peer sent a fatal alert: " .. (ALERT_NAMES[description] or tostring(description))},
+        0
+    )
 end
 
 local function onRecord(self: Session, contentType: integer, header: string, body: string): nil
@@ -1882,7 +1923,8 @@ export function handshake(self: Session): (boolean?, string?)
         return nil, why
     end
     if self.ready then
-        local named = self.server and (self.serverconfig as ServerConfig).protocols or (self.client as ClientConfig).protocols
+        local named = self.server and (self.serverconfig as ServerConfig).protocols
+            or (self.client as ClientConfig).protocols
         if #named > 0 and self.negotiated == nil then
             self.failure = "the TLS peer shares none of the required application protocols"
             sendAlert(self, ALERT_NO_APPLICATION_PROTOCOL)

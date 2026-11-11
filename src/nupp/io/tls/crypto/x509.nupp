@@ -95,7 +95,9 @@ local function parseTime(node: der.Node): integer?
     return daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
 end
 
-const KNOWN_CRITICAL: {[string]: boolean} = {
+const KNOWN_CRITICAL: {
+    [string]: boolean
+} = {
     ["2.5.29.15"] = true,
     ["2.5.29.17"] = true,
     ["2.5.29.19"] = true,
@@ -320,6 +322,7 @@ local function ipBytes(text: string): string?
             return nil
         end
     end
+
     local function groups(part: string): {integer}?
         local out: {integer} = {}
         if part == "" then
@@ -343,6 +346,7 @@ local function ipBytes(text: string): string?
 
         return out
     end
+
     local first = groups(head)
     local last = groups(tail)
     if first == nil or last == nil then
@@ -397,6 +401,7 @@ local function dnsMatches(pattern: string, name: string): boolean
         return false
     end
     -- A wildcard matches one whole label, never a public suffix's worth of them.
+
     return name:sub(dot) == suffix and suffix:find(".", 2, true) ~= nil
 end
 

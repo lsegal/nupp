@@ -160,10 +160,15 @@ local function base64(text: string): string
         local d2 = value // 4096 % 64
         local d3 = value // 64 % 64
         local d4 = value % 64
-        out[#out + 1] = BASE64:sub(d1 + 1, d1 + 1)
-            .. BASE64:sub(d2 + 1, d2 + 1)
-            .. (b ~= nil and BASE64:sub(d3 + 1, d3 + 1) or "=")
-            .. (c ~= nil and BASE64:sub(d4 + 1, d4 + 1) or "=")
+        out[
+            #out + 1
+        ] = BASE64:sub(
+            d1 + 1,
+            d1 + 1
+        ) .. BASE64:sub(
+            d2 + 1,
+            d2 + 1
+        ) .. (b ~= nil and BASE64:sub(d3 + 1, d3 + 1) or "=") .. (c ~= nil and BASE64:sub(d4 + 1, d4 + 1) or "=")
     end
 
     return table.concat(out)
@@ -303,8 +308,13 @@ local function parseProxy(text: string, credentials: string?): (Proxy?, string?)
     end
     local port = portText ~= nil and tonumber(portText) as integer or (kind == "http" and 80 or 1080)
 
-    return Proxy(kind = kind as "http" | "socks5" | "socks5h", host = host, port = port, username = username, password = password),
-        nil
+    return Proxy(
+        kind = kind as "http" | "socks5" | "socks5h",
+        host = host,
+        port = port,
+        username = username,
+        password = password
+    ), nil
 end
 
 local function environment(name: string): string?
@@ -565,8 +575,9 @@ local record Transfer is NativeTransfer
         local declared = self._declared
         if declared ~= nil and self._uploadSent + self._uploadBytes ~= (declared as integer) then
             self:_failBeforeHead(
-                "the upload ended after " .. (self._uploadSent + self._uploadBytes) .. " of its declared "
-                    .. (declared as integer) .. " bytes"
+                "the upload ended after " .. (
+                    self._uploadSent + self._uploadBytes
+                ) .. " of its declared " .. (declared as integer) .. " bytes"
             )
 
             return "closed"
@@ -922,7 +933,10 @@ local record Client is NativeClient
         if limit ~= nil and declaredText == nil and kind ~= BODY_FILE then
             headers[#headers + 1] = Header(name = "content-length", value = tostring(limit))
         end
-        if self._compressed and headerValue(headers, "accept-encoding") == nil and headerValue(headers, "range") == nil then
+        if self._compressed
+            and headerValue(headers, "accept-encoding") == nil
+            and headerValue(headers, "range") == nil
+        then
             headers[#headers + 1] = Header(name = "accept-encoding", value = "gzip, deflate")
         end
         if headerValue(headers, "accept") == nil then
@@ -1029,8 +1043,17 @@ local record Client is NativeClient
         local proxy = transfer._proxy
         local via = proxy ~= nil and ((proxy.kind as string) .. "://" .. proxy.host .. ":" .. proxy.port) or "direct"
 
-        return destination.scheme .. "://" .. destination.host:lower() .. ":" .. destination.port .. "|" .. via .. "|"
-            .. (transfer._insecure and "insecure" or "verify")
+        return destination.scheme
+            .. "://"
+            .. destination.host:lower()
+            .. ":"
+            .. destination.port
+            .. "|"
+            .. via
+            .. "|"
+            .. (
+                transfer._insecure and "insecure" or "verify"
+            )
     end
 
     -- Takes an idle pooled connection that is still open.
@@ -1103,11 +1126,15 @@ local record Client is NativeClient
                     conn.phase = "socks"
                 elseif proxy ~= nil and destination.scheme == "https" then
                     conn.phase = "tunnel"
-                    local request = "CONNECT " .. authorityHost(destination.host) .. ":" .. destination.port
-                        .. " HTTP/1.1\r\nHost: " .. authorityHost(destination.host) .. ":" .. destination.port .. "\r\n"
+                    local request = "CONNECT " .. authorityHost(
+                        destination.host
+                    ) .. ":" .. destination.port .. " HTTP/1.1\r\nHost: " .. authorityHost(
+                        destination.host
+                    ) .. ":" .. destination.port .. "\r\n"
                     if proxy.username ~= nil then
-                        request = request .. "Proxy-Authorization: Basic "
-                            .. base64((proxy.username as string) .. ":" .. (proxy.password or "")) .. "\r\n"
+                        request = request .. "Proxy-Authorization: Basic " .. base64(
+                            (proxy.username as string) .. ":" .. (proxy.password or "")
+                        ) .. "\r\n"
                     end
                     conn.output = request .. "\r\n"
                 else
@@ -1244,7 +1271,12 @@ local record Client is NativeClient
             local four = destination.host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
             if four ~= nil and proxy.kind ~= "socks5h" or four ~= nil then
                 local a, b, c, d = destination.host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
-                address = "\1" .. string.char(tonumber(a) as integer, tonumber(b) as integer, tonumber(c) as integer, tonumber(d) as integer)
+                address = "\1" .. string.char(
+                    tonumber(a) as integer,
+                    tonumber(b) as integer,
+                    tonumber(c) as integer,
+                    tonumber(d) as integer
+                )
             else
                 address = "\3" .. string.char(#destination.host) .. destination.host
             end
@@ -1298,7 +1330,9 @@ local record Client is NativeClient
         end
         if throughProxy and (proxy as Proxy).username ~= nil then
             local p = proxy as Proxy
-            lines[#lines + 1] = "proxy-authorization: Basic " .. base64((p.username as string) .. ":" .. (p.password or ""))
+            lines[
+                #lines + 1
+            ] = "proxy-authorization: Basic " .. base64((p.username as string) .. ":" .. (p.password or ""))
         end
 
         return table.concat(lines, "\r\n") .. "\r\n\r\n"
@@ -1699,8 +1733,11 @@ local record Client is NativeClient
                 moved = true
             end
             if (conn as Connection).failure ~= nil then
-                transfer:_failBeforeHead("error sending request for url (" .. transfer._target.text .. "): "
-                    .. tostring((conn as Connection).failure))
+                transfer:_failBeforeHead(
+                    "error sending request for url (" .. transfer._target.text .. "): " .. tostring(
+                        (conn as Connection).failure
+                    )
+                )
 
                 return true
             end
@@ -1747,8 +1784,11 @@ local record Client is NativeClient
                     end
                 end
             elseif c.failure ~= nil or c.eof then
-                transfer:_failBeforeHead("error sending request for url (" .. transfer._target.text .. "): "
-                    .. (c.failure or "connection closed before message completed"))
+                transfer:_failBeforeHead(
+                    "error sending request for url (" .. transfer._target.text .. "): " .. (
+                        c.failure or "connection closed before message completed"
+                    )
+                )
 
                 return true
             end
@@ -1763,7 +1803,10 @@ local record Client is NativeClient
                 transfer:_failBody("error decoding response body: " .. tostring(c.failure))
                 moved = true
             end
-            if not transfer._terminal and transfer._stallMs > 0 and now - transfer._lastProgress >= transfer._stallMs then
+            if not transfer._terminal
+                and transfer._stallMs > 0
+                and now - transfer._lastProgress >= transfer._stallMs
+            then
                 if transfer._bodyBytes >= RESPONSE_WINDOW then
                     transfer:_failBody("response stalled while its body queue was full")
                 else

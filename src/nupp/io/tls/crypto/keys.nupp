@@ -20,10 +20,7 @@ const RSA_OID = "1.2.840.113549.1.1.1"
 const PSS_OID = "1.2.840.113549.1.1.10"
 const EC_OID = "1.2.840.10045.2.1"
 const ED25519_OID = "1.3.101.112"
-const CURVES: {[string]: string} = {
-    ["1.2.840.10045.3.1.7"] = "p256",
-    ["1.3.132.0.34"] = "p384",
-}
+const CURVES: {[string]: string} = {["1.2.840.10045.3.1.7"] = "p256", ["1.3.132.0.34"] = "p384",}
 
 --- What kind of key.
 export type Kind = "rsa" | "ec" | "ed25519"
@@ -238,7 +235,9 @@ export const RSA_PSS_SHA512 = 0x0806
 export const ED25519 = 0x0807
 
 --- The schemes offered and accepted, in preference order.
-export const SCHEMES: {integer} = {
+export const SCHEMES: {
+    integer
+} = {
     ECDSA_P256_SHA256,
     ECDSA_P384_SHA384,
     ED25519,
@@ -280,7 +279,13 @@ end
 
 --- Verifies `signature` over `message` with a TLS signature scheme. `tls13`
 --- refuses PKCS #1 v1.5, which TLS 1.3 forbids in handshake signatures.
-export function verifyscheme(key: PublicKey, scheme: integer, message: string, signature: string, tls13: boolean): boolean
+export function verifyscheme(
+    key: PublicKey,
+    scheme: integer,
+    message: string,
+    signature: string,
+    tls13: boolean
+): boolean
     if scheme == ED25519 then
         return key.kind == "ed25519" and curve25519.edverify(key.point as string, message, signature)
     end
@@ -291,9 +296,12 @@ export function verifyscheme(key: PublicKey, scheme: integer, message: string, s
     local digest = hash.digest(hashName, message)
     local family = scheme % 256
     if scheme // 256 == 0x08 then
-        return key.kind == "rsa" and rsa.verifypss(key.rsa as rsa.PublicKey, hashName, digest, signature, hash.size(hashName))
+        return key.kind == "rsa"
+            and rsa.verifypss(key.rsa as rsa.PublicKey, hashName, digest, signature, hash.size(hashName))
     elseif family == 0x01 then
-        return not tls13 and key.kind == "rsa" and rsa.verifypkcs1(key.rsa as rsa.PublicKey, hashName, digest, signature)
+        return not tls13
+            and key.kind == "rsa"
+            and rsa.verifypkcs1(key.rsa as rsa.PublicKey, hashName, digest, signature)
     elseif family == 0x03 then
         if (key.kind as string) ~= "ec" then
             return false
@@ -332,7 +340,12 @@ end
 
 --- Signs `message` with a scheme the key can use.
 --- @raises string when the key cannot sign with the scheme
-export function signscheme(key: PrivateKey, scheme: integer, message: string, random: function(count: integer): string): string
+export function signscheme(
+    key: PrivateKey,
+    scheme: integer,
+    message: string,
+    random: function(count: integer): string
+): string
     if (key.kind as string) == "ed25519" then
         return curve25519.edsign(key.seed as string, message)
     end

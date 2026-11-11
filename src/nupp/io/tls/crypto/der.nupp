@@ -23,6 +23,7 @@ end
 
 --- Common tags.
 export const SEQUENCE = 0x30
+
 export const SET = 0x31
 export const INTEGER = 0x02
 export const BITSTRING = 0x03
@@ -229,6 +230,7 @@ export function encodeoid(dotted: string): string
         arcs[#arcs + 1] = tonumber(part) as integer
     end
     local out: {string} = {}
+
     local function arc(value: integer): nil
         local chunk: {integer} = {value % 128}
         value = value // 128
@@ -238,6 +240,7 @@ export function encodeoid(dotted: string): string
         end
         out[#out + 1] = string.char(unpack(chunk))
     end
+
     arc(arcs[1] * 40 + arcs[2])
     for index = 3, #arcs do
         arc(arcs[index])

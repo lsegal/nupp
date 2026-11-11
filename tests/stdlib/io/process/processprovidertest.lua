@@ -75,7 +75,7 @@ function M.beforeAll()
     if not libraryPath then
         root = temporaryRoot()
         os.execute("mkdir -p '" .. root .. "'")
-        local staged, problem = nativeStage.build(root, "out", {["native.process"] = true, ["native.net"] = true})
+        local staged, problem = nativeStage.build(root, "out", {["native.process"] = true})
         if not staged then
             unavailable = tostring(problem)
             return
@@ -476,74 +476,6 @@ function M.aQuietWaitParksInsteadOfSpinning()
     provider:kill(child.owner, true)
     waitExit(child)
     finish(child)
-end
-
--- A socket accepting a connection advances the readiness generation every
--- native family shares, and a process wait sleeping on a quiet child wakes for
--- it rather than sleeping out its timeout.
--- A loopback listener from the same native library the provider sleeps on,
--- answered as a closer and its port, or nil and why there is none.
-local function listen()
-    local native = require("nupp.runtime.native")
-    if bit.band(tonumber(native.C.nuppNativeFeatures()), 256) == 0 then
-        return nil, "the native library was built without the network family"
-    end
-    local ffi = native.ffi
-    -- Each on its own, so declarations the network provider already made stand.
-    for _, declaration in ipairs({
-        "typedef struct { const uint8_t *data; size_t length; } NuppNativeNetSlice;",
-        "typedef struct { NuppNativeNetSlice host; uint16_t port; uint32_t backlog; int32_t reuse_port; } NuppNativeNetListenOptions;",
-        "int32_t nuppNativeNetListenerCreate(const NuppNativeNetListenOptions *, uint64_t *);",
-        "int32_t nuppNativeNetListenerPort(uint64_t, uint16_t *);",
-        "int32_t nuppNativeNetListenerRelease(uint64_t);",
-    }) do
-        pcall(ffi.cdef, declaration)
-    end
-    local host = "127.0.0.1"
-    local options = ffi.new("NuppNativeNetListenOptions")
-    options.host.data = ffi.cast("const uint8_t *", host)
-    options.host.length = #host
-    options.backlog = 16
-    local handle = ffi.new("uint64_t[1]")
-    assert(native.C.nuppNativeNetListenerCreate(options, handle) == 0, "the listener did not open")
-    local port = ffi.new("uint16_t[1]")
-    assert(native.C.nuppNativeNetListenerPort(handle[0], port) == 0 and port[0] > 0)
-
-    return function()
-        native.C.nuppNativeNetListenerRelease(handle[0])
-    end, tonumber(port[0])
-end
-
-function M.socketActivityWakesAProcessWait()
-    ready()
-    local listener, port = listen()
-    if listener == nil then
-        test.suite.skip(port)
-    end
-    local quiet = spawn(longRunning(), {stdout = "null", stderr = "null"})
-    local client = spawn({BASH, "-c", ("sleep 0.5; exec 3<>/dev/tcp/127.0.0.1/%d; sleep 1"):format(port)}, {
-        stdout = "null",
-        stderr = "null"
-    })
-    -- The client's own exit is not in this wait, so only the socket can end it
-    -- early. A return before the client can have connected answers some older
-    -- edge, and the next wait starts from a fresh snapshot.
-    local started, longest = os.monotonic(), 0
-    repeat
-        local before = os.monotonic()
-        provider:waitready(interest(quiet.owner, {}, {}), 8000)
-        longest = math.max(longest, os.monotonic() - before)
-    until os.monotonic() - started >= 300
-    local elapsed = os.monotonic() - started
-    assert(elapsed < 6000, "the process wait slept through the connection: " .. elapsed .. "ms")
-    -- Short polls would also end early; one wait has to have slept until woken.
-    assert(longest >= 200, "no wait slept on the wake handle: the longest took " .. longest .. "ms")
-    provider:kill(quiet.owner, true)
-    waitExit(quiet)
-    finish(quiet)
-    waitExit(client)
-    finish(client)
-    listener()
 end
 
 return M
