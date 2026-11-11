@@ -2,7 +2,7 @@ local fixture = require("helpers.bundlefixture")
 local NUPP = fixture.NUPP
 local tempProject = fixture.tempProject
 local run = fixture.run
-local stampRustHost = fixture.stampRustHost
+local stampNativeHost = fixture.stampNativeHost
 local recordModule = fixture.recordModule
 
 local M = {}
@@ -140,8 +140,8 @@ print(spawned > 1024, tostring(flooded):find("worker queue is full", 1, true) ~=
     local built, builtOk = run(dir, "'" .. NUPP .. "' build")
     assert(builtOk, "the lane-survival binary builds: " .. built)
     local expected = "false\ttrue\ttrue\n256\ttrue\ttrue\ntrue\ttrue\ttrue\n"
-    local rustOutput, rustRanOk = run(dir, stampRustHost(dir, dir .. "/build/app.payload.lua"))
-    assert(rustRanOk and rustOutput == expected, "a task's failure leaves its lane running: " .. rustOutput)
+    local hostOutput, hostRanOk = run(dir, stampNativeHost(dir, dir .. "/build/app.payload.lua"))
+    assert(hostRanOk and hostOutput == expected, "a task's failure leaves its lane running: " .. hostOutput)
     os.execute("rm -rf '" .. dir .. "'")
 end
 

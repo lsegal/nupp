@@ -102,10 +102,11 @@ jobs:
           if-no-files-found: error
 
   # Each platform's universal link kit, built where that platform's libraries
-  # are. A kit needs no nupp, so it is built first and its record is compiled
-  # into every nupp this release builds: that is what lets a released nupp
-  # fetch it, check it against the recorded digest, and link a standalone
-  # program for the platform without a C toolchain.
+  # are. A kit's runtime is the Nupp host, which this tree's nupp compiles with
+  # the prebuilt code generator; the kit is built before any nupp is released,
+  # and its record is compiled into every nupp this release builds: that is what
+  # lets a released nupp fetch it, check it against the recorded digest, and
+  # link a standalone program for the platform without a C toolchain.
   kits:
     name: ${{ matrix.name }} link kit
     # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).

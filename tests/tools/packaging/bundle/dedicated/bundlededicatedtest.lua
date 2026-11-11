@@ -2,7 +2,7 @@ local fixture = require("helpers.bundlefixture")
 local NUPP = fixture.NUPP
 local tempProject = fixture.tempProject
 local run = fixture.run
-local stampRustHost = fixture.stampRustHost
+local stampNativeHost = fixture.stampNativeHost
 
 local M = {}
 
@@ -262,7 +262,7 @@ print("services-ok")
     })
     local built, builtOk = run(dir, "'" .. NUPP .. "' build")
     assert(builtOk, "the service binary builds: " .. built)
-    local output, ranOk = run(dir, stampRustHost(dir, dir .. "/build/app.payload.lua"))
+    local output, ranOk = run(dir, stampNativeHost(dir, dir .. "/build/app.payload.lua"))
     assert(ranOk and output == "services-ok\n", "dedicated channels move, communicate and settle: " .. output)
     os.execute("rm -rf '" .. dir .. "'")
 end

@@ -269,9 +269,7 @@ function M.providerBuildRecordsTheNativeLibrariesItsArchiveNeeds()
     -- have linked beside it.
     assert(arguments:find("--print native-static-libs", 1, true), arguments)
     local libraries = read(answer(output):match("^(.*)/target/") .. "/native-static-libs")
-    assert(libraries == "-lfake
--lother
-", libraries)
+    assert(libraries == "-lfake\n-lother\n", libraries)
 end
 
 -- The GPU provider is Nupp over wgpu-native, which no host links, so a host

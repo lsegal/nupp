@@ -2,7 +2,7 @@ local fixture = require("helpers.bundlefixture")
 local NUPP = fixture.NUPP
 local tempProject = fixture.tempProject
 local run = fixture.run
-local stampRustHost = fixture.stampRustHost
+local stampNativeHost = fixture.stampNativeHost
 
 local M = {}
 
@@ -60,8 +60,8 @@ end
     local built, builtOk = run(dir, "'" .. NUPP .. "' build")
     assert(builtOk, "the forged-region binary builds: " .. built)
     local expected = "false\ttrue\n67\n"
-    local rustOutput, rustRanOk = run(dir, stampRustHost(dir, dir .. "/build/app.payload.lua"))
-    assert(rustRanOk and rustOutput == expected, "a forged region extent is refused before it crosses: " .. rustOutput)
+    local hostOutput, hostRanOk = run(dir, stampNativeHost(dir, dir .. "/build/app.payload.lua"))
+    assert(hostRanOk and hostOutput == expected, "a forged region extent is refused before it crosses: " .. hostOutput)
     os.execute("rm -rf '" .. dir .. "'")
 end
 

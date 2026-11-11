@@ -2,7 +2,7 @@ local fixture = require("helpers.bundlefixture")
 local NUPP = fixture.NUPP
 local tempProject = fixture.tempProject
 local run = fixture.run
-local stampRustHost = fixture.stampRustHost
+local stampNativeHost = fixture.stampNativeHost
 
 local M = {}
 
@@ -81,7 +81,7 @@ print(owing)
     })
     local built, builtOk = run(dir, "'" .. NUPP .. "' build")
     assert(builtOk, "the worker binary builds: " .. built)
-    local output, ranOk = run(dir, stampRustHost(dir, dir .. "/build/app.payload.lua"))
+    local output, ranOk = run(dir, stampNativeHost(dir, dir .. "/build/app.payload.lua"))
     assert(
         ranOk and output == "true\ttrue\n1\n",
         "settled worker tasks left the scope and the unconsumed moved result stayed: " .. output

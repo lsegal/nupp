@@ -33,7 +33,7 @@ local function run(command)
     pipe:close()
     local status = tonumber(output:match("__status__:(%d+)%s*$"))
 
-    return status, (output:gsub("%s*__status__:%d+%s*$", ""):gsub("\r\n", "\n"))
+    return status, (output:gsub("\n__status__:%d+%s*$", ""):gsub("\r\n", "\n"))
 end
 
 local function temporary()
@@ -703,11 +703,11 @@ function M.aDamagedStampIsRefusedRatherThanRun()
         {{digest = ("\0"):rep(8)}, "does not match the digest"},
     }
     for _, case in ipairs(cases) do
-        local host = writeHost(stamped(image, "print('ran')", case[1]))
+        local host = writeHost(stamped(image, "print('the payload ran')", case[1]))
         local status, output = run(quote(host))
         assert(status == 1, output)
         assert(output:find("^nupp: ") and output:find(case[2], 1, true), output)
-        assert(not output:find("ran", 1, true), output)
+        assert(not output:find("the payload ran", 1, true), output)
     end
 end
 
@@ -805,8 +805,8 @@ assert(native.messageOffer(out, message) == 0)
 status, text, attachments = native.endpointReceive(back)
 assert(status == 0 and text == "payload")
 assert(shared.text(attachments[1], attachments[2], attachments[3]) == "shared")
-local file = os.tmpname()
-local handle = io.open(file, "wb")
+local file = assert(arg[1], "a scratch path")
+local handle = assert(io.open(file, "wb"))
 handle:write("from a file")
 handle:close()
 local read, problem = shared.readFile(file)
@@ -819,7 +819,7 @@ print("surface")
 
 function M.aStampedHostServesTheEndpointAndSharedByteSurface()
     local host = stampedHost(SURFACE)
-    local status, output = run(quote(host))
+    local status, output = run(quote(host) .. " " .. quote(temporary() .. "/scratch"))
     assert(status == 0 and output == "surface\n", output)
 end
 

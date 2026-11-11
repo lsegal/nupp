@@ -850,8 +850,8 @@ end
 function M.macOSRustProviderUsesARelocatableInstallName()
     local driver = read(ROOT .. "/scripts/toolchain")
     assert(
-        driver:find("[ \"$PLATFORM\" = darwin ] && cargo_action=rustc", 1, true),
-        "the macOS Rust provider is not built through cargo rustc"
+        driver:find('set -- "$CARGO" rustc \\n        --manifest-path "$ROOT/Cargo.toml" \\n        --package nupp-native', 1, true),
+        "the Rust provider is not built through cargo rustc"
     )
     assert(
         driver:find("-install_name,@rpath/$filename", 1, true),
@@ -985,8 +985,8 @@ function M.macOSHostLinkersCarryTheSecurityFramework()
     assert(security >= 1 and foundation >= 1, "not every macOS toolchain linker carries the trust-store frameworks")
 end
 
--- The Rust application archive now contains the exact-feature provider. Cargo
--- retains its named exports. Windows selects one-codegen-unit Rust surfaces
+-- The application archive is the Nupp host merged with the exact-feature Rust
+-- provider, LuaJIT and LPeg. Windows links the provider's import members
 -- normally so it does not force-load flattened std/import objects; other hosts
 -- retain the authoritative archive directly.
 function M.staticHostsRetainTheRustApplicationArchive()
@@ -1005,11 +1005,10 @@ function M.staticHostsRetainTheRustApplicationArchive()
         importMemberCases = importMemberCases + 1
         importMemberPosition = position + #importMemberCase
     end
-    assert(driver:find("-C link-dead-code", 1, true), "Cargo may discard exports reached only through LuaJIT FFI")
     assert(companionCopy < sanitize, "the import companion is not preserved before archive sanitization")
     assert(
-        driver:find('"$rust_application" "$out/libnupp-host.a" "$out/libnupp-host-imports.a"', 1, true),
-        "the staged application host omits the sanitized Rust archive"
+        driver:find('stage_application_archive "$nh_out/libnupp-host-merged.a" "$nh_out/libnupp-host.a"', 1, true),
+        "the staged application host omits the sanitized merged archive"
     )
     assert(
         importMemberCases == 2,

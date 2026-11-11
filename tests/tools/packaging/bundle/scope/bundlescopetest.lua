@@ -2,7 +2,7 @@ local fixture = require("helpers.bundlefixture")
 local NUPP = fixture.NUPP
 local tempProject = fixture.tempProject
 local run = fixture.run
-local stampRustHost = fixture.stampRustHost
+local stampNativeHost = fixture.stampNativeHost
 
 local M = {}
 
@@ -179,15 +179,15 @@ end
         and output:find("cancelled: its deadline passed", 1, true) ~= nil,
         "running, queued, and deadline cancellation share one task identity: " .. output
     )
-    local rustExecutable = stampRustHost(dir, dir .. "/build/app.payload.lua")
+    local hostExecutable = stampNativeHost(dir, dir .. "/build/app.payload.lua")
     for _ = 1, 32 do
-        local rustOutput, rustRanOk = run(dir, rustExecutable)
-        assert(rustRanOk, "the Rust worker host runs task cancellation: " .. rustOutput)
+        local hostOutput, hostRanOk = run(dir, hostExecutable)
+        assert(hostRanOk, "the stamped host runs task cancellation: " .. hostOutput)
         assert(
-            rustOutput:sub(1, #head) == head
-            and rustOutput:sub(-#tail) == tail
-            and rustOutput:find("cancelled: its deadline passed", 1, true) ~= nil,
-            "Rust-owned workers preserve queued, running, and deadline cancellation: " .. rustOutput
+            hostOutput:sub(1, #head) == head
+            and hostOutput:sub(-#tail) == tail
+            and hostOutput:find("cancelled: its deadline passed", 1, true) ~= nil,
+            "The host's workers preserve queued, running, and deadline cancellation: " .. hostOutput
         )
     end
     os.execute("rm -rf '" .. dir .. "'")

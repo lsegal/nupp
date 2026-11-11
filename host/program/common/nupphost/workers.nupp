@@ -1447,8 +1447,6 @@ local function laneMain(argument: uint64): voidptr?
                 state.nuppHostStateClose(L as voidptr)
             end
             state.nuppHostStateCallFree(record)
-            channel.nuppHostQueueClose(controlQueue(l.inbox))
-            channel.nuppHostQueueClose(controlQueue(l.outbox))
             setPhase(lane, LANE_FAILED)
             return nil
         end
