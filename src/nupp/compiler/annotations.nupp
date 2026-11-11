@@ -452,6 +452,14 @@ local BUILTINS = {
         doc = "Reserves a required whole-function ahead-of-time compilation contract. A build's `aot` policy decides what happens with it: off (default), require, emit-wasm or require-wasm.",
         docsPath = "docs/api.md#annotation-aot",
     },
+    {
+        name = "visibility",
+        arguments = "typed",
+        targets = {"local-binding", "function"},
+        builtin = true,
+        doc = "Sets the ELF and Mach-O visibility of a native program's exported function or data symbol: `\"default\"` or `\"hidden\"`.",
+        docsPath = "docs/learn/performance/ahead-of-time/native-programs.md#exported-data",
+    },
 }
 
 function annotations.new(withBuiltins: boolean?): annotations.Registry
@@ -655,6 +663,22 @@ function annotations.hydrateBuiltins(registry: annotations.Registry, typesApi: a
     }
     syntax.memberOrder = {"value"}
     syntax.singleValue = "value"
+
+    local visibility = registry:get("visibility")
+    visibility.members = {
+        value = member(
+            "value",
+            typesApi.union({
+                typesApi.literal("default"),
+                typesApi.literal("hidden")
+            }),
+            false,
+            "`\"default\"` exports the symbol from the library it is linked into; `\"hidden\"` keeps it to that library.",
+            "docs/api.md#annotation-visibility"
+        ),
+    }
+    visibility.memberOrder = {"value"}
+    visibility.singleValue = "value"
 
 end
 
