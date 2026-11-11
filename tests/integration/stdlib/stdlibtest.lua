@@ -644,61 +644,27 @@ function M.browserHttpRejectsMalformedSharedInputsBeforeEffects()
 end
 
 function M.nativeHttpDispatchDrainsAfterAWakerRaises()
-    local ffi = require("ffi")
-    local C = {}
-    local pending = 0
-    local released = {client = 0, transfer = 0}
-
-    function C.nuppNativeHttpClientCreate(_, output)
-        output[0] = 1
-        return 0
-    end
-
-    function C.nuppNativeHttpClientRelease()
-        released.client = released.client + 1
-        return 0
-    end
-
-    function C.nuppNativeHttpClientSend(_, _, output)
-        output[0] = 2
-        return 0
-    end
-
-    function C.nuppNativeHttpClientPending(_, output)
-        output[0] = pending
-        return 0
-    end
-
-    function C.nuppNativeHttpTransferRelease()
-        released.transfer = released.transfer + 1
-        return 0
-    end
-
-    function C.nuppNativeHttpTransferCancel()
-        return 0
-    end
-
-    function C.nuppNativeHttpClientPoll(_, ready, _, count, more)
-        ready[0].transfer = 2
-        ready[0].tokens = 7
-        count[0] = 1
-        more[0] = 0
-
-        return 0
-    end
-
+    local closed = {connects = 0}
+    local net = {
+        connect = function()
+            return {}
+        end,
+        connectpoll = function()
+            return nil
+        end,
+        closeconnect = function()
+            closed.connects = closed.connects + 1
+        end,
+        run = function()
+        end,
+    }
     local transport = require("helpers.providerstate").nativeHttp({
-        C = C,
-        ffi = ffi,
-        requireFeature = function()
-        end,
-        succeeded = function(status)
-            testAssert.eq(status, 0)
-        end,
+        ["nupp.runtime.provider.nativenet"] = net,
+        ["nupp.runtime.provider.nativetls"] = {},
     })
     local client = assert(
         transport.newClient({
-            connectTimeoutMs = 1,
+            connectTimeoutMs = 1000,
             maxRedirects = 0,
             maxPendingRequests = 1,
             maxConnections = 1,
@@ -707,22 +673,21 @@ function M.nativeHttpDispatchDrainsAfterAWakerRaises()
             insecureHosts = {},
         })
     )
-    local transfer = assert(
-        client:send({
-            uri = {
-                tostring = function()
-                    return "https://example.com/"
-                end
-            },
+    local function request(timeoutMs)
+        return assert(client:send({
+            uri = assert(require("io.internal.uri").newuri("http://example.test/")),
             method = "GET",
             headers = {},
             bodyKind = 0,
-            timeoutMs = 1,
+            timeoutMs = timeoutMs,
             stallTimeoutMs = 0,
             maxBytes = 0,
             insecure = false,
-        })
-    )
+        }))
+    end
+    -- A connect that never completes, under a deadline that has passed by the
+    -- poll, fails the transfer and wakes every waiter it has.
+    local transfer = request(1)
     local woke = {head = false, body = false, upload = false}
     transfer:onHead(function()
         woke.head = true
@@ -736,19 +701,24 @@ function M.nativeHttpDispatchDrainsAfterAWakerRaises()
     transfer:onUpload(function()
         woke.upload = true
     end)
+    local started = os.monotonic()
+    repeat
+    until os.monotonic() - started >= 5
 
-    local ok, problem = pcall(client.poll, client, 0)
+    local ok, problem = pcall(client.poll, client)
     assert(not ok and tostring(problem):find("waker failed", 1, true), tostring(problem))
     assert(woke.head and woke.body and woke.upload, "one failed waker must not strand the others")
+    transfer:close()
 
-    pending = 1
+    -- A second transfer holds the only admission slot, so an admission waiter
+    -- parks until close, and its failure still lets everything be released.
+    request(60000)
     client:onAdmission(function()
         error("admission waker failed")
     end)
     ok, problem = pcall(client.close, client)
     assert(not ok and tostring(problem):find("admission waker failed", 1, true), tostring(problem))
-    testAssert.eq(released.transfer, 1, "transfer releases after an admission waker failure")
-    testAssert.eq(released.client, 1, "client releases after an admission waker failure")
+    testAssert.eq(closed.connects, 2, "both transfers released their connections after an admission waker failure")
 end
 
 function M.nativeHttpProviderRejectsMalformedBoundaries()

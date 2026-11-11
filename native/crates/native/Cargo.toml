@@ -18,9 +18,6 @@ base = []
 # now, so the feature selects nothing; it goes once the pin moves past this.
 gpu = ["base"]
 uri = ["base", "dep:url"]
-http = ["base", "dep:nupp-native-http"]
-net = ["base", "dep:nupp-native-net"]
-tls = ["net", "dep:nupp-native-tls"]
 # A test-only export that panics inside the boundary: nuppNativePanicProbe.
 panic-probe = ["base"]
 # The AOT code generator: LLVM and lld, linked in (NUPP_LLVM_PREFIX).
@@ -28,9 +25,6 @@ codegen = ["base", "dep:nupp-native-codegen", "nupp-native-codegen/llvm"]
 
 [dependencies]
 nupp-native-abi = { path = "../abi" }
-nupp-native-http = { path = "../http", optional = true }
-nupp-native-net = { path = "../net", optional = true }
-nupp-native-tls = { path = "../tls", optional = true }
 nupp-native-runtime = { path = "../runtime" }
 nupp-native-codegen = { path = "../codegen", optional = true }
 url = { version = "2.5.7", optional = true }

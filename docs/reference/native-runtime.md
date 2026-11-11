@@ -15,8 +15,8 @@ The boundary is deliberately narrow:
 
 | Layer | Owner | Responsibilities |
 | --- | --- | --- |
-| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, and the filesystem services, which call the operating system through FFI |
-| native provider | Rust | clocks, UUIDs, URI, HTTP, TCP, UDP, path sockets, TLS, and processes |
+| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, and the filesystem, process, network, TLS and HTTP services, which call the operating system through FFI |
+| native provider | Rust | clocks, URI, the readiness generation and its wake handle, and the AOT code generator |
 | GPU provider | Nupp | GPU contexts, resources, validation, dispatch, readback, and cost records, over the pinned wgpu-native library |
 | host | Rust | payload discovery, LuaJIT state lifetime, native preload registration, workers, components, embedding handles, and shutdown |
 | VM and compatibility modules | C | LuaJIT and the retained LPeg module |
@@ -24,7 +24,7 @@ The boundary is deliberately narrow:
 
 Rust resources cross into LuaJIT as fixed-width values and generational
 handles. Nupp code never receives a Rust reference, future, Tokio handle, or
-Reqwest response. Rust executor threads never enter LuaJIT; they
+AOT code generator handle. Rust executor threads never enter LuaJIT; they
 publish bounded completion records which the owning Lua lane consumes.
 
 ## Compiler-selected features
@@ -32,8 +32,8 @@ publish bounded completion records which the owning Lua lane consumes.
 Authors select APIs, not Cargo features. The compiler records effects from the
 reachable program and closes their dependencies. The build then asks
 `scripts/toolchain` for an exact-feature provider and host. Default Cargo
-features are disabled, so an HTTP-free program does not acquire Reqwest, and a
-GPU-free program stages no wgpu-native library.
+features are disabled, so a URI-free program does not acquire the `url` crate,
+and a GPU-free program stages no wgpu-native library.
 
 | Nupp facility | Rust provider feature | Host feature when linked into a stub |
 | --- | --- | --- |
@@ -41,16 +41,18 @@ GPU-free program stages no wgpu-native library.
 | paths and files | none: Nupp calls the operating system through FFI | none |
 | UUID | `uuid` | provider archive |
 | URI | `uri` | provider archive |
-| HTTP client | `http` | provider archive |
-| TCP, UDP, DNS, and Unix path sockets | `net` | `native-net` |
-| TLS over a Rust-owned network stream | `tls` | `native-tls` |
+| HTTP client | `base`: HTTP/1.1 in Nupp over the network and TLS services | none |
+| TCP, UDP, DNS, and Unix path sockets | `base`: Nupp sockets through FFI, sleeping on the wake handle | none |
+| TLS over a network stream | none: TLS 1.2/1.3 and its cryptography in Nupp | none |
 | child processes and pipes | `process` | `native-process` |
 | native GPU compute | none: Nupp over wgpu-native | none: `lib/wgpu_native` beside the program |
 | workers and shared immutable bytes | host-owned | `workers` |
 | `lpeg` | retained LPeg | `lpeg` |
 
-`tls` includes the Rust network implementation, and the compiler's HTTP effect
-closure also selects URI handling. A standalone link may combine the Rust
+TLS includes the network service, and the compiler's HTTP effect closure also
+selects TLS, the network service and URI handling. The `native-net` and
+`native-tls` host features remain as names that select nothing, so manifests
+and release feature lists naming them keep working. A standalone link may combine the Rust
 application-host archive with one or more exact-feature provider or AOT
 archives. Shared sidecar builds stage the same provider ABI in a dynamic
 library instead.
@@ -71,8 +73,7 @@ as the provider. So the version stays at 2, and the ABI grows by addition:
 - A minor change never renumbers. It adds exports, a feature bit, or an enum
   value an older caller never receives. It does not change a signature, a
   struct layout, or the meaning of a status or state value in place.
-- A replacement is named for the capability it adds, as
-  `nuppNativeNetStreamPeerEndpoint` is for an IPv6 scope, never with a version
+- A replacement is named for the capability it adds, never with a version
   suffix.
 - A new struct that crosses by pointer starts with `uint32_t size`, which the
   caller sets to the size it was compiled with. The provider refuses a size
@@ -97,18 +98,20 @@ panic's text as the last error.
 
 ### Readiness
 
-Every native family advances one process-wide readiness generation when
-something a caller could be waiting for changes: a socket or TLS session moves,
-a whole-file transfer settles, an HTTP client has events, or a child exits or
-one of its pipes moves. `nuppNativePoll` snapshots it and
+The Rust provider keeps one process-wide readiness generation, which its
+families advance when something a caller could be waiting for changes.
+`nuppNativePoll` snapshots it and
 `nuppNativeWait` sleeps until it moves past a snapshot. A caller polls first,
 checks what it is waiting for with the families' non-blocking calls, and waits
 from the snapshot, so an edge after the poll ends the wait at once and none is
 lost.
 
-So every native wait in a Lua state sleeps on the same thing, and a program
-waiting on a socket and a child at once wakes for whichever
-moves first. `nupp.runtime.native` keeps one snapshot for all of them, and each
+The families Nupp provides through FFI -- sockets, TLS and HTTP, processes and
+their pipes -- own no thread that could advance the generation. Each sleeps in
+one `poll` (`WSAPoll` or `WaitForMultipleObjects` on Windows) over its own
+handles and the provider's wake handle, so its wait still ends for any
+generation advance, and a scheduler polling every source between bounded waits
+sees whichever family moves first. `nupp.runtime.native` keeps one snapshot for all of them, and each
 family's readiness source sleeps from it. GPU `synchronize` is the exception:
 wgpu-native reports finished work only when asked, so its readiness source
 polls the device and sleeps one bounded slice between polls. It is still a
@@ -129,17 +132,20 @@ The current implementation choices are:
   platform against a digest in `scripts/toolchain.pins`; it uses Metal on macOS,
   DX12 and Vulkan on Windows, and Vulkan and GLES on other Unix systems, and
   `WGPU_BACKEND` narrows the choice.
-- Tokio owns the shared asynchronous executor and the file, network, process,
-  timer, and cancellation lanes built on it. Nupp uses Tokio rather than a
-  second Mio-based reactor.
-- Reqwest owns the HTTP client, connection pooling, streaming, proxy support,
-  and content decoding. The selected build uses Rustls rather than a native TLS
-  backend.
-- Rustls owns TLS policy and protocol state. `ring` is the explicitly selected
-  cryptography provider and system roots come through `rustls-native-certs`.
-- Rust standard APIs, `socket2`, `windows-sys`, and narrow `libc` calls cover
-  files, sockets, process handles, and platform details not exposed by the
-  standard library.
+- Nupp owns sockets and name resolution (`nupp.runtime.provider.nativesocket`
+  and `nativenet`), calling BSD sockets or Winsock through LuaJIT's FFI from a
+  reactor that never runs a thread.
+- Nupp owns TLS 1.2 and 1.3 and their cryptography (`nupp.io.tls`): AES-GCM,
+  ChaCha20-Poly1305, X25519, P-256 and P-384, RSA and Ed25519, and X.509 path
+  validation with webpki's rules. Default trust anchors come from
+  `SSL_CERT_FILE`/`SSL_CERT_DIR`, the Windows certificate stores (asking the
+  Windows chain engine for a root it has not delivered yet), or the system
+  bundle file. It is not constant time.
+- Nupp owns the HTTP/1.1 client, connection pooling, streaming, HTTP and SOCKS5
+  proxies, and gzip and deflate decoding, over those sockets and TLS.
+- Tokio owns the Rust provider's remaining asynchronous executor.
+- Rust standard APIs, `windows-sys`, and narrow `libc` calls cover the
+  platform details the Rust provider and host need.
 
 These libraries are implementation details. The Nupp modules define the public
 contracts and may intentionally expose less than the underlying crate.
@@ -154,7 +160,8 @@ claim that every executable byte is Rust. Native builds still retain:
 - `native/crates/host/c/lua_shim.c` and `worker_shim.c`, which contain the
   protected LuaJIT stack, userdata, callback, and longjmp boundary while Rust
   owns every persistent host and worker resource;
-- `ring`'s bounded C and assembly implementation under its Rust API;
+- `ring`'s bounded C and assembly implementation under its Rust API, which the
+  code generator's link-kit download still uses;
 - compiled AOT code, and the AOT runtime (`native/crates/native/c/ks_rt.c`) a
   builder entry calls through a table the provider hands it;
 - LLVM and lld, linked into `nupp` as the AOT code generator and never into the
@@ -236,8 +243,12 @@ artifact:
   standalone binary cannot carry it.
 - Curl and ada were removed. URI behavior follows Rust's WHATWG `url` contract,
   and HTTP follows the documented Reqwest contract rather than curl parity.
-- Libuv and mbedTLS were removed. Tokio owns network resources and Rustls owns
-  ordinary TLS over those resources. DTLS, kTLS, the old public session-ID and
+- Libuv and mbedTLS were removed, and later the Rust `net`, `http` and `tls`
+  crates, with Tokio's network lanes, Reqwest and Rustls. Sockets, TLS and HTTP
+  are Nupp over FFI; their `nuppNativeNet*`, `nuppNativeTls*` and
+  `nuppNativeHttp*` exports and the `NET`, `TLS`, `HTTP` and
+  `NET_ENDPOINT` feature bits are gone. HTTP/2 was never selected and is
+  not offered. DTLS, kTLS, the old public session-ID and
   ticket-key controls, and Windows named-pipe emulation of Unix path streams
   are not part of the retained contract.
 - File and process resources moved behind Rust ownership. Cancellation and

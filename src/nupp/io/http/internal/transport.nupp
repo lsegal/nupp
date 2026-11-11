@@ -1841,12 +1841,12 @@ local record Client is NativeClient
             self:_drive(transfer)
             local count: integer
             local problem: any
-            if transfer._packed ~= nil or transfer._headFailure ~= nil then
+            if transfer._packed ~= nil or transfer._headFailure ~= nil or transfer._terminal then
                 count, problem = dispatch(transfer, "_headWaiters")
                 moved = moved + count
                 failure = failure or problem
             end
-            if #transfer._body > 0 or transfer._bodyDone or transfer._bodyFailure ~= nil then
+            if #transfer._body > 0 or transfer._bodyDone or transfer._bodyFailure ~= nil or transfer._terminal then
                 count, problem = dispatch(transfer, "_bodyWaiters")
                 moved = moved + count
                 failure = failure or problem

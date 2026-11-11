@@ -13,35 +13,6 @@ _Static_assert(offsetof(NuppNativeSlice, data) == 0
         && offsetof(NuppNativeSlice, length) == sizeof(void *)
         && sizeof(NuppNativeSlice) == 2 * sizeof(void *),
     "the byte slice has an unexpected layout");
-_Static_assert(offsetof(NuppNativeHttpSlice, data) == 0,
-    "HTTP slice data moved");
-_Static_assert(offsetof(NuppNativeHttpSlice, length) == sizeof(void *),
-    "HTTP slice length has an unexpected offset");
-_Static_assert(offsetof(NuppNativeHttpHead, state) == 0,
-    "HTTP head state moved");
-_Static_assert(offsetof(NuppNativeHttpHead, status) == 4,
-    "HTTP head status has an unexpected offset");
-_Static_assert(offsetof(NuppNativeHttpHead, version) == 6,
-    "HTTP head version has an unexpected offset");
-_Static_assert(offsetof(NuppNativeHttpHead, url_length) == 8,
-    "HTTP head URL length has an unexpected offset");
-_Static_assert(offsetof(NuppNativeHttpHead, headers_length)
-        == 8 + sizeof(size_t),
-    "HTTP head header length has an unexpected offset");
-_Static_assert(offsetof(NuppNativeHttpReady, transfer) == 0,
-    "HTTP ready handle moved");
-_Static_assert(offsetof(NuppNativeHttpReady, tokens) == sizeof(uint64_t),
-    "HTTP ready tokens have an unexpected offset");
-_Static_assert(offsetof(NuppNativeTlsOptions, certificate)
-        == sizeof(NuppNativeNetSlice),
-    "TLS certificate slice has an unexpected offset");
-_Static_assert(offsetof(NuppNativeTlsOptions, authority_present)
-        == 5 * sizeof(NuppNativeNetSlice),
-    "TLS authority-present flag has an unexpected offset");
-_Static_assert(offsetof(NuppNativeTlsOptions, verify)
-        == 5 * sizeof(NuppNativeNetSlice) + 2 * sizeof(int32_t),
-    "TLS verify flag has an unexpected offset");
-
 static int failed(const char *operation, int32_t status) {
     fprintf(stderr, "%s: status %d: %s\n", operation, status,
         nuppNativeLastError());
@@ -75,34 +46,18 @@ static int readiness_generation_answers_waiters(void) {
 }
 
 int main(void) {
-    size_t length = 0;
     uint64_t uri = 0;
-    uint64_t client = 0;
-    NuppNativeHttpClientOptions http_options = {0};
     int32_t status;
 
     if (nuppNativeAbiVersion() != NUPP_NATIVE_ABI_VERSION) {
         fprintf(stderr, "unexpected ABI version\n");
         return 1;
     }
-    if ((nuppNativeFeatures() & (NUPP_NATIVE_FEATURE_BASE
-            | NUPP_NATIVE_FEATURE_URI | NUPP_NATIVE_FEATURE_HTTP
-            | NUPP_NATIVE_FEATURE_NET | NUPP_NATIVE_FEATURE_TLS))
-        != (NUPP_NATIVE_FEATURE_BASE
-            | NUPP_NATIVE_FEATURE_URI | NUPP_NATIVE_FEATURE_HTTP
-            | NUPP_NATIVE_FEATURE_NET | NUPP_NATIVE_FEATURE_TLS)) {
+    if ((nuppNativeFeatures()
+            & (NUPP_NATIVE_FEATURE_BASE | NUPP_NATIVE_FEATURE_URI))
+        != (NUPP_NATIVE_FEATURE_BASE | NUPP_NATIVE_FEATURE_URI)) {
         fprintf(stderr, "a requested Rust-native feature bit is absent\n");
         return 1;
-    }
-    {
-        int32_t connected = 0;
-        if (nuppNativeTlsConnected(0, &connected)
-                != NUPP_NATIVE_STALE_HANDLE
-            || nuppNativeTlsConnected(0, NULL)
-                != NUPP_NATIVE_INVALID_ARGUMENT) {
-            fprintf(stderr, "invalid TLS handle or output was accepted\n");
-            return 1;
-        }
     }
     if (readiness_generation_answers_waiters()) return 1;
     status = nuppNativeUriParse((const uint8_t *)"https://EXAMPLE.com",
@@ -131,20 +86,6 @@ int main(void) {
     if (status != NUPP_NATIVE_OK) return failed("URI release", status);
     if (nuppNativeUriRelease(uri) != NUPP_NATIVE_STALE_HANDLE) {
         fprintf(stderr, "released URI handle was revived\n");
-        return 1;
-    }
-    http_options.connect_timeout_ms = 1000;
-    http_options.max_pending_requests = 1;
-    http_options.max_connections = 1;
-    http_options.max_connections_per_host = 1;
-    http_options.proxy_mode = NUPP_NATIVE_HTTP_PROXY_NONE;
-    status = nuppNativeHttpClientCreate(&http_options, &client);
-    if (status != NUPP_NATIVE_OK) return failed("HTTP client create", status);
-    status = nuppNativeHttpClientRelease(client);
-    if (status != NUPP_NATIVE_OK) return failed("HTTP client release", status);
-    if (nuppNativeHttpClientPending(client, &length)
-        != NUPP_NATIVE_STALE_HANDLE) {
-        fprintf(stderr, "released HTTP client handle was revived\n");
         return 1;
     }
     return 0;

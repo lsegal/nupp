@@ -247,7 +247,7 @@ for Rust-native builds:
 ./scripts/toolchain rust-vendor /opt/nupp-rust-sources
 NUPP_RUST_VENDOR_DIR=/opt/nupp-rust-sources \
 NUPP_HOST_OFFLINE=1 \
-./scripts/toolchain native-rust http,net,tls,uri
+./scripts/toolchain native-rust uri
 ```
 
 An offline Rust build without `NUPP_RUST_VENDOR_DIR` fails before Cargo runs.

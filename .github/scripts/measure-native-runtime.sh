@@ -47,7 +47,7 @@ bench/native-runtime/resource.sh > "$results/resources.txt"
 # even when the compiler and host caches were restored. The second invocation
 # measures the content-addressed warm lookup. These are observations, not
 # acceptance limits.
-features=base,filesystem,http,net,uri
+features=base,uri
 exact_root=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nupp-native-exact-$$
 trap 'rm -rf "$exact_root"' EXIT HUP INT TERM
 
