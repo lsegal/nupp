@@ -14,6 +14,8 @@ permissions:
 jobs:
   build:
     name: Build website
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    if: false
     runs-on: ubuntu-24.04
     outputs:
       pages: ${{ steps.pages.outputs.enabled }}
