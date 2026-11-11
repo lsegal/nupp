@@ -186,10 +186,7 @@ local function exchange(frame)
     return response
 end
 
-_G.__nuppBrowser = {
-    memory = guestMemory,
-    now = now,
-}
+_G.__nuppBrowser = {memory = guestMemory, now = now,}
 
 -- The compiler fixes a target's host when it builds the runtime, and the tests'
 -- runtime is a native build; a browser build would carry this.
