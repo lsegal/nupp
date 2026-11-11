@@ -149,6 +149,30 @@ local function newStream(owner: any, readable: boolean): any
     return {owner = owner, handle = true, released = false, readable = readable, scratch = nil, capacity = 0}
 end
 
+-- Holds a struct this provider declared to the fields it relies on.
+--
+-- LuaJIT keeps one C namespace for the whole process and silently ignores a
+-- typedef of a name it already holds, so a block can find its names taken by
+-- an earlier definition of another shape. The checker declares every literal
+-- cdef block of a file it checks into the compiler's own namespace, the other
+-- platform's block included. That is why each platform names its types apart
+-- from the other's, why each block is declared on every load rather than
+-- skipped when one of its names exists, and why a definition of another shape
+-- -- another copy or version of this provider -- stops here, by name, rather
+-- than at the first field access or inside a system call.
+local function conform(name: string, fields: {string}): nil
+    for _, field in ipairs(fields) do
+        if ffi.offsetof(name, field) == nil then
+            error(
+                (
+                    "nupp: the C type %s was already declared without the field %s; another definition of it was loaded first"
+                ):format(name, field),
+                0
+            )
+        end
+    end
+end
+
 -- The backend: one implementation of each primitive per platform family.
 local spawnChild: function(options: shared.SpawnOptions): (any?, any?, any?, any?, integer, string?, integer?)
 local reapExit: function(owner: any): nil
@@ -161,93 +185,108 @@ local streamReady: function(stream: any): boolean
 local sleepOn: function(interest: shared.Interest, timeout: integer): nil
 
 if windows then
-    if not pcall(ffi.typeof, "NuppProcessOverlapped") then
-        ffi.cdef[[
-        typedef struct {
-            uint32_t nLength;
-            void *lpSecurityDescriptor;
-            int32_t bInheritHandle;
-        } NuppProcessSecurity;
-        typedef struct {
-            uintptr_t Internal;
-            uintptr_t InternalHigh;
-            uint32_t Offset;
-            uint32_t OffsetHigh;
-            void *hEvent;
-        } NuppProcessOverlapped;
-        typedef struct {
-            uint32_t cb;
-            uint16_t *lpReserved;
-            uint16_t *lpDesktop;
-            uint16_t *lpTitle;
-            uint32_t dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars;
-            uint32_t dwFillAttribute;
-            uint32_t dwFlags;
-            uint16_t wShowWindow;
-            uint16_t cbReserved2;
-            uint8_t *lpReserved2;
-            void *hStdInput;
-            void *hStdOutput;
-            void *hStdError;
-        } NuppProcessStartup;
-        typedef struct {
-            NuppProcessStartup StartupInfo;
-            void *lpAttributeList;
-        } NuppProcessStartupEx;
-        typedef struct {
-            void *hProcess;
-            void *hThread;
-            uint32_t dwProcessId;
-            uint32_t dwThreadId;
-        } NuppProcessInformation;
-        typedef struct {
-            void *handle;
-            void *event;
-            NuppProcessOverlapped overlapped;
-            int32_t pending;
-            int32_t eof;
-            uint32_t failed;
-            uint32_t offset;
-            uint32_t filled;
-            uint8_t buffer[65536];
-        } NuppProcessPipe;
-        typedef struct {
-            void *process;
-        } NuppProcessChild;
-        int32_t CreateProcessW(const uint16_t *, uint16_t *, void *, void *, int32_t, uint32_t,
-            void *, const uint16_t *, NuppProcessStartup *, NuppProcessInformation *);
-        void *CreateNamedPipeW(const uint16_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-            uint32_t, NuppProcessSecurity *);
-        void *CreateFileW(const uint16_t *, uint32_t, uint32_t, NuppProcessSecurity *, uint32_t,
-            uint32_t, void *);
-        void *CreateEventW(void *, int32_t, int32_t, const uint16_t *);
-        int32_t ResetEvent(void *);
-        int32_t ReadFile(void *, void *, uint32_t, uint32_t *, NuppProcessOverlapped *);
-        int32_t WriteFile(void *, const void *, uint32_t, uint32_t *, NuppProcessOverlapped *);
-        int32_t GetOverlappedResult(void *, NuppProcessOverlapped *, uint32_t *, int32_t);
-        int32_t CancelIoEx(void *, NuppProcessOverlapped *);
-        int32_t CloseHandle(void *);
-        uint32_t GetLastError(void);
-        uint32_t WaitForSingleObject(void *, uint32_t);
-        uint32_t WaitForMultipleObjects(uint32_t, void *const *, int32_t, uint32_t);
-        int32_t GetExitCodeProcess(void *, uint32_t *);
-        int32_t TerminateProcess(void *, uint32_t);
-        void *GetStdHandle(uint32_t);
-        void *GetCurrentProcess(void);
-        uint32_t GetCurrentProcessId(void);
-        int32_t DuplicateHandle(void *, void *, void *, void **, uint32_t, int32_t, uint32_t);
-        int32_t InitializeProcThreadAttributeList(void *, uint32_t, uint32_t, size_t *);
-        int32_t UpdateProcThreadAttribute(void *, uint32_t, uintptr_t, void *, size_t, void *, size_t *);
-        void DeleteProcThreadAttributeList(void *);
-        int32_t MultiByteToWideChar(uint32_t, uint32_t, const char *, int32_t, uint16_t *, int32_t);
-        int32_t WideCharToMultiByte(uint32_t, uint32_t, const uint16_t *, int32_t, char *, int32_t,
-            const char *, int32_t *);
-        uint16_t *GetEnvironmentStringsW(void);
-        int32_t FreeEnvironmentStringsW(uint16_t *);
-        uint32_t FormatMessageW(uint32_t, const void *, uint32_t, uint32_t, uint16_t *, uint32_t, void *);
-        uint32_t GetFileAttributesW(const uint16_t *);
-        ]]
-    end
+    ffi.cdef[[
+    typedef struct {
+        uint32_t nLength;
+        void *lpSecurityDescriptor;
+        int32_t bInheritHandle;
+    } NuppProcessSecurity;
+    typedef struct {
+        uintptr_t Internal;
+        uintptr_t InternalHigh;
+        uint32_t Offset;
+        uint32_t OffsetHigh;
+        void *hEvent;
+    } NuppProcessOverlapped;
+    typedef struct {
+        uint32_t cb;
+        uint16_t *lpReserved;
+        uint16_t *lpDesktop;
+        uint16_t *lpTitle;
+        uint32_t dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars;
+        uint32_t dwFillAttribute;
+        uint32_t dwFlags;
+        uint16_t wShowWindow;
+        uint16_t cbReserved2;
+        uint8_t *lpReserved2;
+        void *hStdInput;
+        void *hStdOutput;
+        void *hStdError;
+    } NuppProcessStartup;
+    typedef struct {
+        NuppProcessStartup StartupInfo;
+        void *lpAttributeList;
+    } NuppProcessStartupEx;
+    typedef struct {
+        void *hProcess;
+        void *hThread;
+        uint32_t dwProcessId;
+        uint32_t dwThreadId;
+    } NuppProcessInformation;
+    typedef struct {
+        void *handle;
+        void *event;
+        NuppProcessOverlapped overlapped;
+        int32_t pending;
+        int32_t eof;
+        uint32_t failed;
+        uint32_t offset;
+        uint32_t filled;
+        uint8_t buffer[65536];
+    } NuppProcessWindowsPipe;
+    typedef struct {
+        void *process;
+    } NuppProcessWindowsChild;
+    int32_t CreateProcessW(const uint16_t *, uint16_t *, void *, void *, int32_t, uint32_t,
+        void *, const uint16_t *, NuppProcessStartup *, NuppProcessInformation *);
+    void *CreateNamedPipeW(const uint16_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+        uint32_t, NuppProcessSecurity *);
+    void *CreateFileW(const uint16_t *, uint32_t, uint32_t, NuppProcessSecurity *, uint32_t,
+        uint32_t, void *);
+    void *CreateEventW(void *, int32_t, int32_t, const uint16_t *);
+    int32_t ResetEvent(void *);
+    int32_t ReadFile(void *, void *, uint32_t, uint32_t *, NuppProcessOverlapped *);
+    int32_t WriteFile(void *, const void *, uint32_t, uint32_t *, NuppProcessOverlapped *);
+    int32_t GetOverlappedResult(void *, NuppProcessOverlapped *, uint32_t *, int32_t);
+    int32_t CancelIoEx(void *, NuppProcessOverlapped *);
+    int32_t CloseHandle(void *);
+    uint32_t GetLastError(void);
+    uint32_t WaitForSingleObject(void *, uint32_t);
+    uint32_t WaitForMultipleObjects(uint32_t, void *const *, int32_t, uint32_t);
+    int32_t GetExitCodeProcess(void *, uint32_t *);
+    int32_t TerminateProcess(void *, uint32_t);
+    void *GetStdHandle(uint32_t);
+    void *GetCurrentProcess(void);
+    uint32_t GetCurrentProcessId(void);
+    int32_t DuplicateHandle(void *, void *, void *, void **, uint32_t, int32_t, uint32_t);
+    int32_t InitializeProcThreadAttributeList(void *, uint32_t, uint32_t, size_t *);
+    int32_t UpdateProcThreadAttribute(void *, uint32_t, uintptr_t, void *, size_t, void *, size_t *);
+    void DeleteProcThreadAttributeList(void *);
+    int32_t MultiByteToWideChar(uint32_t, uint32_t, const char *, int32_t, uint16_t *, int32_t);
+    int32_t WideCharToMultiByte(uint32_t, uint32_t, const uint16_t *, int32_t, char *, int32_t,
+        const char *, int32_t *);
+    uint16_t *GetEnvironmentStringsW(void);
+    int32_t FreeEnvironmentStringsW(uint16_t *);
+    uint32_t FormatMessageW(uint32_t, const void *, uint32_t, uint32_t, uint16_t *, uint32_t, void *);
+    uint32_t GetFileAttributesW(const uint16_t *);
+    ]]
+    conform("NuppProcessSecurity", {"nLength", "lpSecurityDescriptor", "bInheritHandle"})
+    conform("NuppProcessOverlapped", {"Internal", "InternalHigh", "Offset", "OffsetHigh", "hEvent"})
+    conform("NuppProcessStartup", {"cb", "dwFlags", "hStdInput", "hStdOutput", "hStdError"})
+    conform("NuppProcessStartupEx", {"StartupInfo", "lpAttributeList"})
+    conform("NuppProcessInformation", {"hProcess", "hThread", "dwProcessId", "dwThreadId"})
+    conform("NuppProcessWindowsPipe", {
+        "handle",
+        "event",
+        "overlapped",
+        "pending",
+        "eof",
+        "failed",
+        "offset",
+        "filled",
+        "buffer"
+    })
+    conform("NuppProcessWindowsChild", {"process"})
 
     local GENERIC_READ: integer = 0x80000000
     local GENERIC_WRITE: integer = 0x40000000
@@ -544,7 +583,7 @@ if windows then
             C.CloseHandle(client)
             return nil, nil, problem
         end
-        local pipe: any = ffi.new("NuppProcessPipe")
+        local pipe: any = ffi.new("NuppProcessWindowsPipe")
         pipe.handle = server
         pipe.event = event
         pipe.overlapped.hEvent = event
@@ -854,7 +893,7 @@ if windows then
         C.CloseHandle(information.hThread)
 
         local owner = newOwner(tonumber(information.dwProcessId) as integer)
-        local child: any = ffi.new("NuppProcessChild")
+        local child: any = ffi.new("NuppProcessWindowsChild")
         child.process = information.hProcess
         owner.child = ffi.gc(child, closeChild)
         local streams: {any} = {}
@@ -1074,69 +1113,72 @@ if windows then
         baseReap(owner)
     end
 else
-    if not pcall(ffi.typeof, "NuppProcessPollFd") then
-        ffi.cdef[[
-        typedef struct {
-            int fd;
-            short events;
-            short revents;
-        } NuppProcessPollFd;
-        typedef struct {
-            long seconds;
-            long nanoseconds;
-        } NuppProcessTimespec;
-        typedef struct {
-            uintptr_t ident;
-            int16_t filter;
-            uint16_t flags;
-            uint32_t fflags;
-            intptr_t data;
-            void *udata;
-        } NuppProcessKevent;
-        typedef struct {
-            int32_t pid;
-            int32_t descriptor;
-            int32_t reaped;
-        } NuppProcessChild;
-        typedef struct {
-            int32_t descriptor;
-        } NuppProcessPipe;
-        int pipe(int *);
-        int pipe2(int *, int);
-        int fcntl(int, int, ...);
-        int close(int);
-        int open(const char *, int, ...);
-        int access(const char *, int);
-        ssize_t read(int, void *, size_t);
-        ssize_t write(int, const void *, size_t);
-        int poll(NuppProcessPollFd *, unsigned long, int);
-        int kill(int, int);
-        int waitpid(int, int *, int);
-        char *strerror(int);
-        long syscall(long, ...);
-        int kqueue(void);
-        int kevent(int, const NuppProcessKevent *, int, NuppProcessKevent *, int, const NuppProcessTimespec *);
-        int posix_spawn(int *, const char *, const void *, const void *, char *const *, char *const *);
-        int posix_spawnp(int *, const char *, const void *, const void *, char *const *, char *const *);
-        int posix_spawn_file_actions_init(void *);
-        int posix_spawn_file_actions_destroy(void *);
-        int posix_spawn_file_actions_adddup2(void *, int, int);
-        int posix_spawn_file_actions_addchdir_np(void *, const char *);
-        int posix_spawnattr_init(void *);
-        int posix_spawnattr_destroy(void *);
-        int posix_spawnattr_setflags(void *, short);
-        int posix_spawnattr_setsigmask(void *, const void *);
-        int posix_spawnattr_setsigdefault(void *, const void *);
-        int sigemptyset(void *);
-        int sigaddset(void *, int);
-        int sigismember(const void *, int);
-        int sigpending(void *);
-        int pthread_sigmask(int, const void *, void *);
-        int sigtimedwait(const void *, void *, const NuppProcessTimespec *);
-        char ***_NSGetEnviron(void);
-        extern char **environ;
-        ]]
-    end
+    ffi.cdef[[
+    typedef struct {
+        int fd;
+        short events;
+        short revents;
+    } NuppProcessPollFd;
+    typedef struct {
+        long seconds;
+        long nanoseconds;
+    } NuppProcessTimespec;
+    typedef struct {
+        uintptr_t ident;
+        int16_t filter;
+        uint16_t flags;
+        uint32_t fflags;
+        intptr_t data;
+        void *udata;
+    } NuppProcessKevent;
+    typedef struct {
+        int32_t pid;
+        int32_t descriptor;
+        int32_t reaped;
+    } NuppProcessPosixChild;
+    typedef struct {
+        int32_t descriptor;
+    } NuppProcessPosixPipe;
+    int pipe(int *);
+    int pipe2(int *, int);
+    int fcntl(int, int, ...);
+    int close(int);
+    int open(const char *, int, ...);
+    int access(const char *, int);
+    ssize_t read(int, void *, size_t);
+    ssize_t write(int, const void *, size_t);
+    int poll(NuppProcessPollFd *, unsigned long, int);
+    int kill(int, int);
+    int waitpid(int, int *, int);
+    char *strerror(int);
+    long syscall(long, ...);
+    int kqueue(void);
+    int kevent(int, const NuppProcessKevent *, int, NuppProcessKevent *, int, const NuppProcessTimespec *);
+    int posix_spawn(int *, const char *, const void *, const void *, char *const *, char *const *);
+    int posix_spawnp(int *, const char *, const void *, const void *, char *const *, char *const *);
+    int posix_spawn_file_actions_init(void *);
+    int posix_spawn_file_actions_destroy(void *);
+    int posix_spawn_file_actions_adddup2(void *, int, int);
+    int posix_spawn_file_actions_addchdir_np(void *, const char *);
+    int posix_spawnattr_init(void *);
+    int posix_spawnattr_destroy(void *);
+    int posix_spawnattr_setflags(void *, short);
+    int posix_spawnattr_setsigmask(void *, const void *);
+    int posix_spawnattr_setsigdefault(void *, const void *);
+    int sigemptyset(void *);
+    int sigaddset(void *, int);
+    int sigismember(const void *, int);
+    int sigpending(void *);
+    int pthread_sigmask(int, const void *, void *);
+    int sigtimedwait(const void *, void *, const NuppProcessTimespec *);
+    char ***_NSGetEnviron(void);
+    extern char **environ;
+    ]]
+    conform("NuppProcessPollFd", {"fd", "events", "revents"})
+    conform("NuppProcessTimespec", {"seconds", "nanoseconds"})
+    conform("NuppProcessKevent", {"ident", "filter", "flags", "fflags", "data", "udata"})
+    conform("NuppProcessPosixChild", {"pid", "descriptor", "reaped"})
+    conform("NuppProcessPosixPipe", {"descriptor"})
 
     local F_GETFL: integer = 3
     local F_SETFL: integer = 4
@@ -1195,7 +1237,7 @@ else
     end
 
     local function wrapDescriptor(descriptor: integer): any
-        local cell: any = ffi.new("NuppProcessPipe")
+        local cell: any = ffi.new("NuppProcessPosixPipe")
         cell.descriptor = descriptor
 
         return ffi.gc(cell, closeDescriptor)
@@ -1511,7 +1553,7 @@ else
 
         local pid = pidOut[0]
         local owner = newOwner(pid)
-        local child: any = ffi.new("NuppProcessChild")
+        local child: any = ffi.new("NuppProcessPosixChild")
         child.pid = pid
         child.descriptor = exitDescriptor(pid)
         owner.child = ffi.gc(child, closeChild)
