@@ -43,7 +43,9 @@ relink while the program is unchanged; see
 ## The shape of a program
 
 The top level holds only `cdef function` and `cdef struct` declarations,
-`const` literals and plain functions. Every function becomes a C function, so
+`const` literals, [module state](#module-state), the
+[modules it requires](#programs-that-span-modules) and plain functions. Every
+function becomes a C function, so
 each parameter and result needs a written C type: `number`, `integer`, `float`,
 `boolean`, the fixed-width integers, `cstring`, `voidptr` and typed pointers
 such as `int64*`.
@@ -78,7 +80,10 @@ refinements: a value enters those through an establishing call such as
 `math.i32.wrap` or `math.f32.narrow`, not through an operator that wraps. `//`
 and `%` floor and `/` divides exactly. Only `int64` and `uint64` are
 fixed-width, and they wrap as LuaJIT's do. `math.floor`, `math.ceil`,
-`math.abs` and `math.sqrt` are lowered in place.
+`math.abs` and `math.sqrt` are lowered in place. The bit operators `&`, `|`,
+`~`, `<<`, `>>` and `~>>` are LuaJIT's: numbers meet as 32-bit words and give
+the signed word back, and an `int64` or `uint64` operand makes the operation
+64-bit.
 
 ## Calling into LuaJIT
 
@@ -160,6 +165,137 @@ A field is read or written in place, never the whole struct, and a struct does
 not pass by value. A `cdef union`, or a struct with a bitfield, is refused where
 its fields are read, because the layout model does not place those as C does.
 
+## Module state
+
+A top-level `local` is module state: a global that lives as long as the
+program, which every function of its module reads and writes. It holds a
+scalar, a pointer or a `cdef struct`. A scalar or pointer starts as a literal,
+`nil` or a `const`, and as zero when it has no value; a struct starts zeroed
+and has no value written. A struct's name stands for the address of its
+storage, so its fields are reached with `.` and it is passed wherever C takes a
+pointer to it:
+
+```nupp
+cdef struct Totals
+    count: int32
+    sum: number
+end
+
+cdef function memset(s: Totals*, c: int32, n: uint64): voidptr
+
+const FIRST = 1
+
+local calls: int32 = FIRST
+local scale: number = 0.5
+local last: cstring? = nil
+local totals: Totals
+
+local function record(value: number): nil
+    calls = math.i32.wrap(calls + 1)
+    totals.count = math.i32.wrap(totals.count + 1)
+    totals.sum += value * scale
+    last = "recorded"
+end
+
+local function main(): int32
+    memset(totals, 0, 16)
+    record(4)
+    record(6)
+    if last == nil then
+        return 1
+    end
+    return math.i32.wrap(math.floor(totals.sum) + calls)
+end
+```
+
+The program exits with status 8. State is private to its module: two modules
+may each have a `count` of their own, and another module reaches one only
+through the functions its own module exports.
+
+## Programs that span modules
+
+A program module can `require` other modules, which are native-program
+modules themselves, and `nupp aot` and `kind = "program"` targets build the
+modules it requires, directly or not, into the one program. A required module
+declares itself with `module`, and what it marks `export` is what the modules
+requiring it see: its functions, and its `const` literals.
+
+`app/counter.nupp`:
+
+```nupp:fragment
+module app.counter
+
+local count: int32 = 0
+export const STEP = 2
+
+export function bump(): int32
+    count = math.i32.wrap(count + STEP)
+    return count
+end
+```
+
+`host.nupp`:
+
+```nupp:fragment
+local counter = require("app.counter")
+const {bump, STEP as step} = require("app.counter")
+
+local function main(): int32
+    counter.bump()
+    return math.i32.wrap(bump() + step)
+end
+```
+
+`require` binds the module to one name, whose exported members are reached as
+`counter.bump`, or selects members with a pattern. Either is written at the top
+level, with the module's name as a literal. A function's exports are its
+module's; the state behind them stays private, and an export is never
+assigned.
+
+An `export function` is also a C symbol under its own name, with external
+linkage, where every other function is internal to the program. That is how a
+static archive linked into the program, or the code that loads a library, finds
+it, so two modules of one program cannot export the same name.
+
+## Libraries
+
+`--emit static-library` writes a static archive, and `--emit shared-library` a
+shared library: a `.so`, `.dylib` or `.dll`. Neither needs a `main`. What a
+library publishes is its `export function`s:
+
+```nupp:fragment
+module runtime
+
+local created: int32 = 0
+
+export function runtime_new(): int32
+    created = math.i32.wrap(created + 1)
+    return created
+end
+```
+
+```bash
+nupp aot --emit static-library --output build/libruntime.a runtime.nupp
+nupp aot --emit shared-library --exports runtime.exports --output build/libruntime.so runtime.nupp
+```
+
+A shared library links LuaJIT from the link kit as an executable does. A static
+archive holds only the program's own code and is linked by whoever links it, so
+it needs no link kit.
+
+`--archive PATH`, repeated for each, links more static archives in whole, such
+as a native provider's archive: into an executable or shared library, or
+merged into a static archive. A program declares what it calls in one with
+`cdef function`, as for any C library.
+
+`--exports PATH` names a file listing every symbol an executable or shared
+library exports, one per line, with `#` comments and blank lines skipped.
+Nothing it leaves out is exported, LuaJIT's API included. The list is handed to
+each platform's linker in its own form: a version script on Linux, an
+exported-symbols list on macOS, and a module definition file on Windows.
+Without one, a shared library exports everything it defines, and an executable
+what a standalone host does.
+
 ## Threads and atomics
 
 A native program starts OS threads with its platform's own functions, passing
@@ -236,8 +372,7 @@ There is no Lua state to fall back to, so anything outside the subset above is
 refused where it was written, as `file:line:col: native: ...`, before anything
 is compiled. That includes tables, closures and Lua strings as values, string
 concatenation, methods, several results, destructuring, numeric truthiness (a
-condition is a boolean or a pointer), bitwise operators, and `/` and `%` over
-64-bit integers.
+condition is a boolean or a pointer), and `^` over 64-bit integers.
 
 ## Exporting Nupp functions to C
 

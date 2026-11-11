@@ -256,6 +256,12 @@ local record Value
     kind: Kind
 end
 
+--- A name a binding pattern selected from a required module.
+local record Alias
+    unit: Program
+    member: string
+end
+
 --- One module's lowering. The modules of a program share the LLVM module,
 --- the struct declarations and their layouts; names are each module's own.
 local record Program
@@ -268,6 +274,10 @@ local record Program
 
     --- The modules this one requires, by the name each is bound to.
     imports: {[string]: Program}
+
+    --- The names a binding pattern selected from the modules this one
+    --- requires, each resolved where it is read.
+    aliases: {[string]: Alias}
 
     --- What `export` makes visible to the modules requiring this one.
     exportedCallees: {[string]: Callee}
@@ -551,6 +561,10 @@ local function calleeOf(program: Program, body: Body, node: any): Callee?
     local name = ((node as cst.NameExpr).token as lexer.Token).text
     if variable(program, body, name) ~= nil then
         return nil
+    end
+    local alias = program.aliases[name]
+    if alias ~= nil then
+        return (alias as Alias).unit.exportedCallees[(alias as Alias).member]
     end
 
     return program.callees[name]
@@ -1373,6 +1387,15 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
             -- A function as a value is its address: what C takes as a callback.
             return Value(text = "@" .. (callee as Callee).symbol, kind = PTR)
         end
+        local alias = program.aliases[name]
+        if alias ~= nil then
+            local selected = alias as Alias
+            local exported = selected.unit.exportedCallees[selected.member]
+            if exported ~= nil then
+                return Value(text = "@" .. (exported as Callee).symbol, kind = PTR)
+            end
+            return expression(program, body, importedConstant(selected.unit, selected.member, node), want)
+        end
         refuse(node, name .. " is not a local, a parameter or a function of this native program")
     elseif kind == "call" then
         return call(program, body, node as cst.Call)
@@ -1869,6 +1892,16 @@ local function constant(program: Program, stat: cst.LocalStmt): nil
     end
 end
 
+--- The values a top-level `local` or `const` binds: its initializers, or the
+--- one a binding pattern selects from.
+local function valuesOf(stat: cst.LocalStmt): {any}
+    if stat.patternSource ~= nil then
+        return {stat.patternSource}
+    end
+
+    return stat.exprs or {}
+end
+
 --- The module `node` requires, when it is `require("name")` with a literal name.
 local function required(node: any): string?
     if node == nil or node.kind ~= "call" then
@@ -2074,7 +2107,7 @@ function native.requires(tree: cst.Chunk): ({string}?, native.Problem?)
             for _, written in ipairs(top.stats or {}) do
                 local stat = unexported(written)
                 if (stat as any).kind == "localStmt" then
-                    for _, expr in ipairs((stat as cst.LocalStmt).exprs or {}) do
+                    for _, expr in ipairs(valuesOf(stat as cst.LocalStmt)) do
                         local name = required(expr)
                         if name ~= nil then
                             names[#names + 1] = name as string
@@ -2094,30 +2127,51 @@ function native.requires(tree: cst.Chunk): ({string}?, native.Problem?)
     return names, nil
 end
 
---- Binds a top-level `local m = require("name")` to the unit named `name`;
---- false when `stat` requires nothing.
+--- Binds a top-level `local m = require("name")` to the unit named `name`, or
+--- each name `const {f, X as Y} = require("name")` selects to what it names
+--- there; false when `stat` requires nothing.
 local function import(program: Program, stat: cst.LocalStmt, units: {[string]: Program}): boolean
-    local exprs = stat.exprs or {}
+    local sources = valuesOf(stat)
     local requires = false
-    for _, expr in ipairs(exprs) do
+    for _, expr in ipairs(sources) do
         requires = requires or required(expr) ~= nil
     end
     if not requires then
         return false
     end
-    if stat.pattern ~= nil or #stat.names ~= 1 or #exprs ~= 1 then
+    if #sources ~= 1 or stat.pattern == nil and #stat.names ~= 1 then
         refuse(stat, "a native program binds each module it requires to one name")
     end
-    local name = required(exprs[1]) as string
+    local name = required(sources[1]) as string
     local unit = units[name]
     if unit == nil then
-        refuse(exprs[1], "module " .. name .. " is not a module of this native program")
+        refuse(sources[1], "module " .. name .. " is not a module of this native program")
     end
-    local bound = stat.names[1].text
-    if program.imports[bound] ~= nil or program.callees[bound] ~= nil or program.globals[bound] ~= nil then
-        refuse(stat, bound .. " is defined twice")
+
+    local function bind(bound: string): nil
+        if program.imports[bound] ~= nil
+            or program.aliases[bound] ~= nil
+            or program.callees[bound] ~= nil
+            or program.globals[bound] ~= nil
+        then
+            refuse(stat, bound .. " is defined twice")
+        end
     end
-    program.imports[bound] = unit as Program
+
+    if stat.pattern == nil then
+        local bound = stat.names[1].text
+        bind(bound)
+        program.imports[bound] = unit as Program
+        return true
+    end
+    for _, entry in ipairs(stat.pattern as {cst.BindingEntry}) do
+        if entry.typeOnly == nil and entry.sourceName ~= nil then
+            local member = (entry.sourceName as lexer.Token).text
+            local bound = entry.alias ~= nil and (entry.alias as lexer.Token).text or member
+            bind(bound)
+            program.aliases[bound] = Alias(unit = unit as Program, member = member)
+        end
+    end
 
     return true
 end
@@ -2253,6 +2307,7 @@ function native.program(
             callees = {},
             globals = {},
             imports = {},
+            aliases = {},
             exportedCallees = {},
             exportedConstants = {},
             name = unit.name,

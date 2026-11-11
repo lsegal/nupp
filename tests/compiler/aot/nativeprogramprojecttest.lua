@@ -160,4 +160,141 @@ function M.anEntryNoIncludeRootHasIsRefused()
     assert(output:find("program target host names entry missing", 1, true), output)
 end
 
+-- The entry requires a module under the same include root, which the target
+-- builds with it.
+function M.aProgramTargetBuildsTheModulesItsEntryRequires()
+    requireCodegen()
+    local dir = project(
+        '{kind = "program", entries = {"host"}, outDir = "out"}',
+        [[
+local greeting = require("app.greeting")
+
+local function main(): int32
+    greeting.say()
+    return greeting.CODE
+end
+]]
+    )
+    assert(os.execute("mkdir -p " .. quote(dir .. "/src/app")) == 0)
+    write(dir .. "/src/app/greeting.nupp", [[
+module app.greeting
+
+cdef function puts(borrows s: cstring): int32
+
+local said: int32 = 0
+export const CODE = 9
+
+export function say(): nil
+    said = math.i32.wrap(said + 1)
+    puts("from a module")
+end
+]])
+    local status, output = build(dir)
+    test.eq(status, 0, output)
+    local ran
+    status, ran = run(quote(dir .. "/out/host" .. EXE))
+    test.eq(status, 9, ran)
+    test.eq(ran, "from a module")
+end
+
+local LIBRARY = [[
+module lib
+
+export function nupp_project_twice(n: int32): int32
+    return math.i32.wrap(n * 2)
+end
+
+export function nupp_project_hidden(): int32
+    return 7
+end
+]]
+
+--- A project whose `lib` target is LIBRARY in `src/lib.nupp`, with `host`
+--- beside it when given.
+local function libraryProject(lib, host, source)
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. quote(dir .. "/src")) == 0)
+    write(
+        dir .. "/nupp.lua",
+        ('return {include = {"src"}, build = {targets = {lib = %s%s}}}\n'):format(
+            lib,
+            host and (", host = " .. host) or ""
+        )
+    )
+    write(dir .. "/src/lib.nupp", LIBRARY)
+    if source ~= nil then
+        write(dir .. "/src/host.nupp", source)
+    end
+
+    return dir
+end
+
+-- A static library target needs no `main`, and a program target links it with
+-- `archives`.
+function M.aStaticLibraryTargetLinksIntoAProgramTarget()
+    requireCodegen()
+    local dir = libraryProject(
+        '{kind = "program", entries = {"lib"}, linkage = "static", outDir = "out"}',
+        '{kind = "program", entries = {"host"}, archives = {"out/liblib.a"}, outDir = "out"}',
+        [[
+cdef function nupp_project_twice(n: int32): int32
+
+local function main(): int32
+    return nupp_project_twice(21)
+end
+]]
+    )
+    local status, output = run(("cd %s && NO_COLOR= %s build --target lib"):format(quote(dir), quote(NUPP)))
+    test.eq(status, 0, output)
+    status, output = run(("cd %s && NO_COLOR= %s build --target host"):format(quote(dir), quote(NUPP)))
+    test.eq(status, 0, output)
+    local ran
+    status, ran = run(quote(dir .. "/out/host" .. EXE))
+    test.eq(status, 42, ran)
+end
+
+local SHARED = jit.os == "Windows" and ".dll" or jit.os == "OSX" and ".dylib" or ".so"
+
+local ffi = require("ffi")
+
+pcall(ffi.cdef, "int nupp_project_twice(int n); int nupp_project_hidden(void);")
+
+-- A shared library target is named as its platform names one, and exports
+-- what its `exportList` names.
+function M.aSharedLibraryTargetExportsWhatItsListNames()
+    requireCodegen()
+    local dir = libraryProject('{kind = "program", entries = {"lib"}, linkage = "shared", exportList = "lib.exports", outDir = "out"}')
+    write(dir .. "/lib.exports", "nupp_project_twice\n")
+    local status, output = run(("cd %s && NO_COLOR= %s build --target lib"):format(quote(dir), quote(NUPP)))
+    test.eq(status, 0, output)
+    local name = (jit.os == "Windows" and "" or "lib") .. "lib" .. SHARED
+    local loaded = ffi.load(dir .. "/out/" .. name)
+    test.eq(loaded.nupp_project_twice(4), 8)
+    assert(not pcall(function()
+        return loaded.nupp_project_hidden
+    end), "a symbol the export list leaves out was exported")
+end
+
+function M.aProgramLinkageIsOneOfThree()
+    local dir = project('{kind = "program", entries = {"host"}, linkage = "dynamic"}')
+    local status, output = build(dir)
+    assert(status ~= 0, output)
+    assert(output:find('build.targets.host.linkage must be "executable", "static" or "shared"', 1, true), output)
+end
+
+function M.aStaticLibraryTargetTakesNoExportList()
+    local dir = project('{kind = "program", entries = {"host"}, linkage = "static", exportList = "x"}')
+    local status, output = build(dir)
+    assert(status ~= 0, output)
+    assert(output:find("build.targets.host.exportList is for an executable or a shared library", 1, true), output)
+end
+
+function M.onlyAProgramTargetLinksArchives()
+    local dir = project('{kind = "bundle", entries = {"host"}, archives = {"lib.a"}}')
+    local status, output = build(dir)
+    assert(status ~= 0, output)
+    assert(output:find("build.targets.host.archives is only valid for a program target", 1, true), output)
+end
+
 return M

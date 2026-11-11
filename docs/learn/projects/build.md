@@ -340,9 +340,10 @@ built before it carried those stubs refuses the GPU provider. A path-valued thir
 
 ### Native programs
 
-A `program` target links one file as a native program, the way
-`nupp aot --emit executable` does: its `main` is the executable's own, and it
-reaches LuaJIT and other C libraries through its `cdef function` declarations.
+A `program` target links a native program, the way `nupp aot --emit executable`
+does: its `main` is the executable's own, and it reaches LuaJIT and other C
+libraries through its `cdef function` declarations. The entry module and every
+module it requires are built together.
 
 ```lua
 build = {
@@ -363,6 +364,28 @@ with it the link kit whose static LuaJIT it carries; the default is this
 machine. The link is keyed on the program's LLVM IR, the code generator and
 the kit, so a rebuild that would link the same program keeps the one already
 there.
+
+`linkage` builds the program as a library instead, with no `main` needed:
+`"static"` writes the static archive `build/libhost.a`, and `"shared"` the
+shared library `build/libhost.so`, `build/libhost.dylib` or `build/host.dll`.
+`archives` names static archives, relative to the project, that are linked in
+whole, or merged into a static archive. `exportList` names a file listing, one
+per line, every symbol an executable or shared library exports, and nothing
+else is exported:
+
+```lua
+build = {
+   targets = {
+      runtime = {
+         kind = "program",
+         entries = { "runtime" },
+         linkage = "shared",
+         archives = { "build/libprovider.a" },
+         exportList = "runtime.exports",
+      }
+   }
+}
+```
 
 ### Static AOT components
 

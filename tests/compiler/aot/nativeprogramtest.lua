@@ -23,7 +23,9 @@ local function run(command)
     return status, (output:gsub("%s*__status__:%d+%s*$", ""))
 end
 
-local function project(source)
+--- A project holding `source` as `host.nupp`, and each of `modules` at the
+--- path it is keyed by.
+local function project(source, modules)
     local dir = os.tmpname()
     os.remove(dir)
     assert(os.execute("mkdir -p " .. quote(dir)) == 0)
@@ -33,6 +35,13 @@ local function project(source)
     local handle = assert(io.open(dir .. "/host.nupp", "wb"))
     handle:write(source)
     handle:close()
+    for path, text in pairs(modules or {}) do
+        local file = dir .. "/" .. path
+        assert(os.execute("mkdir -p " .. quote(file:match("^(.*)/"))) == 0)
+        handle = assert(io.open(file, "wb"))
+        handle:write(text)
+        handle:close()
+    end
 
     return dir
 end
@@ -41,9 +50,10 @@ local function executableName(dir)
     return dir .. "/host" .. (jit.os == "Windows" and ".exe" or "")
 end
 
---- Links `source` as a native program, or returns nil and what `nupp` said.
-local function link(source)
-    local dir = project(source)
+--- Links `source` as a native program, with `modules` beside it, or returns
+--- nil and what `nupp` said.
+local function link(source, modules)
+    local dir = project(source, modules)
     local executable = executableName(dir)
     local status, output = run(
         ("cd %s && NO_COLOR= %s aot --emit executable --output %s host.nupp"):format(
@@ -948,6 +958,305 @@ function M.outputIsRequired()
     local status, output = run(("cd %s && NO_COLOR= %s aot --emit executable host.nupp"):format(quote(dir), quote(NUPP)))
     assert(status ~= 0, output)
     assert(output:find("--emit executable needs --output PATH", 1, true), output)
+end
+
+-- A module a program requires: private state of each kind, a `cdef struct`
+-- held in place and handed to C, an exported constant and exported functions.
+local COUNTER = [[
+module app.counter
+
+cdef struct Tally
+    count: int32
+    total: number
+end
+
+cdef function memset(s: Tally*, c: int32, n: uint64): voidptr
+
+local tally: Tally
+local step: int32 = 2
+local label: cstring = "counter"
+local latest: voidptr? = nil
+local started = false
+export const START = 40
+
+local function bumped(by: int32): int32
+    tally.count = math.i32.wrap(tally.count + by)
+    tally.total += by
+    return tally.count
+end
+
+export function reset(): nil
+    memset(tally, 0, 16)
+    step = math.i32.wrap(2)
+    latest = nil
+    started = true
+end
+
+export function bump(): int32
+    step = math.i32.wrap(step + 1)
+    latest = tally
+    return bumped(step)
+end
+
+export function name(): cstring
+    if latest == nil or not started then
+        return "unset"
+    end
+    return label
+end
+
+export function total(): number
+    return tally.total
+end
+]]
+
+-- A program spans modules: `main` calls into the module it requires, by its
+-- binding and by names a pattern selects, and each module's state, its
+-- private `step` and the entry's own, is its own.
+function M.aProgramSpansTheModulesItRequires()
+    requireCodegen()
+    local executable, output = link([[
+cdef function puts(borrows s: cstring): int32
+local counter = require("app.counter")
+const {bump, START as LIMIT} = require("app.counter")
+
+local runs: int32 = 0
+local step: number = 0.5
+
+local function main(): int32
+    counter.reset()
+    counter.bump()
+    bump()
+    runs = math.i32.wrap(runs + 1)
+    puts(counter.name())
+    return math.i32.wrap(math.floor(counter.bump() + counter.total() + LIMIT + runs + step * 2))
+end
+]], {["app/counter.nupp"] = COUNTER})
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    -- Steps 3, 4 and 5: a count and total of 12, then 40, one run and 2 * 0.5.
+    test.eq(status, 66, ran)
+    test.eq(ran, "counter")
+end
+
+-- Module state starts as a literal, a const or zero, and is read and written by
+-- every function of its module across calls.
+function M.moduleStateKeepsItsValueAcrossCalls()
+    requireCodegen()
+    local executable, output = link([[
+cdef struct Point
+    x: int32
+    y: number
+end
+
+const BASE = 5
+
+local calls: int32 = BASE
+local scale: number = -1.5
+local wide: int64 = 3LL
+local flag: boolean = true
+local origin: Point
+local cursor: voidptr? = nil
+
+local function step(): nil
+    calls = math.i32.wrap(calls + 1)
+    scale *= -2
+    wide += 1LL
+    flag = not flag
+    origin.x = math.i32.wrap(origin.x + 2)
+    origin.y += 0.25
+    cursor = origin
+end
+
+local function main(): int32
+    step()
+    step()
+    local failed: integer = 0
+    if calls ~= 7 then
+        failed += 1
+    end
+    if scale ~= -6 then
+        failed += 2
+    end
+    if wide ~= 5LL then
+        failed += 4
+    end
+    if not flag then
+        failed += 8
+    end
+    @unsafe do
+        if origin.x ~= 4 or origin.y ~= 0.5 or cursor == nil then
+            failed += 16
+        end
+    end
+    return math.i32.wrap(failed)
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+end
+
+-- What a native library publishes: an exported function under its own name,
+-- beside module state, with no `main`.
+local LIBRARY = [[
+module host
+
+local calls: int32 = 0
+
+export function nupp_native_twice(n: int32): int32
+    calls = math.i32.wrap(calls + 1)
+    return math.i32.wrap(n * 2 + calls)
+end
+
+export function nupp_native_hidden(): int32
+    return 7
+end
+]]
+
+local SHARED = jit.os == "Windows" and ".dll" or jit.os == "OSX" and ".dylib" or ".so"
+
+--- Builds `source` as `emit`, written to `name` in its project, or returns nil
+--- and what `nupp` said.
+local function library(source, emit, name, extra)
+    local dir = project(source)
+    local output = dir .. "/" .. name
+    local status, said = run(
+        ("cd %s && NO_COLOR= %s aot --emit %s --output %s %s host.nupp"):format(
+            quote(dir),
+            quote(NUPP),
+            emit,
+            quote(output),
+            extra or ""
+        )
+    )
+    if status ~= 0 then
+        return nil, said, dir
+    end
+
+    return output, said, dir
+end
+
+-- A static library needs no `main`, and a program linking it with `--archive`
+-- calls what it exports by name.
+function M.aStaticLibraryLinksIntoAProgram()
+    requireCodegen()
+    local archive, output = library(LIBRARY, "static-library", "libtwice.a")
+    assert(archive ~= nil, output)
+    local dir = project([[
+cdef function nupp_native_twice(n: int32): int32
+
+local function main(): int32
+    nupp_native_twice(1)
+    return nupp_native_twice(20)
+end
+]])
+    local executable = executableName(dir)
+    local status
+    status, output = run(
+        ("cd %s && NO_COLOR= %s aot --emit executable --archive %s --output %s host.nupp"):format(
+            quote(dir),
+            quote(NUPP),
+            quote(archive),
+            quote(executable)
+        )
+    )
+    test.eq(status, 0, output)
+    local ran
+    status, ran = run(quote(executable))
+    test.eq(status, 42, ran)
+end
+
+local ffi = require("ffi")
+
+pcall(ffi.cdef, "int nupp_native_twice(int n); int nupp_native_hidden(void);")
+
+-- A shared library exports every function a module exports, and with
+-- `--exports` exactly the symbols the list names.
+function M.aSharedLibraryExportsWhatItsListNames()
+    requireCodegen()
+    local everything, output = library(LIBRARY, "shared-library", "libtwice" .. SHARED)
+    assert(everything ~= nil, output)
+    local loaded = ffi.load(everything)
+    test.eq(loaded.nupp_native_twice(20), 41)
+    test.eq(loaded.nupp_native_twice(20), 42)
+    test.eq(loaded.nupp_native_hidden(), 7)
+
+    local dir = project(LIBRARY)
+    local list = assert(io.open(dir .. "/host.exports", "wb"))
+    list:write("# What the library publishes.\nnupp_native_twice\n")
+    list:close()
+    local listed
+    listed, output = library(LIBRARY, "shared-library", "liblisted" .. SHARED, "--exports " .. quote(dir .. "/host.exports"))
+    assert(listed ~= nil, output)
+    loaded = ffi.load(listed)
+    test.eq(loaded.nupp_native_twice(1), 3)
+    assert(not pcall(function()
+        return loaded.nupp_native_hidden
+    end), "a symbol the export list leaves out was exported")
+end
+
+-- An export list is read, and a line that names no symbol refused, before
+-- anything is compiled, so this needs no code generator.
+function M.anExportListIsReadBeforeLinking()
+    local dir = project(LIBRARY)
+    local list = assert(io.open(dir .. "/bad.exports", "wb"))
+    list:write("nupp_native_twice\nnot a symbol\n")
+    list:close()
+    local status, output = run(
+        ("cd %s && NO_COLOR= %s aot --emit shared-library --exports bad.exports --output lib.so host.nupp"):format(
+            quote(dir),
+            quote(NUPP)
+        )
+    )
+    assert(status ~= 0, output)
+    assert(output:find("bad.exports: line 2 names no symbol: not a symbol", 1, true), output)
+end
+
+function M.aStaticLibraryTakesNoExportList()
+    local dir = project(LIBRARY)
+    local status, output = run(
+        ("cd %s && NO_COLOR= %s aot --emit static-library --exports x --output lib.a host.nupp"):format(
+            quote(dir),
+            quote(NUPP)
+        )
+    )
+    assert(status ~= 0, output)
+    assert(output:find("--exports names what an executable or shared library exports", 1, true), output)
+end
+
+function M.moduleStateStartsAsALiteral()
+    local executable, output = link([[
+local start: int32 = math.i32.wrap(3)
+
+local function main(): int32
+    return start
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("host.nupp:1:22: native: module state start starts as a literal, nil or a const", 1, true), output)
+end
+
+-- A refusal in a module the program requires names that module's file.
+function M.aRefusalInARequiredModuleNamesItsFile()
+    local executable, output = link([[
+local helper = require("app.helper")
+
+local function main(): int32
+    return helper.value()
+end
+]], {
+        ["app/helper.nupp"] = [[
+module app.helper
+
+export function value(): int32
+    local t = {}
+    return 0
+end
+]],
+    })
+    test.eq(executable, nil)
+    assert(output:find("helper.nupp:4:15: native: a native program cannot evaluate tableExpr expressions", 1, true), output)
 end
 
 return M
