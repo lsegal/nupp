@@ -1,0 +1,175 @@
+--[[
+The AOT runtime: what LLVM-compiled Lua-builder entries call.
+
+Generated code reaches the runtime through one table of pointers rather than
+through symbols, so nothing has to be exported from the process that loads it or
+resolved by the loader: the provider hands the table's address to a compiled
+module's registrar, which keeps it. Slot 0 is the ABI version and slots 1-4 the
+sizes of the blocks generated code allocates; the registrar refuses a table that
+disagrees with what it was compiled for.
+
+Slots 5-10 are where generated code finds a value stream's depth and its current
+frame's kind and count, which it reads itself rather than paying a call for
+three loads; the registrar refuses a table whose layout differs.
+
+What the table points at is the Lua API surface an entry needs and the
+value-stream builder that assembles Lua tables from a compiled body's stream.
+Every slot takes pointers and 64-bit scalars (narrow values widened by the
+caller), no aggregate by value, and every raise goes through `luaL_error`,
+which does not return.
+
+The slot order is the ABI. `nupp.compiler.aot.llvm.lua.runtime` lists the same
+slots, and a test holds the two lists to one another.
+
+The slots themselves live with what they call: `ksrt.values` and
+`ksrt.builder`. `ksrt.api` is how the runtime calls the Lua API, and
+`ksrt.build` what the platform decides: `size_t`'s width and the size of
+LuaJIT's `luaL_Buffer`, which the C library's `BUFSIZ` sets. `scripts/toolchain`
+writes `ksrt.build` for the provider, and `scripts/guest-runtime` for the
+browser guest.
+]]
+module ksrt.runtime
+
+const {STRING_BUFFER_BYTES} = require("ksrt.build")
+const {
+    ks_rt_raise,
+    ks_rt_raise_count,
+    ks_rt_raise_index,
+    ks_rt_bytes,
+    ks_rt_count,
+    ks_rt_index,
+    ks_rt_string_match,
+    ks_rt_string_length,
+    ks_rt_string_byte,
+    ks_rt_string_byte_lua,
+    ks_rt_string_u32,
+    ks_rt_substring,
+    ks_rt_table_number,
+    ks_rt_string_buffer_init,
+    ks_rt_string_buffer_append,
+    ks_rt_string_buffer_append_slice,
+    ks_rt_string_buffer_append_top,
+    ks_rt_string_buffer_finish,
+    ks_rt_scratch_u32,
+    ks_rt_scratch_u32_fixed,
+    ks_rt_scratch_u32_stack,
+    ks_rt_scratch_u32_get,
+    ks_rt_scratch_u32_get_fixed,
+    ks_rt_scratch_u32_escape_get,
+    ks_rt_scratch_u32_set,
+    ks_rt_scratch_u32_set_fixed,
+    ks_rt_scratch_u8,
+    ks_rt_scratch_u8_cached,
+    ks_rt_scratch_u8_stack,
+    ks_rt_scratch_u8_get,
+    ks_rt_scratch_u8_get_fixed,
+    ks_rt_scratch_u8_set,
+    ks_rt_scratch_u8_set_fixed,
+    ks_rt_scratch_u8_set4,
+    ks_rt_scratch_u8_set4_fixed,
+    ks_rt_scratch_u8_push,
+    SCRATCH_U32_BYTES,
+    SCRATCH_U8_BYTES
+} = require("ksrt.values")
+const {
+    ks_rt_builder_init,
+    ks_rt_builder_open,
+    ks_rt_builder_string,
+    ks_rt_builder_string_escapes,
+    ks_rt_builder_number_slice,
+    ks_rt_builder_integer_slice,
+    ks_rt_builder_number,
+    ks_rt_builder_integer64,
+    ks_rt_builder_decimal64,
+    ks_rt_builder_boolean,
+    ks_rt_builder_null,
+    ks_rt_builder_close,
+    ks_rt_builder_key_scratch,
+    ks_rt_builder_string_scratch,
+    ks_rt_builder_pushed_scalar,
+    ks_rt_builder_key,
+    ks_rt_builder_query,
+    ks_rt_builder_number_token,
+    ks_rt_builder_finish,
+    BUILDER_BYTES,
+    BUILDER_DEPTH,
+    BUILDER_FRAMES,
+    BUILDER_INLINE_FRAMES,
+    FRAME_BYTES,
+    FRAME_KIND,
+    FRAME_COUNT
+} = require("ksrt.builder")
+
+const ABI_VERSION = 1
+
+--- The ABI, slot by slot. Sizes and offsets first so a registrar can check
+--- its blocks and the fields it reads.
+@visibility("hidden")
+export const ks_rt_table = ffi.new<const voidptr[66]>({
+    ABI_VERSION as voidptr,
+    BUILDER_BYTES as voidptr,
+    STRING_BUFFER_BYTES as voidptr,
+    SCRATCH_U32_BYTES as voidptr,
+    SCRATCH_U8_BYTES as voidptr,
+    BUILDER_DEPTH as voidptr,
+    BUILDER_FRAMES as voidptr,
+    BUILDER_INLINE_FRAMES as voidptr,
+    FRAME_BYTES as voidptr,
+    FRAME_KIND as voidptr,
+    FRAME_COUNT as voidptr,
+    ks_rt_raise as voidptr,
+    ks_rt_raise_count as voidptr,
+    ks_rt_raise_index as voidptr,
+    ks_rt_bytes as voidptr,
+    ks_rt_count as voidptr,
+    ks_rt_index as voidptr,
+    ks_rt_string_match as voidptr,
+    ks_rt_string_length as voidptr,
+    ks_rt_string_byte as voidptr,
+    ks_rt_string_byte_lua as voidptr,
+    ks_rt_string_u32 as voidptr,
+    ks_rt_substring as voidptr,
+    ks_rt_table_number as voidptr,
+    ks_rt_string_buffer_init as voidptr,
+    ks_rt_string_buffer_append as voidptr,
+    ks_rt_string_buffer_append_slice as voidptr,
+    ks_rt_string_buffer_append_top as voidptr,
+    ks_rt_string_buffer_finish as voidptr,
+    ks_rt_scratch_u32 as voidptr,
+    ks_rt_scratch_u32_fixed as voidptr,
+    ks_rt_scratch_u32_stack as voidptr,
+    ks_rt_scratch_u32_get as voidptr,
+    ks_rt_scratch_u32_get_fixed as voidptr,
+    ks_rt_scratch_u32_escape_get as voidptr,
+    ks_rt_scratch_u32_set as voidptr,
+    ks_rt_scratch_u32_set_fixed as voidptr,
+    ks_rt_scratch_u8 as voidptr,
+    ks_rt_scratch_u8_cached as voidptr,
+    ks_rt_scratch_u8_stack as voidptr,
+    ks_rt_scratch_u8_get as voidptr,
+    ks_rt_scratch_u8_get_fixed as voidptr,
+    ks_rt_scratch_u8_set as voidptr,
+    ks_rt_scratch_u8_set_fixed as voidptr,
+    ks_rt_scratch_u8_set4 as voidptr,
+    ks_rt_scratch_u8_set4_fixed as voidptr,
+    ks_rt_scratch_u8_push as voidptr,
+    ks_rt_builder_init as voidptr,
+    ks_rt_builder_open as voidptr,
+    ks_rt_builder_string as voidptr,
+    ks_rt_builder_string_escapes as voidptr,
+    ks_rt_builder_number_slice as voidptr,
+    ks_rt_builder_integer_slice as voidptr,
+    ks_rt_builder_number as voidptr,
+    ks_rt_builder_integer64 as voidptr,
+    ks_rt_builder_decimal64 as voidptr,
+    ks_rt_builder_boolean as voidptr,
+    ks_rt_builder_null as voidptr,
+    ks_rt_builder_close as voidptr,
+    ks_rt_builder_key_scratch as voidptr,
+    ks_rt_builder_string_scratch as voidptr,
+    ks_rt_builder_pushed_scalar as voidptr,
+    ks_rt_builder_key as voidptr,
+    ks_rt_builder_query as voidptr,
+    ks_rt_builder_number_token as voidptr,
+    ks_rt_builder_finish as voidptr
+})

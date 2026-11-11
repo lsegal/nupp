@@ -1,0 +1,229 @@
+--[[
+The Lua C API the AOT runtime calls, for the browser guest.
+
+There the runtime is linked into each module, beside the VM that exports the
+API, so it calls the API directly and binds nothing. Everywhere else the
+provider carries the runtime and binds the API from the process (`bound/`).
+]]
+module ksrt.api
+
+const {type Size} = require("ksrt.build")
+
+cdef function luaL_addlstring(borrows B: voidptr, borrows s: voidptr, l: Size)
+cdef function luaL_addvalue(borrows B: voidptr)
+cdef function luaL_buffinit(borrows L: voidptr, borrows B: voidptr)
+cdef function luaL_error(borrows L: voidptr, format: cstring, ...): int32
+cdef function luaL_pushresult(borrows B: voidptr)
+cdef function lua_call(borrows L: voidptr, nargs: int32, nresults: int32)
+cdef function lua_checkstack(borrows L: voidptr, extra: int32): int32
+cdef function lua_createtable(borrows L: voidptr, narr: int32, nrec: int32)
+cdef function lua_equal(borrows L: voidptr, index1: int32, index2: int32): int32
+cdef function lua_getfield(borrows L: voidptr, index: int32, borrows k: cstring)
+cdef function lua_gettop(borrows L: voidptr): int32
+cdef function lua_insert(borrows L: voidptr, index: int32)
+cdef function lua_newuserdata(borrows L: voidptr, size: Size): voidptr
+cdef function lua_next(borrows L: voidptr, index: int32): int32
+cdef function lua_objlen(borrows L: voidptr, index: int32): Size
+cdef function lua_pushboolean(borrows L: voidptr, b: int32)
+cdef function lua_pushlightuserdata(borrows L: voidptr, borrows p: voidptr)
+cdef function lua_pushlstring(borrows L: voidptr, borrows s: voidptr, l: Size)
+cdef function lua_pushnil(borrows L: voidptr)
+cdef function lua_pushnumber(borrows L: voidptr, n: number)
+cdef function lua_pushvalue(borrows L: voidptr, index: int32)
+cdef function lua_rawget(borrows L: voidptr, index: int32)
+cdef function lua_rawgeti(borrows L: voidptr, index: int32, n: int32)
+cdef function lua_rawset(borrows L: voidptr, index: int32)
+cdef function lua_rawseti(borrows L: voidptr, index: int32, n: int32)
+cdef function lua_remove(borrows L: voidptr, index: int32)
+cdef function lua_setmetatable(borrows L: voidptr, index: int32): int32
+cdef function lua_settop(borrows L: voidptr, index: int32)
+cdef function lua_toboolean(borrows L: voidptr, index: int32): int32
+cdef function lua_tolstring(borrows L: voidptr, index: int32, len: voidptr?): voidptr?
+cdef function lua_tonumber(borrows L: voidptr, index: int32): number
+cdef function lua_topointer(borrows L: voidptr, index: int32): voidptr?
+cdef function lua_touserdata(borrows L: voidptr, index: int32): voidptr?
+cdef function lua_type(borrows L: voidptr, index: int32): int32
+
+@visibility("hidden")
+export function ksAddlstring(B: voidptr, s: voidptr, l: Size): nil
+    luaL_addlstring(B, s, l)
+end
+
+@visibility("hidden")
+export function ksAddvalue(B: voidptr): nil
+    luaL_addvalue(B)
+end
+
+@visibility("hidden")
+export function ksBuffinit(L: voidptr, B: voidptr): nil
+    luaL_buffinit(L, B)
+end
+
+--- Raises `message` as it stands: it is passed as a `%s` argument, never as
+--- the format.
+@visibility("hidden")
+export function ksError(L: voidptr, message: cstring): nil
+    luaL_error(L, "%s", message)
+end
+
+--- Raises `format` with its one `%s` filled from `text`.
+@visibility("hidden")
+export function ksErrorText(L: voidptr, format: cstring, text: cstring): nil
+    luaL_error(L, format, text)
+end
+
+--- Raises `format` with its one `%d` filled from `value`.
+@visibility("hidden")
+export function ksErrorNumber(L: voidptr, format: cstring, value: int32): nil
+    luaL_error(L, format, value)
+end
+
+@visibility("hidden")
+export function ksPushresult(B: voidptr): nil
+    luaL_pushresult(B)
+end
+
+@visibility("hidden")
+export function ksCall(L: voidptr, nargs: int32, nresults: int32): nil
+    lua_call(L, nargs, nresults)
+end
+
+@visibility("hidden")
+export function ksCheckstack(L: voidptr, extra: int32): int32
+    return lua_checkstack(L, extra)
+end
+
+@visibility("hidden")
+export function ksCreatetable(L: voidptr, narr: int32, nrec: int32): nil
+    lua_createtable(L, narr, nrec)
+end
+
+@visibility("hidden")
+export function ksEqual(L: voidptr, index1: int32, index2: int32): int32
+    return lua_equal(L, index1, index2)
+end
+
+@visibility("hidden")
+export function ksGetfield(L: voidptr, index: int32, k: cstring): nil
+    lua_getfield(L, index, k)
+end
+
+@visibility("hidden")
+export function ksGettop(L: voidptr): int32
+    return lua_gettop(L)
+end
+
+@visibility("hidden")
+export function ksInsert(L: voidptr, index: int32): nil
+    lua_insert(L, index)
+end
+
+@visibility("hidden")
+export function ksNewuserdata(L: voidptr, size: Size): voidptr
+    return lua_newuserdata(L, size)
+end
+
+@visibility("hidden")
+export function ksNext(L: voidptr, index: int32): int32
+    return lua_next(L, index)
+end
+
+@visibility("hidden")
+export function ksObjlen(L: voidptr, index: int32): Size
+    return lua_objlen(L, index)
+end
+
+@visibility("hidden")
+export function ksPushboolean(L: voidptr, b: int32): nil
+    lua_pushboolean(L, b)
+end
+
+@visibility("hidden")
+export function ksPushlightuserdata(L: voidptr, p: voidptr): nil
+    lua_pushlightuserdata(L, p)
+end
+
+@visibility("hidden")
+export function ksPushlstring(L: voidptr, s: voidptr, l: Size): nil
+    lua_pushlstring(L, s, l)
+end
+
+@visibility("hidden")
+export function ksPushnil(L: voidptr): nil
+    lua_pushnil(L)
+end
+
+@visibility("hidden")
+export function ksPushnumber(L: voidptr, n: number): nil
+    lua_pushnumber(L, n)
+end
+
+@visibility("hidden")
+export function ksPushvalue(L: voidptr, index: int32): nil
+    lua_pushvalue(L, index)
+end
+
+@visibility("hidden")
+export function ksRawget(L: voidptr, index: int32): nil
+    lua_rawget(L, index)
+end
+
+@visibility("hidden")
+export function ksRawgeti(L: voidptr, index: int32, n: int32): nil
+    lua_rawgeti(L, index, n)
+end
+
+@visibility("hidden")
+export function ksRawset(L: voidptr, index: int32): nil
+    lua_rawset(L, index)
+end
+
+@visibility("hidden")
+export function ksRawseti(L: voidptr, index: int32, n: int32): nil
+    lua_rawseti(L, index, n)
+end
+
+@visibility("hidden")
+export function ksRemove(L: voidptr, index: int32): nil
+    lua_remove(L, index)
+end
+
+@visibility("hidden")
+export function ksSetmetatable(L: voidptr, index: int32): int32
+    return lua_setmetatable(L, index)
+end
+
+@visibility("hidden")
+export function ksSettop(L: voidptr, index: int32): nil
+    lua_settop(L, index)
+end
+
+@visibility("hidden")
+export function ksToboolean(L: voidptr, index: int32): int32
+    return lua_toboolean(L, index)
+end
+
+@visibility("hidden")
+export function ksTolstring(L: voidptr, index: int32, len: voidptr?): voidptr?
+    return lua_tolstring(L, index, len)
+end
+
+@visibility("hidden")
+export function ksTonumber(L: voidptr, index: int32): number
+    return lua_tonumber(L, index)
+end
+
+@visibility("hidden")
+export function ksTopointer(L: voidptr, index: int32): voidptr?
+    return lua_topointer(L, index)
+end
+
+@visibility("hidden")
+export function ksTouserdata(L: voidptr, index: int32): voidptr?
+    return lua_touserdata(L, index)
+end
+
+@visibility("hidden")
+export function ksType(L: voidptr, index: int32): int32
+    return lua_type(L, index)
+end
