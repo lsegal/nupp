@@ -1,0 +1,429 @@
+--- The operating system beneath the host, on Windows: locks, condition
+--- variables, threads, the monotonic clock, files, and the process's
+--- arguments and standard error. Every platform's `nupphost.sys` exports the
+--- same functions. Paths and arguments are UTF-8 here and UTF-16 to Windows.
+module nupphost.sys
+
+cdef function calloc(count: uint64, size: uint64): voidptr?
+cdef function malloc(size: uint64): voidptr?
+cdef function realloc(borrows p: voidptr, size: uint64): voidptr?
+cdef function free(borrows p: voidptr)
+cdef function strlen(borrows s: cstring): uint64
+cdef function snprintf(borrows buffer: voidptr, size: uint64, borrows format: cstring, ...): int32
+
+cdef function AcquireSRWLockExclusive(borrows lock: voidptr)
+cdef function ReleaseSRWLockExclusive(borrows lock: voidptr)
+cdef function SleepConditionVariableSRW(borrows condition: voidptr, borrows lock: voidptr, milliseconds: uint32, flags: uint32): int32
+cdef function WakeConditionVariable(borrows condition: voidptr)
+cdef function WakeAllConditionVariable(borrows condition: voidptr)
+cdef function CreateThread(
+    borrows attributes: voidptr?,
+    stack: uint64,
+    start: function(arg: uint64): voidptr?,
+    arg: uint64,
+    flags: uint32,
+    borrows identifier: voidptr?
+): voidptr?
+cdef function WaitForSingleObject(borrows handle: voidptr, milliseconds: uint32): uint32
+cdef function CloseHandle(borrows handle: voidptr): int32
+cdef function QueryPerformanceCounter(borrows value: int64*): int32
+cdef function QueryPerformanceFrequency(borrows value: int64*): int32
+cdef function Sleep(milliseconds: uint32)
+cdef function GetSystemInfo(borrows info: voidptr)
+cdef function GetLastError(): uint32
+cdef function FormatMessageA(
+    flags: uint32,
+    borrows source: voidptr?,
+    message: uint32,
+    language: uint32,
+    borrows buffer: voidptr,
+    size: uint32,
+    borrows arguments: voidptr?
+): uint32
+cdef function GetModuleFileNameW(borrows module: voidptr?, borrows buffer: voidptr, size: uint32): uint32
+cdef function MultiByteToWideChar(
+    page: uint32,
+    flags: uint32,
+    borrows text: voidptr,
+    length: int32,
+    borrows wide: voidptr?,
+    count: int32
+): int32
+cdef function WideCharToMultiByte(
+    page: uint32,
+    flags: uint32,
+    borrows wide: voidptr,
+    count: int32,
+    borrows text: voidptr?,
+    length: int32,
+    borrows fallback: voidptr?,
+    borrows used: voidptr?
+): int32
+cdef function CreateFileW(
+    borrows path: voidptr,
+    access: uint32,
+    share: uint32,
+    borrows security: voidptr?,
+    disposition: uint32,
+    attributes: uint32,
+    borrows template: voidptr?
+): voidptr
+cdef function ReadFile(borrows file: voidptr, borrows buffer: voidptr, count: uint32, borrows read: uint32*, borrows overlapped: voidptr?): int32
+cdef function GetStdHandle(which: uint32): voidptr?
+cdef function WriteFile(borrows file: voidptr, borrows buffer: voidptr, count: uint32, borrows written: uint32*, borrows overlapped: voidptr?): int32
+cdef function GetCommandLineW(): voidptr
+cdef function CommandLineToArgvW(borrows line: voidptr, borrows count: int32*): voidptr?
+cdef function LocalFree(borrows memory: voidptr): voidptr?
+
+-- An SRWLOCK and a CONDITION_VARIABLE are each one pointer, ready at zero.
+const PRIMITIVE_BYTES = 16ULL
+const INFINITE = 4294967295
+const ERROR_TIMEOUT = 1460ULL
+const CP_UTF8 = 65001
+const GENERIC_READ = 2147483648
+const FILE_SHARE_ALL = 7
+const OPEN_EXISTING = 3
+const FILE_ATTRIBUTE_NORMAL = 128
+const INVALID_HANDLE = 18446744073709551615ULL
+const STD_ERROR_HANDLE = 4294967284
+const FORMAT_FROM_SYSTEM = 4608
+const READ_CHUNK = 1048576ULL
+
+local frequency: int64 = 0LL
+
+--- A new lock, or nil without memory.
+export function nuppHostSysMutexNew(): voidptr?
+    return calloc(1ULL, PRIMITIVE_BYTES)
+end
+
+export function nuppHostSysMutexFree(borrows mutex: voidptr): nil
+    free(mutex)
+end
+
+export function nuppHostSysLock(borrows mutex: voidptr): nil
+    AcquireSRWLockExclusive(mutex)
+end
+
+export function nuppHostSysUnlock(borrows mutex: voidptr): nil
+    ReleaseSRWLockExclusive(mutex)
+end
+
+--- A new condition variable, or nil without memory.
+export function nuppHostSysCondNew(): voidptr?
+    return calloc(1ULL, PRIMITIVE_BYTES)
+end
+
+export function nuppHostSysCondFree(borrows condition: voidptr): nil
+    free(condition)
+end
+
+export function nuppHostSysWait(borrows condition: voidptr, borrows mutex: voidptr): nil
+    SleepConditionVariableSRW(condition, mutex, INFINITE, 0)
+end
+
+--- Waits at most `milliseconds` for `condition`. True when the wait timed out.
+export function nuppHostSysWaitMs(borrows condition: voidptr, borrows mutex: voidptr, milliseconds: int64): boolean
+    local bounded = milliseconds
+    if bounded < 0LL then
+        bounded = 0LL
+    elseif bounded > 4294967294LL then
+        bounded = 4294967294LL
+    end
+    if SleepConditionVariableSRW(condition, mutex, math.u32.wrap(bounded as integer), 0) ~= 0 then
+        return false
+    end
+    return (GetLastError() as uint64) == ERROR_TIMEOUT
+end
+
+export function nuppHostSysSignal(borrows condition: voidptr): nil
+    WakeConditionVariable(condition)
+end
+
+export function nuppHostSysBroadcast(borrows condition: voidptr): nil
+    WakeAllConditionVariable(condition)
+end
+
+--- Starts a thread running `entry(argument)`, or nil when it cannot.
+export function nuppHostSysThreadStart(entry: function(arg: uint64): voidptr?, argument: uint64): voidptr?
+    return CreateThread(nil, 0ULL, entry, argument, 0, nil)
+end
+
+--- Waits for a thread `nuppHostSysThreadStart` started to end, and closes it.
+export function nuppHostSysThreadJoin(borrows thread: voidptr): nil
+    WaitForSingleObject(thread, INFINITE)
+    CloseHandle(thread)
+end
+
+--- Nanoseconds on the performance counter, the clock
+--- `nupp.runtime.provider.nativeplatform` reads, so worker deadlines computed
+--- there compare against it.
+export function nuppHostSysMonotonicNs(): uint64
+    local value = calloc(1ULL, 8ULL) as int64*?
+    if value == nil then
+        return 0ULL
+    end
+    local slot = value as int64*
+    if frequency <= 0LL then
+        QueryPerformanceFrequency(slot)
+        frequency = @unsafe (slot[0])
+        if frequency <= 0LL then
+            frequency = 1LL
+        end
+    end
+    QueryPerformanceCounter(slot)
+    local ticks = @unsafe (slot[0] as uint64)
+    free(slot as voidptr)
+    local rate = frequency as uint64
+    -- ticks * 1e9 / rate, without the product overflowing.
+    return (ticks // rate) * 1000000000ULL + ((ticks % rate) * 1000000000ULL) // rate
+end
+
+export function nuppHostSysSleepMs(milliseconds: int64): nil
+    local bounded = milliseconds
+    if bounded < 0LL then
+        bounded = 0LL
+    elseif bounded > 4294967294LL then
+        bounded = 4294967294LL
+    end
+    Sleep(math.u32.wrap(bounded as integer))
+end
+
+--- How many threads can run at once: the processors Windows reports.
+export function nuppHostSysParallelism(): int64
+    local info = calloc(1ULL, 64ULL)
+    if info == nil then
+        return 1LL
+    end
+    GetSystemInfo(info as voidptr)
+    local count = @unsafe (((info as uint64 + 32ULL) as uint32*)[0] as int64)
+    free(info as voidptr)
+    if count < 1LL then
+        return 1LL
+    end
+    return count
+end
+
+--- The text of the last failed call's error, as Rust's `io::Error` shows it.
+export function nuppHostSysLastError(borrows buffer: voidptr, capacity: uint64): nil
+    local code = GetLastError()
+    local text = calloc(1ULL, 512ULL)
+    if text == nil then
+        snprintf(buffer, capacity, "os error %u", code)
+        return
+    end
+    local length = FormatMessageA(FORMAT_FROM_SYSTEM, nil, code, 0, text as voidptr, 511, nil) as integer
+    @unsafe do
+        local bytes = text as uint8*
+        -- Windows ends its messages with a line break, which Rust trims.
+        while length > 0 and (bytes[length - 1] == 10 or bytes[length - 1] == 13 or bytes[length - 1] == 32) do
+            length = length - 1
+        end
+        bytes[length] = 0
+    end
+    snprintf(buffer, capacity, "%s (os error %u)", text as cstring, code)
+    free(text as voidptr)
+end
+
+--- `count` UTF-16 units at `wide` as NUL-terminated UTF-8, allocated, with its
+--- byte count in `length[0]` when `length` is given; or nil. Unpaired
+--- surrogates become U+FFFD, as Rust's lossy conversion makes them.
+local function narrow(borrows wide: voidptr, count: int32, borrows length: uint64*?): voidptr?
+    local size = WideCharToMultiByte(CP_UTF8, 0, wide, count, nil, 0, nil, nil)
+    if size < 0 then
+        return nil
+    end
+    local text = malloc((size as uint64) + 1ULL)
+    if text == nil then
+        return nil
+    end
+    if size > 0 then
+        WideCharToMultiByte(CP_UTF8, 0, wide, count, text as voidptr, size, nil, nil)
+    end
+    @unsafe do
+        (text as uint8*)[size as integer] = 0
+        if length ~= nil then
+            (length as uint64*)[0] = size as uint64
+        end
+    end
+    return text
+end
+
+--- The NUL-terminated UTF-8 `text` as NUL-terminated UTF-16, allocated, or nil.
+local function widen(borrows text: cstring): voidptr?
+    local units = MultiByteToWideChar(CP_UTF8, 0, text as voidptr, -1, nil, 0)
+    if units <= 0 then
+        return nil
+    end
+    local wide = calloc(units as uint64, 2ULL)
+    if wide == nil then
+        return nil
+    end
+    MultiByteToWideChar(CP_UTF8, 0, text as voidptr, -1, wide as voidptr, units)
+    return wide
+end
+
+--- This executable's path, NUL-terminated UTF-8 and allocated, or nil.
+export function nuppHostSysExecutable(): voidptr?
+    local capacity: uint64 = 512ULL
+    while capacity <= 65536ULL do
+        local wide = calloc(capacity, 2ULL)
+        if wide == nil then
+            return nil
+        end
+        local count = GetModuleFileNameW(nil, wide as voidptr, math.u32.wrap(capacity as integer)) as uint64
+        if count == 0ULL then
+            free(wide as voidptr)
+            return nil
+        end
+        if count < capacity then
+            local text = narrow(wide as voidptr, math.i32.wrap(count as integer), nil)
+            free(wide as voidptr)
+            return text
+        end
+        free(wide as voidptr)
+        capacity = capacity * 2ULL
+    end
+    return nil
+end
+
+--- The bytes of the file at the UTF-8 `path`, allocated, with their count
+--- written to `length[0]`; or nil, with the reason written to `message`.
+export function nuppHostSysReadFile(borrows path: cstring, borrows length: int64*, borrows message: voidptr, capacity: uint64): voidptr?
+    local wide = widen(path)
+    if wide == nil then
+        snprintf(message, capacity, "the path is not valid UTF-8")
+        return nil
+    end
+    local file = CreateFileW(wide as voidptr, GENERIC_READ, FILE_SHARE_ALL, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nil)
+    free(wide as voidptr)
+    if (file as uint64) == INVALID_HANDLE then
+        nuppHostSysLastError(message, capacity)
+        return nil
+    end
+    local read = calloc(1ULL, 8ULL) as uint32*?
+    local size: uint64 = 0ULL
+    local reserved: uint64 = READ_CHUNK
+    local buffer = malloc(reserved)
+    local failed = false
+    while buffer ~= nil and read ~= nil do
+        if reserved - size < READ_CHUNK then
+            local grown = realloc(buffer as voidptr, reserved * 2ULL)
+            if grown == nil then
+                free(buffer as voidptr)
+                buffer = nil
+                break
+            end
+            buffer = grown
+            reserved = reserved * 2ULL
+        end
+        local target = ((buffer as uint64) + size) as voidptr
+        if ReadFile(file, target, math.u32.wrap(READ_CHUNK as integer), read as uint32*, nil) == 0 then
+            nuppHostSysLastError(message, capacity)
+            failed = true
+            break
+        end
+        local step = @unsafe ((read as uint32*)[0] as uint64)
+        if step == 0ULL then
+            break
+        end
+        size = size + step
+    end
+    CloseHandle(file)
+    if read ~= nil then
+        free(read as voidptr)
+    end
+    if buffer == nil then
+        if not failed then
+            snprintf(message, capacity, "out of memory")
+        end
+        return nil
+    end
+    if failed then
+        free(buffer as voidptr)
+        return nil
+    end
+    @unsafe do
+        length[0] = size as int64
+    end
+    return buffer
+end
+
+--- Writes `count` bytes to standard error.
+export function nuppHostSysWriteError(borrows bytes: voidptr, count: uint64): nil
+    local handle = GetStdHandle(STD_ERROR_HANDLE)
+    if handle == nil or (handle as uint64) == INVALID_HANDLE then
+        return
+    end
+    local written = calloc(1ULL, 8ULL) as uint32*?
+    if written == nil then
+        return
+    end
+    local done: uint64 = 0ULL
+    while done < count do
+        local step = count - done
+        if step > 1073741824ULL then
+            step = 1073741824ULL
+        end
+        local target = ((bytes as uint64) + done) as voidptr
+        if WriteFile(handle as voidptr, target, math.u32.wrap(step as integer), written as uint32*, nil) == 0 then
+            break
+        end
+        local wrote = @unsafe ((written as uint32*)[0] as uint64)
+        if wrote == 0ULL then
+            break
+        end
+        done = done + wrote
+    end
+    free(written as voidptr)
+end
+
+--- The process's arguments as UTF-8 byte strings, from Windows' own command
+--- line rather than the ANSI `argv`: their addresses in `texts[0]` and their
+--- lengths in `lengths[0]`, both allocated. The count, or -1.
+export function nuppHostSysArguments(argc: int32, borrows argv: cstring*, borrows texts: voidptr*, borrows lengths: voidptr*): int32
+    local found = calloc(1ULL, 8ULL) as int32*?
+    if found == nil then
+        return -1
+    end
+    local wide = CommandLineToArgvW(GetCommandLineW(), found as int32*)
+    local count = @unsafe ((found as int32*)[0])
+    free(found as voidptr)
+    if wide == nil then
+        return -1
+    end
+    local addresses = calloc((count as uint64) + 1ULL, 8ULL) as voidptr*?
+    local sizes = calloc((count as uint64) + 1ULL, 8ULL) as uint64*?
+    if addresses == nil or sizes == nil then
+        LocalFree(wide as voidptr)
+        return -1
+    end
+    @unsafe do
+        local list = wide as voidptr*
+        local into = addresses as voidptr*
+        local measured = sizes as uint64*
+        for index = 0, count - 1 do
+            local text = narrow(list[index], -1, ((sizes as uint64) + (index as uint64) * 8ULL) as uint64*)
+            if text == nil then
+                LocalFree(wide as voidptr)
+                return -1
+            end
+            into[index] = text as voidptr
+            -- The count a NUL-terminated conversion gives includes the NUL.
+            if measured[index] > 0ULL then
+                measured[index] = measured[index] - 1ULL
+            end
+        end
+        texts[0] = addresses as voidptr
+        lengths[0] = sizes as voidptr
+    end
+    LocalFree(wide as voidptr)
+    return count
+end
+
+--- LuaJIT's traces stay reachable from its interpreter on Windows without a
+--- reservation, so there is nothing to hold.
+export function nuppHostSysMcodeReserve(): nil
+end
+
+export function nuppHostSysMcodeRelease(): nil
+end
