@@ -1687,7 +1687,7 @@ write_host_program() {
     hp_system=$(native_path "$ROOT/host/program/$hp_platform")
     printf 'return { include = { ".", "%s", "%s" } }\n' "$hp_common" "$hp_system" > "$hp_directory/nupp.lua"
     {
-        printf 'module nupphost.main\n\n'
+        printf 'module main\n\n'
         printf 'const {nuppHostCliMain as run} = require("nupphost.cli")\n\n'
         printf 'export function main(argc: int32, argv: cstring*): int32\n'
         printf '    return run(argc, argv)\n'
