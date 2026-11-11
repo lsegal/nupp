@@ -211,7 +211,10 @@ local function clientConfig(
         anchors = anchors,
         verify = verify,
         protocols = protocols,
-        cachekey = cachekey
+        cachekey = cachekey,
+        discover = verify and authority == nil and function(chain: {string}): boolean
+            return roots.discover(chain) ~= nil
+        end or nil
     ), nil
 end
 

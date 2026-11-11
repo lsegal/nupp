@@ -58,6 +58,9 @@ export record ClientConfig
     @readonly verify: boolean
     @readonly protocols: {string}
     @readonly cachekey: string
+    --- Asks the platform for a missing root of a chain; true when one was
+    --- added to `anchors`. Only set for the default anchors.
+    @readonly discover: (function(chain: {string}): boolean)?
 end
 
 --- What a server session is configured with.
@@ -741,7 +744,7 @@ local function onServerHello(self: Session, body: string): nil
     local extensions = parseExtensions(reader)
     reader:finish()
     local suite = suiteByCode(suiteCode)
-    if suite == nil or compression ~= 0 or sessionId ~= self.sessionId then
+    if suite == nil or compression ~= 0 then
         fatal(ALERT_ILLEGAL_PARAMETER, "the server chose parameters that were not offered")
     end
     local versions = extensions[EXT_SUPPORTED_VERSIONS]
@@ -773,6 +776,9 @@ local function onServerHello(self: Session, body: string): nil
         self.phase = "wait_certificate12"
 
         return
+    end
+    if sessionId ~= self.sessionId then
+        fatal(ALERT_ILLEGAL_PARAMETER, "the server did not echo the session id")
     end
     if versions ~= uint(0x0304, 2) or not suite.tls13 then
         fatal(ALERT_ILLEGAL_PARAMETER, "the server chose an unsupported version")
@@ -897,6 +903,10 @@ local function checkPeerCertificate(self: Session): nil
     if config.verify then
         local anchors = config.anchors as {x509.Certificate}
         local ok, reason = x509.verifyserver(self.peerChain, anchors, config.hostname, now())
+        local discover = config.discover
+        if not ok and discover ~= nil and discover(self.peerChain) then
+            ok, reason = x509.verifyserver(self.peerChain, anchors, config.hostname, now())
+        end
         if not ok then
             fatal(ALERT_BAD_CERTIFICATE, "invalid peer certificate: " .. (reason as string))
         end
