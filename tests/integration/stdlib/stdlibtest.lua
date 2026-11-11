@@ -898,6 +898,8 @@ function M.anHttpClientPumpsItsTransfersOnRequest()
             polls = polls + 1
             return 0
         end,
+        wait = function()
+        end,
         pending = function()
             return 0
         end,
@@ -914,9 +916,9 @@ function M.anHttpClientPumpsItsTransfersOnRequest()
     })
     local client = provider.newclient()
     testAssert.eq(client.flush, nil, "the old flush spelling is gone")
-    -- Waiting sleeps on the shared readiness generation rather than inside the
-    -- transport, so a pump drains once and, told to wait and finding nothing
-    -- settled, drains again after the sleep.
+    -- Waiting sleeps on the network reactor through the transport's wait, so a
+    -- pump drains once and, told to wait and finding nothing settled, drains
+    -- again after the sleep.
     client:pump()
     testAssert.eq(polls, 1, "a pump without a timeout drains once and does not wait")
     client:pump(25)

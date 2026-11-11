@@ -781,6 +781,10 @@ local FEATURES: {[string]: native.Feature} = {
         -- provider; nothing here reaches the Rust provider.
         module = "nupp.runtime.provider.nativetls",
         runtimeModule = "nupp.runtime.provider.nativetls",
+        host = "native-tls",
+        -- Binary through the network provider's wake handle, and so a feature a
+        -- manifest may turn off by name.
+        binary = true,
         requires = {"runtime.tls_contract", "runtime.tls_types", "native.net", "runtime.suspension"},
     },
     ["native.process"] = {
