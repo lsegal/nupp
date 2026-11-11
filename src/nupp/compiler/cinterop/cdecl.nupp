@@ -664,15 +664,7 @@ local AGGREGATES = wordSet({"struct", "union", "enum"})
 
 -- Words that take a parenthesized argument and say nothing about which name a
 -- declaration introduces.
-local DECORATORS = wordSet({
-    "__attribute__",
-    "__attribute",
-    "__declspec",
-    "__asm__",
-    "__asm",
-    "asm",
-    "_Alignas",
-})
+local DECORATORS = wordSet({"__attribute__", "__attribute", "__declspec", "__asm__", "__asm", "asm", "_Alignas",})
 
 -- Qualifiers and storage classes: neither a type nor a name.
 local QUALIFIERS = wordSet({
@@ -1058,11 +1050,7 @@ export function declare(text: string): boolean, string?, {[string]: boolean}?
     end
     local declared: {[string]: boolean} = {}
     for id, entry in ctypes() do
-        if entry.name
-            and entry.cname
-            and kindOf(entry.info) == CT_FUNC
-            and (not before[id] or spelled[entry.name])
-        then
+        if entry.name and entry.cname and kindOf(entry.info) == CT_FUNC and (not before[id] or spelled[entry.name]) then
             declared[entry.name] = true
         end
     end

@@ -140,7 +140,7 @@ end
 -- typedef the checker reached first decided what a runtime module declaring the same
 -- name afterwards got from ffi.new (#117).
 function M.checkingAFileLeavesTheRuntimeItsOwnTypedefs()
-    local D = "local ffi = require('ffi')\nffi.cdef[[ typedef struct { int32_t checked; } CstShadow; ]]\n"
+    local D = "local ffi = require('ffi')\nffi.cdef[[ typedef struct CstShadow { int32_t checked; } CstShadow; ]]\n"
     testAssert.eq(diagsOf(D .. "local p = ffi.new('CstShadow')\nlocal n: number = p.checked"), "")
     local ffi = require("ffi")
     ffi.cdef("typedef struct { int64_t pid; int32_t status; } CstShadow;")
