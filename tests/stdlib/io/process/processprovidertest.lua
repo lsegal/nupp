@@ -7,10 +7,11 @@
 -- another native family -- a socket accepting a connection -- still wakes it.
 local test = require("assert")
 local nativeStage = require("nupp.tools.build.native")
+local process = require("nupp.compiler.process")
 
 local M = {}
 
-local provider, root, unavailable, priorPreload, priorLoaded
+local provider, root, unavailable, priorPreload, priorLoaded, nativeLibrary
 
 local WINDOWS = package.config:sub(1, 1) == "\\"
 local SHELL = os.getenv("NUPP_TEST_SH") or "/bin/sh"
@@ -81,6 +82,7 @@ function M.beforeAll()
         end
         libraryPath = root .. "/out/lib/nupp_native"
     end
+    nativeLibrary = libraryPath
     priorPreload = package.preload["nupp.runtime.native"]
     priorLoaded = package.loaded["nupp.runtime.native"]
     preloadNative(libraryPath)
@@ -218,6 +220,80 @@ function M.exitCodesAreReported()
     test.eq(exit.exitcode, 7)
     test.eq(exit.killed, false)
     finish(child)
+end
+
+-- The checker declares every literal cdef block of a file it checks to the
+-- compiler's own FFI, the other platform's block included, and can do that
+-- before the compiler first loads this provider (#117). A fresh interpreter
+-- that has declared them the same way, the other platform's first, must still
+-- start a child. This suite's own interpreter already holds the provider's
+-- types, so the case needs one of its own.
+local DECLARED_FIRST = [==[
+local ffi = require("ffi")
+local source, library, shellPath, declared = ...
+if declared then
+    ffi.cdef(declared)
+else
+    local blocks = {}
+    for block in assert(io.open(source, "rb")):read("*a"):gmatch("ffi%s*%.%s*cdef%s*%[%[(.-)%]%]") do
+        table.insert(blocks, ffi.os == "Windows" and 1 or #blocks + 1, block)
+    end
+    assert(#blocks >= 2, "expected one cdef block per platform")
+    for _, block in ipairs(blocks) do
+        pcall(ffi.cdef, block)
+    end
+end
+local text = assert(io.open(assert(package.searchpath("nupp.runtime.native", package.path)), "rb")):read("*a")
+text = text:gsub('os%.getenv%("NUPP_NATIVE_LIBRARY"%)', function()
+    return ("%q"):format(library)
+end)
+package.preload["nupp.runtime.native"] = assert(loadstring(text, "@nupp.runtime.native"))
+local provider = require("nupp.runtime.provider.nativeprocess")
+local owner, _, _, _, _, problem = provider:spawn({
+    args = {shellPath, "-c", "exit 7"}, stdin = "null", stdout = "null", stderr = "null",
+})
+assert(owner ~= nil, tostring(problem))
+local exit
+repeat
+    exit = provider:poll(owner)
+    if not exit then
+        provider:waitready({child = owner, read = {}, write = {}}, 100)
+    end
+until exit
+assert(provider:reap(owner))
+io.write("exit ", tostring(exit.exitcode))
+]==]
+
+local function declaredFirst(declared)
+    local script = process.tmpname() .. ".lua"
+    local handle = assert(io.open(script, "wb"))
+    handle:write(DECLARED_FIRST)
+    handle:close()
+    local source = assert(package.searchpath("nupp.runtime.provider.nativeprocess", package.path))
+    local status, output = process.capture({"luajit", script, source, nativeLibrary, SHELL, declared}, {
+        env = {LUA_PATH = package.path, LUA_CPATH = package.cpath},
+    })
+    os.remove(script)
+
+    return status, output
+end
+
+function M.theOtherPlatformsDeclarationsDoNotShadowTheProvidersTypes()
+    ready()
+    local status, output = declaredFirst()
+    test.eq(output, "exit 7")
+    test.eq(status, 0)
+end
+
+-- Another copy or version of the provider can hold one of its names in another
+-- shape. The provider cannot redefine it, so it has to refuse by name rather
+-- than index a field the type does not have.
+function M.aDifferentlyShapedEarlierDeclarationIsRefusedByName()
+    ready()
+    local name = WINDOWS and "NuppProcessWindowsChild" or "NuppProcessPosixChild"
+    local status, output = declaredFirst("typedef struct { void *elsewhere; } " .. name .. ";")
+    test.ne(status, 0)
+    assert(output:find(name .. " was already declared without the field", 1, true), output)
 end
 
 function M.aSignalExitStaysDistinctFromAnEqualExitCode()
