@@ -43,6 +43,8 @@ concurrency:
 jobs:
   native-runtime:
     name: Native runtime / ${{ matrix.name }}
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    if: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -101,6 +103,8 @@ jobs:
 
   reification:
     name: Reification and array-of-structs / ${{ matrix.name }}
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    if: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:

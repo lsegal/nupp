@@ -63,6 +63,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   guest:
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
