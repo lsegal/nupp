@@ -601,10 +601,17 @@ export function install(c: state.Checker): state.ExprHandlers
         end
         -- Ordinary builtin members need no extension module. Taking the whole
         -- table, or selecting a new member, initializes the shared table once.
+        -- Under compat = "lua51" a member the stock runtime already has stays
+        -- the stock one: the extension implementing it is not portable Lua.
+        local stockMember = target.kind == "name"
+            and target.token
+            and builtinExtensions.has(target.token.text)
+            and c.opts.compat == "lua51"
+            and runtimeSurface.stockMember(target.token.text, memberName)
         if target.kind == "name"
             and target.token
             and builtinExtensions.has(target.token.text)
-            and not builtinExtensions.member(target.token.text, memberName)
+            and (stockMember or not builtinExtensions.member(target.token.text, memberName))
         then
             (target as any).skipBuiltinExtension = true
         end
@@ -979,7 +986,7 @@ export function install(c: state.Checker): state.ExprHandlers
                     or native.forModuleMember(holder.requiredModule, memberName)
             end
         end
-        if effect and c.recordEffect then
+        if effect and c.recordEffect and not stockMember then
             (node as any).compilerFeatureEffect = effect
             c.recordEffect(effect)
         end
