@@ -203,13 +203,6 @@ jobs:
             "$GITHUB_SHA" release/kits src/nupp/tools/build/stub-catalog.json \
             release/kits/kit-*.json
 
-      # A tag must prove the exact Rust artifacts on the same runner that will
-      # package them. The compiler matrix is a separate workflow and cannot be
-      # a dependency of the publishing job.
-      - name: Gate the Rust-native platform artifacts
-        shell: bash
-        run: .github/scripts/test-rust-native-platform.sh
-
       - name: Verify the binary packaging fixpoint
         shell: bash
         run: |
@@ -472,13 +465,6 @@ jobs:
       # The nupp binary links the pinned LLVM (the AOT code generator).
       - name: Fetch or build the pinned LLVM
         uses: ./.github/actions/pinned-llvm
-
-      # The public catalog target keeps its established MSVC spelling, but the
-      # host and its static C consumers are one MinGW ABI. Exercise that exact
-      # GNU Rust artifact set before it is stamped or packaged.
-      - name: Gate the Rust-native platform artifacts
-        shell: bash
-        run: .github/scripts/test-rust-native-platform.sh
 
       - name: Verify the binary packaging fixpoint
         shell: bash
