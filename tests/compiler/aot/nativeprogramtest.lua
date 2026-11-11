@@ -1900,4 +1900,32 @@ end
     assert(message:find("a native program reads only jit.os and jit.arch", 1, true), message)
 end
 
+-- A Windows library's module definition marks its exported data `DATA`, so the
+-- import library lld-link writes from it gives a C consumer the `__imp_`
+-- pointer `__declspec(dllimport)` reads, and no code thunk.
+function M.aWindowsLibrarysModuleDefinitionMarksItsData()
+    local parser = require("nupp.compiler.syntax.parser")
+    local check = require("helpers.fragment")
+    local env = require("nupp.compiler.project.env").new(require("helpers.paths").tests .. "/..")
+    local tree = parser.parse(DATA_LIBRARY, "host.nupp")
+    assert(#tree.errors == 0, tree.errors[1] and tree.errors[1].message)
+    local diagnostics = check.check(tree, "host.nupp", env)
+    assert(#diagnostics == 0, diagnostics[1] and diagnostics[1].code .. " " .. tostring(diagnostics[1].msg))
+    local triple = "x86_64-pc-windows-msvc"
+    local ir, problem = require("nupp.compiler.aot.llvm.native").program(
+        {{name = "", tree = tree.root}},
+        triple,
+        "",
+        {library = true}
+    )
+    assert(ir ~= nil, problem and problem.message)
+    local profile = require("nupp.compiler.aot.llvm.profile")
+    local list = profile.exportList(
+        assert(profile.of(triple)),
+        {"nupp_native_twice", "nupp_native_powers", "nupp_native_calls"},
+        profile.publicData(ir)
+    )
+    test.eq(list, "EXPORTS\n    nupp_native_calls DATA\n    nupp_native_powers DATA\n    nupp_native_twice\n")
+end
+
 return M

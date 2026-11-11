@@ -84,6 +84,46 @@ function M.aWindowsLibraryPublishesItsListThroughAModuleDefinition()
     assert(has(argv, "/def:out.exports"), table.concat(argv, " "))
 end
 
+local DATA_IR = [[
+@table = constant [3 x i64] [i64 1, i64 10, i64 100], align 8
+@counts = global [1 x i32] [i32 4], align 4
+@local_counts = dso_local global i32 0, align 4
+@scratch = internal global [8 x i8] zeroinitializer, align 1
+@hidden_table = hidden constant [3 x i32] [i32 2, i32 20, i32 200], align 4
+@.str = private unnamed_addr constant [4 x i8] c"abc\00"
+@environ = external global ptr
+@weak_hook = extern_weak global ptr
+@game_add = alias i32 (i32, i32), ptr @ks_0123_add__baseline
+define i32 @twice(i32 %n) {
+]]
+
+function M.publicDataIsTheGlobalsNothingKeepsLocal()
+    local data = profile.publicData(DATA_IR)
+    local names = {}
+    for name in pairs(data) do
+        names[#names + 1] = name
+    end
+    table.sort(names)
+    assert(table.concat(names, ",") == "counts,local_counts,table", table.concat(names, ","))
+    assert(next(profile.publicData(IR)) == nil, "a function or alias was taken for data")
+end
+
+-- An import library gives an export without `DATA` a code thunk, which a C
+-- consumer declaring the symbol `__declspec(dllimport)` does not read through.
+function M.aWindowsModuleDefinitionMarksDataExports()
+    local coff = target("x86_64-pc-windows-msvc")
+    local list = profile.exportList(coff, {"twice", "table", "counts"}, profile.publicData(DATA_IR))
+    assert(list == "EXPORTS\n    counts DATA\n    table DATA\n    twice\n", list)
+end
+
+function M.onlyAModuleDefinitionSaysWhatIsData()
+    local data = {table = true}
+    local elf = profile.exportList(target("x86_64-unknown-linux-gnu"), {"table"}, data)
+    assert(elf == "{\n  global:\n    table;\n  local:\n    *;\n};\n", elf)
+    local macho = profile.exportList(target("aarch64-apple-darwin"), {"table"}, data)
+    assert(macho == "_table\n", macho)
+end
+
 function M.aLinkWithoutAListStatesNone()
     for _, triple in ipairs({"x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"}) do
         local argv = table.concat(profile.sharedLink(target(triple), "out", {"a.o"}, "out"), " ")
