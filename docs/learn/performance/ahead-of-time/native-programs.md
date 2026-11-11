@@ -131,6 +131,84 @@ The program prints `answer is 42` and exits with status 2. Every function
 carries unwind tables, so `luaL_error` raised inside a Nupp callback unwinds
 through it to the `lua_pcall` that called it.
 
+## Function pointers
+
+A function type such as `function(L: voidptr): int32` is a C function pointer.
+A local, a parameter or [module state](#module-state) of that type holds one,
+and calling it is an indirect call with the declared signature. A function of
+the program's own, or a declared C function, is a pointer of its own type when
+used as a value. A pointer from anywhere else, such as the `voidptr` that
+`dlsym` or `GetProcAddress` returns, is given its type with `as`. A function
+type ending in `...` is variadic, and its extra arguments pass as they would to
+a variadic C function.
+
+This is how a program binds an API it does not link against directly, at run
+time: here `lua_atpanic` hands back the handler it replaces, and module state
+holds `luaL_error` to be called later:
+
+```nupp
+cdef function luaL_newstate(): voidptr
+cdef function luaL_error(borrows L: voidptr, format: cstring, ...): int32
+cdef function lua_atpanic(borrows L: voidptr, panicf: function(L: voidptr): int32): function(L: voidptr): int32
+cdef function lua_close(borrows L: voidptr)
+
+local raise: function(L: voidptr, format: cstring, ...): int32
+
+local function first(L: voidptr): int32
+    return raise(L, "first handler, %d", 1)
+end
+
+local function second(L: voidptr): int32
+    return 2
+end
+
+local function main(): int32
+    raise = luaL_error
+    local L = luaL_newstate()
+    lua_atpanic(L, second)
+    local previous = lua_atpanic(L, first)
+    local erased = previous as voidptr
+    local handler = erased as function(L: voidptr): int32
+    local status = math.i32.wrap(handler(L))
+    lua_close(L)
+    return status
+end
+```
+
+The program exits with status 2. A function type whose parameters or result
+have no C representation, such as a table, is refused where it is called.
+
+A field of a [`cdef struct`](#c-structs) can have a function type too, and is
+laid out as a pointer, as C lays out the same declaration. That is how a
+program mirrors a C table of callbacks: it writes a function to the field and
+calls through it.
+
+```nupp
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+
+cdef struct Handlers
+    panic: function(code: int32): int32
+end
+
+local function doubled(code: int32): int32
+    return code * 2
+end
+
+local function main(): int32
+    local handlers = calloc(1, 8) as Handlers*
+    local status: int32 = 0
+    @unsafe do
+        handlers.panic = doubled
+        status = handlers.panic(3)
+    end
+    free(handlers as voidptr)
+    return status
+end
+```
+
+The program exits with status 6.
+
 ## C structs
 
 A `cdef struct` is laid out for the target triple by the same model the
@@ -393,6 +471,42 @@ as a static archive's, find it by name, and nothing outside does. Without it, a
 symbol's visibility is the default, which a shared library exports. A scalar
 `export const` stays a literal, read where it is named, and a top-level `local`
 stays private to its module.
+
+## Choosing code by target
+
+A program reads `jit.os` and `jit.arch` as LuaJIT spells them (`"Windows"`,
+`"Linux"`, `"OSX"`, `"BSD"`; `"x64"`, `"x86"`, `"arm64"`), but for the target
+being compiled, so a cross-compiled program sees its target, not the machine
+building it. A test that compares one of them with a string literal is decided
+while compiling. An `if` clause it rules out is not lowered at all, so a branch
+can call a C function that exists only on its own platform, and the other
+targets' programs never refer to it:
+
+```nupp
+cdef function GetCurrentProcessId(): uint32
+cdef function getpid(): int32
+cdef function puts(borrows s: cstring): int32
+
+local function main(): int32
+    puts(jit.os)
+    if jit.os == "Windows" then
+        if GetCurrentProcessId() == 0 then
+            return 1
+        end
+    elseif jit.arch == "arm64" then
+        puts("an arm64 POSIX system")
+    elseif getpid() <= 0 then
+        return 1
+    end
+    return 0
+end
+```
+
+`not`, `and` and `or` over such tests are decided too, and so is a run-time
+test after an `and` whose left side is already false, or an `or` whose left side
+is already true, because that right side never runs. Read elsewhere, `jit.os`
+and `jit.arch` are C strings. Compared with anything but a string literal they
+are refused, because C strings compare by address.
 
 ## Threads and atomics
 

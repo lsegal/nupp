@@ -182,6 +182,154 @@ end
     assert(ran:find("failed with 7", 1, true), ran)
 end
 
+-- A function-typed value is called through: a pointer a C function returns,
+-- module state assigned one at run time, a local bound to a function of the
+-- program's own, and a pointer that passed through a `voidptr`.
+function M.aFunctionPointerFromCIsCalledThrough()
+    requireCodegen()
+    local executable, output = link(LUA_API .. [[
+cdef function lua_atpanic(borrows L: voidptr, panicf: function(L: voidptr): int32): function(L: voidptr): int32
+local handler: function(L: voidptr): int32
+
+local function seven(L: voidptr): int32
+    return 7
+end
+
+local function nine(L: voidptr): int32
+    return 9
+end
+
+local function main(): int32
+    local L = luaL_newstate()
+    lua_atpanic(L, seven)
+    handler = lua_atpanic(L, nine)
+    local previous = lua_atpanic(L, seven)
+    local direct = nine
+    local erased = handler as voidptr
+    local restored = erased as function(L: voidptr): int32
+    local failed: integer = 0
+    @unsafe do
+        if handler(L) ~= 7 then
+            failed += 1
+        end
+        if previous(L) ~= 9 then
+            failed += 2
+        end
+        if direct(L) ~= 9 then
+            failed += 4
+        end
+        if restored(L) ~= 7 then
+            failed += 8
+        end
+    end
+    lua_close(L)
+    return math.i32.wrap(failed)
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+end
+
+-- A variadic function pointer passes its variadic arguments as a call to the
+-- C function itself would, here raising through `luaL_error`.
+function M.aVariadicFunctionPointerIsCalledThrough()
+    requireCodegen()
+    local executable, output = link(LUA_API .. [[
+cdef function luaL_error(borrows L: voidptr, format: cstring, ...): int32
+
+local raise: function(L: voidptr, format: cstring, ...): int32
+
+local function fail(L: voidptr): int32
+    return raise(L, "failed with %g and %s", 7, "more")
+end
+
+local function main(): int32
+    raise = luaL_error
+    local L = luaL_newstate()
+    luaL_openlibs(L)
+    lua_pushcclosure(L, fail, 0)
+    lua_setfield(L, GLOBALS, "fail")
+    if luaL_loadstring(L, "fail()") ~= 0 then
+        return 100
+    end
+    local status = lua_pcall(L, 0, 0, 0)
+    puts(lua_tolstring(L, -1, nil))
+    lua_close(L)
+    return status
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 2, ran)
+    assert(ran:find("failed with 7 and more", 1, true), ran)
+end
+
+-- A function-typed field of a `cdef struct` holds a C function pointer: one
+-- written from a program function, from a C function and from a pointer a C
+-- function returns, and each called back through the field.
+function M.aFunctionPointerFieldIsWrittenAndCalledThrough()
+    requireCodegen()
+    local executable, output = link(LUA_API .. [[
+cdef function lua_atpanic(borrows L: voidptr, panicf: function(L: voidptr): int32): function(L: voidptr): int32
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+
+cdef struct Handlers
+    tag: int8
+    panic: function(L: voidptr): int32
+    fallback: (function(L: voidptr): int32)?
+    after: int8
+end
+
+local function seven(L: voidptr): int32
+    return 7
+end
+
+local function nine(L: voidptr): int32
+    return 9
+end
+
+local function main(): int32
+    local L = luaL_newstate()
+    local handlers = calloc(1, 64) as Handlers*
+    local failed: integer = 0
+    @unsafe do
+        handlers.tag = 3
+        handlers.after = 5
+        handlers.panic = seven
+        lua_atpanic(L, nine)
+        handlers.fallback = lua_atpanic(L, seven)
+        if handlers.panic(L) ~= 7 then
+            failed += 1
+        end
+        local fallback = handlers.fallback
+        if fallback ~= nil then
+            if fallback(L) ~= 9 then
+                failed += 2
+            end
+            handlers.panic = fallback
+        else
+            failed += 16
+        end
+        local copied = handlers.panic
+        if copied(L) ~= 9 then
+            failed += 4
+        end
+        if handlers.tag ~= 3 or handlers.after ~= 5 then
+            failed += 8
+        end
+        free(handlers as voidptr)
+    end
+    lua_close(L)
+    return math.i32.wrap(failed)
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+end
+
 -- `integer` and `number` are binary64, so `//` and `%` floor and `/` divides
 -- exactly; `int64` wraps; refinements enter through the establishing calls.
 function M.arithmeticKeepsTheLanguagesMeaning()
@@ -913,6 +1061,18 @@ end
     test.eq(executable, nil)
     assert(output:find("native: module data scratch is not a C array of a fixed size", 1, true), output)
 end
+function M.aFunctionPointerWithoutACSignatureIsRefusedWhereItIsCalled()
+    local executable, output = link([[
+local apply: function(values: {number}): int32
+
+local function main(): int32
+    return apply({})
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("host.nupp:4:12: native: parameter 1 of apply has type ", 1, true), output)
+end
+
 function M.aTopLevelStatementIsRefusedWhereItIsWritten()
     local executable, output = link([[
 print("not native")
@@ -1256,6 +1416,7 @@ end
 end
 
 
+
 --[[
 C arrays and module data. What each lowers to is read from the module text, so
 these cases need no code generator; the programs after them are run, and the
@@ -1270,7 +1431,7 @@ local TRIPLE = "x86_64-unknown-linux-gnu"
 
 --- The module `source` lowers to for x86-64 Linux, or nil and the refusal's
 --- message.
-local function lower(source)
+local function lowerData(source)
     local tree = parser.parse(source, "host.nupp")
     if #tree.errors > 0 then
         error("syntax: " .. tree.errors[1].message, 2)
@@ -1328,7 +1489,7 @@ local seen = ffi.new<boolean[2]>({true})
 -- and the rest zero, a layout query is the target's answer, and a function as
 -- an address is its symbol.
 function M.constantArraysAndArrayStateLowerToData()
-    local ir = assert(lower(ARRAYS .. [[
+    local ir = assert(lowerData(ARRAYS .. [[
 
 export function nupp_native_read(i: int32): number
     counts[i] = math.i32.wrap(counts[i] + 1)
@@ -1361,7 +1522,7 @@ end
 -- A C array field is indexed in place, a nested one row by row, and a
 -- `boolean` element is a byte as a field is.
 function M.cArrayFieldsAreIndexedInPlace()
-    local ir = assert(lower(ARRAYS .. [[
+    local ir = assert(lowerData(ARRAYS .. [[
 
 export function nupp_native_fill(header: Header*, i: int32): number
     @unsafe do
@@ -1389,7 +1550,7 @@ end
 -- its own name, read-only when its type is `const` and with the visibility
 -- `@visibility` gives it.
 function M.exportedDataIsASymbolWithItsVisibility()
-    local ir = assert(lower([[
+    local ir = assert(lowerData([[
 module runtime
 
 local ffi = require("ffi")
@@ -1430,7 +1591,7 @@ end
 end
 
 function M.aConstantArrayIsNeverWritten()
-    local ir, message = lower(ARRAYS .. [[
+    local ir, message = lowerData(ARRAYS .. [[
 
 export function nupp_native_write(i: int32): nil
     POWERS[i] = 2ULL
@@ -1441,7 +1602,7 @@ end
 end
 
 function M.aWholeArrayIsNeverAssigned()
-    local ir, message = lower([[
+    local ir, message = lowerData([[
 module host
 
 cdef struct Pair
@@ -1459,7 +1620,7 @@ end
 end
 
 function M.anArrayHoldsNoMoreThanItsCount()
-    local ir, message = lower([[
+    local ir, message = lowerData([[
 local values = ffi.new<int32[2]>({1, 2, 3})
 ]])
     test.eq(ir, nil)
@@ -1467,7 +1628,7 @@ local values = ffi.new<int32[2]>({1, 2, 3})
 end
 
 function M.visibilityIsForAnExport()
-    local ir, message = lower([[
+    local ir, message = lowerData([[
 @visibility("hidden")
 local function helper(): int32
     return 1
@@ -1588,6 +1749,152 @@ end
     local ran
     status, ran = run(quote(executable))
     test.eq(status, 42, ran)
+end
+
+
+-- `jit.os` and `jit.arch` name the target, and a test of them is decided while
+-- compiling: a clause it rules out is not lowered, so it may call what only
+-- another platform has.
+local TARGETED = [[
+cdef function GetCurrentProcessId(): uint32
+cdef function getpid(): int32
+cdef function puts(borrows s: cstring): int32
+
+local function main(): int32
+    puts(jit.os)
+    puts(jit.arch)
+    if jit.os == "Windows" then
+        if GetCurrentProcessId() == 0 then
+            return 1
+        end
+        return 7
+    elseif jit.os ~= "OSX" and not (jit.arch == "x64") then
+        if getpid() <= 0 then
+            return 1
+        end
+        return 8
+    else
+        if getpid() <= 0 then
+            return 1
+        end
+        return 9
+    end
+end
+]]
+
+--- The module `source` lowers to for `triple`, or nil and the refusal.
+local function lower(source, triple)
+    local parser = require("nupp.compiler.syntax.parser")
+    local check = require("helpers.fragment")
+    local env = require("nupp.compiler.project.env").new(require("helpers.paths").tests .. "/..")
+    local tree = parser.parse(source, "host.nupp")
+    assert(#tree.errors == 0, tree.errors[1] and tree.errors[1].message)
+    local diagnostics = check.check(tree, "host.nupp", env)
+    assert(#diagnostics == 0, diagnostics[1] and diagnostics[1].code .. " " .. tostring(diagnostics[1].msg))
+    local ir, problem = require("nupp.compiler.aot.llvm.native").module(tree.root, triple, "")
+    if ir == nil then
+        return nil, problem.message
+    end
+
+    return ir
+end
+
+local function calls(ir, symbol)
+    return ir:find("call [^\n]*@" .. symbol .. "%(") ~= nil
+end
+
+function M.aTargetTestLowersOnlyTheBranchItSelects()
+    for triple, expected in pairs({
+        ["x86_64-pc-windows-msvc"] = {status = 7, os = "Windows", arch = "x64", windows = true},
+        ["aarch64-pc-windows-msvc"] = {status = 7, os = "Windows", arch = "arm64", windows = true},
+        ["aarch64-unknown-linux-gnu"] = {status = 8, os = "Linux", arch = "arm64"},
+        ["i686-unknown-linux-gnu"] = {status = 8, os = "Linux", arch = "x86"},
+        ["x86_64-unknown-linux-gnu"] = {status = 9, os = "Linux", arch = "x64"},
+        ["aarch64-apple-darwin"] = {status = 9, os = "OSX", arch = "arm64"},
+    }) do
+        local ir = assert(lower(TARGETED, triple))
+        test.eq(calls(ir, "GetCurrentProcessId"), expected.windows == true, triple)
+        test.eq(calls(ir, "getpid"), expected.windows ~= true, triple)
+        assert(ir:find("ret i32 " .. expected.status, 1, true), triple .. ":\n" .. ir)
+        for _, other in ipairs({7, 8, 9}) do
+            if other ~= expected.status then
+                assert(not ir:find("ret i32 " .. other, 1, true), triple .. ":\n" .. ir)
+            end
+        end
+        assert(ir:find('c"' .. expected.os .. '\\00"', 1, true), triple .. ":\n" .. ir)
+        assert(ir:find('c"' .. expected.arch .. '\\00"', 1, true), triple .. ":\n" .. ir)
+    end
+end
+
+-- Linked and run for this machine, the program takes the branch LuaJIT's own
+-- `jit.os` and `jit.arch` select, and links without the other platform's
+-- functions.
+function M.aTargetedProgramRunsTheBranchForThisMachine()
+    requireCodegen()
+    local executable, output = link(TARGETED)
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    local expected = 9
+    if jit.os == "Windows" then
+        expected = 7
+    elseif jit.os ~= "OSX" and jit.arch ~= "x64" then
+        expected = 8
+    end
+    test.eq(status, expected, ran)
+    test.eq((ran:gsub("\r", "")), jit.os .. "\n" .. jit.arch)
+end
+
+-- An `and` whose left side the target settles leaves the right side
+-- unlowered; a left side decided at run time still runs.
+function M.aSettledTargetTestSkipsItsRightSide()
+    local source = [[
+cdef function probe(): boolean
+cdef function windowsOnly(): boolean
+
+local function main(): int32
+    if jit.os == "Windows" and windowsOnly() then
+        return 1
+    end
+    if probe() or jit.os == "Windows" then
+        return 2
+    end
+    return 0
+end
+]]
+    local linux = assert(lower(source, "x86_64-unknown-linux-gnu"))
+    test.eq(calls(linux, "windowsOnly"), false)
+    test.eq(calls(linux, "probe"), true)
+    local windows = assert(lower(source, "x86_64-pc-windows-msvc"))
+    test.eq(calls(windows, "windowsOnly"), true)
+    test.eq(calls(windows, "probe"), true)
+end
+
+function M.aTargetComparedWithAnythingButALiteralIsRefused()
+    local ir, message = lower([[
+local function main(argc: int32, argv: cstring*): int32
+    @unsafe do
+        if jit.os == argv[0] then
+            return 1
+        end
+    end
+    return 0
+end
+]], "x86_64-unknown-linux-gnu")
+    test.eq(ir, nil)
+    assert(message:find("jit.os and jit.arch are compared only with a string literal", 1, true), message)
+end
+
+function M.onlyTheTargetIsReadFromJit()
+    local ir, message = lower([[
+local function main(): int32
+    if jit.version == "LuaJIT" then
+        return 1
+    end
+    return 0
+end
+]], "x86_64-unknown-linux-gnu")
+    test.eq(ir, nil)
+    assert(message:find("a native program reads only jit.os and jit.arch", 1, true), message)
 end
 
 return M
