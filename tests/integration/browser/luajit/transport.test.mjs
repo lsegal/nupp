@@ -48,6 +48,28 @@ test('a missing guest response hits the host deadline', async () => {
   await assert.rejects(guest.receive(), /timed out/);
   assert.equal(Worker.instances.at(-1).terminated, true);
 });
+test('a compiler deadline names the request it expired on', async () => {
+  const startup = createCompiler({...options, deadlineMs: 10});
+  await assert.rejects(startup, /^Error: Compiler startup exceeded its 10 ms deadline$/);
+  const starting = createCompiler({...options, deadlineMs: 10});
+  const worker = Worker.instances.at(-1);
+  worker.deliver({type: 'compiler', sequence: 0, result: {ready: true}});
+  const compiler = await starting;
+  await assert.rejects(compiler.request({kind: 'compile', source: 'return 1', filename: 'tour.nupp'}),
+    /^Error: Compiler compile request for tour\.nupp exceeded its 10 ms deadline$/);
+  assert.equal(worker.terminated, true);
+});
+test('one compiler request can carry a longer deadline than the rest', async () => {
+  const starting = createCompiler({...options, deadlineMs: 10});
+  const worker = Worker.instances.at(-1);
+  worker.deliver({type: 'compiler', sequence: 0, result: {ready: true}});
+  const compiler = await starting;
+  const first = compiler.request({kind: 'check', source: 'return 1'}, {deadlineMs: 1000});
+  await new Promise(resolve => setTimeout(resolve, 50));
+  worker.deliver({type: 'compiler', sequence: 1, result: {ok: true, response: {diagnostics: []}}});
+  assert.deepEqual(await first, {diagnostics: []});
+  await assert.rejects(compiler.request({kind: 'hover', offset: 1}), /hover request exceeded its 10 ms deadline/);
+});
 test('asset bytes and hashes are enforced before they reach the emulator', async () => {
   const original = globalThis.fetch;
   try {

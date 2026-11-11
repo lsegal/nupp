@@ -1,7 +1,8 @@
 /**
  * Own one guest worker. CPU-bound cancellation always terminates the VM.
  * `deadlineMs` bounds the guest's own work: booting to its first frame, and each
- * response to the frame that follows it.
+ * response to the frame that follows it. `respond` can size one response's
+ * deadline and name what timed out, for a response known to take longer.
  */
 export function createGuest({manifestUrl, app, config = {}, profile = 'runner', signal,
   deadlineMs = 30000, timeoutMessage = 'Guest request timed out', snapshot = true, captureSnapshot = false,
@@ -31,7 +32,10 @@ export function createGuest({manifestUrl, app, config = {}, profile = 'runner', 
     else if (messages.length < 2) messages.push(value);
     else close(new Error('Guest produced unsolicited frames'));
   }
-  const arm = (failed = close) => { clearTimeout(timer); timer = setTimeout(() => failed(new Error(timeoutMessage)), deadlineMs); };
+  const arm = (failed = close, ms = deadlineMs, message = timeoutMessage) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => failed(new Error(message)), ms);
+  };
   function launch(useSnapshot) {
     const instance = new Worker(new URL('./vm-worker.mjs', new URL(manifestUrl, import.meta.url)), {type: 'module'});
     worker = instance;
@@ -67,17 +71,25 @@ export function createGuest({manifestUrl, app, config = {}, profile = 'runner', 
   if (!closed) launch(snapshot);
   return {
     close, receive,
-    respond(response, payload = new Uint8Array()) {
+    respond(response, payload = new Uint8Array(), {deadlineMs: ms = deadlineMs, timeoutMessage: message = timeoutMessage} = {}) {
       if (closed || !Number.isSafeInteger(resultSequence)) throw new Error('Guest is not waiting for input');
       const sequence = resultSequence; resultSequence = undefined;
       const copy = payload.slice();
-      arm();
+      arm(close, ms, message);
       worker.postMessage({type: 'response', sequence, response, payload: copy.buffer}, [copy.buffer]);
     },
   };
 }
+const describe = ({kind, filename}) => `${kind || 'compiler'} request${filename ? ` for ${filename}` : ''}`;
+/**
+ * A request's `deadlineMs` overrides the guest's for that response alone. Its
+ * first request builds the checking environment, which costs a slow engine
+ * far more than any request after it.
+ */
 export async function createCompiler(options) {
-  const guest = createGuest({...options, profile: 'compiler', config: {...options.config, mode: 'compiler', jit: false}});
+  const deadlineMs = options.deadlineMs ?? 30000;
+  const guest = createGuest({timeoutMessage: `Compiler startup exceeded its ${deadlineMs} ms deadline`, ...options,
+    profile: 'compiler', config: {...options.config, mode: 'compiler', jit: false}});
   try {
     const first = await guest.receive();
     if (first.type !== 'compiler' || !first.result.ready) throw new Error(first.result?.error || 'Compiler failed to initialize');
@@ -85,13 +97,14 @@ export async function createCompiler(options) {
   let busy = false;
   return {
     close: guest.close,
-    async request(request) {
+    async request(request, {deadlineMs: ms = deadlineMs} = {}) {
       if (busy) throw new Error('A compiler request is already running');
       busy = true;
       try {
         const {source, ...header} = request;
         guest.respond({...header, ...(source === undefined ? {} : {payloadField: 'source'})},
-          new TextEncoder().encode(source || ''));
+          new TextEncoder().encode(source || ''),
+          {deadlineMs: ms, timeoutMessage: `Compiler ${describe(header)} exceeded its ${ms} ms deadline`});
         const answer = await guest.receive();
         if (answer.type !== 'compiler' || !answer.result.ok) throw new Error(answer.result.error || 'Invalid compiler result');
         return answer.result.response;
