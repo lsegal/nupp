@@ -528,6 +528,87 @@ function M.computesLayoutForTheDeclaredTargetRatherThanTheHost()
     testAssert.eq(table.concat(wasm32, ","), "40,8,8,20,4,4,40,4", "wasm32 layout")
 end
 
+local FUNCTION_FIELDS_SOURCE = [[
+cdef struct Handlers
+    tag: int8
+    panic: function(L: voidptr): int32
+    fallback: (function(L: voidptr): int32)?
+    after: int8
+end
+return comptime do
+    return {
+        types.sizeof(Handlers),
+        types.alignof(Handlers),
+        types.offsetof(Handlers, "panic"),
+        types.offsetof(Handlers, "fallback"),
+        types.offsetof(Handlers, "after")
+    }
+end
+]]
+
+-- A function-typed field of a `cdef struct` is a C function pointer: it is laid
+-- out as a pointer on every target, as LuaJIT lays out the same declaration.
+function M.aCdefStructsFunctionFieldIsLaidOutAsAPointer()
+    local lp64 = runIn(FUNCTION_FIELDS_SOURCE, layoutEnv("x86_64-unknown-linux-gnu"))
+    testAssert.eq(table.concat(lp64, ","), "32,8,8,16,24", "LP64 layout")
+
+    local ilp32 = runIn(FUNCTION_FIELDS_SOURCE, layoutEnv("i686-unknown-linux-gnu"))
+    testAssert.eq(table.concat(ilp32, ","), "16,4,4,8,12", "i686 SysV layout")
+
+    local wasm32 = runIn(FUNCTION_FIELDS_SOURCE, layoutEnv("wasm32-unknown-emscripten"))
+    testAssert.eq(table.concat(wasm32, ","), "16,4,4,8,12", "wasm32 layout")
+
+    local host = require("nupp.compiler.targetlayout").hostKey()
+    if host ~= nil then
+        local ffi = require("ffi")
+        local native = runIn(FUNCTION_FIELDS_SOURCE, layoutEnv(host))
+        local ct = ffi.typeof([[struct {
+            int8_t tag;
+            int32_t (*panic)(void *L);
+            int32_t (*fallback)(void *L);
+            int8_t after;
+        }]])
+        testAssert.eq(
+            table.concat(native, ","),
+            table.concat({
+                ffi.sizeof(ct),
+                ffi.alignof(ct),
+                ffi.offsetof(ct, "panic"),
+                ffi.offsetof(ct, "fallback"),
+                ffi.offsetof(ct, "after"),
+            }, ","),
+            "the host layout agrees with LuaJIT's"
+        )
+    end
+end
+
+-- Outside a `cdef` declaration a function-typed field is a Lua function, which
+-- has no runtime layout, even nested in a `cdef struct` by value.
+function M.aFunctionFieldOutsideCdefHasNoLayout()
+    local targetLayout = require("nupp.compiler.targetlayout")
+    local func = {tag = "func", params = {{tag = "voidptr"}}, rets = {{tag = "int32"}}}
+    local plain = {
+        tag = "nominal",
+        declKind = "struct",
+        name = "Plain",
+        fieldOrder = {"tag", "panic"},
+        byname = {tag = {tag = "int8"}, panic = func},
+    }
+    local _, why = targetLayout.of(plain, "x86_64-unknown-linux-gnu")
+    assert(why and why:find('field "panic" func has no runtime layout', 1, true), tostring(why))
+
+    local outer = {
+        tag = "nominal",
+        declKind = "struct",
+        name = "Outer",
+        cdefName = "Outer",
+        fieldOrder = {"inner"},
+        byname = {inner = plain},
+    }
+    local _, nested = targetLayout.of(outer, "x86_64-unknown-linux-gnu")
+    assert(nested and nested:find('field "panic" func has no runtime layout', 1, true), tostring(nested))
+end
+
 function M.layoutNamesRespectShadowedTypesAtRuntimeAndComptime()
     local source = [[
 local types: {
