@@ -182,6 +182,89 @@ end
     assert(ran:find("failed with 7", 1, true), ran)
 end
 
+-- A function-typed value is called through: a pointer a C function returns,
+-- module state assigned one at run time, a local bound to a function of the
+-- program's own, and a pointer that passed through a `voidptr`.
+function M.aFunctionPointerFromCIsCalledThrough()
+    requireCodegen()
+    local executable, output = link(LUA_API .. [[
+cdef function lua_atpanic(borrows L: voidptr, panicf: function(L: voidptr): int32): function(L: voidptr): int32
+local handler: function(L: voidptr): int32
+
+local function seven(L: voidptr): int32
+    return 7
+end
+
+local function nine(L: voidptr): int32
+    return 9
+end
+
+local function main(): int32
+    local L = luaL_newstate()
+    lua_atpanic(L, seven)
+    handler = lua_atpanic(L, nine)
+    local previous = lua_atpanic(L, seven)
+    local direct = nine
+    local erased = handler as voidptr
+    local restored = erased as function(L: voidptr): int32
+    local failed: integer = 0
+    @unsafe do
+        if handler(L) ~= 7 then
+            failed += 1
+        end
+        if previous(L) ~= 9 then
+            failed += 2
+        end
+        if direct(L) ~= 9 then
+            failed += 4
+        end
+        if restored(L) ~= 7 then
+            failed += 8
+        end
+    end
+    lua_close(L)
+    return math.i32.wrap(failed)
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+end
+
+-- A variadic function pointer passes its variadic arguments as a call to the
+-- C function itself would, here raising through `luaL_error`.
+function M.aVariadicFunctionPointerIsCalledThrough()
+    requireCodegen()
+    local executable, output = link(LUA_API .. [[
+cdef function luaL_error(borrows L: voidptr, format: cstring, ...): int32
+
+local raise: function(L: voidptr, format: cstring, ...): int32
+
+local function fail(L: voidptr): int32
+    return raise(L, "failed with %g and %s", 7, "more")
+end
+
+local function main(): int32
+    raise = luaL_error
+    local L = luaL_newstate()
+    luaL_openlibs(L)
+    lua_pushcclosure(L, fail, 0)
+    lua_setfield(L, GLOBALS, "fail")
+    if luaL_loadstring(L, "fail()") ~= 0 then
+        return 100
+    end
+    local status = lua_pcall(L, 0, 0, 0)
+    puts(lua_tolstring(L, -1, nil))
+    lua_close(L)
+    return status
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 2, ran)
+    assert(ran:find("failed with 7 and more", 1, true), ran)
+end
+
 -- `integer` and `number` are binary64, so `//` and `%` floor and `/` divides
 -- exactly; `int64` wraps; refinements enter through the establishing calls.
 function M.arithmeticKeepsTheLanguagesMeaning()
@@ -920,6 +1003,18 @@ end
     test.eq(executable, nil)
     assert(output:find("native: field bytes of cdef struct Buffer is a C array", 1, true), output)
 end
+function M.aFunctionPointerWithoutACSignatureIsRefusedWhereItIsCalled()
+    local executable, output = link([[
+local apply: function(values: {number}): int32
+
+local function main(): int32
+    return apply({})
+end
+]])
+    test.eq(executable, nil)
+    assert(output:find("host.nupp:4:12: native: parameter 1 of apply has type ", 1, true), output)
+end
+
 function M.aTopLevelStatementIsRefusedWhereItIsWritten()
     local executable, output = link([[
 print("not native")

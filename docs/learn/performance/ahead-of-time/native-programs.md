@@ -131,6 +131,53 @@ The program prints `answer is 42` and exits with status 2. Every function
 carries unwind tables, so `luaL_error` raised inside a Nupp callback unwinds
 through it to the `lua_pcall` that called it.
 
+## Function pointers
+
+A function type such as `function(L: voidptr): int32` is a C function pointer.
+A local, a parameter or [module state](#module-state) of that type holds one,
+and calling it is an indirect call with the declared signature. A function of
+the program's own, or a declared C function, is a pointer of its own type when
+used as a value. A pointer from anywhere else, such as the `voidptr` that
+`dlsym` or `GetProcAddress` returns, is given its type with `as`. A function
+type ending in `...` is variadic, and its extra arguments pass as they would to
+a variadic C function.
+
+This is how a program binds an API it does not link against directly, at run
+time: here `lua_atpanic` hands back the handler it replaces, and module state
+holds `luaL_error` to be called later:
+
+```nupp
+cdef function luaL_newstate(): voidptr
+cdef function luaL_error(borrows L: voidptr, format: cstring, ...): int32
+cdef function lua_atpanic(borrows L: voidptr, panicf: function(L: voidptr): int32): function(L: voidptr): int32
+cdef function lua_close(borrows L: voidptr)
+
+local raise: function(L: voidptr, format: cstring, ...): int32
+
+local function first(L: voidptr): int32
+    return raise(L, "first handler, %d", 1)
+end
+
+local function second(L: voidptr): int32
+    return 2
+end
+
+local function main(): int32
+    raise = luaL_error
+    local L = luaL_newstate()
+    lua_atpanic(L, second)
+    local previous = lua_atpanic(L, first)
+    local erased = previous as voidptr
+    local handler = erased as function(L: voidptr): int32
+    local status = math.i32.wrap(handler(L))
+    lua_close(L)
+    return status
+end
+```
+
+The program exits with status 2. A function type whose parameters or result
+have no C representation, such as a table, is refused where it is called.
+
 ## C structs
 
 A `cdef struct` is laid out for the target triple by the same model the
