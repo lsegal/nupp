@@ -801,47 +801,28 @@ function M.pagesCiInstallsThePinnedRustToolchain()
     )
 end
 
--- The broad suite remains the language gate. Native migration regressions need
--- a smaller named boundary before it: the exact resource crates, C ABI, and
--- production host artifacts on each retained runner. Tagged release jobs must
--- repeat it because one GitHub workflow cannot depend on another workflow's
--- result.
-function M.retainedPlatformsGateTheExactRustNativeArtifacts()
+-- The Rust code is being deleted (#1, #8), so CI no longer tests it: no workflow
+-- runs a crate's own tests or the Rust-native artifact gate, and the sanitizer
+-- workflow over the crates is gone. The Nupp suites, the fixpoint and the
+-- release packaging checks stay; hostembeddingtest runs in the broad suite.
+function M.ciRunsNoRustTestSuites()
     local compiler = read(ROOT .. "/.github/workflows/compiler.yml")
     local release = read(ROOT .. "/.github/workflows/release.yml")
-    local gate = read(ROOT .. "/.github/scripts/test-rust-native-platform.sh")
-    local marker = ".github/scripts/test-rust-native-platform.sh"
+    local groups = read(ROOT .. "/tests/groups.lua")
 
-    assert(countOccurrences(compiler, marker) == 1, "the compiler matrix does not run one native artifact gate")
-    assert(countOccurrences(release, marker) == 2, "the Unix and Windows release builders do not both run the gate")
-    assert(
-        gate:find('NUPP_TEST_BASH=${NUPP_TEST_BASH:-$(cygpath -w "$bash_path")}', 1, true),
-        "the Windows native gate does not provide Git Bash to its test harness"
-    )
-    assert(
-        gate:find('NUPP_TEST_SH=${NUPP_TEST_SH:-$(cygpath -w "$sh_path")}', 1, true),
-        "the Windows native gate does not provide sh.exe to its test harness"
-    )
-    assert(gate:find("$channel-x86_64-pc-windows-gnu", 1, true), "the gate does not select Windows GNU Rust")
-    assert(
-        gate:find(
-            "lpeg,native-checksum,native-compression,native-files,native-net,native-process,native-time,native-tls,workers",
-            1,
-            true
-        ),
-        "the gate does not select the production host feature set"
-    )
-    for _, package in ipairs({
-        "nupp-native-net",
-        "nupp-native-tls",
-        "nupp-native-host",
+    for _, path in ipairs({
+        "/.github/scripts/test-rust-native-platform.sh",
+        "/.github/scripts/sanitize-native.sh",
+        "/.github/workflows/sanitizers.yml",
     }) do
-        assert(gate:find("--package " .. package, 1, true), "the gate omits " .. package)
+        assert(not io.open(ROOT .. path, "rb"), path .. " still exists")
     end
-    for _, artifact in ipairs({"libnupp.a", "libnupp.dll.a", "libnupp.dylib", "libnupp.so", "nupp.dll"}) do
-        assert(gate:find(artifact, 1, true), "the gate does not name " .. artifact)
+    for name, workflow in pairs({compiler = compiler, release = release}) do
+        assert(not workflow:find("test-rust-native-platform", 1, true), name .. " still runs the Rust-native gate")
+        assert(not workflow:find("cargo test", 1, true), name .. " still runs a Rust test suite")
+        assert(not workflow:find("rust-native-gate", 1, true), name .. " still names the Rust-native gate group")
     end
-    assert(gate:find("hostembeddingtest", 1, true), "the gate does not link every host artifact from C")
+    assert(not groups:find("rust-native-gate", 1, true), "tests/groups.lua still defines the Rust-native gate")
     assert(compiler:find("./bin/nupp fixpoint", 1, true), "the retained compiler matrix has no fixpoint gate")
     assert(
         countOccurrences(release, "./bin/nupp fixpoint --binary") == 2,
