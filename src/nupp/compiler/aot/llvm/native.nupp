@@ -74,6 +74,9 @@ local record Kind
     signed: boolean
     elem: Kind?
     aggregate: any?
+
+    --- For a function pointer, the checked function type it is called through.
+    signature: any?
 end
 
 local VOID = Kind(llvm = "void", signed = false)
@@ -167,8 +170,10 @@ local function kindOf(t: any): Kind?
         return INTEGERS[tag]
     elseif tag == "nil" then
         return VOID
-    elseif tag == "voidptr" or tag == "func" then
+    elseif tag == "voidptr" then
         return PTR
+    elseif tag == "func" then
+        return Kind(llvm = "ptr", signed = false, signature = raw)
     elseif tag == "cstring" then
         return Kind(llvm = "ptr", signed = false, elem = INTEGERS.uint8)
     elseif tag == "ptr" then
@@ -233,6 +238,10 @@ local record Callee
     --- Defined with external linkage under its own name: an `export function`,
     --- which other modules call and C finds by name.
     public: boolean?
+
+    --- Its checked function type, which its address carries as a function
+    --- pointer's signature.
+    signature: any?
 end
 
 --- A name a body can read: a local's stack slot, or a module's global. A
@@ -549,6 +558,12 @@ local function readVariable(body: Body, entry: Local): Value
     return Value(text = value(body, ("load %s, ptr %s"):format(entry.kind.llvm, entry.slot)), kind = entry.kind)
 end
 
+--- The function `callee` as a value: its address, which C takes as a callback
+--- and a function pointer of its type calls back.
+local function address(callee: Callee): Value
+    return Value(text = "@" .. callee.symbol, kind = Kind(llvm = "ptr", signed = false, signature = callee.signature))
+end
+
 --- The callee a call or a function value names, if it names one.
 local function calleeOf(program: Program, body: Body, node: any): Callee?
     local required, member = memberOf(program, body, node)
@@ -722,14 +737,74 @@ end
 --- A standard-library call lowered in place, by its resolved identity, or nil.
 local intrinsic: function(Program, Body, cst.Call): Value?
 
+--- Whether `node` reads a value of the program's own: a local, a parameter or
+--- module state, or a field or element reached from one, rather than a name
+--- the program does not define.
+local function own(program: Program, body: Body, node: any): boolean
+    local root = node
+    while root ~= nil and (root.kind == "paren" or root.kind == "dotIndex" or root.kind == "bracketIndex") do
+        root = root.kind == "paren" and (root as cst.Paren).expr or root.obj
+    end
+    if root == nil or root.kind ~= "name" then
+        return root ~= nil
+    end
+    local name = ((root as cst.NameExpr).token as lexer.Token).text
+
+    return variable(program, body, name) ~= nil or program.imports[name] ~= nil
+end
+
+--- What a call through a pointer of the checked function type `t` passes and
+--- returns, as a callee whose `symbol` names it in a refusal.
+local function pointerCallee(t: any, node: any): Callee
+    local written = cst.textOf(node as cst.Child)
+    local params: {Kind} = {}
+    for index, param in ipairs(t.params) do
+        local kind = kindOf(param)
+        if kind == nil or (kind as Kind).llvm == "void" then
+            refuse(
+                node,
+                ("parameter %d of %s has type %s, which has no C representation"):format(index, written, T.tostring(param))
+            )
+        end
+        params[index] = kind as Kind
+    end
+    local result = VOID
+    if #t.rets > 1 then
+        refuse(node, written .. " returns more than one value")
+    elseif #t.rets == 1 then
+        local kind = kindOf(t.rets[1])
+        if kind == nil then
+            refuse(
+                node,
+                ("the result of %s has type %s, which has no C representation"):format(written, T.tostring(t.rets[1]))
+            )
+        end
+        result = kind as Kind
+    end
+
+    return Callee(symbol = written, params = params, result = result, varargs = t.vararg == true, foreign = true)
+end
+
 local function call(program: Program, body: Body, node: cst.Call): Value
     local callee = calleeOf(program, body, node.obj)
-    if callee == nil then
+    -- What is called: a function by its symbol, or a function pointer's value.
+    local called: string
+    if callee ~= nil then
+        called = "@" .. (callee as Callee).symbol
+    else
         local inlined = intrinsic(program, body, node)
         if inlined ~= nil then
             return inlined as Value
         end
-        refuse(node, "a native program calls only the functions it defines and the C functions it declares")
+        if not own(program, body, node.obj) then
+            refuse(node, "a native program calls only the functions it defines and the C functions it declares")
+        end
+        local pointer = expression(program, body, node.obj, nil)
+        if pointer.kind.signature == nil then
+            refuse(node, cst.textOf(node.obj as cst.Child) .. " is not a function pointer")
+        end
+        callee = pointerCallee(pointer.kind.signature, node.obj)
+        called = pointer.text
     end
     local target = callee as Callee
     local written = node.args ~= nil and ((node.args as cst.Args).exprs or {}) or {}
@@ -768,7 +843,7 @@ local function call(program: Program, body: Body, node: cst.Call): Value
         fixed[#fixed + 1] = "..."
         signature = signature .. " (" .. table.concat(fixed, ", ") .. ")"
     end
-    local text = ("call %s @%s(%s)"):format(signature, target.symbol, table.concat(arguments, ", "))
+    local text = ("call %s %s(%s)"):format(signature, called, table.concat(arguments, ", "))
     if target.result.llvm == "void" then
         builder.emit(body.f, text)
         return Value(text = "", kind = VOID)
@@ -1385,14 +1460,14 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
                 refuse(node, name .. " is lowered in place, so it has no address")
             end
             -- A function as a value is its address: what C takes as a callback.
-            return Value(text = "@" .. (callee as Callee).symbol, kind = PTR)
+            return address(callee as Callee)
         end
         local alias = program.aliases[name]
         if alias ~= nil then
             local selected = alias as Alias
             local exported = selected.unit.exportedCallees[selected.member]
             if exported ~= nil then
-                return Value(text = "@" .. (exported as Callee).symbol, kind = PTR)
+                return address(exported as Callee)
             end
             return expression(program, body, importedConstant(selected.unit, selected.member, node), want)
         end
@@ -1416,7 +1491,7 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
         if required ~= nil then
             local callee = (required as Program).exportedCallees[member as string]
             if callee ~= nil then
-                return Value(text = "@" .. (callee as Callee).symbol, kind = PTR)
+                return address(callee as Callee)
             end
             return expression(program, body, importedConstant(required as Program, member as string, node), want)
         end
@@ -1827,7 +1902,8 @@ local function signature(
             result = result,
             varargs = false,
             foreign = false,
-            public = public or symbol == "main"
+            public = public or symbol == "main",
+            signature = checked
         ),
         paramNames = names
     )
@@ -1864,7 +1940,14 @@ local function foreign(stat: cst.CdefFunc): Callee
     return atomicCallee(
         stat,
         name,
-        Callee(symbol = name, params = params, result = result, varargs = stat.varargs or false, foreign = true)
+        Callee(
+            symbol = name,
+            params = params,
+            result = result,
+            varargs = stat.varargs or false,
+            foreign = true,
+            signature = physical
+        )
     )
 end
 
