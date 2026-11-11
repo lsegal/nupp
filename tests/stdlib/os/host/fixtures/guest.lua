@@ -19,10 +19,32 @@ local bit = require("bit")
 local encode = dofile(root .. "/src/nupp/runtime/vendor/lunajson/encoder.lua")()
 local decode = dofile(root .. "/src/nupp/runtime/vendor/lunajson/decoder.lua")()
 
-ffi.cdef[[
-typedef struct { long tv_sec; long tv_usec; } nupp_test_timeval;
-int gettimeofday(nupp_test_timeval *tv, void *tz);
-]]
+-- The clock only has to move forward in milliseconds; Windows has no
+-- gettimeofday, so it reads the performance counter instead.
+local now
+if ffi.os == "Windows" then
+    ffi.cdef[[
+    int QueryPerformanceCounter(int64_t *count);
+    int QueryPerformanceFrequency(int64_t *frequency);
+    ]]
+    local count, frequency = ffi.new("int64_t[1]"), ffi.new("int64_t[1]")
+    ffi.C.QueryPerformanceFrequency(frequency)
+    local perMillisecond = tonumber(frequency[0]) / 1000
+    now = function()
+        ffi.C.QueryPerformanceCounter(count)
+        return tonumber(count[0]) / perMillisecond
+    end
+else
+    ffi.cdef[[
+    typedef struct { long tv_sec; long tv_usec; } nupp_test_timeval;
+    int gettimeofday(nupp_test_timeval *tv, void *tz);
+    ]]
+    local timeval = ffi.new("nupp_test_timeval")
+    now = function()
+        ffi.C.gettimeofday(timeval, nil)
+        return tonumber(timeval.tv_sec) * 1000 + tonumber(timeval.tv_usec) / 1000
+    end
+end
 
 local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 local decodeTable = {}
@@ -164,14 +186,7 @@ local function exchange(frame)
     return response
 end
 
-local now = ffi.new("nupp_test_timeval")
-_G.__nuppBrowser = {
-    memory = guestMemory,
-    now = function()
-        ffi.C.gettimeofday(now, nil)
-        return tonumber(now.tv_sec) * 1000 + tonumber(now.tv_usec) / 1000
-    end,
-}
+_G.__nuppBrowser = {memory = guestMemory, now = now,}
 
 -- The compiler fixes a target's host when it builds the runtime, and the tests'
 -- runtime is a native build; a browser build would carry this.

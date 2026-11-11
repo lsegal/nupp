@@ -57,6 +57,11 @@ end
 local function passesNodeSuite(label, file)
     requireNode()
     local events = compiledEvents()
+    if jit.os == "Windows" then
+        -- The runner's Windows shell rewrites `C:/` in a command to Git Bash's
+        -- `/c/`, which the guest's native LuaJIT cannot open; `C:\` is kept.
+        events = events:gsub("/", "\\")
+    end
     local environment = table.concat(
         {
             "NUPP_ROOT=" .. shellQuote(ROOT),

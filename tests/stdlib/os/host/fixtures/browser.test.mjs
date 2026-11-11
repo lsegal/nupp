@@ -13,13 +13,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {spawn} from "node:child_process";
 import {createInterface} from "node:readline";
+import {fileURLToPath} from "node:url";
 import {createTransfers} from "../../../../../runtime/luajit/transfers.mjs";
 import {closeHostChannel, handleBrowserEffects} from "../../../../../runtime/wasm/app-runtime.mjs";
 
-const ROOT = process.env.NUPP_ROOT || new URL("../../../../..", import.meta.url).pathname;
+const ROOT = process.env.NUPP_ROOT || fileURLToPath(new URL("../../../../..", import.meta.url));
 const LUAJIT = process.env.NUPP_LUAJIT || "luajit";
-const GUEST = new URL("./guest.lua", import.meta.url).pathname;
-const SCENARIOS = new URL("./scenarios.lua", import.meta.url).pathname;
+const GUEST = fileURLToPath(new URL("./guest.lua", import.meta.url));
+const SCENARIOS = fileURLToPath(new URL("./scenarios.lua", import.meta.url));
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -111,6 +112,7 @@ async function runGuest(name, host) {
   const child = spawn(LUAJIT, [GUEST, ROOT, SCENARIOS, name], {stdio: ["pipe", "pipe", "pipe"], env: process.env});
   let stderr = "";
   child.stderr.on("data", (data) => { stderr += data; });
+  const stderrClosed = new Promise((resolve) => child.stderr.on("close", resolve));
   const lines = createInterface({input: child.stdout, crlfDelay: Infinity})[Symbol.asyncIterator]();
   // The emulator's clock is wall time, where the guest bridge reads the page's
   // performance clock; deadlines must be measured on the one the guest uses.
@@ -123,6 +125,9 @@ async function runGuest(name, host) {
       const message = JSON.parse(next.value);
       if (message.type === "done") {
         closeHostChannel(options);
+        // The guest exits after its answer, but the two pipes are read
+        // independently: on Windows its last stderr can arrive after it.
+        await stderrClosed;
         return {...message, frames, stderr};
       }
       frames++;
