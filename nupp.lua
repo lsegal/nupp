@@ -612,6 +612,9 @@ end
 LUAJIT_BROWSER_RESOURCES[
     #LUAJIT_BROWSER_RESOURCES + 1
 ] = {source = "build/browser-luajit/preludeimage.bin", output = "nupp/compiler/preludeimage.bin",}
+LUAJIT_BROWSER_RESOURCES[
+    #LUAJIT_BROWSER_RESOURCES + 1
+] = {source = "build/browser-luajit/stdlibimage.bin", output = "nupp/compiler/stdlibimage.bin",}
 for _, relative in ipairs(TEMPLATE_FILES) do
     RESOURCES[#RESOURCES + 1] = {source = "templates/" .. relative, output = "nupp/compiler/templates/" .. relative,}
 end

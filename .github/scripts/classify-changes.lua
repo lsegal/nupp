@@ -42,6 +42,7 @@ local rules = {
     {"^src/nupp/tools/browser%.nupp$", {"compiler", "browser"}},
     {"^src/nupp/compiler/capabilities%.nupp$", {"compiler", "browser", "aot", "simd"}},
     {"^src/nupp/compiler/project/preludeimage", {"compiler", "browser"}},
+    {"^src/nupp/compiler/project/stdlibimage", {"compiler", "browser"}},
     {"^src/nupp/tools/benchrunner%.nupp$", {"compiler", "measurement"}},
     {"^src/nupp/tools/cli/bench%.nupp$", {"compiler", "cli", "measurement"}},
     {"^src/nupp/tools/cli/", {"compiler", "cli"}},

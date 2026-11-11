@@ -17,6 +17,7 @@ local tree = require("nupp.tools.lsp.tree")
 local T = require("nupp.compiler.types")
 local capabilities = require("nupp.compiler.capabilities")
 local preludeImage = require("nupp.compiler.project.preludeimage")
+local stdlibImage = require("nupp.compiler.project.stdlibimage")
 
 local type BrowserOptions = {
     optimize: boolean?,
@@ -101,6 +102,7 @@ function Session:environment(compatibility: string?): any
         },
         typeRoots = {},
         preludeImage = preludeImage,
+        stdlibImage = stdlibImage,
     })
     self.environments[key] = current
 

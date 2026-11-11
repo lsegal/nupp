@@ -53,6 +53,10 @@ for index, request in ipairs(requests) do
     end
     expected[#expected + 1] = response
 end
+-- A standard-library image that does not fit the bundle is refused quietly and
+-- the guest checks from source again, which costs minutes rather than failing.
+local hydrated, refused = require("nupp.compiler.project.stdlibimage").hydrate(session:environment(nil))
+assert(hydrated and next(hydrated.semantics), "compiler carries no usable standard-library image: " .. tostring(refused))
 local bytecode = string.dump(assert(loadfile(bundle, "tW")), "sd")
 assert(#bytecode <= 7 * 1024 * 1024, "compiler exceeds startup mailbox")
 write("compiler.ljbc", bytecode)

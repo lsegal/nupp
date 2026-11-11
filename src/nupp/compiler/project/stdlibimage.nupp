@@ -1,0 +1,373 @@
+@!internal
+
+--[[
+The browser compiler's checked standard-library interfaces.
+
+The prelude image covers what every program sees. A program that `require`s a
+standard-library module used to pay for checking that module's whole graph from
+source the first time it asked: `require("coroutine")` is the suspension, io and
+serde graph behind it, seconds of checking natively and a minute or more in a
+browser guest. This image carries what those checks produce instead -- each module's
+interface, exports, diagnostics and annotations -- as `nupp.compiler.project.interfaceimage`
+already encodes them for semantic workers.
+
+The interfaces are written against the prelude image's own graph. A type the prelude
+image carries is not described again, it is referenced by its table number there, so
+an imported interface that names `io.File` names the very nominal the checker is
+already holding. That makes the image true only of the prelude image it was written
+beside, and only of the settings the modules were checked under: `hydrate` refuses
+anything else and the environment checks from source, as it always could.
+
+It travels inside the compiler, through the guest's fixed startup mailbox, so it is
+written compactly: every string once, every set of table keys once, and every
+table once however often the same plain data recurs. A reader gets each occurrence
+back as a table of its own.
+]]
+module nupp.compiler.project.stdlibimage
+
+local bundled = require("nupp.compiler.bundled")
+local interfaceimage = require("nupp.compiler.project.interfaceimage")
+
+const MAGIC = "NUPP-STDLIB-1\n"
+
+--- Where the prelude image's tables are, by name, inside an interface image.
+const PRELUDE_ARENA = "prelude"
+
+--- The resource the browser compiler carries the image in.
+const RESOURCE = "/stdlibimage.bin"
+
+--- Modules the environment adjusts after checking, which an interface cannot carry.
+const UNIMAGED: {[string]: boolean} = {lpeg = true}
+
+--- What one imaged module is beside its interface.
+export type Module = {
+    declarationOnly: boolean,
+    declared: boolean
+}
+
+--- What an environment needs to build the module records the image stands for.
+export type Hydrated = {
+    semantics: {[string]: any},
+    modules: {[string]: Module}
+}
+
+local function settingsOf(env: any): any
+    return {
+        compat = env.compat or "",
+        layoutTarget = env.layoutTarget or "",
+        preludeTables = #(env.preludeArena or {}),
+        preludeBytes = #(bundled.source("/preludeimage.bin") or ""),
+    }
+end
+
+local function varint(out: {string}, value: integer): nil
+    local rest: number = value
+    while rest >= 128 do
+        out[#out + 1] = string.char(rest % 128 + 128)
+        rest = math.floor(rest / 128)
+    end
+    out[#out + 1] = string.char(rest)
+end
+
+local function keyOrder(left: any, right: any): boolean
+    local leftKind, rightKind = type(left), type(right)
+    if leftKind ~= rightKind then
+        return leftKind == "number"
+    end
+
+    return left < right
+end
+
+--- Writes plain data with every string and every distinct table once, in an order
+--- that depends only on the data.
+local function serialize(root: any): string
+    local strings: {string} = {}
+    local stringIds: {[string]: integer} = {}
+    local bodies: {string} = {}
+    local shapes: {string} = {}
+    local shapeIds: {[string]: integer} = {}
+    local tableIds: {[string]: integer} = {}
+    local written: {[any]: integer} = {}
+    local active: {[any]: boolean} = {}
+
+    local function stringId(value: string): integer
+        local id = stringIds[value]
+        if id == nil then
+            id = #strings + 1
+            strings[id] = value
+            stringIds[value] = id
+        end
+
+        return id
+    end
+
+    local writeTable
+
+    local function scalar(out: {string}, value: any): nil
+        local kind = type(value)
+        if kind == "boolean" then
+            out[#out + 1] = value and "t" or "f"
+        elseif kind == "string" then
+            out[#out + 1] = "s"
+            varint(out, stringId(value as string))
+        elseif kind == "number" then
+            local number = value as number
+            if number == math.floor(number) and math.abs(number) <= 9007199254740991 then
+                out[#out + 1] = number < 0 and "j" or "i"
+                varint(out, math.abs(number) as integer)
+            else
+                out[#out + 1] = "n"
+                varint(out, stringId(string.format("%.17g", number)))
+            end
+        elseif kind == "table" then
+            out[#out + 1] = "r"
+            varint(out, writeTable(value))
+        else
+            error("the standard-library image cannot carry a " .. kind, 0)
+        end
+    end
+
+    writeTable = function(value: any): integer
+        local known = written[value]
+        if known ~= nil then
+            return known
+        end
+        assert(not active[value], "the standard-library image cannot carry a cycle")
+        active[value] = true
+        local keys: {any} = {}
+        for key in pairs(value) do
+            local kind = type(key)
+            assert(kind == "string" or kind == "number", "the standard-library image cannot carry a " .. kind .. " key")
+            keys[#keys + 1] = key
+        end
+        table.sort(keys, keyOrder)
+        local shapeOut: {string} = {}
+        varint(shapeOut, #keys)
+        for _, key in ipairs(keys) do
+            scalar(shapeOut, key)
+        end
+        local shape = table.concat(shapeOut)
+        local shapeId = shapeIds[shape]
+        if shapeId == nil then
+            shapeId = #shapes + 1
+            shapes[shapeId] = shape
+            shapeIds[shape] = shapeId
+        end
+        local out: {string} = {}
+        varint(out, shapeId)
+        for _, key in ipairs(keys) do
+            scalar(out, value[key])
+        end
+        local body = table.concat(out)
+        local id = tableIds[body]
+        if id == nil then
+            id = #bodies + 1
+            bodies[id] = body
+            tableIds[body] = id
+        end
+        active[value] = nil
+        written[value] = id
+
+        return id
+    end
+
+    local rootId = writeTable(root)
+    local out: {string} = {MAGIC}
+    varint(out, #strings)
+    for _, value in ipairs(strings) do
+        varint(out, #value)
+        out[#out + 1] = value
+    end
+    varint(out, #shapes)
+    for _, shape in ipairs(shapes) do
+        out[#out + 1] = shape
+    end
+    varint(out, #bodies)
+    for _, body in ipairs(bodies) do
+        out[#out + 1] = body
+    end
+    varint(out, rootId)
+
+    return table.concat(out)
+end
+
+--- Reads what `serialize` wrote. Shared tables come back as separate copies, so
+--- nothing a reader changes in one place shows up in another.
+local function deserialize(data: string): any
+    assert(data:sub(1, #MAGIC) == MAGIC, "the standard-library image has an unsupported format")
+    local cursor: integer = #MAGIC + 1
+
+    local function readInteger(): integer
+        local result: number = 0
+        local scale: number = 1
+        for _ = 1, 8 do
+            local byte = assert(data:byte(cursor), "the standard-library image is truncated")
+            cursor = cursor + 1
+            result = result + (byte % 128) * scale
+            if byte < 128 then
+                return result as integer
+            end
+            scale = scale * 128
+        end
+        error("the standard-library image has an oversized integer", 0)
+    end
+
+    local strings: {string} = {}
+    for index = 1, readInteger() do
+        local length = readInteger()
+        strings[index] = data:sub(cursor, cursor + length - 1)
+        assert(#strings[index] == length, "the standard-library image is truncated")
+        cursor = cursor + length
+    end
+    local shared: {any} = {}
+    local shapes: {{any}} = {}
+
+    local function value(): any
+        local tag = data:sub(cursor, cursor)
+        cursor = cursor + 1
+        if tag == "t" then
+            return true
+        elseif tag == "f" then
+            return false
+        elseif tag == "i" then
+            return readInteger()
+        elseif tag == "j" then
+            return -readInteger()
+        elseif tag == "s" then
+            return (assert(strings[readInteger()], "the standard-library image has an invalid string"))
+        elseif tag == "n" then
+            local text = assert(strings[readInteger()], "the standard-library image has an invalid number")
+            if text == "nan" or text == "-nan" then
+                return 0 / 0
+            elseif text == "inf" then
+                return math.huge
+            elseif text == "-inf" then
+                return -math.huge
+            end
+
+            return (assert(tonumber(text), "the standard-library image has an invalid number"))
+        elseif tag == "r" then
+            return (assert(shared[readInteger()], "the standard-library image has an invalid table"))
+        end
+        error("the standard-library image has an unknown value tag", 0)
+    end
+
+    -- Every distinct key set once; a table is its key set and then its values.
+    for index = 1, readInteger() do
+        local keys: {any} = {}
+        for position = 1, readInteger() do
+            keys[position] = value()
+        end
+        shapes[index] = keys
+    end
+    for index = 1, readInteger() do
+        local keys = assert(shapes[readInteger()], "the standard-library image has an invalid key set")
+        local entries = {}
+        for _, key in ipairs(keys) do
+            entries[key] = value()
+        end
+        shared[index] = entries
+    end
+    local root = shared[readInteger()]
+    assert(cursor == #data + 1 and root ~= nil, "the standard-library image has trailing bytes")
+
+    local function copy(source: any): any
+        local result = {}
+        for key, member in pairs(source) do
+            result[key] = type(member) == "table" and copy(member) or member
+        end
+
+        return result
+    end
+
+    return copy(root)
+end
+
+--- Encodes every module of `names` the environment checks cleanly.
+---
+--- The environment must have been built from the prelude image, because that is the
+--- graph the interfaces refer into.
+export function encode(env: any, names: {string}): (string?, string?)
+    local arena = env.preludeArena
+    if arena == nil then
+        return nil, "the standard-library image needs an environment built from the prelude image"
+    end
+    local origins: {[any]: any} = {}
+    for index, value in ipairs(arena) do
+        if origins[value] == nil then
+            origins[value] = {arena = PRELUDE_ARENA, node = index}
+        end
+    end
+    local semantics: {[string]: any} = {}
+    local modules: {[string]: Module} = {}
+    for _, name in ipairs(names) do
+        local loaded, record = pcall(function(): any
+            return env.bundled[name]
+        end)
+        if not UNIMAGED[name] and loaded and record and record.type ~= nil then
+            -- The nominal-effect fingerprint is what an incremental session compares
+            -- to decide whether dependents must be rechecked. An image is never
+            -- rechecked, and the fingerprint is a tenth of the image.
+            local exports = {}
+            for key, member in pairs(record.exports or {}) do
+                exports[key] = member
+            end
+            exports.nominalEffectFingerprint = nil
+            semantics[
+                name
+            ] = {
+                interface = {type = record.type, deriveInterfaceFingerprint = exports.deriveInterfaceFingerprint,},
+                exports = exports,
+                diags = record.compatDiagnostics or {},
+                annotations = env.annotations:definedBy(record.path or name),
+            }
+            modules[name] = {declarationOnly = record.declarationOnly == true, declared = record.declared == true}
+        end
+    end
+    local image, problem = interfaceimage.encode(semantics, {origins = origins, arenas = {[PRELUDE_ARENA] = arena}})
+    if image == nil then
+        return nil, problem
+    end
+    -- The arena is named only to be distinct, and this one is never encoded
+    -- against, so a fixed name keeps the process id out of the bytes.
+    image.fingerprint = "stdlib"
+    local ok, data = pcall(serialize, {settings = settingsOf(env), modules = modules, image = image,})
+    if not ok then
+        return nil, tostring(data)
+    end
+
+    return data as string, nil
+end
+
+--- Decodes the carried image into `env`'s checker identity.
+---
+--- Nil when there is none, or when it was written for another prelude image or other
+--- check settings; the caller then checks modules from source.
+export function hydrate(env: any): (Hydrated?, string?)
+    local data = bundled.source(RESOURCE)
+    if data == nil or data == "" then
+        return nil, "no standard-library image"
+    end
+    if env.preludeArena == nil then
+        return nil, "the environment was not built from the prelude image"
+    end
+    local decoded, payload = pcall(deserialize, data)
+    if not decoded or type(payload) ~= "table" or type(payload.settings) ~= "table" then
+        return nil, "the standard-library image is malformed: " .. tostring(payload)
+    end
+    local expected = settingsOf(env)
+    for _, key in ipairs({"compat", "layoutTarget", "preludeTables", "preludeBytes"}) do
+        if payload.settings[key] ~= expected[key] then
+            return nil, "the standard-library image was written for another " .. key
+        end
+    end
+    local semantics, problem = interfaceimage.decode(payload.image, {
+        nominals = {},
+        arenas = {[PRELUDE_ARENA] = env.preludeArena},
+    })
+    if semantics == nil then
+        return nil, problem
+    end
+
+    return {semantics = semantics, modules = payload.modules}, nil
+end
