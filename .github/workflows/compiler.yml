@@ -305,8 +305,8 @@ jobs:
       && needs.classify.outputs.integration-matrix != '[]'
     runs-on: ${{ matrix.os }}
     # A timeout is here to end a hang, so it has to sit above the work rather
-    # than across it. The Rust-native artifact gate precedes the broad suite;
-    # a cold runner must have time for both. A killed job also skips its post
+    # than across it. A cold runner builds the native provider before the
+    # broad suite and must have time for both. A killed job also skips its post
     # steps, so it never saves the cache and would miss again next time.
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -518,14 +518,6 @@ jobs:
           NUPP_TEST_SH=$(cygpath -w "$sh_path") \
           ./bin/nupp test --fresh --scope=all --jobs=1 --group=windows-preflight
 
-      # Name the Rust-native release boundary before the broad suite. This runs
-      # each resource owner's stress/cancellation tests, the aggregate C ABI
-      # smoke, and C consumers of the executable, static application archive,
-      # and static/dynamic embedding SDKs on the retained platform itself.
-      - name: Gate the Rust-native platform artifacts
-        shell: bash
-        run: .github/scripts/test-rust-native-platform.sh
-
       # Keep the external corpus and the C importer explicit. A configured
       # corpus used to be absent and silently skipped, while an import-c failure
       # could be buried among thousands of unrelated cases. The broad suite
@@ -602,12 +594,12 @@ jobs:
           set -euo pipefail
           ulimit -c unlimited || true
           ./bin/nupp test --fresh --scope=all --lane=isolated \
-            --exclude-group=external-corpus,rust-native-gate,measurement,wasm-conformance
+            --exclude-group=external-corpus,measurement,wasm-conformance
           if [ "$RUNNER_OS" != Linux ]; then
             ./bin/nupp test --fresh --scope=all --lane=shared \
-              --exclude-group=external-corpus,rust-native-gate,measurement,wasm-conformance
+              --exclude-group=external-corpus,measurement,wasm-conformance
             ./bin/nupp test --fresh --scope=all --lane=shell --jobs=2 \
-              --exclude-group=external-corpus,rust-native-gate,measurement,wasm-conformance
+              --exclude-group=external-corpus,measurement,wasm-conformance
           fi
 
       # A worker killed by a signal says which suite it was in, and on Linux it
@@ -683,11 +675,11 @@ jobs:
           NUPP_TEST_SH=$(cygpath -w "$sh_path")
           export NUPP_TEST_BASH NUPP_TEST_SH
           ./bin/nupp test --fresh --scope=all --lane=isolated \
-            --exclude-group=external-corpus,windows-preflight,rust-native-gate,measurement,wasm-conformance
+            --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
           ./bin/nupp test --fresh --scope=all --lane=shared \
-            --exclude-group=external-corpus,windows-preflight,rust-native-gate,measurement,wasm-conformance
+            --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
           ./bin/nupp test --fresh --scope=all --lane=shell --jobs=2 \
-            --exclude-group=external-corpus,windows-preflight,rust-native-gate,measurement,wasm-conformance
+            --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
 
       # What the suite saved, named in the log so a reader knows what the
       # artifact holds before downloading it. `aot-libraries.txt` beside these
