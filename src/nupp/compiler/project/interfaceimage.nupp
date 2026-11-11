@@ -166,7 +166,10 @@ local processToken = ""
 --- process id keeps a restarted worker from reusing a name its predecessor issued.
 local function arenaName(): string
     if processToken == "" then
-        local pid = require("nupp.compiler.fs").processId()
+        -- A browser compiler encodes its standard-library image with no host
+        -- filesystem to ask, and the table address below serves it as well.
+        local hasFs, fs = pcall(require, "nupp.compiler.fs")
+        local pid = hasFs and fs.processId() or nil
         processToken = pid ~= nil and tostring(pid) or tostring({}):match("(%x+)$") or "0"
     end
     nextArena = nextArena + 1

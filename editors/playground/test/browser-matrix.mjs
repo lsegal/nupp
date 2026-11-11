@@ -6,9 +6,6 @@ if (!base || !output) throw new Error('usage: browser-matrix.mjs URL RESULT.json
 const selected = (process.env.NUPP_TEST_BROWSERS || 'chromium,firefox,webkit').split(',');
 const results = [];
 const tests = ['smoke.html', 'compiler.html', 'application.html', 'recovery.html', 'lifecycle.html', 'channels.html', ...['aot','native','http','platform','workers','gpu','simd'].map(name=>`packaged.html?app=${name}`)];
-// WebKit is the slowest engine on CI runners: its compiler.html took 157 s on a
-// slow one, and application.html's first compile alone may take 240 s.
-const pageTimeoutMs = name => name === 'webkit' ? 360000 : 180000;
 const record = () => writeFileSync(output, JSON.stringify({ok:results.length === selected.length * tests.length && results.every(x => x.ok && !x.errors.length), scope:'Desktop browser engine conformance; not physical mobile-device acceptance', results}, null, 2)+'\n');
 // Request interception breaks blob workers in Playwright WebKit. A real HTTP
 // endpoint also exercises fetch and CORS instead of replacing the browser's response.
@@ -33,7 +30,7 @@ try {
         let result;
         try {
           await page.goto(new URL(file, base).href);
-          await page.waitForFunction(() => ['passed','failed'].includes(document.querySelector('#result')?.dataset.status), null, {timeout:pageTimeoutMs(name)});
+          await page.waitForFunction(() => ['passed','failed'].includes(document.querySelector('#result')?.dataset.status), null, {timeout:180000});
           result = await page.locator('#result').textContent().then(JSON.parse);
           if (name === 'chromium' && result.unsupported) result.ok = false;
         } catch (error) {

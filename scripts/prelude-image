@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds the browser compiler bundle, generating the prelude image it carries.
+# Builds the browser compiler bundle, generating the prelude and standard-library
+# images it carries.
 #
 # The image is the compiler's own declaration checker, serialized as inert data
 # for a host that cannot run the checker. It is therefore derived from the
@@ -8,9 +9,10 @@
 # was reminded to do: `check`, `test` and `fixpoint` all pass with a stale image,
 # and only the browser compiler job compares them.
 #
-# So it is made here instead, in two passes. The first bundle carries no image,
+# So it is made here instead, in three passes. The first bundle carries no image,
 # which is all `source` mode needs -- it reads the checker and never hydrates
-# one. The second carries what the first produced.
+# one. The second carries what the first produced, and checks the standard
+# library against it; the third carries both.
 #
 # The interpreter matters: the encoding is `%.17g` and a Lua with integers does
 # not write the same bytes as one without. NUPP_PRELUDE_LUA names one; the
@@ -53,10 +55,16 @@ cmp "$IMAGE" "$roundtrip" \
 # The standard-library interfaces are written against the prelude image's graph,
 # so they come from a bundle that already carries it. That bundle carries an empty
 # standard-library image, so every module in it is checked from source, which is
-# what is being imaged; a leftover image would only be copied back out.
+# what is being imaged; a leftover image would only be copied back out. What goes
+# in is what the playground's examples reach.
 : > "$STDLIB_IMAGE"
 "$ROOT/bin/nupp" build --target "$compiler_target" --host browser
-"$LUA" "$STDLIB_GENERATOR" "$ROOT/$image_dir/nupp-compiler.lua" "$STDLIB_IMAGE"
+"$LUA" "$STDLIB_GENERATOR" "$ROOT/$image_dir/nupp-compiler.lua" "$STDLIB_IMAGE" \
+    "$ROOT"/editors/playground/src/examples/*.nupp
+"$LUA" "$STDLIB_GENERATOR" "$ROOT/$image_dir/nupp-compiler.lua" "$roundtrip" \
+    "$ROOT"/editors/playground/src/examples/*.nupp
+cmp "$STDLIB_IMAGE" "$roundtrip" \
+    || { echo "prelude-image: the standard-library image is not byte-reproducible" >&2; exit 1; }
 "$ROOT/bin/nupp" build --target "$compiler_target" --host browser
 
 # The bundle now carries the image, so it can be asked to hydrate one and write

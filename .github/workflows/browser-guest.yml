@@ -62,8 +62,7 @@ concurrency:
 jobs:
   guest:
     runs-on: ubuntu-24.04
-    # A slow runner reached the archive check 23 minutes in; see below.
-    timeout-minutes: 55
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -174,10 +173,8 @@ jobs:
           tar -czf release/nupp-luajit-browser-runtime.tar.gz -C release/browser-luajit .
       # Wasm kernels and the guest's i686 AOT are compiled and linked by nupp
       # itself.
-      # Three engines run every page in turn. A slow runner took 18 minutes to
-      # reach WebKit's application.html, which can then take four more.
       - name: Verify consumers of the extracted release archive
-        timeout-minutes: 30
+        timeout-minutes: 20
         env:
           NUPP_BENCH_ISOLATED: '0'
           NUPP_BENCH_CSP: "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' http://127.0.0.1:8791"

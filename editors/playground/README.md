@@ -24,8 +24,11 @@ The build creates missing pre-LuaJIT snapshots in a derived build cache using
 headless Chromium; it does not modify the toolchain's source package.
 
 `scripts/prelude-image luajit` builds the compiler and checks its prelude image
-round trip. The compiler bytecode, application initializer, emulator and clean
-snapshots are compressed, content identified and verified before use. Matching
+round trip. It also images the checked interfaces of the standard-library
+modules the examples reach, so a first `require("coroutine")` decodes them
+instead of checking that graph from source. The compiler bytecode, application
+initializer, emulator and clean snapshots are compressed, content identified and
+verified before use. Matching
 guest sources and notices accompany the static distribution. HTTP caching and
 compression for JavaScript/CSS remain the static host's responsibility.
 
