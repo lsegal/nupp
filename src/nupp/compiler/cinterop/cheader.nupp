@@ -729,7 +729,7 @@ export function load(path: string, opts: Options?): (Header?, string?, boolean?)
             nominal.fieldOrder = {}
             adoptedById[declaration.id] = nominal
             if not declaration.typedefName then
-                adopted[declaration.kind .. " " .. declaration.name] = nominal
+                adopted[cdecl.checked(declaration.kind .. " " .. declaration.name)] = nominal
             end
             fresh[declaration.id] = true
         end
