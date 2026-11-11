@@ -282,6 +282,16 @@ function M.hostBuildSelectsThePinnedWorkspaceBinary()
     -- committed host/include/nupp.exports list through the host crate's build
     -- script, so its command line only strips local symbols.
     assert(arguments:find("-Wl,-E", 1, true) or arguments:find("-Wl,-x", 1, true) or windows, arguments)
+    -- Linux hides LLVM, C++ and Rust symbols from those exports by pattern,
+    -- or a dlopen()ed library's own LLVM resolves to the host's.
+    if arguments:find("-Wl,-E", 1, true) then
+        local map = arguments:match("%-Wl,%-%-version%-script=(%S+)")
+        assert(map, arguments)
+        local script = read(map)
+        for _, pattern in ipairs({"_Z*;", "_R*;", "LLVM*;", "llvm_*;"}) do
+            assert(script:find(pattern, 1, true), script)
+        end
+    end
     assert(output:find(host, 1, true), output)
 end
 
