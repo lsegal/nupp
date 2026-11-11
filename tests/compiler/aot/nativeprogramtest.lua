@@ -209,17 +209,19 @@ local function main(): int32
     local erased = handler as voidptr
     local restored = erased as function(L: voidptr): int32
     local failed: integer = 0
-    if handler(L) ~= 7 then
-        failed += 1
-    end
-    if previous(L) ~= 9 then
-        failed += 2
-    end
-    if direct(L) ~= 9 then
-        failed += 4
-    end
-    if restored(L) ~= 7 then
-        failed += 8
+    @unsafe do
+        if handler(L) ~= 7 then
+            failed += 1
+        end
+        if previous(L) ~= 9 then
+            failed += 2
+        end
+        if direct(L) ~= 9 then
+            failed += 4
+        end
+        if restored(L) ~= 7 then
+            failed += 8
+        end
     end
     lua_close(L)
     return math.i32.wrap(failed)

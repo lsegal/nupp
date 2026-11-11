@@ -740,6 +740,11 @@ local intrinsic: function(Program, Body, cst.Call): Value?
 --- Whether `node` reads a value of the program's own: a local, a parameter or
 --- module state, or a field or element reached from one, rather than a name
 --- the program does not define.
+--- The source `node` was written as, without the whitespace around it.
+local function spelled(node: any): string
+    return (cst.textOf(node as cst.Child):match("^%s*(.-)%s*$")) as string
+end
+
 local function own(program: Program, body: Body, node: any): boolean
     local root = node
     while root ~= nil and (root.kind == "paren" or root.kind == "dotIndex" or root.kind == "bracketIndex") do
@@ -756,33 +761,33 @@ end
 --- What a call through a pointer of the checked function type `t` passes and
 --- returns, as a callee whose `symbol` names it in a refusal.
 local function pointerCallee(t: any, node: any): Callee
-    local written = cst.textOf(node as cst.Child)
+    local name = spelled(node)
     local params: {Kind} = {}
     for index, param in ipairs(t.params) do
         local kind = kindOf(param)
         if kind == nil or (kind as Kind).llvm == "void" then
             refuse(
                 node,
-                ("parameter %d of %s has type %s, which has no C representation"):format(index, written, T.tostring(param))
+                ("parameter %d of %s has type %s, which has no C representation"):format(index, name, T.tostring(param))
             )
         end
         params[index] = kind as Kind
     end
     local result = VOID
     if #t.rets > 1 then
-        refuse(node, written .. " returns more than one value")
+        refuse(node, name .. " returns more than one value")
     elseif #t.rets == 1 then
         local kind = kindOf(t.rets[1])
         if kind == nil then
             refuse(
                 node,
-                ("the result of %s has type %s, which has no C representation"):format(written, T.tostring(t.rets[1]))
+                ("the result of %s has type %s, which has no C representation"):format(name, T.tostring(t.rets[1]))
             )
         end
         result = kind as Kind
     end
 
-    return Callee(symbol = written, params = params, result = result, varargs = t.vararg == true, foreign = true)
+    return Callee(symbol = name, params = params, result = result, varargs = t.vararg == true, foreign = true)
 end
 
 local function call(program: Program, body: Body, node: cst.Call): Value
@@ -801,7 +806,7 @@ local function call(program: Program, body: Body, node: cst.Call): Value
         end
         local pointer = expression(program, body, node.obj, nil)
         if pointer.kind.signature == nil then
-            refuse(node, cst.textOf(node.obj as cst.Child) .. " is not a function pointer")
+            refuse(node, spelled(node.obj) .. " is not a function pointer")
         end
         callee = pointerCallee(pointer.kind.signature, node.obj)
         called = pointer.text

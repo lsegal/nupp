@@ -169,7 +169,7 @@ local function main(): int32
     local previous = lua_atpanic(L, first)
     local erased = previous as voidptr
     local handler = erased as function(L: voidptr): int32
-    local status = handler(L)
+    local status = math.i32.wrap(handler(L))
     lua_close(L)
     return status
 end
