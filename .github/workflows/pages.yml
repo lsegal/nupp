@@ -15,6 +15,8 @@ jobs:
   build:
     name: Build website
     runs-on: ubuntu-24.04
+    outputs:
+      pages: ${{ steps.pages.outputs.enabled }}
     timeout-minutes: 30
     concurrency:
       group: pages-build-${{ github.ref }}
@@ -169,10 +171,18 @@ jobs:
           NUPP_PLAYGROUND_ALREADY_BUILT: '1'
         run: node scripts/build-pages.mjs
 
+      - name: Find the GitHub Pages site
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/pages-site.sh
+
       - name: Configure GitHub Pages
+        if: steps.pages.outputs.enabled == 'true'
         uses: actions/configure-pages@v5
 
       - name: Upload GitHub Pages artifact
+        if: steps.pages.outputs.enabled == 'true'
         uses: actions/upload-pages-artifact@v4
         with:
           path: build/pages
@@ -180,6 +190,7 @@ jobs:
   deploy:
     name: Deploy website
     needs: build
+    if: needs.build.outputs.pages == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     concurrency:

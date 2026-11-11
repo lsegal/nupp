@@ -1,6 +1,8 @@
 import {createCompiler} from '../../../runtime/luajit/host.mjs';
 import {loadPackedAsset} from '../../../runtime/luajit/assets.mjs';
 import {describeError} from './describe-error.js';
+import {createDeadlines} from './compiler-deadline.js';
+const deadlines = createDeadlines();
 let compiler;
 const queue = [];
 let running = false;
@@ -10,7 +12,7 @@ async function boot() {
   const started = performance.now();
   const app = await loadPackedAsset(new URL(`./${__NUPP_LUAJIT_COMPILER__}`, import.meta.url),
     {sha256:__NUPP_LUAJIT_COMPILER_SHA256__, bytes:__NUPP_LUAJIT_COMPILER_BYTES__, decodedBytes:__NUPP_LUAJIT_COMPILER_DECODED_BYTES__});
-  compiler = await createCompiler({manifestUrl: new URL(`./${__NUPP_LUAJIT_MANIFEST__}`, import.meta.url).href, app});
+  compiler = await createCompiler({manifestUrl: new URL(`./${__NUPP_LUAJIT_MANIFEST__}`, import.meta.url).href, app, deadlineMs: deadlines.deadlineMs});
   postMessage({type: 'ready', timings: {startupMs: performance.now() - started}});
 }
 
@@ -26,7 +28,7 @@ async function drain() {
         if (!['check', 'compile', 'hover'].includes(request.kind)) throw new Error('Unknown compiler request');
         if (typeof request.source === 'string' && new TextEncoder().encode(request.source).length > 1024 * 1024)
           throw new Error('Playground source exceeds 1048576 UTF-8 bytes');
-        const response = await compiler.request(request);
+        const response = await deadlines.request(compiler, request);
         postMessage({id, ok: true, ...response});
       } catch (error) { postMessage({id: message.id, ok: false, error: String(error.message || error)}); }
     }

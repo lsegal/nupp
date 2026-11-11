@@ -1102,7 +1102,8 @@ end
 -- The macOS host exports exactly host/include/nupp.exports, so a name left there
 -- after its definition moved to Nupp fails that link and only that link.
 function M.everyListedCodegenExportIsARustDefinition()
-    local list = read(ROOT .. "/host/include/nupp.exports")
+    -- A Windows checkout may translate the list's line endings.
+    local list = read(ROOT .. "/host/include/nupp.exports"):gsub("\r\n", "\n")
     local codegen = read(ROOT .. "/native/crates/native/src/codegen.rs")
     local section = assert(list:match("%[native%-codegen%]\n(.-)\n%[") or list:match("%[native%-codegen%]\n(.*)$"),
         "the export list has no native-codegen section")
@@ -1496,6 +1497,8 @@ function M.kitManifestsWithDifferentFeaturesDoNotShareACacheEntry()
             {
                 "set -eu",
                 "PREFIX=/fixture",
+                -- Not darwin, so the kit's key does not wait on a wgpu-native build.
+                "PLATFORM=posix",
                 "build_host() { HOST_OUT=/fixture/shared-host; }",
                 "take_lock() { return 1; }",
                 "sha256_stdin() { cksum | cut -d' ' -f1; }",

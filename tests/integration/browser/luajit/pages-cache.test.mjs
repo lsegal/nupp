@@ -155,3 +155,27 @@ test('Only the current main revision can deploy, and a failed lookup cannot auth
   assert.throws(() => execFileSync('sh', [script], {env: {...env, FAIL_LOOKUP: '1'}}));
   assert.equal(readFileSync(output, 'utf8'), '');
 });
+
+test('Only a missing Pages site skips publishing, and any other lookup failure stops it', t => {
+  const f = fixture(t), bin = path.join(f.repo, 'fake-bin');
+  const script = fileURLToPath(new URL('../../../../.github/scripts/pages-site.sh', import.meta.url));
+  f.write('fake-bin/gh', '#!/bin/sh\ncase $PAGES in\n'
+    + 'workflow) echo workflow ;;\n'
+    + 'missing) echo \'{"message":"Not Found"}\'; echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;\n'
+    + '*) echo "gh: Resource not accessible by integration (HTTP 403)" >&2; exit 1 ;;\nesac\n');
+  chmodSync(path.join(bin, 'gh'), 0o755);
+  const output = path.join(f.repo, 'output');
+  const env = {...process.env, PATH: bin + path.delimiter + process.env.PATH,
+    GITHUB_OUTPUT: output, GITHUB_REPOSITORY: 'fixture/repo'};
+  writeFileSync(output, '');
+  execFileSync('sh', [script], {env: {...env, PAGES: 'workflow'}});
+  assert.equal(readFileSync(output, 'utf8'), 'enabled=true\n');
+  writeFileSync(output, '');
+  const notice = execFileSync('sh', [script], {env: {...env, PAGES: 'missing'}, encoding: 'utf8'});
+  assert.equal(readFileSync(output, 'utf8'), 'enabled=false\n');
+  assert.match(notice, /^::notice .*fixture\/repo has no Pages site/);
+  writeFileSync(output, '');
+  assert.throws(() => execFileSync('sh', [script], {env: {...env, PAGES: 'denied'}, stdio: 'pipe'}),
+    /HTTP 403/);
+  assert.equal(readFileSync(output, 'utf8'), '');
+});

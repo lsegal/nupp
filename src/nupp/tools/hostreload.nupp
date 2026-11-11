@@ -130,6 +130,18 @@ end
 -- discover that as a stale generation later.
 local active = false
 
+-- A session compiles in this process, and compiling may start the persistent
+-- comptime worker. A closed session has no use for it, and the host's state
+-- outlives the session: stopped here, the child exits while everything it is
+-- driven through still works. Left running, it is torn down by its finalizer
+-- when the state closes, which waits on an exit that state can no longer report.
+local function stopCompilerServices(): nil
+    local loaded: any = package.loaded["nupp.compiler.comptime.worker"]
+    if type(loaded) == "table" and loaded.stop then
+        pcall(loaded.stop)
+    end
+end
+
 local function isAbsolute(path: string): boolean
     return path:sub(1, 1) == "/" or path:sub(1, 1) == "\\" or path:match("^%a:[/\\]") ~= nil
 end
@@ -226,6 +238,7 @@ export function open(entry: string, root: string?): (Session?, string?)
         -- before another can register the same modules. The program's own values
         -- are unaffected; what stops is reloading them.
         require("nupp.runtime.hotreload").retire()
+        stopCompilerServices()
     end
 
     return {entry = value, member = member, prepare = prepare, apply = apply, poll = poll, close = close}, nil
@@ -351,6 +364,7 @@ export function attach(root: string?): (Session?, string?)
         -- The registry is left as it is: the component still owns its modules and
         -- is still running them, and another session may attach to the same ones.
         session:persist()
+        stopCompilerServices()
     end
 
     return {entry = nil, member = loadedMember, prepare = prepare, apply = apply, poll = poll, close = close}, nil
