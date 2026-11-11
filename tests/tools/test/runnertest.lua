@@ -2172,11 +2172,11 @@ function M.windowsShellUsesArgumentVectorsForNativePipes()
     local last = assert(source:find("local caseDefinitions", first, true))
     local setup = source:sub(first, last - 1)
     for _, native in ipairs({true, false}) do
-        local received, closed, path
+        local received, closed, path, returned
 
         local function popen(command, mode)
             received = {command, mode}
-            return {
+            returned = {
                 read = function()
                     return "worker report"
                 end,
@@ -2185,6 +2185,7 @@ function M.windowsShellUsesArgumentVectorsForNativePipes()
                     return true
                 end,
             }
+            return returned
         end
 
         local environment = setmetatable(
@@ -2199,6 +2200,7 @@ function M.windowsShellUsesArgumentVectorsForNativePipes()
                     }
                 },
                 io = {open = io.open, popen = popen},
+                reservedTempNames = {},
                 os = {
                     execute = function()
                     end,
@@ -2231,7 +2233,13 @@ function M.windowsShellUsesArgumentVectorsForNativePipes()
         test.eq(pipe:read("*a"), "worker report")
         test.eq(pipe:close(), true)
         test.eq(closed, true)
-        test.eq(io.open(path, "rb"), nil, "closing the pipe removes its script")
+        if native then
+            test.eq(pipe, returned, "a native pipe is the process itself, with its whole file surface")
+            test.eq(environment.reservedTempNames[1], path, "its script is removed when the runner exits")
+            os.remove(path)
+        else
+            test.eq(io.open(path, "rb"), nil, "closing the pipe removes its script")
+        end
     end
 end
 
@@ -2266,6 +2274,7 @@ function M.windowsShellSurvivesLaterStandardIOLoad()
             package = {config = "\\", loaded = loaded},
             require = require,
             io = {open = io.open, popen = crtPopen},
+            reservedTempNames = {},
             os = {
                 execute = function()
                 end,
@@ -2293,6 +2302,7 @@ function M.windowsShellSurvivesLaterStandardIOLoad()
     test.eq(received[1][2], path)
     test.eq(read(path), "echo hi; printf '%s' $?\n")
     test.eq(pipe:close(), true)
+    os.remove(path)
 end
 
 function M.windowsTemporaryNamesLeaveTheDriveRoot()
