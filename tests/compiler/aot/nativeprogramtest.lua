@@ -1297,8 +1297,6 @@ end
 local ARRAYS = [[
 module host
 
-local ffi = require("ffi")
-
 cdef struct Header
     tag: int8
     words: uint64[4]

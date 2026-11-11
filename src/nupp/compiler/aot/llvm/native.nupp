@@ -2131,6 +2131,7 @@ local function required(node: any): string?
     return lexer.stringValue(token.text)
 end
 
+--- `node` with any parentheses around it taken off.
 local function stripped(node: any): any
     local current = node
     while current ~= nil and current.kind == "paren" do
@@ -2512,7 +2513,9 @@ local function state(program: Program, stat: cst.LocalStmt): nil
                 builder.once(
                     program.module,
                     "global " .. slot,
-                    ("%s = internal global [%d x i8] zeroinitializer, align %d"):format(slot, layout.size, layout.alignment)
+                    (
+                        "%s = internal global [%d x i8] zeroinitializer, align %d"
+                    ):format(slot, layout.size, layout.alignment)
                 )
                 local storage = Kind(llvm = "struct", signed = false, aggregate = resolved)
                 entry = Local(

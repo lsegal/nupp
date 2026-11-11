@@ -43,7 +43,7 @@ relink while the program is unchanged; see
 ## The shape of a program
 
 The top level holds only `cdef function` and `cdef struct` declarations,
-`const` literals, [module state](#module-state), the
+`const` literals, [module state](#module-state), [C arrays](#c-arrays), the
 [modules it requires](#programs-that-span-modules) and plain functions. Every
 function becomes a C function, so
 each parameter and result needs a written C type: `number`, `integer`, `float`,
@@ -162,8 +162,67 @@ end
 ```
 
 A field is read or written in place, never the whole struct, and a struct does
-not pass by value. A `cdef union`, or a struct with a bitfield, is refused where
-its fields are read, because the layout model does not place those as C does.
+not pass by value. A C array field, such as `words: uint64[4]`, is indexed in
+place from 0, and so is each row of a nested one, `grid: float[3][2]` being two
+rows of three. A `cdef union`, or a struct with a bitfield, is refused where its
+fields are read, because the layout model does not place those as C does.
+
+`ffi.sizeof(T)`, `ffi.alignof(T)` and `ffi.offsetof(T, "field")` are answered
+when the program is compiled, from the same layout, for the triple being
+compiled for. They are numbers, as LuaJIT's are, and a top-level `const` may
+name one:
+
+```nupp
+cdef struct Header
+    tag: int8
+    words: uint64[4]
+end
+
+const HEADER_SIZE = ffi.sizeof(Header)
+
+local function main(): int32
+    -- 40 bytes, with `words` 8 bytes in.
+    return math.i32.wrap(HEADER_SIZE - ffi.offsetof(Header, "words"))
+end
+```
+
+## C arrays
+
+A top-level `ffi.new<T[N]>({...})` is a C array the program holds for as long as
+it runs: its elements in order, any it leaves out zero. Its name stands for the
+address of its first element, so it is indexed from 0 and passed wherever C
+takes a pointer. Without elements, `ffi.new<T[N]>()`, or written as module state
+with only its type, `local scratch: int32[8]`, it starts zeroed. An array of
+`const` elements, `ffi.new<const T[N]>`, is read-only data, as C's `const`
+tables are, and is never written; any other may be:
+
+```nupp
+local function double(n: int32): int32
+    return math.i32.wrap(n * 2)
+end
+
+const POWERS = ffi.new<const uint64[4]>({1ULL, 10ULL, 100ULL, 1000ULL})
+const HANDLERS = ffi.new<const voidptr[2]>({double as voidptr, 7 as voidptr})
+const MATRIX = ffi.new<int16[3][2]>({{1, 2, 3}, {4, 5, 6}})
+local counts: int32[3]
+
+local function main(): int32
+    counts[1] = math.i32.wrap(MATRIX[1][2] + 1)
+    MATRIX[0][0] = 9
+    if POWERS[3] ~= 1000ULL or HANDLERS[0] == nil then
+        return 1
+    end
+    return math.i32.wrap(counts[1] + MATRIX[0][0])
+end
+```
+
+The program exits with status 16. Elements are integers, numbers, booleans,
+pointers or nested arrays, each a literal, a `const`, a layout query, a function
+as a `voidptr`, or an integer cast to a pointer. A `const` binding is a promise
+about its name, not its contents, as everywhere in the language, so it is the
+element type that makes an array read-only. A whole array is never assigned,
+only its elements, and `ffi.new<S>()` of a `cdef struct` is held the same way,
+zeroed.
 
 ## Module state
 
@@ -295,6 +354,45 @@ each platform's linker in its own form: a version script on Linux, an
 exported-symbols list on macOS, and a module definition file on Windows.
 Without one, a shared library exports everything it defines, and an executable
 what a standalone host does.
+
+## Exported data
+
+`export const` of what `ffi.new` makes, an array or a `cdef struct`, is a C data
+symbol under its own name, as an `export function` is a C function: read-only
+for a `const` element type, and writable otherwise. C, or a loader such as
+LuaJIT's `ffi.load`, reads it by name, and an export list names it as it names a
+function. A value C reads and writes, such as a counter, is a one-element array:
+
+```nupp:fragment
+module runtime
+
+cdef struct Builder
+    count: int32
+    words: uint64[4]
+end
+
+export const runtime_calls = ffi.new<int32[1]>()
+
+local function runtime_new(): int32
+    runtime_calls[0] = math.i32.wrap(runtime_calls[0] + 1)
+    return runtime_calls[0]
+end
+
+@visibility("hidden")
+export const runtime_table = ffi.new<const voidptr[3]>({
+    1 as voidptr,
+    ffi.sizeof(Builder) as voidptr,
+    runtime_new as voidptr
+})
+```
+
+`@visibility("hidden")` keeps an exported symbol, data or a function, to the
+library or executable it is linked into, as C's
+`__attribute__((visibility("hidden")))` does: other objects linked with it, such
+as a static archive's, find it by name, and nothing outside does. Without it, a
+symbol's visibility is the default, which a shared library exports. A scalar
+`export const` stays a literal, read where it is named, and a top-level `local`
+stays private to its module.
 
 ## Threads and atomics
 
