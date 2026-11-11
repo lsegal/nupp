@@ -2305,6 +2305,56 @@ function M.windowsShellSurvivesLaterStandardIOLoad()
     os.remove(path)
 end
 
+-- The runner loads the result cache under its own chunk name. Its
+-- `command -v` lookups are shell commands too: sent to cmd.exe they failed
+-- and every Windows run silently went without the cache.
+function M.windowsShellReachesTheResultCache()
+    local source = read(ROOT .. "/tests/run.lua")
+    local first = assert(source:find("-- The suites predate Windows support", 1, true))
+    first = assert(source:find('if package.config:sub(1, 1)', first, true))
+    local last = assert(source:find("local caseDefinitions", first, true))
+    local setup = source:sub(first, last - 1)
+    local received, path
+    local function nativePopen(command, mode)
+        received = {command, mode}
+        return {close = function() return true end}
+    end
+    local environment = setmetatable(
+        {
+            package = {config = "\\", loaded = {["nupp.runtime.standardio"] = {popen = nativePopen}}},
+            io = {open = io.open, popen = nativePopen},
+            reservedTempNames = {},
+            os = {
+                execute = function()
+                end,
+                getenv = function(name)
+                    if name == "NUPP_TEST_BASH" then
+                        return "C:/Program Files/Git/bin/bash.exe"
+                    end
+                end,
+                tmpname = function()
+                    path = os.tmpname() .. ".sh";
+                    return path:sub(1, -4)
+                end,
+                remove = os.remove,
+            },
+        },
+        {__index = _G}
+    )
+    environment._G = environment
+    assert(setfenv(assert(loadstring(setup, "@nupp:test-runner")), environment))()
+    local lookup = 'return io.popen("command -v luajit", "r")'
+    local pipe = assert(setfenv(assert(loadstring(lookup, "@nupp:test-cache")), environment))()
+    test.eq(type(received[1]), "table", "the cache's lookup starts Bash")
+    test.eq(received[1][1], "C:/Program Files/Git/bin/bash.exe")
+    test.eq(received[1][2], path)
+    test.eq(read(path), "command -v luajit\n")
+    test.eq(pipe:close(), true)
+    os.remove(path)
+    assert(setfenv(assert(loadstring(lookup, "@nupp:other")), environment))()
+    test.eq(received[1], "command -v luajit", "other chunks keep the native shell")
+end
+
 function M.windowsTemporaryNamesLeaveTheDriveRoot()
     local source = read(ROOT .. "/tests/run.lua")
     local first = assert(source:find("local rawTmpname, rawExit", 1, true))
