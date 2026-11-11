@@ -1,7 +1,9 @@
 // Loopback HTTP/1.1 server used by the native HTTP provider tests.
 
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { createServer as createSecureServer } from "node:https";
+import { deflateSync, gzipSync } from "node:zlib";
 
 const portFile = process.argv[2];
 if (!portFile) {
@@ -20,7 +22,7 @@ function send(res, status, body = Buffer.alloc(0), headers = {}) {
   res.end(body);
 }
 
-const server = createServer((req, res) => {
+function handle(req, res) {
   if (req.method === "GET") {
     if (req.url === "/redirect") {
       const { port } = server.address();
@@ -85,6 +87,22 @@ const server = createServer((req, res) => {
       return;
     }
 
+    if (req.url === "/gzip" || req.url === "/deflate") {
+      const plain = Buffer.from("compressed response\n".repeat(64));
+      const encoded = req.url === "/gzip" ? gzipSync(plain) : deflateSync(plain);
+      send(res, 200, encoded, {
+        "Content-Encoding": req.url === "/gzip" ? "gzip" : "deflate",
+        "X-Accept-Encoding": req.headers["accept-encoding"] ?? "none",
+      });
+      return;
+    }
+    if (req.url === "/chunked") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.write("chunked ");
+      setTimeout(() => res.end("response\n"), 20);
+      return;
+    }
+
     let body;
     if (req.url === "/authorization") {
       body = Buffer.from(req.headers.authorization ?? "none", "ascii");
@@ -135,10 +153,26 @@ const server = createServer((req, res) => {
   }
 
   send(res, 405);
-});
+}
+
+const server = createServer(handle);
 
 server.on("clientError", (_error, socket) => socket.destroy());
-server.listen(0, "127.0.0.1", () => {
-  const { port } = server.address();
-  writeFileSync(portFile, String(port), "ascii");
+// The same routes over TLS, on the private localhost certificate the TLS
+// suite uses, for the HTTPS path through the Nupp TLS stack.
+const fixtures = new URL("../stdlib/io/net/fixtures/", import.meta.url);
+const secure = createSecureServer({
+  cert: readFileSync(new URL("localhost-cert.pem", fixtures)),
+  key: readFileSync(new URL("localhost-key.pem", fixtures)),
+}, handle);
+secure.on("clientError", (_error, socket) => socket.destroy());
+
+// The TLS port goes first, so the plain port file appears only once both
+// servers are listening.
+secure.listen(0, "127.0.0.1", () => {
+  writeFileSync(portFile + ".tls", String(secure.address().port), "ascii");
+  server.listen(0, "127.0.0.1", () => {
+    const { port } = server.address();
+    writeFileSync(portFile, String(port), "ascii");
+  });
 });

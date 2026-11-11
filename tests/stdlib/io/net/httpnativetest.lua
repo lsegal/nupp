@@ -304,7 +304,7 @@ function M.aCancelledPlainRequestReleasesItsTransfer()
         end,
     })
     test.eq(value, "settled first")
-    test.eq(next(client._native._byHandle), nil, "the abandoned transfer left the client's live table")
+    test.eq(#client._native._transfers, 0, "the abandoned transfer left the client's live table")
     client:close()
 end
 
@@ -337,7 +337,7 @@ function M.aCancelledStreamingUploadReleasesItsReaderAndTransfer()
         end,
     })
     test.eq(value, "settled first")
-    test.eq(next(client._native._byHandle), nil, "the cancelled upload left no live native transfer")
+    test.eq(#client._native._transfers, 0, "the cancelled upload left no live native transfer")
     assert(calls * 64 * 1024 < total, "the cancelled upload stopped before consuming its reader")
     client:close()
 end
@@ -356,7 +356,7 @@ function M.closingAResponseCancelsItsPendingBody()
     })
     test.eq(value, "settled first")
     response:close()
-    test.eq(next(client._native._byHandle), nil, "closing the response retired its pending body transfer")
+    test.eq(#client._native._transfers, 0, "closing the response retired its pending body transfer")
     client:close()
 end
 
@@ -573,14 +573,13 @@ function M.aTecsStyleHandlerOnlyNeedsNonblockingHostPolls()
     client:close()
 end
 
--- A host that sleeps on the one native readiness generation between passes, the way
--- an embedding event loop would: snapshot, drive the sources, and when nothing moved,
--- wait from the snapshot. Activity the waiting family reports has to end that wait;
--- a wait that ran to its timeout means the family never advanced the generation.
-local function generationHost()
-    local ffi = require("ffi")
-    local C = require("nupp.runtime.native").C
-    local seen, found = ffi.new("uint64_t[1]"), ffi.new("uint64_t[1]")
+-- A host that sleeps on the network reactor between passes, the way an embedding
+-- event loop would: drive the sources, and when nothing moved, pump the reactor
+-- with a long timeout. The reactor's sleep holds every live socket and the
+-- runtime's wake handle, so activity the waiting family reports has to end it; a
+-- pump that ran to its timeout means the family's activity never reached it.
+local function reactorHost()
+    local net = require("io.net")
     return {
         canpark = function()
             return true
@@ -590,13 +589,13 @@ local function generationHost()
         park = function(_self, waiting, cancel)
             local sleeps = 0
             while not waiting:ready() do
-                assert(C.nuppNativePoll(seen) == 0)
                 if suspensionHost.poll() == 0 and not waiting:ready() then
                     sleeps = sleeps + 1
-                    assert(C.nuppNativeWait(seen[0], 10000, found) == 0)
-                    if found[0] == seen[0] or sleeps > 1000 then
+                    local before = os.monotonic()
+                    net.pump(10000)
+                    if os.monotonic() - before >= 9000 or sleeps > 100000 then
                         cancel()
-                        error(waiting.operation .. " never advanced the readiness generation", 0)
+                        error(waiting.operation .. " never woke the reactor's sleep", 0)
                     end
                 end
             end
@@ -604,9 +603,9 @@ local function generationHost()
     }
 end
 
-function M.oneReadinessGenerationWakesHttpProcessAndFileWaiters()
+function M.theReactorSleepWakesHttpProcessAndFileWaiters()
     local client = ready()
-    local installation = suspensionHost.install(generationHost())
+    local installation = suspensionHost.install(reactorHost())
     local ok, problem = pcall(function()
         local response = assert(client:send({url = endpoint("/small")}))
         test.eq(response.body:read(64), "small response\n")
@@ -669,15 +668,58 @@ function M.admissionParksUntilAnUnreadBodyReleasesItsSlot()
     client:close()
 end
 
+-- Compressed and chunked bodies are framed and decoded by the transport, and a
+-- decoded body no longer claims the encoding or length it arrived with.
+function M.compressedAndChunkedResponsesArriveDecoded()
+    local client = ready()
+    for _, path in ipairs({"/gzip", "/deflate"}) do
+        local response = assert(client:send({url = endpoint(path)}))
+        test.eq(readAll(response.body):tostring(), ("compressed response\n"):rep(64), path .. " decodes")
+        test.eq(response:header("content-encoding"), nil, path .. " drops its encoding")
+        test.eq(response:header("content-length"), nil, path .. " drops its encoded length")
+        assert(response:header("x-accept-encoding"):find("gzip", 1, true), "the client asked for compression")
+        response:close()
+    end
+    local chunked = assert(client:send({url = endpoint("/chunked")}))
+    test.eq(readAll(chunked.body):tostring(), "chunked response\n", "a chunked body reassembles")
+    chunked:close()
+    client:close()
+end
+
+-- HTTPS runs over the Nupp TLS stack: an insecure host is reached without
+-- verification, and a verifying client refuses the private certificate.
+function M.httpsRunsOverTheNuppTlsStack()
+    local client = ready()
+    client:close()
+    local file = assert(io.open(root .. "/port.tls", "rb"))
+    local tlsPort = assert(tonumber(file:read("*a")))
+    file:close()
+    local url = assert(require("io.internal.uri").newuri("https://127.0.0.1:" .. tlsPort .. "/small"))
+    local insecure = newHttpClient({timeoutms = 10000, insecurehosts = {"127.0.0.1"}})
+    local response = assert(insecure:send({url = url}))
+    test.eq(response.status, 200)
+    test.eq(response.body:read(64), "small response\n")
+    response:close()
+    insecure:close()
+    local strict = newHttpClient({timeoutms = 10000})
+    local refused, why = strict:send({url = url})
+    test.eq(refused, nil, "the private certificate is not trusted")
+    assert(tostring(why):find("certificate", 1, true), tostring(why))
+    strict:close()
+end
+
 function M.thePublicModuleAndNativeProviderHaveSeparateFeatureDependencies()
     ready():close()
     test.eq(native.forModule("io.http"), "runtime.http")
     local feature = assert(native.feature("native.http"))
-    test.eq(feature.providerFeature, "http")
+    -- HTTP is Nupp over the network and TLS providers; the native library is
+    -- needed only for the runtime's wake handle.
+    test.eq(feature.providerFeature, "base")
     test.eq(feature.runtimeModule, "nupp.runtime.provider.nativehttp")
     local expanded = native.expand({["native.http"] = true})
     assert(expanded["runtime.suspension"])
     assert(expanded["stdlib.io"])
+    assert(expanded["native.net"] and expanded["native.tls"], "the transport carries net and TLS")
     assert(not stdlib.bootstrap(expanded):find("nuppNativeHttpClientCreate", 1, true))
 end
 

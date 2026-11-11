@@ -340,7 +340,9 @@ local FEATURES: {[string]: native.Feature} = {
     ] = {
         name = "io_http_internal_transport",
         runtimeModule = "nupp.io.http.internal.transport",
-        requires = {"runtime.native", "native.time"}
+        -- HTTP/1.1 in Nupp over the network and TLS providers; a file body is
+        -- checked through the file provider.
+        requires = {"runtime.native", "native.time", "native.net", "native.tls", "native.files"}
     },
 
     ["runtime.test"] = {name = "test", module = "assert", runtimeModule = "assert", portableRuntime = true,},
@@ -856,7 +858,7 @@ local FEATURES: {[string]: native.Feature} = {
         runtimeModule = "nupp.runtime.provider.nativehttp",
         provider = "nupp_native",
         providerDriver = "native-rust",
-        providerFeature = "http",
+        providerFeature = "base",
         library = "nupp_native",
         binary = true,
         -- A request that races its upload against the response head performs one
