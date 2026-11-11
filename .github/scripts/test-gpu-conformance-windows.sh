@@ -26,7 +26,10 @@ export NUPP_TEST_BASH NUPP_TEST_SH
 
 # First cross the wgpu-native boundary with a small WGSL compute kernel.
 "$root/bin/nupp" build
-"$root/bin/nupp" test gpudevicetest
+# In this process rather than through a Nupp worker: a shared worker lane
+# started from here never reports on Windows, and the job then runs out its
+# whole timeout with the suite unrun.
+"$root/bin/nupp" test --shard=gpudevicetest
 
 # Then cross the public Nupp API with compiler-emitted SPIR-V and compare the
 # GPU result against the AOT CPU body emitted from the same source.
