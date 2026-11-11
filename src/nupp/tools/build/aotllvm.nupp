@@ -23,6 +23,7 @@ const aotllvm.BACKEND = "llvm"
 --- Whether the pinned prebuilt code generator has been asked for yet, and
 --- why it could not be had when that is worth saying.
 local askedPrebuilt = false
+
 local prebuiltProblem: string? = nil
 
 --- A source checkout whose provider was built without LLVM links with the
@@ -34,7 +35,7 @@ local function prebuilt(): nil
         return
     end
     askedPrebuilt = true
-    local path, problem = require("nupp.tools.build.native").prebuilt("codegen")
+    local path, problem = require("nupp.tools.build.prebuilt").fetch("codegen")
     if path == nil then
         -- Nothing pinned for this platform is the ordinary state of a
         -- checkout, not a failure to report.

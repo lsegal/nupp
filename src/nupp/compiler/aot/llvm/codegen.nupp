@@ -69,14 +69,14 @@ local fallback: string? = nil
 
 --- Prebuilt providers already opened, by path, and why one could not be.
 local opened: {[string]: codegen.Provider} = {}
+
 local refused: {[string]: string} = {}
 
 --- This process's provider, when it carries the code generator.
 local function own(): (codegen.Provider?, string?)
     local ok, answer = pcall(function(): boolean
         declare()
-        local provider = reach()
-        local C: any = provider.C
+        local C: any = native.C
         if (C.nuppNativeFeatures() as integer) % (CODEGEN_FEATURE * 2) < CODEGEN_FEATURE then
             return false
         end
@@ -111,7 +111,8 @@ local function prebuilt(path: string): (codegen.Provider?, string?)
         -- unloaded while a handle it returned is still being read.
         local library: any = ffi.load(path)
         if (library.nuppNativeFeatures() as integer) % (CODEGEN_FEATURE * 2) < CODEGEN_FEATURE
-            or library.nuppCodegenAvailable() == 0 then
+            or library.nuppCodegenAvailable() == 0
+        then
             return nil
         end
 
@@ -125,11 +126,13 @@ local function prebuilt(path: string): (codegen.Provider?, string?)
     end
     local ffi: any = native.ffi
     local library: any = answer
+
     local function succeeded(status: integer, level: integer): nil
         if status ~= 0 then
             error("nupp: " .. ffi.string(library.nuppNativeLastError()), level)
         end
     end
+
     local function bytes(handle: any): string
         local length = ffi.new("size_t[1]")
         local status = library.nuppNativeBytesCopy(handle, nil, 0, length)
@@ -155,6 +158,7 @@ local function prebuilt(path: string): (codegen.Provider?, string?)
 
         return ffi.string(buffer, count)
     end
+
     local provider = codegen.Provider(C = library, succeeded = succeeded, bytes = bytes)
     opened[path] = provider
 
@@ -402,14 +406,17 @@ function codegen.compile(ir: string, name: string, options: {[string]: string}):
     local ok, result = pcall(function(): codegen.Compiled
         declare()
         local ffi: any = native.ffi
+        local checked, text = nativeOptions(options, true)
         local provider = reach()
         local C: any = provider.C
-        local checked, text = nativeOptions(options, true)
         local object = ffi.new("uint64_t[1]")
         local spent = ffi.new("uint64_t[1]")
         local assembly = ffi.new("uint64_t[1]")
         local optimized = ffi.new("uint64_t[1]")
-        provider.succeeded(C.nuppCodegenCompile(ir, #ir, name, #name, text, #text, object, spent, assembly, optimized), 2)
+        provider.succeeded(
+            C.nuppCodegenCompile(ir, #ir, name, #name, text, #text, object, spent, assembly, optimized),
+            2
+        )
         local objectBytes = take(provider, object[0]) or ""
         local listing = take(provider, assembly[0])
         local optimizedIr = take(provider, optimized[0])
@@ -477,8 +484,6 @@ function codegen.compileFiles(jobs: {codegen.Job}, width: integer): ({codegen.Ou
     local ok, result = pcall(function(): {codegen.Outcome}
         declare()
         local ffi: any = native.ffi
-        local provider = reach()
-        local C: any = provider.C
         local records: {string} = {}
         local checked: {codegen.Options} = {}
         for position, job in ipairs(jobs) do
@@ -486,6 +491,8 @@ function codegen.compileFiles(jobs: {codegen.Job}, width: integer): ({codegen.Ou
             checked[position] = options
             records[position] = job.ir .. "\31" .. job.object .. "\31" .. text
         end
+        local provider = reach()
+        local C: any = provider.C
         local joined = table.concat(records, "\0") .. "\0"
         local handle = ffi.new("uint64_t[1]")
         provider.succeeded(C.nuppCodegenCompileFiles(joined, #joined, width, handle), 2)

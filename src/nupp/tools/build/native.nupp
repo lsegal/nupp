@@ -243,31 +243,6 @@ function stage.linkHost(
     return output, nil
 end
 
---- The pinned prebuilt `what` -- `codegen`, the provider library, or `kit`,
---- the link kit directory -- for `platform`, or this machine's when nil:
---- fetched and verified by the toolchain driver of the source checkout
---- running this compiler. Nil and why not when there is no checkout or
---- nothing is pinned for the platform.
-function stage.prebuilt(what: string, platform: string?): (string?, string?)
-    local compilerRoot = envMod.compilerRoot()
-    if not compilerRoot then
-        return nil, "the prebuilt " .. what .. " is fetched by a source checkout"
-    end
-    local found, problem = driven(compilerRoot as string, "prebuilt-" .. what, {platform or ""})
-    if not found then
-        local last: string? = nil
-        for line in problem:gmatch("[^\r\n]+") do
-            if line:match("%S") then
-                last = line:gsub("^toolchain: ", "")
-            end
-        end
-
-        return nil, last or problem
-    end
-
-    return found, nil
-end
-
 --- The link kit a native program for `triple` links against, or nil and why
 --- not. A source checkout links with the pinned prebuilt kit for its own
 --- platform, and builds its own when none is pinned.
@@ -279,7 +254,7 @@ function stage.programKit(triple: string): (string?, string?)
         build = function(): (string?, string?)
             -- A native program needs only the kit's LuaJIT, so the previous
             -- release's kit serves this tree's programs as well as its own.
-            local kit = stage.prebuilt("kit", triple)
+            local kit = require("nupp.tools.build.prebuilt").fetch("kit", triple)
             if kit ~= nil then
                 return kit, nil
             end
