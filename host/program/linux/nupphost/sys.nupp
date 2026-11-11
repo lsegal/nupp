@@ -92,16 +92,16 @@ export function nuppHostSysMutexNew(): voidptr?
     return mutex
 end
 
-export function nuppHostSysMutexFree(mutex: voidptr): nil
+export function nuppHostSysMutexFree(borrows mutex: voidptr): nil
     pthread_mutex_destroy(mutex)
     free(mutex)
 end
 
-export function nuppHostSysLock(mutex: voidptr): nil
+export function nuppHostSysLock(borrows mutex: voidptr): nil
     pthread_mutex_lock(mutex)
 end
 
-export function nuppHostSysUnlock(mutex: voidptr): nil
+export function nuppHostSysUnlock(borrows mutex: voidptr): nil
     pthread_mutex_unlock(mutex)
 end
 
@@ -116,17 +116,17 @@ export function nuppHostSysCondNew(): voidptr?
     return condition
 end
 
-export function nuppHostSysCondFree(condition: voidptr): nil
+export function nuppHostSysCondFree(borrows condition: voidptr): nil
     pthread_cond_destroy(condition)
     free(condition)
 end
 
-export function nuppHostSysWait(condition: voidptr, mutex: voidptr): nil
+export function nuppHostSysWait(borrows condition: voidptr, borrows mutex: voidptr): nil
     pthread_cond_wait(condition, mutex)
 end
 
 --- Waits at most `milliseconds` for `condition`. True when the wait timed out.
-export function nuppHostSysWaitMs(condition: voidptr, mutex: voidptr, milliseconds: int64): boolean
+export function nuppHostSysWaitMs(borrows condition: voidptr, borrows mutex: voidptr, milliseconds: int64): boolean
     local deadline = calloc(1ULL, 16ULL) as Timespec*
     if deadline == nil then
         return true
@@ -143,16 +143,16 @@ export function nuppHostSysWaitMs(condition: voidptr, mutex: voidptr, millisecon
     return status == ETIMEDOUT
 end
 
-export function nuppHostSysSignal(condition: voidptr): nil
+export function nuppHostSysSignal(borrows condition: voidptr): nil
     pthread_cond_signal(condition)
 end
 
-export function nuppHostSysBroadcast(condition: voidptr): nil
+export function nuppHostSysBroadcast(borrows condition: voidptr): nil
     pthread_cond_broadcast(condition)
 end
 
 --- Starts a thread running `entry(argument)`, or nil when it cannot.
-export function nuppHostSysThreadStart(entry: function(arg: voidptr): voidptr?, argument: voidptr): voidptr?
+export function nuppHostSysThreadStart(entry: function(arg: voidptr): voidptr?, borrows argument: voidptr): voidptr?
     local thread = calloc(1ULL, 8ULL)
     if thread == nil then
         return nil
@@ -166,7 +166,7 @@ export function nuppHostSysThreadStart(entry: function(arg: voidptr): voidptr?, 
 end
 
 --- Waits for a thread `nuppHostSysThreadStart` started to end, and frees it.
-export function nuppHostSysThreadJoin(thread: voidptr): nil
+export function nuppHostSysThreadJoin(borrows thread: voidptr): nil
     @unsafe do
         pthread_join((thread as uint64*)[0], nil)
     end
@@ -235,7 +235,7 @@ export function nuppHostSysParallelism(): int64
 end
 
 --- The text of the last failed call's error, as Rust's `io::Error` shows it.
-export function nuppHostSysLastError(buffer: voidptr, capacity: uint64): nil
+export function nuppHostSysLastError(borrows buffer: voidptr, capacity: uint64): nil
     local code: int32 = 0
     @unsafe do
         code = __errno_location()[0]
@@ -271,7 +271,7 @@ end
 
 --- The bytes of the file at `path`, allocated, with their count written to
 --- `length[0]`; or nil, with the reason written to `message`.
-export function nuppHostSysReadFile(path: cstring, length: int64*, message: voidptr, capacity: uint64): voidptr?
+export function nuppHostSysReadFile(borrows path: cstring, borrows length: int64*, borrows message: voidptr, capacity: uint64): voidptr?
     local file = fopen(path, "rb")
     if file == nil then
         nuppHostSysLastError(message, capacity)
@@ -414,7 +414,7 @@ end
 cdef function write(fd: int32, borrows buffer: voidptr, count: uint64): int64
 
 --- Writes `count` bytes to standard error.
-export function nuppHostSysWriteError(bytes: voidptr, count: uint64): nil
+export function nuppHostSysWriteError(borrows bytes: voidptr, count: uint64): nil
     local written: uint64 = 0ULL
     while written < count do
         local step = write(2, ((bytes as uint64) + written) as voidptr, count - written)
@@ -427,7 +427,7 @@ end
 
 --- The process's arguments as byte strings: their addresses in `texts[0]` and
 --- their lengths in `lengths[0]`, both allocated. The count, or -1.
-export function nuppHostSysArguments(argc: int32, argv: cstring*, texts: voidptr*, lengths: voidptr*): int32
+export function nuppHostSysArguments(argc: int32, borrows argv: cstring*, borrows texts: voidptr*, borrows lengths: voidptr*): int32
     local count = argc as uint64
     local addresses = calloc(count + 1ULL, 8ULL) as voidptr*
     local sizes = calloc(count + 1ULL, 8ULL) as uint64*

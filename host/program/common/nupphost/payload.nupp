@@ -28,13 +28,13 @@ export const NONE = 0
 export const FOUND = 1
 export const DAMAGED = 2
 
-local function magicAt(bytes: uint8*, at: integer): boolean
+local function magicAt(borrows bytes: uint8*, at: integer): boolean
     return same(offset(bytes, at), "NUPPLOAD" as uint8*, 8)
 end
 
 --- Where the code signature of a thin little-endian 64-bit Mach-O starts, when
 --- it is the file's final blob, or -1.
-local function signatureOffset(bytes: uint8*, size: integer): integer
+local function signatureOffset(borrows bytes: uint8*, size: integer): integer
     if size < MACH_HEADER_LENGTH then
         return -1
     end
@@ -79,7 +79,7 @@ local function signatureOffset(bytes: uint8*, size: integer): integer
     return -1
 end
 
-local function signedTrailerStart(bytes: uint8*, size: integer): integer
+local function signedTrailerStart(borrows bytes: uint8*, size: integer): integer
     local signatureAt = signatureOffset(bytes, size)
     if signatureAt < 0 then
         return -1
@@ -111,10 +111,10 @@ end
 --- interpreting another file. `FOUND` writes the payload's offset, length and
 --- whether it is bytecode (1 or 0) to `found[0..2]`.
 export function nuppHostPayloadFind(
-    bytes: uint8*,
+    borrows bytes: uint8*,
     size: integer,
-    found: int64*,
-    message: voidptr,
+    borrows found: int64*,
+    borrows message: voidptr,
     capacity: uint64
 ): int32
     if size < TRAILER_LENGTH then

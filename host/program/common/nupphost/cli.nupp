@@ -18,17 +18,17 @@ const EXIT_FAILURE = 1
 const EXIT_USAGE = 2
 const MESSAGE_BYTES = 4096ULL
 
-local function say(text: cstring)
+local function say(borrows text: cstring)
     sys.nuppHostSysWriteError(text as voidptr, strlen(text))
 end
 
-local function sayLine(bytes: voidptr, count: uint64)
+local function sayLine(borrows bytes: voidptr, count: uint64)
     sys.nuppHostSysWriteError(bytes, count)
     say("\n")
 end
 
 --- `prefix` and `text` joined, NUL-terminated and allocated, or nil.
-local function joined(prefix: cstring, text: voidptr, count: uint64): voidptr?
+local function joined(borrows prefix: cstring, borrows text: voidptr, count: uint64): voidptr?
     local head = strlen(prefix)
     local answer = malloc(head + count + 1ULL)
     if answer == nil then
@@ -44,7 +44,7 @@ local function joined(prefix: cstring, text: voidptr, count: uint64): voidptr?
 end
 
 --- Reports a state's failure and frees its record.
-local function failed(record: voidptr, prefix: cstring): int32
+local function failed(borrows record: voidptr, borrows prefix: cstring): int32
     local length = malloc(8ULL) as uint64*
     if length ~= nil then
         local text = state.nuppHostStateCallError(record, length)
@@ -63,7 +63,7 @@ local function failed(record: voidptr, prefix: cstring): int32
     return EXIT_FAILURE
 end
 
-export function nuppHostCliMain(argc: int32, argv: cstring*): int32
+export function nuppHostCliMain(argc: int32, borrows argv: cstring*): int32
     local message = malloc(MESSAGE_BYTES)
     local slots = malloc(32ULL) as voidptr*
     if message == nil or slots == nil then

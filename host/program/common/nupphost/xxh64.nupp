@@ -14,7 +14,7 @@ local function rotate(value: uint64, by: int32): uint64
     return (value << by) | (value >> (64 - by))
 end
 
-local function read64(bytes: uint8*, at: integer): uint64
+local function read64(borrows bytes: uint8*, at: integer): uint64
     local value: uint64 = 0ULL
     @unsafe do
         for index = 7, 0, -1 do
@@ -25,7 +25,7 @@ local function read64(bytes: uint8*, at: integer): uint64
     return value
 end
 
-local function read32(bytes: uint8*, at: integer): uint64
+local function read32(borrows bytes: uint8*, at: integer): uint64
     local value: uint64 = 0ULL
     @unsafe do
         for index = 3, 0, -1 do
@@ -45,7 +45,7 @@ local function merge(hash: uint64, lane: uint64): uint64
 end
 
 --- The seed-zero XXH64 of `length` bytes at `bytes`.
-export function nuppHostXxh64(bytes: uint8*, length: integer): uint64
+export function nuppHostXxh64(borrows bytes: uint8*, length: integer): uint64
     local at: integer = 0
     local hash: uint64 = 0ULL
     if length >= 32 then

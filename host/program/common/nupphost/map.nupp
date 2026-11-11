@@ -1,0 +1,201 @@
+--- A hash map from 64-bit keys to 64-bit values, for the host's registries:
+--- task tables, endpoint handles, pending messages and per-state byte
+--- accounts. It does no locking of its own.
+---
+--- The host's objects travel between its modules as addresses held in
+--- `uint64`s, opaque handles whose owners each module's own rules decide.
+module nupphost.map
+
+cdef function calloc(count: uint64, size: uint64): voidptr?
+cdef function free(borrows p: voidptr)
+
+cdef struct Map
+    buckets: uint64
+    capacity: int64
+    count: int64
+end
+
+cdef struct Node
+    key: uint64
+    value: uint64
+    next: uint64
+end
+
+local function slot(key: uint64, capacity: int64): integer
+    local mixed = key * 11400714785074694791ULL
+    return ((mixed >> 32) % (capacity as uint64)) as integer
+end
+
+local function bucket(map: uint64, index: integer): uint64*
+    @unsafe do
+        return ((map as Map*).buckets + (index as uint64) * 8ULL) as uint64*
+    end
+end
+
+--- A new, empty map, or 0.
+export function nuppHostMapNew(): uint64
+    local record = calloc(1ULL, 24ULL)
+    if record == nil then
+        return 0ULL
+    end
+    local buckets = calloc(16ULL, 8ULL)
+    if buckets == nil then
+        free(record as voidptr)
+        return 0ULL
+    end
+    local m = record as Map*
+    @unsafe do
+        m.buckets = buckets as uint64
+        m.capacity = 16LL
+    end
+    return record as uint64
+end
+
+--- Frees a map's own storage; whatever its values name is the caller's.
+export function nuppHostMapFree(map: uint64): nil
+    @unsafe do
+        for index = 0, ((map as Map*).capacity as integer) - 1 do
+            local node = bucket(map, index)[0]
+            while node ~= 0ULL do
+                local next = (node as Node*).next
+                free(node as voidptr)
+                node = next
+            end
+        end
+        free((map as Map*).buckets as voidptr)
+    end
+    free(map as voidptr)
+end
+
+export function nuppHostMapCount(map: uint64): int64
+    @unsafe do
+        return (map as Map*).count
+    end
+end
+
+local function find(map: uint64, key: uint64): uint64
+    @unsafe do
+        local node = bucket(map, slot(key, (map as Map*).capacity))[0]
+        while node ~= 0ULL do
+            if (node as Node*).key == key then
+                return node
+            end
+            node = (node as Node*).next
+        end
+    end
+    return 0ULL
+end
+
+--- The value under `key`, or 0.
+export function nuppHostMapGet(map: uint64, key: uint64): uint64
+    local node = find(map, key)
+    if node == 0ULL then
+        return 0ULL
+    end
+    @unsafe do
+        return (node as Node*).value
+    end
+end
+
+export function nuppHostMapHas(map: uint64, key: uint64): boolean
+    return find(map, key) ~= 0ULL
+end
+
+local function grow(map: uint64): boolean
+    @unsafe do
+        local old = (map as Map*).buckets
+        local oldCapacity = (map as Map*).capacity
+        local capacity = oldCapacity * 2LL
+        local fresh = calloc(capacity as uint64, 8ULL)
+        if fresh == nil then
+            return false
+        end
+        local m = map as Map*
+        m.buckets = fresh as uint64
+        m.capacity = capacity
+        for index = 0, (oldCapacity as integer) - 1 do
+            local node = ((old + (index as uint64) * 8ULL) as uint64*)[0]
+            while node ~= 0ULL do
+                local next = (node as Node*).next
+                local at = bucket(map, slot((node as Node*).key, capacity))
+                local n = node as Node*
+                n.next = at[0]
+                at[0] = node
+                node = next
+            end
+        end
+        free(old as voidptr)
+    end
+    return true
+end
+
+--- Sets `key` to `value`. False without memory, leaving the map as it was.
+export function nuppHostMapPut(map: uint64, key: uint64, value: uint64): boolean
+    local node = find(map, key)
+    @unsafe do
+        if node ~= 0ULL then
+            local n = node as Node*
+            n.value = value
+            return true
+        end
+        if (map as Map*).count >= (map as Map*).capacity then
+            grow(map)
+        end
+        local added = calloc(1ULL, 24ULL)
+        if added == nil then
+            return false
+        end
+        local at = bucket(map, slot(key, (map as Map*).capacity))
+        local fresh = added as Node*
+        fresh.key = key
+        fresh.value = value
+        fresh.next = at[0]
+        at[0] = added as uint64
+        local m = map as Map*
+        m.count = m.count + 1LL
+    end
+    return true
+end
+
+--- Removes `key`, returning the value it held, or 0.
+export function nuppHostMapRemove(map: uint64, key: uint64): uint64
+    @unsafe do
+        local at = bucket(map, slot(key, (map as Map*).capacity))
+        local previous: uint64 = 0ULL
+        local node = at[0]
+        while node ~= 0ULL do
+            if (node as Node*).key == key then
+                if previous == 0ULL then
+                    at[0] = (node as Node*).next
+                else
+                    local p = previous as Node*
+                    p.next = (node as Node*).next
+                end
+                local value = (node as Node*).value
+                free(node as voidptr)
+                local m = map as Map*
+                m.count = m.count - 1LL
+                return value
+            end
+            previous = node
+            node = (node as Node*).next
+        end
+    end
+    return 0ULL
+end
+
+--- Removes some entry, writing its key to `key[0]` and returning its value;
+--- 0 when the map is empty. Draining a map takes entries until there are none.
+export function nuppHostMapTakeAny(map: uint64, borrows key: uint64*): uint64
+    @unsafe do
+        for index = 0, ((map as Map*).capacity as integer) - 1 do
+            local node = bucket(map, index)[0]
+            if node ~= 0ULL then
+                local found = (node as Node*).key
+                key[0] = found
+                return nuppHostMapRemove(map, found)
+            end
+        end
+    end
+    return 0ULL
+end

@@ -1,0 +1,368 @@
+--- Immutable bytes shared between isolated worker lanes, the builders that
+--- fill them, and the per-state account that tells a state's collector about
+--- the memory its handles keep alive.
+---
+--- A region is one reference-counted allocation. A frozen builder and a file
+--- read into a region keep the storage they filled rather than copying it. Lua
+--- states receive only opaque handles to regions, and the final reference may
+--- be released on any thread.
+module nupphost.region
+
+const map = require("nupphost.map")
+
+cdef function calloc(count: uint64, size: uint64): voidptr?
+cdef function malloc(size: uint64): voidptr?
+cdef function realloc(borrows p: voidptr, size: uint64): voidptr?
+cdef function free(borrows p: voidptr)
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, count: uint64): voidptr
+cdef function memset(borrows destination: voidptr, value: int32, count: uint64): voidptr
+cdef function __atomic_fetch_add_8(borrows p: int64*, v: int64, order: int32): int64
+cdef function __atomic_fetch_sub_8(borrows p: int64*, v: int64, order: int32): int64
+
+cdef struct Region
+    references: int64
+    data: uint64
+    length: uint64
+end
+
+cdef struct Builder
+    data: uint64
+    length: uint64
+    capacity: uint64
+    reservedStart: uint64
+    reservedEnd: uint64
+    open: int32
+    taken: int32
+end
+
+cdef struct Account
+    blocks: uint64
+    charged: uint64
+    debt: uint64
+end
+
+cdef struct Charge
+    count: uint64
+    length: uint64
+end
+
+const ACCOUNT_STEP_BYTES = 1048576ULL
+-- A size beyond any allocation: growth past it is refused rather than tried.
+const SIZE_LIMIT = 9223372036854775807ULL
+
+--- A region owning the `length` bytes at `data`, which it frees, or 0, after
+--- freeing `data` itself.
+export function nuppHostRegionAdopt(data: uint64, length: uint64): uint64
+    local record = calloc(1ULL, 24ULL)
+    if record == nil then
+        if data ~= 0ULL then
+            free(data as voidptr)
+        end
+        return 0ULL
+    end
+    local r = record as Region*
+    @unsafe do
+        r.references = 1LL
+        r.data = data
+        r.length = length
+    end
+    return record as uint64
+end
+
+--- A region holding a copy of the `length` bytes at `data`, or 0.
+export function nuppHostRegionNew(data: uint64, length: uint64): uint64
+    local copy = malloc(length + 1ULL)
+    if copy == nil then
+        return 0ULL
+    end
+    if length ~= 0ULL then
+        memcpy(copy as voidptr, data as voidptr, length)
+    end
+    return nuppHostRegionAdopt(copy as uint64, length)
+end
+
+--- Another owner of `region`.
+export function nuppHostRegionRetain(region: uint64): uint64
+    @unsafe do
+        __atomic_fetch_add_8(region as int64*, 1LL, 0)
+    end
+    return region
+end
+
+--- Gives one owner back, freeing the region with its last.
+export function nuppHostRegionRelease(region: uint64): nil
+    @unsafe do
+        if __atomic_fetch_sub_8(region as int64*, 1LL, 4) == 1LL then
+            local data = (region as Region*).data
+            if data ~= 0ULL then
+                free(data as voidptr)
+            end
+            free(region as voidptr)
+        end
+    end
+end
+
+--- The region's bytes. Never null, even for an empty region.
+export function nuppHostRegionData(region: uint64): uint64
+    @unsafe do
+        local data = (region as Region*).data
+        if data == 0ULL then
+            return region
+        end
+        return data
+    end
+end
+
+export function nuppHostRegionLength(region: uint64): uint64
+    @unsafe do
+        return (region as Region*).length
+    end
+end
+
+-- Builders --------------------------------------------------------------------
+
+--- A new, empty builder, or 0.
+export function nuppHostBuilderNew(): uint64
+    local record = calloc(1ULL, 48ULL)
+    if record == nil then
+        return 0ULL
+    end
+    return record as uint64
+end
+
+export function nuppHostBuilderFree(builder: uint64): nil
+    @unsafe do
+        local data = (builder as Builder*).data
+        if data ~= 0ULL then
+            free(data as voidptr)
+        end
+    end
+    free(builder as voidptr)
+end
+
+--- Whether a reservation is open on a builder not yet frozen.
+export function nuppHostBuilderOpen(builder: uint64): boolean
+    local b = builder as Builder*
+    @unsafe do
+        return b.taken == 0 and b.open ~= 0
+    end
+end
+
+--- Makes room for `wanted` bytes in all. Growth the allocator cannot satisfy is
+--- a refusal, not an abort.
+local function ensure(builder: uint64, wanted: uint64, exact: boolean): boolean
+    local b = builder as Builder*
+    @unsafe do
+        if wanted <= b.capacity then
+            return true
+        end
+        local capacity = wanted
+        if not exact then
+            capacity = b.capacity * 2ULL
+            if capacity < wanted then
+                capacity = wanted
+            end
+            if capacity < 64ULL then
+                capacity = 64ULL
+            end
+        end
+        local grown: voidptr? = nil
+        if b.data == 0ULL then
+            grown = malloc(capacity)
+        else
+            grown = realloc(b.data as voidptr, capacity)
+        end
+        if grown == nil then
+            return false
+        end
+        b.data = grown as uint64
+        b.capacity = capacity
+    end
+    return true
+end
+
+export function nuppHostBuilderAppend(builder: uint64, data: uint64, length: uint64): boolean
+    local b = builder as Builder*
+    @unsafe do
+        if b.taken ~= 0 or b.open ~= 0 then
+            return false
+        end
+        if length > SIZE_LIMIT - b.length then
+            return false
+        end
+        if not ensure(builder, b.length + length, false) then
+            return false
+        end
+        if length ~= 0ULL then
+            memcpy((b.data + b.length) as voidptr, data as voidptr, length)
+        end
+        b.length = b.length + length
+    end
+    return true
+end
+
+--- Reserves `count` zeroed bytes at the end for the caller to write, until one
+--- matching commit. 0 while another reservation is open or without memory.
+export function nuppHostBuilderReserve(builder: uint64, count: uint64): uint64
+    local b = builder as Builder*
+    @unsafe do
+        if b.taken ~= 0 or b.open ~= 0 then
+            return 0ULL
+        end
+        if count > SIZE_LIMIT - b.length then
+            return 0ULL
+        end
+        local finish = b.length + count
+        if not ensure(builder, finish, true) or b.data == 0ULL then
+            return 0ULL
+        end
+        local start = b.data + b.length
+        if count ~= 0ULL then
+            memset(start as voidptr, 0, count)
+        end
+        b.reservedStart = b.length
+        b.reservedEnd = finish
+        b.length = finish
+        b.open = 1
+        return start
+    end
+end
+
+--- Keeps the first `written` bytes of the open reservation.
+export function nuppHostBuilderCommit(builder: uint64, written: uint64): boolean
+    local b = builder as Builder*
+    @unsafe do
+        if b.taken ~= 0 or b.open == 0 then
+            return false
+        end
+        if written > b.reservedEnd - b.reservedStart then
+            return false
+        end
+        b.length = b.reservedStart + written
+        b.open = 0
+    end
+    return true
+end
+
+--- The builder's bytes as a region, after which the builder holds nothing.
+--- 0 while a reservation is open, once frozen, or without memory.
+export function nuppHostBuilderFreeze(builder: uint64): uint64
+    local b = builder as Builder*
+    @unsafe do
+        if b.taken ~= 0 or b.open ~= 0 then
+            return 0ULL
+        end
+        b.taken = 1
+        local data = b.data
+        local length = b.length
+        b.data = 0ULL
+        b.length = 0ULL
+        b.capacity = 0ULL
+        return nuppHostRegionAdopt(data, length)
+    end
+end
+
+-- Accounts --------------------------------------------------------------------
+
+export function nuppHostAccountNew(): uint64
+    local record = calloc(1ULL, 24ULL)
+    if record == nil then
+        return 0ULL
+    end
+    local blocks = map.nuppHostMapNew()
+    if blocks == 0ULL then
+        free(record as voidptr)
+        return 0ULL
+    end
+    local a = record as Account*
+    @unsafe do
+        a.blocks = blocks
+    end
+    return record as uint64
+end
+
+export function nuppHostAccountFree(account: uint64): nil
+    local key = calloc(1ULL, 8ULL)
+    @unsafe do
+        local blocks = (account as Account*).blocks
+        if key ~= nil then
+            local charge = map.nuppHostMapTakeAny(blocks, key as uint64*)
+            while charge ~= 0ULL do
+                free(charge as voidptr)
+                charge = map.nuppHostMapTakeAny(blocks, key as uint64*)
+            end
+            free(key as voidptr)
+        end
+        map.nuppHostMapFree(blocks)
+    end
+    free(account as voidptr)
+end
+
+--- Counts one more handle to `region` against the account. The collector step
+--- the new debt calls for, or 0.
+export function nuppHostAccountCharge(account: uint64, region: uint64): uint64
+    local a = account as Account*
+    @unsafe do
+        local existing = map.nuppHostMapGet(a.blocks, region)
+        if existing ~= 0ULL then
+            local charge = existing as Charge*
+            charge.count = charge.count + 1ULL
+            return 0ULL
+        end
+        local length = nuppHostRegionLength(region)
+        local record = calloc(1ULL, 16ULL)
+        if record == nil then
+            return 0ULL
+        end
+        local charge = record as Charge*
+        charge.count = 1ULL
+        charge.length = length
+        if not map.nuppHostMapPut(a.blocks, region, record as uint64) then
+            free(record as voidptr)
+            return 0ULL
+        end
+        a.charged = a.charged + length
+        a.debt = a.debt + length
+        if a.debt < ACCOUNT_STEP_BYTES then
+            return 0ULL
+        end
+        local step = a.debt >> 10
+        a.debt = 0ULL
+        return step
+    end
+end
+
+--- Removes one handle to `region` from the account.
+export function nuppHostAccountDischarge(account: uint64, region: uint64): nil
+    local a = account as Account*
+    @unsafe do
+        local existing = map.nuppHostMapGet(a.blocks, region)
+        if existing == 0ULL then
+            return
+        end
+        local charge = existing as Charge*
+        if charge.count > 1ULL then
+            charge.count = charge.count - 1ULL
+            return
+        end
+        local length = charge.length
+        map.nuppHostMapRemove(a.blocks, region)
+        free(existing as voidptr)
+        if a.charged > length then
+            a.charged = a.charged - length
+        else
+            a.charged = 0ULL
+        end
+        if a.debt > length then
+            a.debt = a.debt - length
+        else
+            a.debt = 0ULL
+        end
+    end
+end
+
+export function nuppHostAccounted(account: uint64): uint64
+    @unsafe do
+        return (account as Account*).charged
+    end
+end
