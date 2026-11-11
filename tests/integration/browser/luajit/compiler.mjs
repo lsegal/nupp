@@ -33,6 +33,7 @@ try {
   output.textContent = JSON.stringify({ok: true, startupMs, requests: samples.length, samples, compilerBytes: app.length});
   output.dataset.status = 'passed';
 } catch (error) {
-  output.textContent = JSON.stringify({ok: false, error: String(error.stack || error)});
+  // WebKit's `stack` leaves out the message, so report both.
+  output.textContent = JSON.stringify({ok: false, error: String(error), stack: String(error?.stack || '')});
   output.dataset.status = 'failed';
 } finally { compiler?.close(); }
