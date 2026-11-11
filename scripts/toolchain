@@ -1931,6 +1931,11 @@ build_kit_windows() {
     cp "$host_out/libnupp-host.a" "$out/libnupp-runtime.a"
     cp "$PREFIX/luajit/lib/libluajit-5.1.a" "$out/libluajit-5.1.a"
     cp "$host_out/libnupp-host-imports.a" "$out/lib/libnupp-host-imports.a"
+    # A native program linked as a DLL starts from the CRT's DLL startup
+    # object where the recorded link has the program's.
+    dllcrt=$("$CC" -print-file-name=dllcrt2.o)
+    [ -f "$dllcrt" ] || die "the C compiler has no dllcrt2.o"
+    cp "$dllcrt" "$out/lib/dllcrt2.o"
 
     probe="$out/probe"
     {
