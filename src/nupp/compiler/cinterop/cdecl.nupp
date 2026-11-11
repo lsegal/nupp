@@ -86,6 +86,10 @@ export interface CType
     --- The ctype id a struct reference keeps, so `structById` can find its members.
     id: integer?
 
+    --- Whether a struct reference's `name` came from a typedef, because the struct has
+    --- no tag of its own.
+    typedefName: boolean?
+
     --- A struct's alignment in bytes, as this ABI lays it out.
     align: integer?
 
@@ -282,6 +286,28 @@ local function resolve(id)
     return nil, nil
 end
 
+local typedefNames: {[integer]: string} = {}
+
+-- The typedef an anonymous struct is known by. LuaJIT resolves a typedef name to the
+-- type it stands for, so `ffi.typeof("Name")` and a pointer to `Name` both reach the
+-- struct with no trace of the typedef, and only the registry still links the two. The
+-- first typedef of it is the one that declared it, so a typedef of that typedef names
+-- the same struct the same way. Ids are never reused, so an answer stays good.
+local function typedefOf(id: integer): string?
+    local known = typedefNames[id]
+    if known then
+        return known
+    end
+    for _, entry in ctypes() do
+        if entry.name and kindOf(entry.info) == CT_TYPEDEF and refOf(entry.info) == id then
+            typedefNames[id] = entry.name
+            return entry.name
+        end
+    end
+
+    return nil
+end
+
 local decodeType
 
 local function decodeFunction(entry)
@@ -340,10 +366,13 @@ decodeType = function(id)
             size = entry.size,
         }
     elseif kind == CT_STRUCT then
+        -- `typedef struct { ... } Name;` is known by the typedef, as `inspect` names it
+        local typedef = entry.name == nil and typedefOf(rid) or nil
         return {
             kind = bit.band(entry.info, CTF_UNION) ~= 0 and "union" or "struct",
             id = rid,
-            name = entry.name,
+            name = entry.name or typedef,
+            typedefName = typedef ~= nil or nil,
             size = entry.size,
             align = alignOf(entry.info),
         }

@@ -29,7 +29,7 @@ local function lower(source)
     if #diagnostics > 0 then
         error("check: " .. diagnostics[1].code .. " " .. tostring(diagnostics[1].msg), 2)
     end
-    local ir, problem = native.module(tree.root, "")
+    local ir, problem = native.module(tree.root, "", "")
     if ir == nil then
         return nil, problem.message
     end
@@ -182,10 +182,10 @@ end
 --- The threads come after the work they run: `spawn` starts `work` on a thread
 --- whose handle goes in a slot, and `join` waits for it.
 local POSIX_THREADS = [[
-cdef function pthread_create(borrows thread: voidptr, attributes: voidptr?, start: function(arg: voidptr): voidptr, borrows arg: voidptr): int32
+cdef function pthread_create(borrows thread: voidptr, attributes: voidptr?, start: function(arg: voidptr): voidptr?, borrows arg: voidptr): int32
 cdef function pthread_join(thread: uint64, result: voidptr?): int32
 
-local function entry(context: voidptr): voidptr
+local function entry(context: voidptr): voidptr?
     work(context as voidptr*)
     return nil
 end
