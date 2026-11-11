@@ -191,6 +191,11 @@ a narrow buffer whose bytes end partway through one is padded to it, and an
 upload, download or binding may end partway through a word only where it ends
 the buffer.
 
+Blocks and types in a kernel nest at most 128 levels deep. On a DX12 adapter,
+loops nest at most 8 deep: the platform shader compiler unrolls nested loops,
+and its time grows about fourfold with each level, so a deeper kernel is
+refused when it is created rather than stalling there.
+
 ## Browser GPU kernels
 
 A browser target combines `host = "browser"` and `aot = "require-wasm"`. GPU

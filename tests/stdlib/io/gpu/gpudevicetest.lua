@@ -503,6 +503,29 @@ local function nestedLoops(depth)
     return kernel({body = body, bound = 1100 + 4 * depth})
 end
 
+-- `count` loops one after another, each leaving through its merge block on its
+-- first pass and the next starting there, with the same labels as
+-- `nestedLoops`.
+local function consecutiveLoops(count)
+    local function label(index, part)
+        return 1000 + 4 * index + part
+    end
+    local body = {}
+    for index = 1, count do
+        local header, merge = label(index, 0), label(index, 3)
+        body[#body + 1] = op(249, header)
+        body[#body + 1] = op(248, header)
+        body[#body + 1] = op(246, merge, label(index, 2), 0)
+        body[#body + 1] = op(249, label(index, 1))
+        body[#body + 1] = op(248, label(index, 1))
+        body[#body + 1] = op(249, merge)
+        body[#body + 1] = op(248, label(index, 2))
+        body[#body + 1] = op(249, header)
+        body[#body + 1] = op(248, merge)
+    end
+    return kernel({body = body, bound = 1100 + 4 * count})
+end
+
 -- A private variable whose type is an int inside `depth` structs (or arrays
 -- of one element), from %1001, loaded in the entry point. Its pointer type
 -- adds no level.
@@ -539,6 +562,32 @@ function M.blocksAndTypesNestedPastTheBoundAreRefused()
     fails(function() structureOf(nestedSelections(129, false)) end, PAST_THE_BOUND)
     -- Constructs one after another do not nest.
     structureOf(consecutiveSelections(1000))
+end
+
+local function loopsPastTheBound(loops)
+    return (" nests %d loops deep; at most %d nested loops are supported"):format(loops + 1, loops)
+end
+
+-- DX12's shader compiler unrolls nested loops in time that grows with each
+-- level, so loops nest less deeply there than other blocks do.
+function M.loopsNestedPastADx12BoundAreRefusedThere()
+    local dx12 = device.loopnesting("dx12")
+    assert(dx12 == device.MAX_DX12_LOOP_NESTING and dx12 < 128, tostring(dx12))
+    assert(device.loopnesting("vulkan") == 128 and device.loopnesting("metal") == 128)
+    local function structure(module, loops)
+        local spirv, count = device.spirvwords(words(module))
+        device.checkstructure(spirv, count, loops)
+    end
+    structure(nestedLoops(dx12), dx12)
+    fails(function() structure(nestedLoops(dx12 + 1), dx12) end, "SPIR-V loop at word ")
+    fails(function() structure(nestedLoops(dx12 + 1), dx12) end, loopsPastTheBound(dx12))
+    -- Loops one after another do not nest, and other blocks keep their bound.
+    structure(consecutiveLoops(dx12 + 1), dx12)
+    structure(nestedSelections(128, true), dx12)
+    structure(nestedTypes(128), dx12)
+    -- Without a loop bound, loops nest as deep as any block.
+    structure(nestedLoops(128))
+    fails(function() structure(nestedLoops(129)) end, PAST_THE_BOUND)
 end
 
 function M.closingAfterAWriteErrorPreservesTheErrorAndResetsTheSink()
@@ -698,21 +747,38 @@ end
 
 -- naga's validator overflows the stack at about 1360 nested selections on a
 -- 2 MiB stack, and an NVIDIA Vulkan driver at about 14000 nested structs. Both
--- ended the process with no message.
+-- ended the process with no message. On DX12, the shader compiler takes
+-- minutes over a dozen nested loops, so loops stop at that backend's bound.
 function M.modulesAtTheNestingBoundCompileWithoutEndingTheProcessWhenAvailable()
     local gpu = open()
-    for index, module in ipairs({nestedSelections(2000, true), nestedLoops(2000), nestedTypes(20000)}) do
-        local _, refused = device.createkernel(gpu, words(module), "main", 0, 1, 0, {1, 1, 1})
-        assert(refused and refused:find("^gpu: ") and refused:find(PAST_THE_BOUND, 1, true),
+    local loops = device.loopnesting(device.description(gpu):match("^([^:]*)"))
+    local cases = {}
+    for name, case in pairs(NESTING) do
+        cases[name] = case
+    end
+    local loopsRefused = PAST_THE_BOUND
+    if loops < 128 then
+        loopsRefused = loopsPastTheBound(loops)
+        cases.loops = {nestedLoops(loops), nestedLoops(loops + 1), "SPIR-V loop at word"}
+    end
+    local deep = {
+        {nestedSelections(2000, true), PAST_THE_BOUND},
+        {nestedLoops(2000), loopsRefused},
+        {nestedTypes(20000), PAST_THE_BOUND},
+    }
+    for index, module in ipairs(deep) do
+        local _, refused = device.createkernel(gpu, words(module[1]), "main", 0, 1, 0, {1, 1, 1})
+        assert(refused and refused:find("^gpu: ") and refused:find(module[2], 1, true),
             index .. ": " .. tostring(refused))
     end
-    for name, case in pairs(NESTING) do
+    for name, case in pairs(cases) do
         local kernel, problem = device.createkernel(gpu, words(case[1]), "main", 0, 1, 0, {1, 1, 1})
         assert(kernel, name .. ": " .. tostring(problem))
         check(device.releasekernel(gpu, kernel))
         local _, refused = device.createkernel(gpu, words(case[2]), "main", 0, 1, 0, {1, 1, 1})
-        assert(refused and refused:find("^gpu: ") and refused:find(PAST_THE_BOUND, 1, true),
-            name .. ": " .. tostring(refused))
+        local past = name == "loops" and loopsRefused or PAST_THE_BOUND
+        assert(refused and refused:find("^gpu: ") and refused:find(case[3], 1, true)
+            and refused:find(past, 1, true), name .. ": " .. tostring(refused))
     end
     check(device.close(gpu))
 end
