@@ -1512,7 +1512,7 @@ end
 
 pcall(ffi.cdef, [[
 extern const uint64_t nupp_native_powers[3];
-extern const uint64_t nupp_native_hidden_powers[3];
+extern const int32_t nupp_native_hidden_powers[3];
 extern int32_t nupp_native_calls[1];
 ]])
 
@@ -1522,7 +1522,7 @@ module host
 export const nupp_native_powers = ffi.new<const uint64[3]>({1ULL, 10ULL, 100ULL})
 
 @visibility("hidden")
-export const nupp_native_hidden_powers = ffi.new<const uint64[3]>({2ULL, 20ULL, 200ULL})
+export const nupp_native_hidden_powers = ffi.new<const int32[3]>({2, 20, 200})
 
 export const nupp_native_calls = ffi.new<int32[1]>({4})
 
