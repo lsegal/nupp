@@ -179,6 +179,9 @@ function image.new(): any
     end
     roots.preludeRuntime = value()
     assert(cursor == #data + 1, "portable prelude image has trailing bytes")
+    -- Every table in image order, so a later image written against this one can
+    -- name what it shares with it; see `nupp.compiler.project.stdlibimage`.
+    roots.arena = tables
 
     -- Intern only after the whole image is valid. A truncated root or trailing
     -- byte must not leave a type or an advanced identity counter behind.

@@ -25,6 +25,8 @@ bootstrap_target=browserLuaJITCompilerWithoutPrelude
 compiler_target=browserLuaJITCompiler
 IMAGE="$ROOT/$image_dir/preludeimage.bin"
 GENERATOR="$ROOT/editors/playground/tools/generate-prelude-image.lua"
+STDLIB_IMAGE="$ROOT/$image_dir/stdlibimage.bin"
+STDLIB_GENERATOR="$ROOT/editors/playground/tools/generate-stdlib-image.lua"
 
 if [ -n "${NUPP_PRELUDE_LUA:-}" ]; then
     LUA=$NUPP_PRELUDE_LUA
@@ -48,6 +50,13 @@ trap 'rm -f "$roundtrip"' EXIT
 cmp "$IMAGE" "$roundtrip" \
     || { echo "prelude-image: fresh generation is not byte-reproducible" >&2; exit 1; }
 
+# The standard-library interfaces are written against the prelude image's graph,
+# so they come from a bundle that already carries it. That bundle carries an empty
+# standard-library image, so every module in it is checked from source, which is
+# what is being imaged; a leftover image would only be copied back out.
+: > "$STDLIB_IMAGE"
+"$ROOT/bin/nupp" build --target "$compiler_target" --host browser
+"$LUA" "$STDLIB_GENERATOR" "$ROOT/$image_dir/nupp-compiler.lua" "$STDLIB_IMAGE"
 "$ROOT/bin/nupp" build --target "$compiler_target" --host browser
 
 # The bundle now carries the image, so it can be asked to hydrate one and write
