@@ -1259,4 +1259,141 @@ end
     assert(output:find("helper.nupp:4:15: native: a native program cannot evaluate tableExpr expressions", 1, true), output)
 end
 
+-- `jit.os` and `jit.arch` name the target, and a test of them is decided while
+-- compiling: a clause it rules out is not lowered, so it may call what only
+-- another platform has.
+local TARGETED = [[
+cdef function GetCurrentProcessId(): uint32
+cdef function getpid(): int32
+cdef function printf(borrows format: cstring, ...): int32
+
+local function main(): int32
+    if jit.os == "Windows" then
+        printf("%s %s %u\n", jit.os, jit.arch, GetCurrentProcessId())
+        return 7
+    elseif jit.os ~= "OSX" and not (jit.arch == "x64") then
+        printf("%s %s %d\n", jit.os, jit.arch, getpid())
+        return 8
+    else
+        printf("%s %s %d\n", jit.os, jit.arch, getpid())
+        return 9
+    end
+end
+]]
+
+--- The module `source` lowers to for `triple`, or nil and the refusal.
+local function lower(source, triple)
+    local parser = require("nupp.compiler.syntax.parser")
+    local check = require("helpers.fragment")
+    local env = require("nupp.compiler.project.env").new(require("helpers.paths").tests .. "/..")
+    local tree = parser.parse(source, "host.nupp")
+    assert(#tree.errors == 0, tree.errors[1] and tree.errors[1].message)
+    local diagnostics = check.check(tree, "host.nupp", env)
+    assert(#diagnostics == 0, diagnostics[1] and diagnostics[1].code .. " " .. tostring(diagnostics[1].msg))
+    local ir, problem = require("nupp.compiler.aot.llvm.native").module(tree.root, triple, "")
+    if ir == nil then
+        return nil, problem.message
+    end
+
+    return ir
+end
+
+local function calls(ir, symbol)
+    return ir:find("call [^\n]*@" .. symbol .. "%(") ~= nil
+end
+
+function M.aTargetTestLowersOnlyTheBranchItSelects()
+    for triple, expected in pairs({
+        ["x86_64-pc-windows-msvc"] = {status = 7, os = "Windows", arch = "x64", windows = true},
+        ["aarch64-pc-windows-msvc"] = {status = 7, os = "Windows", arch = "arm64", windows = true},
+        ["aarch64-unknown-linux-gnu"] = {status = 8, os = "Linux", arch = "arm64"},
+        ["i686-unknown-linux-gnu"] = {status = 8, os = "Linux", arch = "x86"},
+        ["x86_64-unknown-linux-gnu"] = {status = 9, os = "Linux", arch = "x64"},
+        ["aarch64-apple-darwin"] = {status = 9, os = "OSX", arch = "arm64"},
+    }) do
+        local ir = assert(lower(TARGETED, triple))
+        test.eq(calls(ir, "GetCurrentProcessId"), expected.windows == true, triple)
+        test.eq(calls(ir, "getpid"), expected.windows ~= true, triple)
+        assert(ir:find("ret i32 " .. expected.status, 1, true), triple .. ":\n" .. ir)
+        for _, other in ipairs({7, 8, 9}) do
+            if other ~= expected.status then
+                assert(not ir:find("ret i32 " .. other, 1, true), triple .. ":\n" .. ir)
+            end
+        end
+        assert(ir:find('c"' .. expected.os .. '\\00"', 1, true), triple .. ":\n" .. ir)
+        assert(ir:find('c"' .. expected.arch .. '\\00"', 1, true), triple .. ":\n" .. ir)
+    end
+end
+
+-- Linked and run for this machine, the program takes the branch LuaJIT's own
+-- `jit.os` and `jit.arch` select, and links without the other platform's
+-- functions.
+function M.aTargetedProgramRunsTheBranchForThisMachine()
+    requireCodegen()
+    local executable, output = link(TARGETED)
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    local expected = 9
+    if jit.os == "Windows" then
+        expected = 7
+    elseif jit.os ~= "OSX" and jit.arch ~= "x64" then
+        expected = 8
+    end
+    test.eq(status, expected, ran)
+    assert(ran:match("^" .. jit.os .. " " .. jit.arch .. " %d+$"), ran)
+end
+
+-- An `and` whose left side the target settles leaves the right side
+-- unlowered; a left side decided at run time still runs.
+function M.aSettledTargetTestSkipsItsRightSide()
+    local source = [[
+cdef function probe(): boolean
+cdef function windowsOnly(): boolean
+
+local function main(): int32
+    if jit.os == "Windows" and windowsOnly() then
+        return 1
+    end
+    if probe() or jit.os == "Windows" then
+        return 2
+    end
+    return 0
+end
+]]
+    local linux = assert(lower(source, "x86_64-unknown-linux-gnu"))
+    test.eq(calls(linux, "windowsOnly"), false)
+    test.eq(calls(linux, "probe"), true)
+    local windows = assert(lower(source, "x86_64-pc-windows-msvc"))
+    test.eq(calls(windows, "windowsOnly"), true)
+    test.eq(calls(windows, "probe"), true)
+end
+
+function M.aTargetComparedWithAnythingButALiteralIsRefused()
+    local ir, message = lower([[
+local function main(argc: int32, argv: cstring*): int32
+    @unsafe do
+        if jit.os == argv[0] then
+            return 1
+        end
+    end
+    return 0
+end
+]], "x86_64-unknown-linux-gnu")
+    test.eq(ir, nil)
+    assert(message:find("jit.os and jit.arch are compared only with a string literal", 1, true), message)
+end
+
+function M.onlyTheTargetIsReadFromJit()
+    local ir, message = lower([[
+local function main(): int32
+    if jit.version == "LuaJIT" then
+        return 1
+    end
+    return 0
+end
+]], "x86_64-unknown-linux-gnu")
+    test.eq(ir, nil)
+    assert(message:find("a native program reads only jit.os and jit.arch", 1, true), message)
+end
+
 return M

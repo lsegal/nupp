@@ -486,15 +486,21 @@ local function number(node: cst.NumberLit, want: Kind?, negated: boolean?): Valu
 end
 
 --- A string literal as a pointer to its NUL-terminated bytes.
+--- `bytes` as a C string: the address of a NUL-terminated constant.
+local function cString(program: Program, bytes: string): Value
+    local name = builder.bytes(program.module, bytes .. "\0")
+
+    return Value(text = name, kind = Kind(llvm = "ptr", signed = false, elem = INTEGERS.uint8))
+end
+
 local function stringConstant(program: Program, node: any): Value
     local token = (node as any).token as lexer.Token
     local bytes = lexer.stringValue(token.text)
     if bytes == nil then
         refuse(node, "a native program cannot read this string literal")
     end
-    local name = builder.bytes(program.module, (bytes as string) .. "\0")
 
-    return Value(text = name, kind = Kind(llvm = "ptr", signed = false, elem = INTEGERS.uint8))
+    return cString(program, bytes as string)
 end
 
 --- The local, parameter or module global the name `name` reads, innermost first.
@@ -547,6 +553,142 @@ local function readVariable(body: Body, entry: Local): Value
     end
 
     return Value(text = value(body, ("load %s, ptr %s"):format(entry.kind.llvm, entry.slot)), kind = entry.kind)
+end
+
+--[[
+Target selection. A program reads `jit.os` and `jit.arch` as LuaJIT spells them,
+but for the triple being compiled rather than the machine compiling it, so the
+same test reads the same under LuaJIT and in a cross-compiled program. A test
+that compares one with a string literal is decided here, and an `if` clause it
+rules out is not lowered at all: a branch may call a C function that only its
+own platform has, and no other target's program refers to it.
+]]
+
+--- What `jit.os` is on `triple`, or on this machine when `triple` is empty.
+local function targetOs(triple: string): string
+    local named = triple ~= "" and triple or targetLayout.hostKey() or ""
+    if named:find("windows", 1, true) ~= nil or named:find("mingw", 1, true) ~= nil then
+        return "Windows"
+    elseif named:find("darwin", 1, true) ~= nil or named:find("apple", 1, true) ~= nil then
+        return "OSX"
+    elseif named:find("linux", 1, true) ~= nil then
+        return "Linux"
+    elseif named:find("bsd", 1, true) ~= nil or named:find("dragonfly", 1, true) ~= nil then
+        return "BSD"
+    end
+
+    return "Other"
+end
+
+--- What `jit.arch` is on `triple`, or on this machine when `triple` is empty.
+local function targetArch(triple: string): string
+    local named = triple ~= "" and triple or targetLayout.hostKey() or ""
+    local architecture = named:match("^([^-]+)") or named
+    if architecture == "x86_64" or architecture == "amd64" then
+        return "x64"
+    elseif architecture:match("^i[3-6]86$") ~= nil then
+        return "x86"
+    elseif architecture == "aarch64" or architecture == "arm64" then
+        return "arm64"
+    elseif architecture == "aarch64_be" then
+        return "arm64be"
+    elseif architecture:match("^arm") ~= nil or architecture:match("^thumb") ~= nil then
+        return "arm"
+    end
+
+    return architecture
+end
+
+--- `jit.os` or `jit.arch` for the program's target, when `node` reads one
+--- and nothing of the program's own is named `jit`.
+local function targetQuery(program: Program, body: Body, node: any): string?
+    if node == nil or node.kind ~= "dotIndex" then
+        return nil
+    end
+    local index = node as cst.DotIndex
+    local obj = index.obj as any
+    if obj == nil or obj.kind ~= "name" or index.name == nil then
+        return nil
+    end
+    local name = ((obj as cst.NameExpr).token as lexer.Token).text
+    if
+        name ~= "jit"
+            or variable(program, body, name) ~= nil
+            or program.imports[name] ~= nil
+            or program.aliases[name] ~= nil
+            or program.constants[name] ~= nil
+            or program.callees[name] ~= nil
+    then
+        return nil
+    end
+    local member = (index.name as lexer.Token).text
+    if member == "os" then
+        return targetOs(program.triple)
+    elseif member == "arch" then
+        return targetArch(program.triple)
+    end
+    refuse(node, "a native program reads only jit.os and jit.arch, which name its target")
+end
+
+--- The bytes of the string literal `node`, when it is one.
+local function stringLiteral(node: any): string?
+    while node ~= nil and node.kind == "paren" do
+        node = (node as cst.Paren).expr
+    end
+    if node == nil or node.kind ~= "string" then
+        return nil
+    end
+
+    return lexer.stringValue(((node as any).token as lexer.Token).text)
+end
+
+--- Whether the test `node` holds, when it is decided by the target alone:
+--- `jit.os` or `jit.arch` compared with a string literal, and `not`, `and`
+--- and `or` over such tests. Nil when it is decided at run time.
+local function targetTest(program: Program, body: Body, node: any): boolean?
+    local kind = node ~= nil and node.kind or nil
+    if kind == "paren" then
+        return targetTest(program, body, (node as cst.Paren).expr)
+    elseif kind == "unop" then
+        local unop = node as cst.Unop
+        if (unop.op as lexer.Token).text ~= "not" then
+            return nil
+        end
+        local inner = targetTest(program, body, unop.expr)
+        if inner == nil then
+            return nil
+        end
+        return not inner
+    elseif kind ~= "binop" then
+        return nil
+    end
+    local binop = node as cst.Binop
+    local op = (binop.op as lexer.Token).text
+    if op == "and" or op == "or" then
+        -- A left side that settles the result leaves the right unevaluated, as
+        -- at run time, so it may be anything. A left side decided at run time
+        -- is still evaluated, so the whole test is too.
+        local left = targetTest(program, body, binop.lhs)
+        if left == nil or left == (op == "or") then
+            return left
+        end
+        return targetTest(program, body, binop.rhs)
+    elseif op ~= "==" and op ~= "~=" then
+        return nil
+    end
+    local leftQuery = targetQuery(program, body, binop.lhs)
+    local rightQuery = targetQuery(program, body, binop.rhs)
+    if leftQuery == nil and rightQuery == nil then
+        return nil
+    end
+    local left = leftQuery or stringLiteral(binop.lhs)
+    local right = rightQuery or stringLiteral(binop.rhs)
+    if left == nil or right == nil then
+        -- A C string compares by address, which is never what this means.
+        refuse(node, "jit.os and jit.arch are compared only with a string literal")
+    end
+
+    return (left == right) == (op == "==")
 end
 
 --- The callee a call or a function value names, if it names one.
@@ -1399,9 +1541,13 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
         refuse(node, name .. " is not a local, a parameter or a function of this native program")
     elseif kind == "call" then
         return call(program, body, node as cst.Call)
-    elseif kind == "binop" then
-        return binary(program, body, node as cst.Binop, want)
-    elseif kind == "unop" then
+    elseif kind == "binop" or kind == "unop" then
+        local decided = targetTest(program, body, node)
+        if decided ~= nil then
+            return Value(text = decided and "true" or "false", kind = BOOL)
+        elseif kind == "binop" then
+            return binary(program, body, node as cst.Binop, want)
+        end
         return unary(program, body, node as cst.Unop, want)
     elseif kind == "castExpr" then
         local cast = node as cst.CastExpr
@@ -1412,6 +1558,10 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
         end
         return convert(body, inner, to, node, true)
     elseif kind == "bracketIndex" or kind == "dotIndex" then
+        local target = targetQuery(program, body, node)
+        if target ~= nil then
+            return cString(program, target as string)
+        end
         local required, member = memberOf(program, body, node)
         if required ~= nil then
             local callee = (required as Program).exportedCallees[member as string]
@@ -1532,14 +1682,24 @@ local function ifStmt(program: Program, body: Body, stat: cst.IfStmt): nil
         if (clause as any).binding ~= nil then
             refuse(clause, "a native condition cannot bind a name")
         end
-        local test = condition(program, body, (clause as any).cond)
-        local taken = builder.label(body.f, "if.then")
-        local otherwise = builder.label(body.f, "if.else")
-        builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(test, taken, otherwise))
-        builder.start(body.f, taken)
-        block(program, body, (clause as any).body)
-        builder.jump(body.f, done)
-        builder.start(body.f, otherwise)
+        -- A clause the target rules out is not lowered, and one it selects
+        -- leaves every clause after it, and the else, unlowered.
+        local decided = targetTest(program, body, (clause as any).cond)
+        if decided == true then
+            block(program, body, (clause as any).body)
+            builder.jump(body.f, done)
+            builder.start(body.f, done)
+            return
+        elseif decided == nil then
+            local test = condition(program, body, (clause as any).cond)
+            local taken = builder.label(body.f, "if.then")
+            local otherwise = builder.label(body.f, "if.else")
+            builder.terminate(body.f, ("br i1 %s, label %%%s, label %%%s"):format(test, taken, otherwise))
+            builder.start(body.f, taken)
+            block(program, body, (clause as any).body)
+            builder.jump(body.f, done)
+            builder.start(body.f, otherwise)
+        end
     end
     if stat.elseClause ~= nil then
         block(program, body, (stat.elseClause as cst.ElseClause).body)
