@@ -736,12 +736,11 @@ local function isName(word: string?): boolean
         and not BASE_TYPES[word]
 end
 
--- The tokens of a block of C declarations, with where each starts and ends in the
+-- The tokens of a block of C declarations, with where each ends in the
 -- text. Comments, preprocessor lines and literals are dropped or stood in for, since
 -- none of them declares anything.
-local function lex(text: string): ({string}, {integer}, {integer})
+local function lex(text: string): ({string}, {integer})
     local words: {string} = {}
-    local starts: {integer} = {}
     local ends: {integer} = {}
     local pos: integer = 1
     local n = #text
@@ -791,13 +790,12 @@ local function lex(text: string): ({string}, {integer}, {integer})
                 end
                 words[#words + 1] = text:sub(s as integer, e as integer)
             end
-            starts[#words] = s as integer
             ends[#words] = e as integer
             pos = (e as integer) + 1
         end
     end
 
-    return words, starts, ends
+    return words, ends
 end
 
 -- The index past the bracketed group that starts at `i`.
@@ -980,7 +978,7 @@ end
 -- `text` with every tag in `tags` and every other identifier in `names` given the
 -- checked suffix.
 local function rename(text: string, tags: {[string]: boolean}, names: {[string]: boolean}): string
-    local words, starts, ends = lex(text)
+    local words, ends = lex(text)
     local out: {string} = {}
     local pos: integer = 1
     local tagNext = false

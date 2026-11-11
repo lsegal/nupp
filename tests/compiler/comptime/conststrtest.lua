@@ -136,4 +136,20 @@ function M.theCNamespaceIsTypedFromDeclarations()
     testAssert.eq(diagsOf(D .. "local lib = ffi.load('m')\nlib.nsA(42)"), "NUPP2006")
 end
 
+-- Checking a file used to declare its blocks into the compiler's own FFI, where a
+-- typedef the checker reached first decided what a runtime module declaring the same
+-- name afterwards got from ffi.new (#117).
+function M.checkingAFileLeavesTheRuntimeItsOwnTypedefs()
+    local D = "local ffi = require('ffi')\nffi.cdef[[ typedef struct { int32_t checked; } CstShadow; ]]\n"
+    testAssert.eq(diagsOf(D .. "local p = ffi.new('CstShadow')\nlocal n: number = p.checked"), "")
+    local ffi = require("ffi")
+    ffi.cdef("typedef struct { int64_t pid; int32_t status; } CstShadow;")
+    local child = ffi.new("CstShadow")
+    child.pid = 42
+    testAssert.eq(tonumber(child.pid), 42)
+    -- and the checked file keeps its own shape once the runtime holds the name
+    testAssert.eq(diagsOf(D .. "local p = ffi.new('CstShadow')\nlocal n: number = p.checked"), "")
+    testAssert.eq(diagsOf(D .. "local p = ffi.new('CstShadow')\nlocal n = p.pid"), "NUPP2004")
+end
+
 return M
