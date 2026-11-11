@@ -1051,6 +1051,68 @@ jobs:
         shell: bash
         run: .github/scripts/test-gpu-conformance-windows.sh
 
+  # The one job that bootstraps the compiler today: with Cargo unusable, so the
+  # compiler's own provider and the code generator both come from the pinned
+  # prebuilt release (`scripts/toolchain`, "the prebuilt native provider"), and
+  # a native program is linked with the prebuilt kit. `cargo` and `rustc` on
+  # PATH are replaced by shims that record being run, so a step that reaches
+  # Cargo anyway fails here rather than quietly building Rust (#139, #172).
+  prebuilt-native-program:
+    name: Native program without Cargo
+    needs: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      NUPP_CARGO: /nonexistent
+      NUPP_RUSTC: /nonexistent
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Shadow Cargo and rustc
+        run: |
+          set -eu
+          shims="$RUNNER_TEMP/no-rust"
+          mkdir -p "$shims"
+          for tool in cargo rustc rustup; do
+            printf '#!/bin/sh\necho "%s $*" >> "%s/ran"\nexit 1\n' "$tool" "$shims" > "$shims/$tool"
+            chmod +x "$shims/$tool"
+          done
+          echo "$shims" >> "$GITHUB_PATH"
+
+      - name: Provision the pinned toolchain
+        run: ./scripts/toolchain --all
+
+      - name: Bootstrap the compiler
+        run: ./bin/nupp --version
+
+      - name: Link and run a native program
+        run: |
+          set -eu
+          program="$RUNNER_TEMP/program"
+          mkdir -p "$program"
+          cat > "$program/prog.nupp" <<'NUPP'
+          cdef function puts(borrows s: cstring): int32
+
+          local function main(): int32
+              puts("hello from native Nupp")
+              return 0
+          end
+          NUPP
+          (cd "$program" && "$GITHUB_WORKSPACE/bin/nupp" aot --emit executable --output prog prog.nupp)
+          output=$("$program/prog")
+          echo "$output"
+          [ "$output" = "hello from native Nupp" ]
+
+      - name: Require that Cargo never ran
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/no-rust/ran" ]; then
+            echo "Cargo or rustc ran:" >&2
+            cat "$RUNNER_TEMP/no-rust/ran" >&2
+            exit 1
+          fi
+
   # The one status a ruleset should require. Its meaning does not change when
   # the jobs above are reorganized, renamed, or split, and it cannot pass by a
   # job being skipped: a job the classifier selected and that did not succeed
@@ -1068,6 +1130,7 @@ jobs:
       - docs-site
       - gpu-conformance
       - gpu-conformance-windows
+      - prebuilt-native-program
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # The run's queue delay and its per-job durations are only on the API, and

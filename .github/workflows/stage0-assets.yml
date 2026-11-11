@@ -7,6 +7,10 @@ name: Publish the prebuilt code generator with stage zero
 # `nupp-stage0-TAG.lua.gz`, and appends their digests to its notes. The
 # `PREBUILT_*` pins in scripts/toolchain.pins then move to that release.
 #
+# The code generator is the release's whole native provider (`base`, `uri`
+# and `codegen`), so a checkout without Cargo bootstraps the compiler on it
+# too.
+#
 # Run by hand only. It builds the provider with Cargo and LLVM, which is why it
 # never runs on a pull request or on main (#139): nothing a checkout or CI does
 # afterwards builds them again.

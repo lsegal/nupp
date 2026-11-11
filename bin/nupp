@@ -245,6 +245,10 @@ build_native() {
     # already built (or named by NUPP_LLVM_PREFIX): building LLVM takes minutes
     # to an hour, and nothing but AOT compilation needs it. A tree without it
     # still builds and runs the compiler; `@aot` then says what is missing.
+    #
+    # A machine without Cargo gets the pinned prebuilt provider from the same
+    # request, code generator included, without Cargo or rustc being asked
+    # anything (`scripts/toolchain`, "the prebuilt native provider").
     features=base,uri
     if llvm_is_available; then
         features=$features,codegen
