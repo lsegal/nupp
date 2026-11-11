@@ -68,8 +68,38 @@ local function open(): any
     return ffi.load(root .. library)
 end
 
+-- The state's registry, when the debug library is present. A global alone does
+-- not keep the provider loaded: code that puts `_G` back the way it found it
+-- drops the library while cached symbols and the wake finalizer still point
+-- into it, and LuaJIT finalizes the library before a cdata finalizer collected
+-- with it, so that finalizer called into an unloaded DLL. Anchored here, both
+-- live until the state closes, which runs cdata finalizers first.
+local registry: any = do
+    local debugLibrary: any = rawget(_G, "debug")
+    yield debugLibrary and debugLibrary.getregistry and debugLibrary.getregistry() or nil
+end
+
+local function stateValue(key: string): any
+    local value: any = rawget(_G, key)
+    if value == nil and registry ~= nil then
+        value = registry[key]
+        if value ~= nil then
+            rawset(_G, key, value)
+        end
+    end
+
+    return value
+end
+
+local function setStateValue(key: string, value: any): nil
+    rawset(_G, key, value)
+    if registry ~= nil then
+        registry[key] = value
+    end
+end
+
 local function library(): any
-    local value: any = rawget(_G, LIBRARY_KEY)
+    local value: any = stateValue(LIBRARY_KEY)
     if value == nil then
         local opened: any = open()
         local version = opened.nuppNativeAbiVersion()
@@ -81,7 +111,7 @@ local function library(): any
                 3
             )
         end
-        rawset(_G, LIBRARY_KEY, opened)
+        setStateValue(LIBRARY_KEY, opened)
         value = opened
     end
 
@@ -207,7 +237,7 @@ const WAKE_KEY = "__nuppNativeWake"
 --- predates it or cannot open one.
 --- @export
 function native.wake(): any?
-    local cell: any = rawget(_G, WAKE_KEY)
+    local cell: any = stateValue(WAKE_KEY)
     if cell == nil then
         local opened, open = pcall(function(): any
             ffi.cdef[[
@@ -225,7 +255,7 @@ function native.wake(): any?
         else
             cell = false
         end
-        rawset(_G, WAKE_KEY, cell)
+        setStateValue(WAKE_KEY, cell)
     end
     if not cell then
         return nil
