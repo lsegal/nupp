@@ -171,7 +171,7 @@ local greeting = require("app.greeting")
 
 local function main(): int32
     greeting.say()
-    return greeting.CODE
+    return math.i32.wrap(greeting.CODE)
 end
 ]]
     )
