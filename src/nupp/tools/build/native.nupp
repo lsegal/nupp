@@ -266,20 +266,25 @@ function stage.programKit(triple: string): (string?, string?)
     return require("nupp.tools.build.kits").resolve(triple, {}, build)
 end
 
---- Compiles a native program's LLVM IR `ir` for `triple` and links it into
---- the executable `output` against the static LuaJIT of that platform's link
---- kit.
-function stage.linkProgram(triple: string, output: string, ir: string): (string?, string?)
+--- Compiles a native program's LLVM IR `ir` for `triple` into `output`: by
+--- default an executable linked against the static LuaJIT of that platform's
+--- link kit, or what `how` asks for, where a static archive needs no kit.
+function stage.linkProgram(triple: string, output: string, ir: string, how: any?): (string?, string?)
     local aotllvm = require("nupp.tools.build.aotllvm")
     local available, availableErr = aotllvm.selected()
     if available ~= true then
         return nil, tostring(availableErr)
     end
-    local kit, kitErr = stage.programKit(triple)
-    if kit == nil then
-        return nil, kitErr
+    local linking = (how or aotllvm.NativeLink(linkage = "executable", archives = {})) as aotllvm.NativeLink
+    local kit: string? = nil
+    if linking.linkage ~= "static" then
+        local found, kitErr = stage.programKit(triple)
+        if found == nil then
+            return nil, kitErr
+        end
+        kit = found
     end
-    local linkErr = aotllvm.program(ir, triple, kit as string, output)
+    local linkErr = aotllvm.nativeProgram(ir, triple, kit, output, linking)
     if linkErr ~= nil then
         return nil, linkErr
     end

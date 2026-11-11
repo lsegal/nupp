@@ -439,6 +439,9 @@ native assembly, or the generated Nupp binding with `--emit`.
 `--emit executable` instead links the file as a native program: its `main` is
 the executable's own, and it reaches LuaJIT and other C libraries through
 its `cdef function` declarations. The program is written to `--output`.
+`--emit static-library` and `--emit shared-library` build it as a library,
+which needs no `main`; `--archive` links static archives in and `--exports`
+names every symbol the executable or shared library exports.
 
 Examples:
 
@@ -449,6 +452,7 @@ Examples:
     nupp aot --emit wgsl --function transform src/gpu.nupp
     nupp aot --format json src/kernel.nupp
     nupp aot --emit executable --output build/host src/host.nupp
+    nupp aot --emit shared-library --exports nupp.exports --output build/libhost.so src/host.nupp
 
 Usage:
   nupp aot [options] FILE
@@ -457,9 +461,14 @@ Arguments:
   FILE  Source file to inspect.
 
 Options:
-  --emit ARTIFACT  Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or
-                   executable.
-  --output PATH    Where --emit executable writes the program.
+  --emit ARTIFACT  Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or a
+                   native program linked as an executable, static-library or
+                   shared-library.
+  --output PATH    Where a native program is written.
+  --archive PATH   A static archive a native program links in whole; repeat for
+                   more.
+  --exports PATH   A file naming, one per line, every symbol a native
+                   executable or shared library exports.
   --function NAME  Show only this function.
   --triple TRIPLE  Target triple to compile for.
   --features TIER  CPU feature tier to promise.

@@ -504,7 +504,7 @@ function M.aotHelpNamesArtifactsAndShowsHighlightedExamples()
     -- every accepted artifact is named.
     local flowed = plain:gsub("%s+", " ")
     assert(
-        flowed:find("Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or executable.", 1, true),
+        flowed:find("Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or a native program linked as an executable, static-library or shared-library.", 1, true),
         "--emit names every accepted artifact: " .. plain
     )
     assert(

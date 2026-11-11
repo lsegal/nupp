@@ -52,6 +52,17 @@ record native.Problem
     line: integer
     column: integer
     message: string
+
+    --- The file of the module the problem is in, when the caller named one.
+    path: string?
+end
+
+--- One module of a native program: its checked tree, the name other modules
+--- `require` it by, and the file it came from, which a problem names.
+record native.Unit
+    name: string
+    tree: cst.Chunk
+    path: string?
 end
 
 --- A C value as LLVM holds it: its type, whether integer conversions extend it
@@ -218,12 +229,19 @@ local record Callee
     foreign: boolean
     atomic: string?
     width: integer?
+
+    --- Defined with external linkage under its own name: an `export function`,
+    --- which other modules call and C finds by name.
+    public: boolean?
 end
 
---- A name a body can read: a local's stack slot.
+--- A name a body can read: a local's stack slot, or a module's global. A
+--- global `cdef struct` is `aggregate`: its slot is the struct's storage,
+--- which the name evaluates to the address of.
 local record Local
     slot: string
     kind: Kind
+    aggregate: Kind?
 end
 
 --- The lexical scopes of one body, innermost last.
@@ -238,16 +256,51 @@ local record Value
     kind: Kind
 end
 
---- One program's lowering.
+--- A name a binding pattern selected from a required module.
+local record Alias
+    unit: Program
+    member: string
+end
+
+--- One module's lowering. The modules of a program share the LLVM module,
+--- the struct declarations and their layouts; names are each module's own.
 local record Program
     module: builder.Module
     callees: {[string]: Callee}
+
+    --- Top-level state, by name: a global every function of the module reads
+    --- and writes. A `cdef struct` held in place is a pointer to its storage.
+    globals: {[string]: Local}
+
+    --- The modules this one requires, by the name each is bound to.
+    imports: {[string]: Program}
+
+    --- The names a binding pattern selected from the modules this one
+    --- requires, each resolved where it is read.
+    aliases: {[string]: Alias}
+
+    --- What `export` makes visible to the modules requiring this one.
+    exportedCallees: {[string]: Callee}
+
+    --- The `export const`s, by name, as the literals they bind.
+    exportedConstants: {[string]: any}
+
+    --- The name other modules require this one by.
+    name: string
+
+    --- What symbols of the module's own are prefixed with: empty for the
+    --- entry module, so a one-file program's IR is unchanged.
+    prefix: string
 
     --- Top-level `const` literals, by name, lowered where they are read.
     constants: {[string]: any}
 
     --- The target triple, which `cdef struct` fields are laid out for.
     triple: string
+
+    --- Every symbol a module of the program defines, shared by them all, so
+    --- two `export`s of one name are refused rather than merged.
+    symbols: {[string]: boolean}
 
     --- The program's `cdef struct` declarations, by their checked identity.
     aggregates: {[string]: cst.CdefStruct}
@@ -444,14 +497,74 @@ local function stringConstant(program: Program, node: any): Value
     return Value(text = name, kind = Kind(llvm = "ptr", signed = false, elem = INTEGERS.uint8))
 end
 
+--- The local, parameter or module global the name `name` reads, innermost first.
+local function variable(program: Program, body: Body, name: string): Local?
+    return lookup(body.scope, name) or program.globals[name]
+end
+
+--- The required module and member `node` names, when it is `m.name` with `m`
+--- bound to a module this one requires.
+local function memberOf(program: Program, body: Body, node: any): (Program?, string?)
+    if node == nil or node.kind ~= "dotIndex" then
+        return nil, nil
+    end
+    local index = node as cst.DotIndex
+    local obj = index.obj as any
+    if obj == nil or obj.kind ~= "name" or index.name == nil then
+        return nil, nil
+    end
+    local name = ((obj as cst.NameExpr).token as lexer.Token).text
+    if variable(program, body, name) ~= nil then
+        return nil, nil
+    end
+    local required = program.imports[name]
+    if required == nil then
+        return nil, nil
+    end
+
+    return required, (index.name as lexer.Token).text
+end
+
+--- The literal the `export const` `m.name` binds in a module this one
+--- requires, or a refusal at `node` when that module exports no such constant
+--- or function.
+local function importedConstant(required: Program, member: string, node: any): any
+    local found = required.exportedConstants[member]
+    if found == nil and required.exportedCallees[member] == nil then
+        refuse(node, ("module %s exports no function or constant %s"):format(required.name, member))
+    elseif found == nil then
+        refuse(node, ("%s.%s is a function, which is not assigned"):format(required.name, member))
+    end
+
+    return found
+end
+
+--- The value of the local or global `entry`. A global `cdef struct` is the
+--- address of its storage, which `.` reaches through and C takes as a pointer.
+local function readVariable(body: Body, entry: Local): Value
+    if entry.aggregate ~= nil then
+        return Value(text = entry.slot, kind = entry.kind)
+    end
+
+    return Value(text = value(body, ("load %s, ptr %s"):format(entry.kind.llvm, entry.slot)), kind = entry.kind)
+end
+
 --- The callee a call or a function value names, if it names one.
 local function calleeOf(program: Program, body: Body, node: any): Callee?
+    local required, member = memberOf(program, body, node)
+    if required ~= nil then
+        return (required as Program).exportedCallees[member as string]
+    end
     if node == nil or node.kind ~= "name" then
         return nil
     end
     local name = ((node as cst.NameExpr).token as lexer.Token).text
-    if lookup(body.scope, name) ~= nil then
+    if variable(program, body, name) ~= nil then
         return nil
+    end
+    local alias = program.aliases[name]
+    if alias ~= nil then
+        return (alias as Alias).unit.exportedCallees[(alias as Alias).member]
     end
 
     return program.callees[name]
@@ -1181,7 +1294,7 @@ local function aggregatePlace(program: Program, body: Body, node: any): (string,
     local kind = node ~= nil and node.kind or nil
     if kind == "paren" then
         return aggregatePlace(program, body, (node as cst.Paren).expr)
-    elseif kind == "dotIndex" or kind == "bracketIndex" then
+    elseif (kind == "dotIndex" or kind == "bracketIndex") and memberOf(program, body, node) == nil then
         local address, stored = place(program, body, node)
         if stored.aggregate ~= nil then
             return address, stored
@@ -1258,10 +1371,9 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
         return Value(text = "false", kind = BOOL)
     elseif kind == "name" then
         local name = ((node as cst.NameExpr).token as lexer.Token).text
-        local found = lookup(body.scope, name)
+        local found = variable(program, body, name)
         if found ~= nil then
-            local entry = found as Local
-            return Value(text = value(body, ("load %s, ptr %s"):format(entry.kind.llvm, entry.slot)), kind = entry.kind)
+            return readVariable(body, found as Local)
         end
         local constant = program.constants[name]
         if constant ~= nil then
@@ -1274,6 +1386,15 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
             end
             -- A function as a value is its address: what C takes as a callback.
             return Value(text = "@" .. (callee as Callee).symbol, kind = PTR)
+        end
+        local alias = program.aliases[name]
+        if alias ~= nil then
+            local selected = alias as Alias
+            local exported = selected.unit.exportedCallees[selected.member]
+            if exported ~= nil then
+                return Value(text = "@" .. (exported as Callee).symbol, kind = PTR)
+            end
+            return expression(program, body, importedConstant(selected.unit, selected.member, node), want)
         end
         refuse(node, name .. " is not a local, a parameter or a function of this native program")
     elseif kind == "call" then
@@ -1291,6 +1412,14 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
         end
         return convert(body, inner, to, node, true)
     elseif kind == "bracketIndex" or kind == "dotIndex" then
+        local required, member = memberOf(program, body, node)
+        if required ~= nil then
+            local callee = (required as Program).exportedCallees[member as string]
+            if callee ~= nil then
+                return Value(text = "@" .. (callee as Callee).symbol, kind = PTR)
+            end
+            return expression(program, body, importedConstant(required as Program, member as string, node), want)
+        end
         local address, stored, read = place(program, body, node)
         return readPlace(body, address, stored, read, node)
     end
@@ -1304,6 +1433,9 @@ local function condition(program: Program, body: Body, node: any): string
 end
 
 local function store(body: Body, entry: Local, v: Value, node: any): nil
+    if entry.aggregate ~= nil then
+        refuse(node, "a native program assigns a cdef struct's fields, not the whole struct")
+    end
     local converted = convert(body, v, entry.kind, node)
     builder.emit(body.f, ("store %s %s, ptr %s"):format(entry.kind.llvm, converted.text, entry.slot))
 end
@@ -1356,14 +1488,19 @@ end
 local function assign(program: Program, body: Body, target: any, v: any): nil
     if target.kind == "name" then
         local name = ((target as cst.NameExpr).token as lexer.Token).text
-        local found = lookup(body.scope, name)
+        local found = variable(program, body, name)
         if found == nil then
-            refuse(target, "a native program assigns only its own locals")
+            refuse(target, "a native program assigns only its own locals and module state")
         end
         local entry = found as Local
         store(body, entry, expression(program, body, v, entry.kind), v)
         return
     elseif target.kind == "bracketIndex" or target.kind == "dotIndex" then
+        local required, member = memberOf(program, body, target)
+        if required ~= nil then
+            importedConstant(required as Program, member as string, target)
+            refuse(target, "a module's exports are constant; its own functions assign its state")
+        end
         local address, stored, read = place(program, body, target)
         writePlace(body, address, stored, read, expression(program, body, v, read), v)
         return
@@ -1524,6 +1661,11 @@ local function statement(program: Program, body: Body, stat: any): nil
         local op = ((compound.op as lexer.Token).text):sub(1, -2)
         local target = compound.target
         local targetKind = target ~= nil and (target as any).kind or nil
+        local required, member = memberOf(program, body, target)
+        if required ~= nil then
+            importedConstant(required as Program, member as string, target)
+            refuse(target, "a module's exports are constant; its own functions assign its state")
+        end
         if targetKind == "dotIndex" or targetKind == "bracketIndex" then
             local address, stored, read = place(program, body, target)
             local current = readPlace(body, address, stored, read, target)
@@ -1534,10 +1676,10 @@ local function statement(program: Program, body: Body, stat: any): nil
         end
         local found = target ~= nil
             and (target as any).kind == "name"
-            and lookup(body.scope, ((target as cst.NameExpr).token as lexer.Token).text)
+            and variable(program, body, ((target as cst.NameExpr).token as lexer.Token).text)
             or nil
         if found == nil then
-            refuse(stat, "a native compound assignment updates a local, a field or an element")
+            refuse(stat, "a native compound assignment updates a local, module state, a field or an element")
         end
         local current = expression(program, body, target, nil)
         local wanted = BITWISE[op] == nil and current.kind or nil
@@ -1619,7 +1761,17 @@ local function definition(stat: any): (string?, cst.Funcbody?)
     return nil, nil
 end
 
-local function signature(name: string, stat: any, funcbody: cst.Funcbody): Definition
+--- The C signature of the function `name` that `stat` defines in `program`.
+--- `public` is an `export function`, defined under its own name; `main` is the
+--- entry module's.
+local function signature(
+    program: Program,
+    name: string,
+    stat: any,
+    funcbody: cst.Funcbody,
+    public: boolean,
+    entry: boolean
+): Definition
     local params: {Kind} = {}
     local names: {string} = {}
     for index, param in ipairs(funcbody.params) do
@@ -1653,8 +1805,8 @@ local function signature(name: string, stat: any, funcbody: cst.Funcbody): Defin
         end
         result = kind as Kind
     end
-    local symbol = "nupp." .. name
-    if name == "main" then
+    local symbol = public and name or "nupp." .. program.prefix .. name
+    if name == "main" and entry then
         symbol = "main"
         local integral = result.llvm == "void" or result.llvm == "i32"
         if not integral then
@@ -1669,7 +1821,14 @@ local function signature(name: string, stat: any, funcbody: cst.Funcbody): Defin
         name = name,
         node = stat,
         funcbody = funcbody,
-        callee = Callee(symbol = symbol, params = params, result = result, varargs = false, foreign = false),
+        callee = Callee(
+            symbol = symbol,
+            params = params,
+            result = result,
+            varargs = false,
+            foreign = false,
+            public = public or symbol == "main"
+        ),
         paramNames = names
     )
 end
@@ -1733,6 +1892,150 @@ local function constant(program: Program, stat: cst.LocalStmt): nil
     end
 end
 
+--- The values a top-level `local` or `const` binds: its initializers, or the
+--- one a binding pattern selects from.
+local function valuesOf(stat: cst.LocalStmt): {any}
+    if stat.patternSource ~= nil then
+        return {stat.patternSource}
+    end
+
+    return stat.exprs or {}
+end
+
+--- The module `node` requires, when it is `require("name")` with a literal name.
+local function required(node: any): string?
+    if node == nil or node.kind ~= "call" then
+        return nil
+    end
+    local called = node as cst.Call
+    local callee = called.obj as any
+    if callee == nil or callee.kind ~= "name" or ((callee as cst.NameExpr).token as lexer.Token).text ~= "require" then
+        return nil
+    end
+    local args = called.args as cst.Args?
+    local written = args ~= nil and (args as cst.Args).exprs or nil
+    if written == nil or #(written as {cst.Node}) ~= 1 or (written as {any})[1].kind ~= "string" then
+        refuse(node, "a native program requires a module by its literal name")
+    end
+    local token = ((written as {any})[1] as any).token as lexer.Token
+
+    return lexer.stringValue(token.text)
+end
+
+--- The constant text of the initial value `node` gives a global of `kind`.
+local function initial(program: Program, node: any, kind: Kind, name: string): string
+    local current = node
+    while current.kind == "paren" do
+        current = (current as cst.Paren).expr
+    end
+    if current.kind == "name" then
+        local named = program.constants[((current as cst.NameExpr).token as lexer.Token).text]
+        if named ~= nil then
+            return initial(program, named, kind, name)
+        end
+    end
+    local v: Value? = nil
+    if current.kind == "number" then
+        v = number(current as cst.NumberLit, kind)
+    elseif current.kind == "unop"
+        and ((current as cst.Unop).op as lexer.Token).text == "-"
+        and ((current as cst.Unop).operand as any).kind == "number"
+    then
+        v = number((current as cst.Unop).operand as cst.NumberLit, kind, true)
+    elseif current.kind == "trueExpr" or current.kind == "falseExpr" then
+        v = Value(text = current.kind == "trueExpr" and "true" or "false", kind = BOOL)
+    elseif current.kind == "string" then
+        v = stringConstant(program, current)
+    elseif current.kind == "nilExpr" then
+        v = Value(text = "null", kind = PTR)
+    end
+    if v == nil then
+        refuse(node, "module state " .. name .. " starts as a literal, nil or a const")
+    end
+    local got = v as Value
+    if got.kind.llvm ~= kind.llvm or isInteger(kind) and got.kind.llvm == "i64" and got.kind.signed ~= kind.signed then
+        refuse(node, "the initial value of module state " .. name .. " is not of its type")
+    end
+
+    return got.text
+end
+
+--- Declares a top-level `local` as module state: a global with a constant
+--- initial value, or zero, private to the module. A `cdef struct` is held in
+--- place, zeroed.
+local function state(program: Program, stat: cst.LocalStmt): nil
+    if stat.pattern ~= nil then
+        refuse(stat, "a native program cannot destructure")
+    end
+    local exprs = stat.exprs or {}
+    if #exprs > #stat.names then
+        refuse(stat, "module state binds one value per name")
+    end
+    for index, token in ipairs(stat.names) do
+        local name = token.text
+        if program.globals[name] ~= nil or program.callees[name] ~= nil or program.imports[name] ~= nil then
+            refuse(stat, name .. " is defined twice")
+        end
+        local symbol = "nupp." .. program.prefix .. name
+        if program.symbols[symbol] then
+            refuse(stat, symbol .. " is defined by more than one module of this program")
+        end
+        program.symbols[symbol] = true
+        local slot = llvmText.name("@", symbol)
+        local written = stat.types[index]
+        local resolved = written ~= nil and bare((written as any).resolvedType) or nil
+        local entry: Local
+        if isAggregate(resolved) then
+            if exprs[index] ~= nil then
+                refuse(exprs[index], "module state " .. name .. " holds a cdef struct, which starts zeroed")
+            end
+            local layout = layoutOf(program, resolved, written)
+            builder.once(
+                program.module,
+                "global " .. slot,
+                ("%s = internal global [%d x i8] zeroinitializer, align %d"):format(slot, layout.size, layout.alignment)
+            )
+            local storage = Kind(llvm = "struct", signed = false, aggregate = resolved)
+            entry = Local(slot = slot, kind = Kind(llvm = "ptr", signed = false, elem = storage), aggregate = storage)
+        else
+            local kind: Kind? = written ~= nil and annotated(written, "module state " .. name) or nil
+            local start = exprs[index]
+            if kind == nil then
+                if start == nil or (start as any).kind == "nilExpr" then
+                    refuse(stat, "module state " .. name .. " needs a written C type")
+                end
+                kind = kindOf((start as any).inferredType)
+                if kind == nil then
+                    refuse(stat, "module state " .. name .. " needs a written C type")
+                end
+            end
+            local held = kind as Kind
+            if held.llvm == "void" then
+                refuse(stat, "module state " .. name .. " cannot be nil")
+            end
+            local text: string
+            if start ~= nil then
+                text = initial(program, start, held, name)
+            elseif held.llvm == "ptr" then
+                text = "null"
+            elseif isFloat(held) then
+                text = "0.0"
+            elseif held.llvm == "i1" then
+                text = "false"
+            else
+                text = "0"
+            end
+            builder.once(
+                program.module,
+                "global " .. slot,
+                ("%s = internal global %s %s"):format(slot, held.llvm, text)
+            )
+            entry = Local(slot = slot, kind = held)
+        end
+        program.globals[name] = entry
+    end
+end
+
 local function lowerDefinition(program: Program, attributes: string, item: Definition): nil
     local callee = item.callee
     local params: {string} = {}
@@ -1742,7 +2045,7 @@ local function lowerDefinition(program: Program, attributes: string, item: Defin
     if callee.symbol == "main" and #params == 0 then
         params = {"i32 %arg1", "ptr %arg2"}
     end
-    local linkage = callee.symbol == "main" and "" or "internal "
+    local linkage = callee.public and "" or "internal "
     local header = (
         "define %s%s @%s(%s) %s {"
     ):format(
@@ -1773,59 +2076,191 @@ local function lowerDefinition(program: Program, attributes: string, item: Defin
     end
 end
 
---- The program in `tree` as one LLVM IR module for `triple`, or nil and what it
---- does that a native program cannot. `functionAttributes` are the target
---- profile's.
---- @raises string when lowering fails for a reason other than the program: a
----   defect here, which must not be reported as something the program did
-function native.module(tree: cst.Chunk, triple: string, functionAttributes: string): (string?, native.Problem?)
-    local program = Program(
-        module = builder.module(),
-        callees = {},
-        constants = {},
-        triple = triple,
-        aggregates = {},
-        layouts = {}
-    )
-    local definitions: {Definition} = {}
+--- How a program is built: as an executable, whose entry module defines
+--- `main`, or as a library, which needs none.
+record native.Options
+    library: boolean?
+end
+
+--- The top-level statement `stat` with any `export` taken off, and whether it
+--- had one.
+local function unexported(stat: any): (any, boolean)
+    if stat.kind ~= "exportStmt" then
+        return stat, false
+    end
+    local exported = stat as cst.ExportStmt
+    if exported.stat == nil then
+        refuse(stat, "a native program exports declarations, not a module value")
+    end
+
+    return exported.stat, true
+end
+
+--- The modules the top level of `tree` requires, in order, as the names a
+--- caller resolves to the units it passes `native.program`.
+--- @return the names, or nil and the problem with the first one
+--- @raises string on a defect here rather than in the program
+function native.requires(tree: cst.Chunk): ({string}?, native.Problem?)
+    local names: {string} = {}
     local ok, err = pcall(function(): nil
-        local hasMain = false
         for _, top in ipairs(tree.blocks) do
-            for _, stat in ipairs(top.stats or {}) do
-                local kind = (stat as any).kind
-                if kind == "cdefFunc" then
-                    local declared = foreign(stat as cst.CdefFunc)
-                    if program.callees[declared.symbol] ~= nil then
-                        refuse(stat, declared.symbol .. " is declared twice")
+            for _, written in ipairs(top.stats or {}) do
+                local stat = unexported(written)
+                if (stat as any).kind == "localStmt" then
+                    for _, expr in ipairs(valuesOf(stat as cst.LocalStmt)) do
+                        local name = required(expr)
+                        if name ~= nil then
+                            names[#names + 1] = name as string
+                        end
                     end
-                    program.callees[declared.symbol] = declared
-                elseif kind == "localFuncStmt" or kind == "funcStmt" then
-                    local name, funcbody = definition(stat)
-                    if name == nil or funcbody == nil then
-                        refuse(stat, "a native program defines plain named functions")
-                    end
-                    if program.callees[name as string] ~= nil then
-                        refuse(stat, (name as string) .. " is defined twice")
-                    end
-                    local item = signature(name as string, stat, funcbody as cst.Funcbody)
-                    definitions[#definitions + 1] = item
-                    program.callees[name as string] = item.callee
-                    hasMain = hasMain or name == "main"
-                elseif kind == "localStmt" and (stat as cst.LocalStmt).isConst then
-                    constant(program, stat as cst.LocalStmt)
-                elseif kind == "cdefStruct" then
-                    local identity = (stat as cst.CdefStruct).cdefIdentity
-                    if identity ~= nil then
-                        program.aggregates[identity as string] = stat as cst.CdefStruct
-                    end
-                elseif kind ~= "emptyStmt" and kind ~= "moduleStmt" then
-                    refuse(stat, "a native program's top level holds only cdef declarations and functions")
                 end
             end
         end
-        if not hasMain then
-            refuse(tree, "a native program defines main")
+    end)
+    if not ok then
+        if type(err) == "table" and (err as any).problem ~= nil then
+            return nil, (err as Refusal).problem
         end
+        error(err, 0)
+    end
+
+    return names, nil
+end
+
+--- Binds a top-level `local m = require("name")` to the unit named `name`, or
+--- each name `const {f, X as Y} = require("name")` selects to what it names
+--- there; false when `stat` requires nothing.
+local function import(program: Program, stat: cst.LocalStmt, units: {[string]: Program}): boolean
+    local sources = valuesOf(stat)
+    local requires = false
+    for _, expr in ipairs(sources) do
+        requires = requires or required(expr) ~= nil
+    end
+    if not requires then
+        return false
+    end
+    if #sources ~= 1 or stat.pattern == nil and #stat.names ~= 1 then
+        refuse(stat, "a native program binds each module it requires to one name")
+    end
+    local name = required(sources[1]) as string
+    local unit = units[name]
+    if unit == nil then
+        refuse(sources[1], "module " .. name .. " is not a module of this native program")
+    end
+
+    local function bind(bound: string): nil
+        if program.imports[bound] ~= nil
+            or program.aliases[bound] ~= nil
+            or program.callees[bound] ~= nil
+            or program.globals[bound] ~= nil
+        then
+            refuse(stat, bound .. " is defined twice")
+        end
+    end
+
+    if stat.pattern == nil then
+        local bound = stat.names[1].text
+        bind(bound)
+        program.imports[bound] = unit as Program
+        return true
+    end
+    for _, entry in ipairs(stat.pattern as {cst.BindingEntry}) do
+        if entry.typeOnly == nil and entry.sourceName ~= nil then
+            local member = (entry.sourceName as lexer.Token).text
+            local bound = entry.alias ~= nil and (entry.alias as lexer.Token).text or member
+            bind(bound)
+            program.aliases[bound] = Alias(unit = unit as Program, member = member)
+        end
+    end
+
+    return true
+end
+
+--- A function a module defines, waiting for its body to be lowered.
+local record Pending
+    program: Program
+    unit: native.Unit
+    item: Definition
+end
+
+--- Records the top-level declarations of one module: its C declarations,
+--- structs, constants, state, required modules and function signatures.
+--- @return whether it is the entry module and defines `main`
+local function declarations(
+    program: Program,
+    unit: native.Unit,
+    entry: boolean,
+    units: {[string]: Program},
+    pending: {Pending}
+): boolean
+    local hasMain = false
+    for _, top in ipairs(unit.tree.blocks) do
+        for _, written in ipairs(top.stats or {}) do
+            local stat, public = unexported(written)
+            local kind = (stat as any).kind
+            if kind == "cdefFunc" then
+                local declared = foreign(stat as cst.CdefFunc)
+                if program.callees[declared.symbol] ~= nil then
+                    refuse(stat, declared.symbol .. " is declared twice")
+                end
+                program.callees[declared.symbol] = declared
+            elseif kind == "localFuncStmt" or kind == "funcStmt" then
+                local name, funcbody = definition(stat)
+                if name == nil or funcbody == nil then
+                    refuse(stat, "a native program defines plain named functions")
+                end
+                if program.callees[name as string] ~= nil
+                    or program.globals[name as string] ~= nil
+                    or program.imports[name as string] ~= nil
+                then
+                    refuse(stat, (name as string) .. " is defined twice")
+                end
+                local item = signature(program, name as string, stat, funcbody as cst.Funcbody, public, entry)
+                if program.symbols[item.callee.symbol] then
+                    refuse(stat, item.callee.symbol .. " is defined by more than one module of this program")
+                end
+                program.symbols[item.callee.symbol] = true
+                pending[#pending + 1] = Pending(program = program, unit = unit, item = item)
+                program.callees[name as string] = item.callee
+                if public then
+                    program.exportedCallees[name as string] = item.callee
+                end
+                hasMain = hasMain or entry and name == "main"
+            elseif kind == "localStmt" then
+                local declared = stat as cst.LocalStmt
+                if not import(program, declared, units) then
+                    if declared.isConst then
+                        constant(program, declared)
+                        if public then
+                            for _, name in ipairs(declared.names) do
+                                program.exportedConstants[name.text] = program.constants[name.text]
+                            end
+                        end
+                    else
+                        state(program, declared)
+                    end
+                end
+            elseif kind == "cdefStruct" then
+                local identity = (stat as cst.CdefStruct).cdefIdentity
+                if identity ~= nil then
+                    program.aggregates[identity as string] = stat as cst.CdefStruct
+                end
+            elseif kind ~= "emptyStmt" and kind ~= "moduleStmt" then
+                refuse(
+                    stat,
+                    "a native program's top level holds only cdef declarations, functions, constants, "
+                    .. "module state and the modules it requires"
+                )
+            end
+        end
+    end
+
+    return hasMain
+end
+
+--- Declares every C function the modules of a program call.
+local function declareForeign(module: builder.Module, programs: {Program}): nil
+    for _, program in ipairs(programs) do
         for _, callee in pairs(program.callees) do
             if callee.foreign and callee.atomic == nil then
                 local params: {string} = {}
@@ -1836,7 +2271,7 @@ function native.module(tree: cst.Chunk, triple: string, functionAttributes: stri
                     params[#params + 1] = "..."
                 end
                 builder.declare(
-                    program.module,
+                    module,
                     "@" .. callee.symbol,
                     (
                         "declare %s%s @%s(%s)"
@@ -1844,21 +2279,92 @@ function native.module(tree: cst.Chunk, triple: string, functionAttributes: stri
                 )
             end
         end
+    end
+end
+
+--- The program made of `units` as one LLVM IR module for `triple`, or nil and
+--- what it does that a native program cannot. The first unit is the entry
+--- module; the others are the modules it requires, directly or not, each named
+--- as `require` names it. `functionAttributes` are the target profile's.
+--- @raises string when lowering fails for a reason other than the program: a
+---   defect here, which must not be reported as something the program did
+function native.program(
+    units: {native.Unit},
+    triple: string,
+    functionAttributes: string,
+    options: native.Options?
+): (string?, native.Problem?)
+    local library = options ~= nil and (options as native.Options).library == true
+    local module = builder.module()
+    local aggregates: {[string]: cst.CdefStruct} = {}
+    local layouts: {[any]: any} = {}
+    local symbols: {[string]: boolean} = {}
+    local programs: {Program} = {}
+    local byName: {[string]: Program} = {}
+    for index, unit in ipairs(units) do
+        local program = Program(
+            module = module,
+            callees = {},
+            globals = {},
+            imports = {},
+            aliases = {},
+            exportedCallees = {},
+            exportedConstants = {},
+            name = unit.name,
+            prefix = index == 1 and "" or unit.name .. ".",
+            constants = {},
+            triple = triple,
+            symbols = symbols,
+            aggregates = aggregates,
+            layouts = layouts
+        )
+        programs[index] = program
+        byName[unit.name] = program
+    end
+    -- The unit being lowered, which names the file a refusal is reported in.
+    local current: native.Unit = units[1]
+    local pending: {Pending} = {}
+    local ok, err = pcall(function(): nil
+        local hasMain = false
+        -- Every module's declarations before any body, so a function may call
+        -- one, or read state, of a module declared after its own.
+        for index, unit in ipairs(units) do
+            current = unit
+            hasMain = declarations(programs[index], unit, index == 1, byName, pending) or hasMain
+        end
+        current = units[1]
+        if not hasMain and not library then
+            refuse(units[1].tree, "a native program defines main")
+        end
+        declareForeign(module, programs)
         -- Unwind tables, because a C function a Nupp callback calls may raise a
         -- Lua error that unwinds through it to the VM's protected call.
-        local attributes = builder.attributes(program.module, (("uwtable " .. functionAttributes):gsub("%s+$", "")))
-        for _, item in ipairs(definitions) do
-            lowerDefinition(program, attributes, item)
+        local attributes = builder.attributes(module, (("uwtable " .. functionAttributes):gsub("%s+$", "")))
+        for _, one in ipairs(pending) do
+            current = one.unit
+            lowerDefinition(one.program, attributes, one.item)
         end
     end)
     if not ok then
         if type(err) == "table" and (err as any).problem ~= nil then
-            return nil, (err as Refusal).problem
+            local problem = (err as Refusal).problem
+            problem.path = current.path
+
+            return nil, problem
         end
         error(err, 0)
     end
 
-    return builder.render(program.module), nil
+    return builder.render(module), nil
+end
+
+--- The one-module program in `tree` as one LLVM IR module for `triple`, or nil
+--- and what it does that a native program cannot. `functionAttributes` are the
+--- target profile's.
+--- @raises string when lowering fails for a reason other than the program: a
+---   defect here, which must not be reported as something the program did
+function native.module(tree: cst.Chunk, triple: string, functionAttributes: string): (string?, native.Problem?)
+    return native.program({native.Unit(name = "", tree = tree)}, triple, functionAttributes)
 end
 
 export = native
