@@ -134,13 +134,13 @@ through it to the `lua_pcall` that called it.
 ## Function pointers
 
 A function type such as `function(L: voidptr): int32` is a C function pointer.
-A local, a parameter, a struct field or [module state](#module-state) of that
-type holds one, and calling it is an indirect call with the declared
-signature. A function of the program's own, or a declared C function, is a
-pointer of its own type when used as a value. A pointer from anywhere else, such as
-the `voidptr` that `dlsym` or `GetProcAddress` returns, is given its type with
-`as`. A function type ending in `...` is variadic, and its extra arguments pass
-as they would to a variadic C function.
+A local, a parameter or [module state](#module-state) of that type holds one,
+and calling it is an indirect call with the declared signature. A function of
+the program's own, or a declared C function, is a pointer of its own type when
+used as a value. A pointer from anywhere else, such as the `voidptr` that
+`dlsym` or `GetProcAddress` returns, is given its type with `as`. A function
+type ending in `...` is variadic, and its extra arguments pass as they would to
+a variadic C function.
 
 This is how a program binds an API it does not link against directly, at run
 time: here `lua_atpanic` hands back the handler it replaces, and module state

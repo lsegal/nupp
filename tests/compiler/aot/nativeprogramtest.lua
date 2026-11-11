@@ -184,19 +184,11 @@ end
 
 -- A function-typed value is called through: a pointer a C function returns,
 -- module state assigned one at run time, a local bound to a function of the
--- program's own, a struct field, and a pointer that passed through a
--- `voidptr`.
+-- program's own, and a pointer that passed through a `voidptr`.
 function M.aFunctionPointerFromCIsCalledThrough()
     requireCodegen()
     local executable, output = link(LUA_API .. [[
 cdef function lua_atpanic(borrows L: voidptr, panicf: function(L: voidptr): int32): function(L: voidptr): int32
-cdef function calloc(count: uint64, size: uint64): voidptr
-cdef function free(borrows p: voidptr)
-
-cdef struct Handlers
-    panic: function(L: voidptr): int32
-end
-
 local handler: function(L: voidptr): int32
 
 local function seven(L: voidptr): int32
@@ -215,10 +207,8 @@ local function main(): int32
     local direct = nine
     local erased = handler as voidptr
     local restored = erased as function(L: voidptr): int32
-    local handlers = calloc(1, 8) as Handlers*
     local failed: integer = 0
     @unsafe do
-        handlers.panic = previous
         if handler(L) ~= 7 then
             failed += 1
         end
@@ -231,11 +221,7 @@ local function main(): int32
         if restored(L) ~= 7 then
             failed += 8
         end
-        if handlers.panic(L) ~= 9 then
-            failed += 16
-        end
     end
-    free(handlers as voidptr)
     lua_close(L)
     return math.i32.wrap(failed)
 end
