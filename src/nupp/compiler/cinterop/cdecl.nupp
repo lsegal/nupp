@@ -86,6 +86,10 @@ export interface CType
     --- The ctype id a struct reference keeps, so `structById` can find its members.
     id: integer?
 
+    --- Whether a struct reference's `name` came from a typedef, because the struct has
+    --- no tag of its own.
+    typedefName: boolean?
+
     --- A struct's alignment in bytes, as this ABI lays it out.
     align: integer?
 
@@ -264,8 +268,10 @@ end
 
 -- Follow typedef and attribute wrappers to the type they describe. Const is retained on
 -- the resolved entry by LuaJIT, so callers can still distinguish a pointer to const
--- data.
+-- data. The last typedef passed through is returned too: it is the only name an
+-- anonymous struct has.
 local function resolve(id)
+    local typedef = nil
     for _ = 1, 16 do
         local entry = info(id)
         if not entry then
@@ -273,9 +279,12 @@ local function resolve(id)
         end
         local kind = kindOf(entry.info)
         if kind == CT_TYPEDEF or kind == CT_ATTRIB then
+            if kind == CT_TYPEDEF then
+                typedef = entry.name
+            end
             id = refOf(entry.info)
         else
-            return id, entry
+            return id, entry, typedef
         end
     end
 
@@ -311,7 +320,7 @@ end
 -- references by id and name; their fields live in a declaration so recursive and
 -- mutually-referential types terminate naturally.
 decodeType = function(id)
-    local rid, entry = resolve(id)
+    local rid, entry, typedef = resolve(id)
     if not entry then
         return {kind = "unknown"}
     end
@@ -343,7 +352,9 @@ decodeType = function(id)
         return {
             kind = bit.band(entry.info, CTF_UNION) ~= 0 and "union" or "struct",
             id = rid,
-            name = entry.name,
+            -- `typedef struct { ... } Name;` is known by the typedef, as `inspect` names it
+            name = entry.name or typedef,
+            typedefName = entry.name == nil and typedef ~= nil or nil,
             size = entry.size,
             align = alignOf(entry.info),
         }

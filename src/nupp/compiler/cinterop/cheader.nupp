@@ -77,6 +77,7 @@ local INT_BY_BITS = {
 
 local modelFunction -- defined below; a pointer may be to a function
 local adoptStruct -- defined below; aggregate references may be recursive
+local adoptAnonymous -- defined below; aggregate references may be recursive
 
 --- The declaration key of a C aggregate. LuaJIT keeps one C declaration namespace per
 --- process, so a tag or a typedef name means one aggregate wherever a header spelled
@@ -92,6 +93,28 @@ end
 -- checker answer "Hfa is not a Hfa" to a program passing a struct it built with
 -- `ffi.new` to the header's own function.
 local adoptedById: {[integer]: T.Type} = {}
+
+-- The type a struct or union reference stands for. A tag goes through `resolver`
+-- and the tag adoption; a typedef of an anonymous struct has no tag to look up, so
+-- it is adopted by its ctype id under the typedef's name.
+local function namedAggregate(model, structs, resolver)
+    local named = structs and structs[model.id]
+    if not named and resolver and model.name and not model.typedefName then
+        named = resolver(model.name)
+    end
+    if not named and model.id then
+        named = adoptedById[model.id]
+    end
+    if not named and model.name then
+        if model.typedefName then
+            named = adoptAnonymous(model)
+        else
+            named = adoptStruct(model.name, model.kind)
+        end
+    end
+
+    return named
+end
 
 -- A neutral C declaration type, as the Nupp type that stands for it.
 local function nuppType(model, structs, resolver)
@@ -126,16 +149,7 @@ local function nuppType(model, structs, resolver)
             return T.optional(modelFunction(pointee, structs, resolver))
         end
         if pointee and (pointee.kind == "struct" or pointee.kind == "union") then
-            local named = structs and structs[pointee.id]
-            if not named and resolver and pointee.name then
-                named = resolver(pointee.name)
-            end
-            if not named and pointee.id then
-                named = adoptedById[pointee.id]
-            end
-            if not named and pointee.name then
-                named = adoptStruct(pointee.name, pointee.kind)
-            end
+            local named = namedAggregate(pointee, structs, resolver)
             if named then
                 -- the header said whether it writes through this pointer
                 if readOnly then
@@ -158,16 +172,7 @@ local function nuppType(model, structs, resolver)
         end
         return T.optional(T.voidptr)
     elseif kind == "struct" or kind == "union" then
-        local named = structs and structs[model.id]
-        if not named and resolver and model.name then
-            named = resolver(model.name)
-        end
-        if not named and model.id then
-            named = adoptedById[model.id]
-        end
-        if not named and model.name then
-            named = adoptStruct(model.name, kind)
-        end
+        local named = namedAggregate(model, structs, resolver)
         if named then
             return named
         end
@@ -630,6 +635,34 @@ adoptStruct = function(tag, aggregateKind)
     nominal.fieldOrder = {}
     -- before decoding, so a self-reference terminates
     adopted[key] = nominal
+    adoptedById[declaration.id] = nominal
+    for _, field in ipairs(declaration.fields) do
+        local fieldType = nuppType(field.type, nil, adoptingResolver(nil)) or T.any
+        nominal.byname[field.name] = fieldType
+        nominal.writeByname[field.name] = fieldType
+        nominal.fieldOrder[#nominal.fieldOrder + 1] = field.name
+    end
+
+    return nominal
+end
+
+-- `typedef struct { ... } Name;` has only the typedef to be known by, and LuaJIT has
+-- only the ctype id to tell it apart, so that is what keeps one identity across
+-- mentions, under the typedef's name as `load` names it from a header.
+adoptAnonymous = function(model)
+    local known = adoptedById[model.id]
+    if known then
+        return known
+    end
+    local declaration = cdecl.structById(model.id)
+    if not declaration then
+        return nil
+    end
+    local nominal = T.nominal(model.name, "struct", cDeclarationKey(declaration.kind, "typedef", model.name))
+    nominal.cdefName = model.name
+    nominal.cdefKind = declaration.kind
+    nominal.fieldOrder = {}
+    -- before decoding, so a self-reference terminates
     adoptedById[declaration.id] = nominal
     for _, field in ipairs(declaration.fields) do
         local fieldType = nuppType(field.type, nil, adoptingResolver(nil)) or T.any
