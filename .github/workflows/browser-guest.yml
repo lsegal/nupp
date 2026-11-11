@@ -17,6 +17,8 @@ on:
       - 'tests/stdlib/os/host/fixtures/**'
       - 'bench/host-channel/**'
       - 'editors/playground/test/browser-matrix.mjs'
+      - 'editors/playground/src/compiler-deadline.js'
+      - 'editors/playground/test/compiler-deadline.test.js'
       - 'tests/integration/browser/luajit/**'
       - 'bench/luajit-browser/*.mjs'
       - 'scripts/browser-*.py'
@@ -88,7 +90,7 @@ jobs:
           npx --prefix editors/playground playwright install --with-deps firefox webkit
       - name: Test transport boundaries
         run: |
-          node --test tests/integration/browser/luajit/transport.test.mjs tests/integration/browser/luajit/native.test.mjs tests/integration/browser/luajit/package-assets.test.mjs tests/integration/browser/luajit/pages-cache.test.mjs
+          node --test tests/integration/browser/luajit/transport.test.mjs editors/playground/test/compiler-deadline.test.js tests/integration/browser/luajit/native.test.mjs tests/integration/browser/luajit/package-assets.test.mjs tests/integration/browser/luajit/pages-cache.test.mjs
           python3 tests/integration/browser/luajit/toolchain_test.py
           python3 tests/integration/browser/luajit/cold_checkout_test.py
       - name: Install the guest build tools
