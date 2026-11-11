@@ -67,6 +67,11 @@ local record Engine is streaming.Hasher
     writeDigest: function(self: Engine, exclusive destination: span.ByteWriteSpan): nil
 end
 
+-- SHA-384 is SHA-512 with its own initial words and a truncated result.
+local function wide(name: string): boolean
+    return name == "sha512" or name == "sha384"
+end
+
 local function readWord(bytes: string, at: integer, little: boolean): integer
     local a, b, c, d = bytes:byte(at, at + 3)
     if little then
@@ -171,7 +176,7 @@ local function sha512(self: Engine): nil
 end
 
 local function compress(self: Engine, bytes: string, offset: integer): nil
-    local count = self.name == "sha512" and 32 or 16
+    local count = wide(self.name) and 32 or 16
     for i = 1, count do
         self.schedule[i] = readWord(bytes, offset + (i - 1) * 4, self.name == "md5")
     end
@@ -185,7 +190,7 @@ local function compress(self: Engine, bytes: string, offset: integer): nil
 end
 
 function Engine.update(self: Engine, bytes: string): streaming.Hasher
-    local block = self.name == "sha512" and 128 or 64
+    local block = wide(self.name) and 128 or 64
     local length = self.low + #bytes
     self.low = length % 4294967296
     self.high = (self.high + math.floor(length / 4294967296)) % 4294967296
@@ -222,8 +227,8 @@ local function encodedWord(value: integer, little: boolean): string
 end
 
 local function finish(self: Engine): nil
-    local block = self.name == "sha512" and 128 or 64
-    local lengthSize = self.name == "sha512" and 16 or 8
+    local block = wide(self.name) and 128 or 64
+    local lengthSize = wide(self.name) and 16 or 8
     local little = self.name == "md5"
     local low = bit.tobit(self.low * 8)
     local high = bit.tobit(self.high * 8 + math.floor(self.low / 536870912))
@@ -241,10 +246,14 @@ local function finish(self: Engine): nil
     self.tail = ""
 end
 
+local function outputWords(self: Engine): integer
+    return self.name == "sha384" and 12 or #self.state
+end
+
 function Engine.writeDigest(self: Engine, exclusive destination: span.ByteWriteSpan): nil
     finish(self)
     local little = self.name == "md5"
-    for word = 1, #self.state do
+    for word = 1, outputWords(self) do
         local value = unsigned(self.state[word])
         for byte = 0, 3 do
             local shift = little and byte * 8 or 24 - byte * 8
@@ -256,8 +265,8 @@ end
 function Engine.digest(self: Engine): string
     finish(self)
     local bytes: {string} = {}
-    for _, word in ipairs(self.state) do
-        bytes[#bytes + 1] = encodedWord(word, self.name == "md5")
+    for index = 1, outputWords(self) do
+        bytes[#bytes + 1] = encodedWord(self.state[index], self.name == "md5")
     end
 
     return table.concat(bytes)
@@ -269,7 +278,9 @@ end
 
 export function create(name: string): streaming.Hasher
     local state: {integer} = {}
-    local initial = name == "sha512" and constants.sha512Initial or {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476}
+    local initial = name == "sha512" and constants.sha512Initial
+        or name == "sha384" and constants.sha384Initial
+        or {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476}
     for i, word in ipairs(initial) do
         state[i] = bit.tobit(word)
     end

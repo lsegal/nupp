@@ -1,0 +1,335 @@
+@!internal
+--[[ChaCha20-Poly1305 authenticated encryption (RFC 8439).
+
+ChaCha20 runs on signed 32-bit words from `bit`. Poly1305 follows TweetNaCl:
+seventeen limbs of eight bits, so every product and partial sum stays well inside
+a double's exact integer range and the arithmetic needs no 64-bit type.
+]]
+module nupp.io.tls.crypto.chacha
+
+const bit = require("nupp.runtime.bitops")
+
+const band = bit.band
+const bor = bit.bor
+const bxor = bit.bxor
+const lshift = bit.lshift
+const rshift = bit.rshift
+const tobit = bit.tobit
+
+local function rotate(value: integer, count: integer): integer
+    return bor(lshift(value, count), rshift(value, 32 - count))
+end
+
+local function littleWord(text: string, at: integer): integer
+    local a, b, c, d = text:byte(at, at + 3)
+
+    return tobit(((d * 256 + c) * 256 + b) * 256 + a)
+end
+
+const SIGMA0 = tobit(0x61707865)
+const SIGMA1 = tobit(0x3320646e)
+const SIGMA2 = tobit(0x79622d32)
+const SIGMA3 = tobit(0x6b206574)
+
+-- One 64-byte keystream block as sixteen words.
+local function block(key: {integer}, counter: integer, nonce: {integer}, out: {integer}): nil
+    local x0, x1, x2, x3 = SIGMA0, SIGMA1, SIGMA2, SIGMA3
+    local x4, x5, x6, x7 = key[1], key[2], key[3], key[4]
+    local x8, x9, x10, x11 = key[5], key[6], key[7], key[8]
+    local x12, x13, x14, x15 = tobit(counter), nonce[1], nonce[2], nonce[3]
+    for _ = 1, 10 do
+        x0 = tobit(x0 + x4)
+        x12 = rotate(bxor(x12, x0), 16)
+        x8 = tobit(x8 + x12)
+        x4 = rotate(bxor(x4, x8), 12)
+        x0 = tobit(x0 + x4)
+        x12 = rotate(bxor(x12, x0), 8)
+        x8 = tobit(x8 + x12)
+        x4 = rotate(bxor(x4, x8), 7)
+        x1 = tobit(x1 + x5)
+        x13 = rotate(bxor(x13, x1), 16)
+        x9 = tobit(x9 + x13)
+        x5 = rotate(bxor(x5, x9), 12)
+        x1 = tobit(x1 + x5)
+        x13 = rotate(bxor(x13, x1), 8)
+        x9 = tobit(x9 + x13)
+        x5 = rotate(bxor(x5, x9), 7)
+        x2 = tobit(x2 + x6)
+        x14 = rotate(bxor(x14, x2), 16)
+        x10 = tobit(x10 + x14)
+        x6 = rotate(bxor(x6, x10), 12)
+        x2 = tobit(x2 + x6)
+        x14 = rotate(bxor(x14, x2), 8)
+        x10 = tobit(x10 + x14)
+        x6 = rotate(bxor(x6, x10), 7)
+        x3 = tobit(x3 + x7)
+        x15 = rotate(bxor(x15, x3), 16)
+        x11 = tobit(x11 + x15)
+        x7 = rotate(bxor(x7, x11), 12)
+        x3 = tobit(x3 + x7)
+        x15 = rotate(bxor(x15, x3), 8)
+        x11 = tobit(x11 + x15)
+        x7 = rotate(bxor(x7, x11), 7)
+
+        x0 = tobit(x0 + x5)
+        x15 = rotate(bxor(x15, x0), 16)
+        x10 = tobit(x10 + x15)
+        x5 = rotate(bxor(x5, x10), 12)
+        x0 = tobit(x0 + x5)
+        x15 = rotate(bxor(x15, x0), 8)
+        x10 = tobit(x10 + x15)
+        x5 = rotate(bxor(x5, x10), 7)
+        x1 = tobit(x1 + x6)
+        x12 = rotate(bxor(x12, x1), 16)
+        x11 = tobit(x11 + x12)
+        x6 = rotate(bxor(x6, x11), 12)
+        x1 = tobit(x1 + x6)
+        x12 = rotate(bxor(x12, x1), 8)
+        x11 = tobit(x11 + x12)
+        x6 = rotate(bxor(x6, x11), 7)
+        x2 = tobit(x2 + x7)
+        x13 = rotate(bxor(x13, x2), 16)
+        x8 = tobit(x8 + x13)
+        x7 = rotate(bxor(x7, x8), 12)
+        x2 = tobit(x2 + x7)
+        x13 = rotate(bxor(x13, x2), 8)
+        x8 = tobit(x8 + x13)
+        x7 = rotate(bxor(x7, x8), 7)
+        x3 = tobit(x3 + x4)
+        x14 = rotate(bxor(x14, x3), 16)
+        x9 = tobit(x9 + x14)
+        x4 = rotate(bxor(x4, x9), 12)
+        x3 = tobit(x3 + x4)
+        x14 = rotate(bxor(x14, x3), 8)
+        x9 = tobit(x9 + x14)
+        x4 = rotate(bxor(x4, x9), 7)
+    end
+    out[1] = tobit(x0 + SIGMA0)
+    out[2] = tobit(x1 + SIGMA1)
+    out[3] = tobit(x2 + SIGMA2)
+    out[4] = tobit(x3 + SIGMA3)
+    out[5] = tobit(x4 + key[1])
+    out[6] = tobit(x5 + key[2])
+    out[7] = tobit(x6 + key[3])
+    out[8] = tobit(x7 + key[4])
+    out[9] = tobit(x8 + key[5])
+    out[10] = tobit(x9 + key[6])
+    out[11] = tobit(x10 + key[7])
+    out[12] = tobit(x11 + key[8])
+    out[13] = tobit(x12 + tobit(counter))
+    out[14] = tobit(x13 + nonce[1])
+    out[15] = tobit(x14 + nonce[2])
+    out[16] = tobit(x15 + nonce[3])
+end
+
+local function keyWords(key: string): {integer}
+    local words: {integer} = {}
+    for index = 1, 8 do
+        words[index] = littleWord(key, index * 4 - 3)
+    end
+
+    return words
+end
+
+local function nonceWords(nonce: string): {integer}
+    return {littleWord(nonce, 1), littleWord(nonce, 5), littleWord(nonce, 9)}
+end
+
+-- XORs the keystream starting at `counter` into `text`.
+local function xorStream(key: {integer}, nonce: {integer}, counter: integer, text: string): string
+    local stream: {integer} = {}
+    local parts: {string} = {}
+    local bytes: {integer} = {}
+    local length = #text
+    local at = 1
+    while at <= length do
+        block(key, counter, nonce, stream)
+        counter = counter + 1
+        local count = math.min(64, length - at + 1)
+        for offset = 0, count - 1 do
+            local value = stream[(offset // 4) + 1]
+            local keyByte = band(rshift(value, (offset % 4) * 8), 0xff)
+            bytes[offset + 1] = bxor(text:byte(at + offset), keyByte)
+        end
+        for offset = count + 1, #bytes do
+            bytes[offset] = nil
+        end
+        parts[#parts + 1] = string.char(unpack(bytes, 1, count))
+        at = at + 64
+    end
+
+    return table.concat(parts)
+end
+
+--- Runs the bare ChaCha20 cipher with a 32-byte key and a 12-byte nonce.
+export function chacha20(key: string, nonce: string, counter: integer, text: string): string
+    return xorStream(keyWords(key), nonceWords(nonce), counter, text)
+end
+
+-- TweetNaCl's limb addition.
+local function add1305(h: {integer}, c: {integer}): nil
+    local carry = 0
+    for index = 1, 17 do
+        carry = carry + h[index] + c[index]
+        h[index] = carry % 256
+        carry = carry // 256
+    end
+end
+
+const MINUS_P: {integer} = {5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 252}
+
+--- Computes the Poly1305 tag of `message` under a 32-byte one-time key.
+export function poly1305(key: string, message: string): string
+    local r: {integer} = {}
+    local h: {integer} = {}
+    local c: {integer} = {}
+    local x: {integer} = {}
+    for index = 1, 17 do
+        r[index] = index <= 16 and key:byte(index) or 0
+        h[index] = 0
+    end
+    r[4] = r[4] % 16
+    r[5] = r[5] - r[5] % 4
+    r[8] = r[8] % 16
+    r[9] = r[9] - r[9] % 4
+    r[12] = r[12] % 16
+    r[13] = r[13] - r[13] % 4
+    r[16] = r[16] % 16
+    local length = #message
+    local at = 1
+    while at <= length do
+        local count = math.min(16, length - at + 1)
+        for index = 1, 17 do
+            c[index] = 0
+        end
+        for index = 1, count do
+            c[index] = message:byte(at + index - 1)
+        end
+        c[count + 1] = 1
+        at = at + count
+        add1305(h, c)
+        for i = 1, 17 do
+            local sum = 0
+            for j = 1, 17 do
+                if j <= i then
+                    sum = sum + h[j] * r[i - j + 1]
+                else
+                    sum = sum + h[j] * 320 * r[i + 17 - j + 1]
+                end
+            end
+            x[i] = sum
+        end
+        local u = 0
+        for index = 1, 16 do
+            u = u + x[index]
+            h[index] = u % 256
+            u = u // 256
+        end
+        u = u + x[17]
+        h[17] = u % 4
+        u = 5 * (u // 4)
+        for index = 1, 16 do
+            u = u + h[index]
+            h[index] = u % 256
+            u = u // 256
+        end
+        h[17] = h[17] + u
+    end
+    local g: {integer} = {}
+    for index = 1, 17 do
+        g[index] = h[index]
+    end
+    add1305(h, MINUS_P)
+    -- A set top bit means h - p went negative, so h was already reduced.
+    if h[17] >= 128 then
+        for index = 1, 17 do
+            h[index] = g[index]
+        end
+    end
+    for index = 1, 16 do
+        c[index] = key:byte(index + 16)
+    end
+    c[17] = 0
+    add1305(h, c)
+    local out: {string} = {}
+    for index = 1, 16 do
+        out[index] = string.char(h[index])
+    end
+
+    return table.concat(out)
+end
+
+local function littleLength(value: integer): string
+    local bytes: {string} = {}
+    for index = 1, 8 do
+        bytes[index] = string.char(value % 256)
+        value = value // 256
+    end
+
+    return table.concat(bytes)
+end
+
+local function pad16(length: integer): string
+    local remainder = length % 16
+
+    return remainder == 0 and "" or string.rep("\0", 16 - remainder)
+end
+
+local function macInput(aad: string, ciphertext: string): string
+    return aad .. pad16(#aad) .. ciphertext .. pad16(#ciphertext) .. littleLength(#aad) .. littleLength(#ciphertext)
+end
+
+local function oneTimeKey(key: {integer}, nonce: {integer}): string
+    local stream: {integer} = {}
+    block(key, 0, nonce, stream)
+    local bytes: {string} = {}
+    for index = 1, 8 do
+        local value = stream[index]
+        bytes[index] = string.char(
+            band(value, 0xff),
+            band(rshift(value, 8), 0xff),
+            band(rshift(value, 16), 0xff),
+            band(rshift(value, 24), 0xff)
+        )
+    end
+
+    return table.concat(bytes)
+end
+
+--- A prepared ChaCha20-Poly1305 key.
+export record Aead
+    @readonly words: {integer}
+end
+
+--- Prepares a 32-byte key.
+export function aead(key: string): Aead
+    return Aead(words = keyWords(key))
+end
+
+--- Encrypts and authenticates, returning the ciphertext and 16-byte tag.
+export function seal(context: Aead, nonce: string, aad: string, plaintext: string): string
+    local words = nonceWords(nonce)
+    local ciphertext = xorStream(context.words, words, 1, plaintext)
+
+    return ciphertext .. poly1305(oneTimeKey(context.words, words), macInput(aad, ciphertext))
+end
+
+--- Authenticates and decrypts, or returns nil when the tag does not match.
+export function open(context: Aead, nonce: string, aad: string, sealed: string): string?
+    if #sealed < 16 then
+        return nil
+    end
+    local words = nonceWords(nonce)
+    local ciphertext = sealed:sub(1, #sealed - 16)
+    local expected = poly1305(oneTimeKey(context.words, words), macInput(aad, ciphertext))
+    local received = sealed:sub(#sealed - 15)
+    local difference = 0
+    for index = 1, 16 do
+        difference = bor(difference, bxor(expected:byte(index), received:byte(index)))
+    end
+    if difference ~= 0 then
+        return nil
+    end
+
+    return xorStream(context.words, words, 1, ciphertext)
+end
