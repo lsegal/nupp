@@ -850,7 +850,7 @@ end
 function M.macOSRustProviderUsesARelocatableInstallName()
     local driver = read(ROOT .. "/scripts/toolchain")
     assert(
-        driver:find('set -- "$CARGO" rustc \\n        --manifest-path "$ROOT/Cargo.toml" \\n        --package nupp-native', 1, true),
+        driver:find('set -- "$CARGO" rustc \\\n        --manifest-path "$ROOT/Cargo.toml" \\\n        --package nupp-native', 1, true),
         "the Rust provider is not built through cargo rustc"
     )
     assert(

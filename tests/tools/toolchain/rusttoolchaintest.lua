@@ -658,6 +658,7 @@ esac
     )
     env.NUPP_CARGO = nil
     env.NUPP_RUSTC = nil
+    env.NUPP_TEST_RUST_LIBRARY = "nupp_native.dll"
     env.CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER = "poison-gnullvm-linker"
     env.PATH = directory .. ":$PATH"
 
@@ -704,6 +705,7 @@ esac
     env.NUPP_CARGO = nil
     env.NUPP_RUSTC = nil
     env.NUPP_RUST_WINDOWS_ABI = "gnullvm"
+    env.NUPP_TEST_RUST_LIBRARY = "nupp_native.dll"
     env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "poison-gnu-linker"
     env.PATH = directory .. ":$PATH"
 
