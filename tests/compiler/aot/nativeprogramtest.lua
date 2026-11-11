@@ -693,9 +693,12 @@ function M.wideDivisionAgreesWithLuaJIT()
     local chunk = assert(io.open(dir .. "/host.lua", "wb"))
     chunk:write(lua, "\nos.exit(main())\n")
     chunk:close()
+    -- The runtime is found relative to `build/` rather than through an
+    -- absolute LUA_PATH: under Git Bash `HERE` is spelled `/c/...`, which a
+    -- native Windows `luajit` cannot open. `dir` is already native.
     local reference
     status, reference = run(
-        ("cd %s && LUA_PATH=%s luajit -joff host.lua"):format(quote(dir), quote(HERE .. "/../build/?.lua;;"))
+        ("cd %s && LUA_PATH='./?.lua;;' luajit -joff %s"):format(quote(HERE .. "/../build"), quote(dir .. "/host.lua"))
     )
     test.eq(status, 0, reference)
 
