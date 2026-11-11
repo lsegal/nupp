@@ -709,20 +709,18 @@ function M.providerByteCountsCannotExceedTheRequest()
     socket:close()
 end
 
-function M.netAndTlsSelectTheUnifiedRustProvider()
+function M.netAndTlsAreNuppProviders()
+    -- Sockets and TLS are Nupp; the native library is carried only for the
+    -- runtime's wake handle, which the reactor sleeps on.
     local netFeature = assert(native.feature("native.net"))
-    testAssert.eq(netFeature.provider, "nupp_native", "network provider")
-    testAssert.eq(netFeature.providerDriver, "native-rust", "network provider driver")
-    testAssert.eq(netFeature.providerFeature, "net", "network provider feature")
-    testAssert.eq(netFeature.library, "nupp_native", "network provider library")
+    testAssert.eq(netFeature.module, "nupp.runtime.provider.nativenet", "network provider module")
+    testAssert.eq(netFeature.providerFeature, "base", "network provider feature")
     local tlsFeature = assert(native.feature("native.tls"))
-    testAssert.eq(tlsFeature.provider, "nupp_native", "TLS provider")
-    testAssert.eq(tlsFeature.providerDriver, "native-rust", "TLS provider driver")
-    testAssert.eq(tlsFeature.providerFeature, "tls", "TLS provider feature")
-    testAssert.eq(tlsFeature.library, "nupp_native", "TLS provider library")
+    testAssert.eq(tlsFeature.module, "nupp.runtime.provider.nativetls", "TLS provider module")
+    testAssert.eq(tlsFeature.providerFeature, nil, "TLS asks the native library for nothing")
     local expanded = native.expand({["native.tls"] = true})
-    assert(expanded["native.net"], "TLS omitted its Rust transport")
-    assert(expanded["runtime.native"], "networking omitted the native ABI runtime")
+    assert(expanded["native.net"], "TLS omitted its network transport")
+    assert(expanded["runtime.native"], "networking omitted the native runtime it sleeps on")
 end
 
 return M

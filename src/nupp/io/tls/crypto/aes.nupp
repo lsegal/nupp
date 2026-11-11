@@ -1,0 +1,437 @@
+@!internal
+--[[AES-128/256 encryption and the GCM authenticated mode (FIPS 197, SP 800-38D).
+
+Only the forward cipher exists: GCM, the one mode TLS uses AES in, never runs
+the block cipher backwards. Blocks go through four 256-entry tables built once
+at load, and GHASH multiplies with Shoup's sixteen-entry tables for the session
+key. Both are table lookups indexed by secret data, so neither is constant
+time; the owner chose a TLS stack written in Nupp knowing LuaJIT gives no such
+guarantee (#3).
+
+Words are signed 32-bit values from `bit`, big-endian within a block.
+]]
+module nupp.io.tls.crypto.aes
+
+const bit = require("nupp.runtime.bitops")
+
+const band = bit.band
+const bor = bit.bor
+const bxor = bit.bxor
+const lshift = bit.lshift
+const rshift = bit.rshift
+const tobit = bit.tobit
+
+-- The S-box and the four round tables, built from GF(2^8) arithmetic.
+const SBOX: {integer} = {}
+const T0: {integer} = {}
+const T1: {integer} = {}
+const T2: {integer} = {}
+const T3: {integer} = {}
+
+do
+    local exp: {integer} = {}
+    local log: {integer} = {}
+    local value: integer = 1
+    for index = 0, 254 do
+        exp[index] = value
+        log[value] = index
+        -- Multiply by the generator 3.
+        local doubled = value * 2
+        if doubled >= 256 then
+            doubled = bxor(doubled, 0x11b)
+        end
+        value = bxor(value, doubled)
+    end
+
+    local function multiply(a: integer, b: integer): integer
+        if a == 0 or b == 0 then
+            return 0
+        end
+
+        return exp[(log[a] + log[b]) % 255]
+    end
+
+    for index = 0, 255 do
+        local inverse = index == 0 and 0 or exp[(255 - log[index]) % 255]
+        local s = inverse
+        local x = inverse
+        for _ = 1, 4 do
+            x = band(bor(lshift(x, 1), rshift(x, 7)), 0xff)
+            s = bxor(s, x)
+        end
+        s = bxor(s, 0x63)
+        SBOX[index] = s
+        local two = multiply(s, 2)
+        local three = multiply(s, 3)
+        local word = tobit(two * 16777216 + s * 65536 + s * 256 + three)
+        T0[index] = word
+        T1[index] = bor(rshift(word, 8), lshift(word, 24))
+        T2[index] = bor(rshift(word, 16), lshift(word, 16))
+        T3[index] = bor(rshift(word, 24), lshift(word, 8))
+    end
+end
+
+local function word(text: string, at: integer): integer
+    local a, b, c, d = text:byte(at, at + 3)
+
+    return tobit(((a * 256 + b) * 256 + c) * 256 + d)
+end
+
+local function wordBytes(value: integer): string
+    return string.char(
+        band(rshift(value, 24), 0xff),
+        band(rshift(value, 16), 0xff),
+        band(rshift(value, 8), 0xff),
+        band(value, 0xff)
+    )
+end
+
+--- An expanded encryption key.
+export record Key
+    @readonly rounds: integer
+    @readonly words: {integer}
+end
+
+--- Expands a 16- or 32-byte key.
+--- @raises string when the key is another length
+export function expand(key: string): Key
+    local length = #key
+    if length ~= 16 and length ~= 32 then
+        error("nupp: an AES key is 16 or 32 bytes", 2)
+    end
+    local nk = length // 4
+    local rounds = nk + 6
+    local words: {integer} = {}
+    for index = 0, nk - 1 do
+        words[index] = word(key, index * 4 + 1)
+    end
+    local rcon: integer = 1
+    for index = nk, 4 * (rounds + 1) - 1 do
+        local temp = words[index - 1]
+        if index % nk == 0 then
+            temp = bor(lshift(temp, 8), band(rshift(temp, 24), 0xff))
+            temp = tobit(
+                SBOX[
+                    band(rshift(temp, 24), 0xff)
+                ] * 16777216 + SBOX[
+                    band(rshift(temp, 16), 0xff)
+                ] * 65536 + SBOX[band(rshift(temp, 8), 0xff)] * 256 + SBOX[band(temp, 0xff)]
+            )
+            temp = bxor(temp, lshift(rcon, 24))
+            rcon = rcon * 2
+            if rcon >= 256 then
+                rcon = bxor(rcon, 0x11b)
+            end
+        elseif nk > 6 and index % nk == 4 then
+            temp = tobit(
+                SBOX[
+                    band(rshift(temp, 24), 0xff)
+                ] * 16777216 + SBOX[
+                    band(rshift(temp, 16), 0xff)
+                ] * 65536 + SBOX[band(rshift(temp, 8), 0xff)] * 256 + SBOX[band(temp, 0xff)]
+            )
+        end
+        words[index] = bxor(words[index - nk], temp)
+    end
+
+    return Key(rounds = rounds, words = words)
+end
+
+--- Encrypts one block given as four words, returning four words.
+export function encryptWords(
+    key: Key,
+    s0: integer,
+    s1: integer,
+    s2: integer,
+    s3: integer
+): (integer, integer, integer, integer)
+    local w = key.words
+    s0 = bxor(s0, w[0])
+    s1 = bxor(s1, w[1])
+    s2 = bxor(s2, w[2])
+    s3 = bxor(s3, w[3])
+    local at: integer = 4
+    for _ = 1, key.rounds - 1 do
+        local t0 = bxor(
+            T0[band(rshift(s0, 24), 0xff)],
+            T1[band(rshift(s1, 16), 0xff)],
+            T2[band(rshift(s2, 8), 0xff)],
+            T3[band(s3, 0xff)],
+            w[at]
+        )
+        local t1 = bxor(
+            T0[band(rshift(s1, 24), 0xff)],
+            T1[band(rshift(s2, 16), 0xff)],
+            T2[band(rshift(s3, 8), 0xff)],
+            T3[band(s0, 0xff)],
+            w[at + 1]
+        )
+        local t2 = bxor(
+            T0[band(rshift(s2, 24), 0xff)],
+            T1[band(rshift(s3, 16), 0xff)],
+            T2[band(rshift(s0, 8), 0xff)],
+            T3[band(s1, 0xff)],
+            w[at + 2]
+        )
+        local t3 = bxor(
+            T0[band(rshift(s3, 24), 0xff)],
+            T1[band(rshift(s0, 16), 0xff)],
+            T2[band(rshift(s1, 8), 0xff)],
+            T3[band(s2, 0xff)],
+            w[at + 3]
+        )
+        s0, s1, s2, s3 = t0, t1, t2, t3
+        at = at + 4
+    end
+
+    local function last(a: integer, b: integer, c: integer, d: integer, k: integer): integer
+        return bxor(
+            tobit(
+                SBOX[
+                    band(rshift(a, 24), 0xff)
+                ] * 16777216 + SBOX[
+                    band(rshift(b, 16), 0xff)
+                ] * 65536 + SBOX[band(rshift(c, 8), 0xff)] * 256 + SBOX[band(d, 0xff)]
+            ),
+            k
+        )
+    end
+
+    return last(
+        s0,
+        s1,
+        s2,
+        s3,
+        w[at]
+    ), last(s1, s2, s3, s0, w[at + 1]), last(s2, s3, s0, s1, w[at + 2]), last(s3, s0, s1, s2, w[at + 3])
+end
+
+--- Encrypts one 16-byte block.
+export function encryptBlock(key: Key, block: string): string
+    local a, b, c, d = encryptWords(key, word(block, 1), word(block, 5), word(block, 9), word(block, 13))
+
+    return wordBytes(a) .. wordBytes(b) .. wordBytes(c) .. wordBytes(d)
+end
+
+-- GHASH reduction constants for the four bits shifted out of each step.
+const LAST4: {
+    integer
+} = {
+    [0] = 0x0000,
+    0x1c20,
+    0x3840,
+    0x2460,
+    0x7080,
+    0x6ca0,
+    0x48c0,
+    0x54e0,
+    0xe100,
+    0xfd20,
+    0xd940,
+    0xc560,
+    0x9180,
+    0x8da0,
+    0xa9c0,
+    0xb5e0,
+}
+
+--- A GCM context: the cipher key and GHASH's tables for H.
+export record Gcm
+    @readonly key: Key
+    @readonly m0: {integer}
+    @readonly m1: {integer}
+    @readonly m2: {integer}
+    @readonly m3: {integer}
+end
+
+--- Prepares GCM for a 16- or 32-byte key.
+export function gcm(keyBytes: string): Gcm
+    local key = expand(keyBytes)
+    local v0, v1, v2, v3 = encryptWords(key, 0, 0, 0, 0)
+    local m0: {integer} = {[0] = 0}
+    local m1: {integer} = {[0] = 0}
+    local m2: {integer} = {[0] = 0}
+    local m3: {integer} = {[0] = 0}
+    m0[8], m1[8], m2[8], m3[8] = v0, v1, v2, v3
+    local index: integer = 4
+    while index > 0 do
+        local carry = band(v3, 1)
+        v3 = bor(rshift(v3, 1), lshift(v2, 31))
+        v2 = bor(rshift(v2, 1), lshift(v1, 31))
+        v1 = bor(rshift(v1, 1), lshift(v0, 31))
+        v0 = rshift(v0, 1)
+        if carry ~= 0 then
+            v0 = bxor(v0, tobit(0xe1000000))
+        end
+        m0[index], m1[index], m2[index], m3[index] = v0, v1, v2, v3
+        index = index // 2
+    end
+    index = 2
+    while index <= 8 do
+        for low = 1, index - 1 do
+            m0[index + low] = bxor(m0[index], m0[low])
+            m1[index + low] = bxor(m1[index], m1[low])
+            m2[index + low] = bxor(m2[index], m2[low])
+            m3[index + low] = bxor(m3[index], m3[low])
+        end
+        index = index * 2
+    end
+
+    return Gcm(key = key, m0 = m0, m1 = m1, m2 = m2, m3 = m3)
+end
+
+-- Multiplies the GHASH accumulator (x0..x3) by H.
+local function multiply(
+    context: Gcm,
+    x0: integer,
+    x1: integer,
+    x2: integer,
+    x3: integer
+): (integer, integer, integer, integer)
+    local m0, m1, m2, m3 = context.m0, context.m1, context.m2, context.m3
+    local z0: integer, z1: integer, z2: integer, z3: integer = 0, 0, 0, 0
+    local first = true
+    for position = 15, 0, -1 do
+        local source = position >= 12 and x3 or position >= 8 and x2 or position >= 4 and x1 or x0
+        local byte = band(rshift(source, (3 - position % 4) * 8), 0xff)
+        local low = band(byte, 0x0f)
+        local high = rshift(byte, 4)
+        if first then
+            z0, z1, z2, z3 = m0[low], m1[low], m2[low], m3[low]
+            first = false
+        else
+            local rem = band(z3, 0x0f)
+            z3 = bor(rshift(z3, 4), lshift(z2, 28))
+            z2 = bor(rshift(z2, 4), lshift(z1, 28))
+            z1 = bor(rshift(z1, 4), lshift(z0, 28))
+            z0 = bxor(rshift(z0, 4), lshift(LAST4[rem], 16))
+            z0, z1, z2, z3 = bxor(z0, m0[low]), bxor(z1, m1[low]), bxor(z2, m2[low]), bxor(z3, m3[low])
+        end
+        local rem = band(z3, 0x0f)
+        z3 = bor(rshift(z3, 4), lshift(z2, 28))
+        z2 = bor(rshift(z2, 4), lshift(z1, 28))
+        z1 = bor(rshift(z1, 4), lshift(z0, 28))
+        z0 = bxor(rshift(z0, 4), lshift(LAST4[rem], 16))
+        z0, z1, z2, z3 = bxor(z0, m0[high]), bxor(z1, m1[high]), bxor(z2, m2[high]), bxor(z3, m3[high])
+    end
+
+    return z0, z1, z2, z3
+end
+
+-- Absorbs `text` into the accumulator, zero-padding its last block.
+local function absorb(
+    context: Gcm,
+    text: string,
+    x0: integer,
+    x1: integer,
+    x2: integer,
+    x3: integer
+): (integer, integer, integer, integer)
+    local length = #text
+    local at: integer = 1
+    while at <= length do
+        local block = text:sub(at, at + 15)
+        if #block < 16 then
+            block = block .. string.rep("\0", 16 - #block)
+        end
+        x0 = bxor(x0, word(block, 1))
+        x1 = bxor(x1, word(block, 5))
+        x2 = bxor(x2, word(block, 9))
+        x3 = bxor(x3, word(block, 13))
+        x0, x1, x2, x3 = multiply(context, x0, x1, x2, x3)
+        at = at + 16
+    end
+
+    return x0, x1, x2, x3
+end
+
+-- CTR keystream applied to `text` starting at counter `counter` for `nonce`.
+local function ctr(context: Gcm, n0: integer, n1: integer, n2: integer, counter: integer, text: string): string
+    local key = context.key
+    local parts: {string} = {}
+    local length = #text
+    local at: integer = 1
+    local chars = string.char
+    while at <= length do
+        local k0, k1, k2, k3 = encryptWords(key, n0, n1, n2, tobit(counter))
+        counter = counter + 1
+        local a1, a2, a3, a4, b1, b2, b3, b4, c1, c2, c3, c4, d1, d2, d3, d4 = text:byte(at, at + 15)
+        if d4 ~= nil then
+            parts[
+                #parts + 1
+            ] = chars(
+                bxor(a1, band(rshift(k0, 24), 0xff)),
+                bxor(a2, band(rshift(k0, 16), 0xff)),
+                bxor(a3, band(rshift(k0, 8), 0xff)),
+                bxor(a4, band(k0, 0xff)),
+                bxor(b1, band(rshift(k1, 24), 0xff)),
+                bxor(b2, band(rshift(k1, 16), 0xff)),
+                bxor(b3, band(rshift(k1, 8), 0xff)),
+                bxor(b4, band(k1, 0xff)),
+                bxor(c1, band(rshift(k2, 24), 0xff)),
+                bxor(c2, band(rshift(k2, 16), 0xff)),
+                bxor(c3, band(rshift(k2, 8), 0xff)),
+                bxor(c4, band(k2, 0xff)),
+                bxor(d1, band(rshift(k3, 24), 0xff)),
+                bxor(d2, band(rshift(k3, 16), 0xff)),
+                bxor(d3, band(rshift(k3, 8), 0xff)),
+                bxor(d4, band(k3, 0xff))
+            )
+        else
+            local stream = wordBytes(k0) .. wordBytes(k1) .. wordBytes(k2) .. wordBytes(k3)
+            local tail: {string} = {}
+            for offset = 0, length - at do
+                tail[#tail + 1] = chars(bxor(text:byte(at + offset), stream:byte(offset + 1)))
+            end
+            parts[#parts + 1] = table.concat(tail)
+        end
+        at = at + 16
+    end
+
+    return table.concat(parts)
+end
+
+local function tag(context: Gcm, n0: integer, n1: integer, n2: integer, aad: string, ciphertext: string): string
+    local x0, x1, x2, x3 = absorb(context, aad, 0, 0, 0, 0)
+    x0, x1, x2, x3 = absorb(context, ciphertext, x0, x1, x2, x3)
+    local aadBits = #aad * 8
+    local textBits = #ciphertext * 8
+    x0 = bxor(x0, tobit(aadBits // 4294967296))
+    x1 = bxor(x1, tobit(aadBits % 4294967296))
+    x2 = bxor(x2, tobit(textBits // 4294967296))
+    x3 = bxor(x3, tobit(textBits % 4294967296))
+    x0, x1, x2, x3 = multiply(context, x0, x1, x2, x3)
+    local e0, e1, e2, e3 = encryptWords(context.key, n0, n1, n2, 1)
+
+    return wordBytes(bxor(x0, e0)) .. wordBytes(bxor(x1, e1)) .. wordBytes(bxor(x2, e2)) .. wordBytes(bxor(x3, e3))
+end
+
+--- Encrypts and authenticates `plaintext` under a 12-byte nonce, returning the
+--- ciphertext with its 16-byte tag appended.
+export function seal(context: Gcm, nonce: string, aad: string, plaintext: string): string
+    local n0, n1, n2 = word(nonce, 1), word(nonce, 5), word(nonce, 9)
+    local ciphertext = ctr(context, n0, n1, n2, 2, plaintext)
+
+    return ciphertext .. tag(context, n0, n1, n2, aad, ciphertext)
+end
+
+--- Authenticates and decrypts a sealed value, or returns nil when the tag does
+--- not match.
+export function open(context: Gcm, nonce: string, aad: string, sealed: string): string?
+    if #sealed < 16 then
+        return nil
+    end
+    local n0, n1, n2 = word(nonce, 1), word(nonce, 5), word(nonce, 9)
+    local ciphertext = sealed:sub(1, #sealed - 16)
+    local expected = tag(context, n0, n1, n2, aad, ciphertext)
+    local received = sealed:sub(#sealed - 15)
+    local difference: integer = 0
+    for index = 1, 16 do
+        difference = bor(difference, bxor(expected:byte(index), received:byte(index)))
+    end
+    if difference ~= 0 then
+        return nil
+    end
+
+    return ctr(context, n0, n1, n2, 2, ciphertext)
+end

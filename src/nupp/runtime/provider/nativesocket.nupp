@@ -1,0 +1,901 @@
+@!internal
+--[[Nonblocking sockets through LuaJIT's FFI: BSD sockets on Linux and Darwin,
+Winsock on Windows.
+
+Every function makes one system call (two at most) and returns at once; the
+reactor in [](nupp.runtime.provider.nativenet) decides when to call again.
+Failures come back as a reason in words the [](io) error classifier knows --
+"connection refused", "timed out", "permission denied" -- with the platform's
+code appended, the way the Rust provider this replaces reported them (#3).
+
+Descriptors are plain numbers: a file descriptor on POSIX, a `SOCKET` value on
+Windows. The platform tables below hold every constant and structure layout
+that differs between Linux, Darwin and Windows.
+]]
+module nupp.runtime.provider.nativesocket
+
+const ffi: any = require("ffi")
+const bit = require("nupp.runtime.bitops")
+
+local system: string = ffi.os
+local windows = system == "Windows"
+local darwin = system == "OSX"
+local linux = not windows and not darwin
+
+--- Address families as this module names them.
+export const INET = 4
+
+export const INET6 = 6
+export const UNIX = 1
+
+-- Platform constants.
+local AF_INET: integer = 2
+local AF_INET6: integer = linux and 10 or darwin and 30 or 23
+local AF_UNIX: integer = 1
+local SOCK_STREAM: integer = 1
+local SOCK_DGRAM: integer = 2
+local SOL_SOCKET: integer = linux and 1 or 0xffff
+local SO_REUSEADDR: integer = linux and 2 or 4
+local SO_REUSEPORT: integer = linux and 15 or 0x200
+local SO_KEEPALIVE: integer = linux and 9 or 8
+local SO_BROADCAST: integer = linux and 6 or 0x20
+local SO_ERROR: integer = linux and 4 or 0x1007
+local SO_NOSIGPIPE: integer = 0x1022
+local IPPROTO_IP: integer = 0
+local IPPROTO_TCP: integer = 6
+local IPPROTO_IPV6: integer = 41
+local TCP_NODELAY: integer = 1
+local TCP_KEEPIDLE: integer = linux and 4 or 0x10
+local IP_MULTICAST_TTL: integer = linux and 33 or 10
+local IP_MULTICAST_LOOP: integer = linux and 34 or 11
+local IP_ADD_MEMBERSHIP: integer = linux and 35 or 12
+local IP_DROP_MEMBERSHIP: integer = linux and 36 or 13
+local IPV6_MULTICAST_HOPS: integer = linux and 18 or 10
+local IPV6_MULTICAST_LOOP: integer = linux and 19 or 11
+local IPV6_JOIN_GROUP: integer = linux and 20 or 12
+local IPV6_LEAVE_GROUP: integer = linux and 21 or 13
+local MSG_NOSIGNAL: integer = linux and 0x4000 or 0
+local SHUT_WR: integer = 1
+local F_GETFL: integer = 3
+local F_SETFL: integer = 4
+local O_NONBLOCK: integer = linux and 2048 or 4
+
+--- Poll event bits, which all three platforms share for these values.
+export const POLLIN = windows and 0x0300 or 1
+
+export const POLLOUT = windows and 0x0010 or 4
+export const POLLERR = windows and 0x0001 or 8
+export const POLLHUP = windows and 0x0002 or 16
+export const POLLNVAL = windows and 0x0004 or 32
+
+-- Error codes.
+local EINTR: integer = windows and 10004 or 4
+local EAGAIN: integer = windows and 10035 or linux and 11 or 35
+local EINPROGRESS: integer = windows and 10036 or linux and 115 or 36
+local EALREADY: integer = windows and 10037 or linux and 114 or 37
+local EMSGSIZE: integer = windows and 10040 or linux and 90 or 40
+
+const MESSAGES: {[integer]: string} = windows
+    and {
+        [10013] = "permission denied",
+        [10022] = "invalid argument",
+        [10024] = "too many open sockets",
+        [10040] = "message too long",
+        [10047] = "address family not supported",
+        [10048] = "address in use",
+        [10049] = "address not available",
+        [10050] = "network is down",
+        [10051] = "network is unreachable",
+        [10052] = "network dropped connection on reset",
+        [10053] = "connection aborted",
+        [10054] = "connection reset by peer",
+        [10055] = "no buffer space available",
+        [10056] = "already connected",
+        [10057] = "not connected",
+        [10058] = "the connection was shut down",
+        [10060] = "connection timed out",
+        [10061] = "connection refused",
+        [10064] = "host is down",
+        [10065] = "no route to host",
+        [10093] = "the socket library is not initialized",
+    }
+    or linux
+    and {
+        [1] = "operation not permitted",
+        [2] = "no such file or directory",
+        [13] = "permission denied",
+        [22] = "invalid argument",
+        [24] = "too many open files",
+        [32] = "broken pipe",
+        [90] = "message too long",
+        [97] = "address family not supported",
+        [98] = "address in use",
+        [99] = "address not available",
+        [100] = "network is down",
+        [101] = "network is unreachable",
+        [103] = "connection aborted",
+        [104] = "connection reset by peer",
+        [105] = "no buffer space available",
+        [106] = "already connected",
+        [107] = "not connected",
+        [110] = "connection timed out",
+        [111] = "connection refused",
+        [112] = "host is down",
+        [113] = "no route to host",
+    }
+    or {
+        [1] = "operation not permitted",
+        [2] = "no such file or directory",
+        [13] = "permission denied",
+        [22] = "invalid argument",
+        [24] = "too many open files",
+        [32] = "broken pipe",
+        [40] = "message too long",
+        [47] = "address family not supported",
+        [48] = "address in use",
+        [49] = "address not available",
+        [50] = "network is down",
+        [51] = "network is unreachable",
+        [53] = "connection aborted",
+        [54] = "connection reset by peer",
+        [55] = "no buffer space available",
+        [56] = "already connected",
+        [57] = "not connected",
+        [60] = "connection timed out",
+        [61] = "connection refused",
+        [64] = "host is down",
+        [65] = "no route to host",
+    }
+
+--- The words for an error code, with the code appended.
+export function message(code: integer): string
+    return (MESSAGES[code] or "system error") .. " (os error " .. code .. ")"
+end
+
+-- Structures. Darwin's carry a length byte before an 8-bit family.
+if darwin then
+    pcall(
+        ffi.cdef,
+        [[
+    typedef struct NuppNetSockaddrIn {
+        uint8_t len; uint8_t family; uint16_t port; uint8_t address[4]; uint8_t zero[8];
+    } NuppNetSockaddrIn;
+    typedef struct NuppNetSockaddrIn6 {
+        uint8_t len; uint8_t family; uint16_t port; uint32_t flowinfo; uint8_t address[16]; uint32_t scope;
+    } NuppNetSockaddrIn6;
+    typedef struct NuppNetSockaddrUn { uint8_t len; uint8_t family; char path[104]; } NuppNetSockaddrUn;
+    typedef struct NuppNetSockaddrHead { uint8_t len; uint8_t family; } NuppNetSockaddrHead;
+    typedef struct NuppNetAddrinfo {
+        int flags; int family; int socktype; int protocol; uint32_t addrlen;
+        char *canonname; void *addr; struct NuppNetAddrinfo *next;
+    } NuppNetAddrinfo;
+    ]]
+    )
+else
+    pcall(
+        ffi.cdef,
+        [[
+    typedef struct NuppNetSockaddrIn {
+        uint16_t family; uint16_t port; uint8_t address[4]; uint8_t zero[8];
+    } NuppNetSockaddrIn;
+    typedef struct NuppNetSockaddrIn6 {
+        uint16_t family; uint16_t port; uint32_t flowinfo; uint8_t address[16]; uint32_t scope;
+    } NuppNetSockaddrIn6;
+    typedef struct NuppNetSockaddrUn { uint16_t family; char path[108]; } NuppNetSockaddrUn;
+    typedef struct NuppNetSockaddrHead { uint16_t family; } NuppNetSockaddrHead;
+    ]]
+    )
+    if windows then
+        pcall(
+            ffi.cdef,
+            [[
+        typedef struct NuppNetAddrinfo {
+            int flags; int family; int socktype; int protocol; size_t addrlen;
+            char *canonname; void *addr; struct NuppNetAddrinfo *next;
+        } NuppNetAddrinfo;
+        ]]
+        )
+    else
+        pcall(
+            ffi.cdef,
+            [[
+        typedef struct NuppNetAddrinfo {
+            int flags; int family; int socktype; int protocol; uint32_t addrlen;
+            void *addr; char *canonname; struct NuppNetAddrinfo *next;
+        } NuppNetAddrinfo;
+        ]]
+        )
+    end
+end
+
+pcall(
+    ffi.cdef,
+    [[
+typedef struct NuppNetStorage { uint8_t bytes[128]; uint64_t align; } NuppNetStorage;
+typedef struct NuppNetMreq { uint8_t group[4]; uint8_t interface[4]; } NuppNetMreq;
+typedef struct NuppNetMreq6 { uint8_t group[16]; uint32_t interface; } NuppNetMreq6;
+]]
+)
+
+local lib: any
+local ws: any = nil
+if windows then
+    pcall(
+        ffi.cdef,
+        [[
+    typedef struct NuppNetPollFd { uint64_t fd; int16_t events; int16_t revents; } NuppNetPollFd;
+    typedef struct NuppNetWsaData { uint8_t bytes[512]; } NuppNetWsaData;
+    typedef struct NuppNetKeepalive { uint32_t enabled; uint32_t time; uint32_t interval; } NuppNetKeepalive;
+    int nupp_net_startup(uint16_t, NuppNetWsaData *) __asm__("WSAStartup");
+    int nupp_net_last_error(void) __asm__("WSAGetLastError");
+    uint64_t nupp_net_socket(int, int, int) __asm__("socket");
+    int nupp_net_close(uint64_t) __asm__("closesocket");
+    int nupp_net_ioctl(uint64_t, uint32_t, uint32_t *) __asm__("ioctlsocket");
+    int nupp_net_wsaioctl(uint64_t, uint32_t, void *, uint32_t, void *, uint32_t, uint32_t *, void *, void *)
+        __asm__("WSAIoctl");
+    int nupp_net_bind(uint64_t, const void *, int) __asm__("bind");
+    int nupp_net_listen(uint64_t, int) __asm__("listen");
+    uint64_t nupp_net_accept(uint64_t, void *, int *) __asm__("accept");
+    int nupp_net_connect(uint64_t, const void *, int) __asm__("connect");
+    int nupp_net_recv(uint64_t, void *, int, int) __asm__("recv");
+    int nupp_net_send(uint64_t, const void *, int, int) __asm__("send");
+    int nupp_net_recvfrom(uint64_t, void *, int, int, void *, int *) __asm__("recvfrom");
+    int nupp_net_sendto(uint64_t, const void *, int, int, const void *, int) __asm__("sendto");
+    int nupp_net_shutdown(uint64_t, int) __asm__("shutdown");
+    int nupp_net_setsockopt(uint64_t, int, int, const void *, int) __asm__("setsockopt");
+    int nupp_net_getsockopt(uint64_t, int, int, void *, int *) __asm__("getsockopt");
+    int nupp_net_getsockname(uint64_t, void *, int *) __asm__("getsockname");
+    int nupp_net_getpeername(uint64_t, void *, int *) __asm__("getpeername");
+    int nupp_net_poll(NuppNetPollFd *, uint32_t, int) __asm__("WSAPoll");
+    int nupp_net_getaddrinfo(const char *, const char *, const NuppNetAddrinfo *, NuppNetAddrinfo **)
+        __asm__("getaddrinfo");
+    void nupp_net_freeaddrinfo(NuppNetAddrinfo *) __asm__("freeaddrinfo");
+    int nupp_net_inet_pton(int, const char *, void *) __asm__("inet_pton");
+    const char *nupp_net_inet_ntop(int, const void *, char *, size_t) __asm__("inet_ntop");
+    ]]
+    )
+    ws = ffi.load("ws2_32")
+    lib = ws as any
+    local data: any = ffi.new("NuppNetWsaData")
+    ws.nupp_net_startup(0x0202, data)
+else
+    pcall(
+        ffi.cdef,
+        [[
+    typedef struct NuppNetPollFd { int fd; int16_t events; int16_t revents; } NuppNetPollFd;
+    int nupp_net_socket(int, int, int) __asm__("socket");
+    int nupp_net_close(int) __asm__("close");
+    int nupp_net_fcntl(int, int, ...) __asm__("fcntl");
+    int nupp_net_bind(int, const void *, uint32_t) __asm__("bind");
+    int nupp_net_listen(int, int) __asm__("listen");
+    int nupp_net_accept(int, void *, uint32_t *) __asm__("accept");
+    int nupp_net_connect(int, const void *, uint32_t) __asm__("connect");
+    intptr_t nupp_net_recv(int, void *, size_t, int) __asm__("recv");
+    intptr_t nupp_net_send(int, const void *, size_t, int) __asm__("send");
+    intptr_t nupp_net_recvfrom(int, void *, size_t, int, void *, uint32_t *) __asm__("recvfrom");
+    intptr_t nupp_net_sendto(int, const void *, size_t, int, const void *, uint32_t) __asm__("sendto");
+    int nupp_net_shutdown(int, int) __asm__("shutdown");
+    int nupp_net_setsockopt(int, int, int, const void *, uint32_t) __asm__("setsockopt");
+    int nupp_net_getsockopt(int, int, int, void *, uint32_t *) __asm__("getsockopt");
+    int nupp_net_getsockname(int, void *, uint32_t *) __asm__("getsockname");
+    int nupp_net_getpeername(int, void *, uint32_t *) __asm__("getpeername");
+    int nupp_net_poll(NuppNetPollFd *, unsigned long, int) __asm__("poll");
+    int nupp_net_getaddrinfo(const char *, const char *, const NuppNetAddrinfo *, NuppNetAddrinfo **)
+        __asm__("getaddrinfo");
+    void nupp_net_freeaddrinfo(NuppNetAddrinfo *) __asm__("freeaddrinfo");
+    const char *nupp_net_gai_strerror(int) __asm__("gai_strerror");
+    int nupp_net_inet_pton(int, const char *, void *) __asm__("inet_pton");
+    const char *nupp_net_inet_ntop(int, const void *, char *, uint32_t) __asm__("inet_ntop");
+    unsigned int nupp_net_if_nametoindex(const char *) __asm__("if_nametoindex");
+    ]]
+    )
+    lib = ffi.C as any
+end
+
+local INVALID: any = windows and ffi.cast("uint64_t", -1) or -1
+
+local function lastError(): integer
+    if windows then
+        return ws.nupp_net_last_error() as integer
+    end
+
+    return ffi.errno() as integer
+end
+
+--- Whether local-path sockets are available.
+export const PATHS = not windows
+
+local function htons(value: integer): integer
+    return bit.bor(bit.rshift(value, 8), bit.lshift(bit.band(value, 0xff), 8))
+end
+
+--- A socket address with its length and family.
+export record Endpoint
+    @readonly storage: any
+    @readonly length: integer
+    @readonly family: integer
+end
+
+--- Parses an IP literal, with an optional IPv6 `%zone`, into an endpoint.
+--- Answers nil and why when it is not one.
+export function endpoint(host: string, port: integer): (Endpoint?, string?)
+    local bare = host
+    if bare:sub(1, 1) == "[" and bare:sub(-1) == "]" then
+        bare = bare:sub(2, -2)
+    end
+    local zone: string? = nil
+    local percent = bare:find("%", 1, true)
+    if percent ~= nil then
+        zone = bare:sub(percent + 1)
+        bare = bare:sub(1, percent - 1)
+    end
+    local four: any = ffi.new("uint8_t[4]")
+    if zone == nil and lib.nupp_net_inet_pton(AF_INET, bare, four) == 1 then
+        local address: any = ffi.new("NuppNetSockaddrIn")
+        if darwin then
+            address.len = ffi.sizeof("NuppNetSockaddrIn")
+        end
+        address.family = AF_INET
+        address.port = htons(port)
+        ffi.copy(address.address, four, 4)
+
+        return Endpoint(storage = address, length = ffi.sizeof("NuppNetSockaddrIn") as integer, family = INET), nil
+    end
+    local sixteen: any = ffi.new("uint8_t[16]")
+    if lib.nupp_net_inet_pton(AF_INET6, bare, sixteen) == 1 then
+        local scope: integer = 0
+        if zone ~= nil then
+            if (zone as string):find("^%d+$") ~= nil then
+                scope = tonumber(zone) as integer
+            elseif not windows then
+                scope = lib.nupp_net_if_nametoindex(zone) as integer
+                if scope == 0 then
+                    return nil, "unknown interface " .. (zone as string)
+                end
+            else
+                return nil, "an interface zone must be a number on this platform"
+            end
+        end
+        local address: any = ffi.new("NuppNetSockaddrIn6")
+        if darwin then
+            address.len = ffi.sizeof("NuppNetSockaddrIn6")
+        end
+        address.family = AF_INET6
+        address.port = htons(port)
+        address.scope = scope
+        ffi.copy(address.address, sixteen, 16)
+
+        return Endpoint(storage = address, length = ffi.sizeof("NuppNetSockaddrIn6") as integer, family = INET6), nil
+    end
+    if zone ~= nil then
+        return nil, "a zone needs an IPv6 address"
+    end
+
+    return nil, "not an IP address: " .. host
+end
+
+--- A local-path endpoint.
+export function pathendpoint(path: string): (Endpoint?, string?)
+    if not PATHS then
+        return nil, "path network endpoints are unavailable on this platform"
+    end
+    local limit = darwin and 103 or 107
+    if #path > limit or path == "" then
+        return nil, "the socket path is too long"
+    end
+    local address: any = ffi.new("NuppNetSockaddrUn")
+    if darwin then
+        address.len = ffi.sizeof("NuppNetSockaddrUn")
+    end
+    address.family = AF_UNIX
+    ffi.copy(address.path, path)
+
+    return Endpoint(storage = address, length = ffi.sizeof("NuppNetSockaddrUn") as integer, family = UNIX), nil
+end
+
+--- Resolves a host name to its endpoints, in the order the resolver gave them.
+--- This is the one call that may block, for as long as the resolver takes.
+export function resolve(host: string, port: integer): ({Endpoint}?, string?)
+    local literal = endpoint(host, port)
+    if literal ~= nil then
+        return {literal as Endpoint}, nil
+    end
+    local hints: any = ffi.new("NuppNetAddrinfo")
+    hints.socktype = SOCK_STREAM
+    local result: any = ffi.new("NuppNetAddrinfo *[1]")
+    local status = lib.nupp_net_getaddrinfo(host, tostring(port), hints, result) as integer
+    if status ~= 0 then
+        local detail: string
+        if windows then
+            detail = (MESSAGES[status] or "no such host is known") .. " (os error " .. status .. ")"
+        else
+            detail = ffi.string(lib.nupp_net_gai_strerror(status)) as string
+        end
+
+        return nil, "failed to lookup address information: " .. detail
+    end
+    local out: {Endpoint} = {}
+    local entry: any = result[0]
+    while entry ~= nil do
+        local family = entry.family as integer
+        if family == AF_INET or family == AF_INET6 then
+            local length = tonumber(entry.addrlen) as integer
+            local storage: any = ffi.new("NuppNetStorage")
+            ffi.copy(storage, entry.addr, length)
+            out[#out + 1] = Endpoint(storage = storage, length = length, family = family == AF_INET and INET or INET6)
+        end
+        entry = entry.next
+    end
+    lib.nupp_net_freeaddrinfo(result[0])
+    if #out == 0 then
+        return nil, "failed to lookup address information: no address of a supported family"
+    end
+
+    return out, nil
+end
+
+local function nativeFamily(family: integer): integer
+    return family == INET and AF_INET or family == INET6 and AF_INET6 or AF_UNIX
+end
+
+local function setInt(fd: number, level: integer, name: integer, value: integer): boolean
+    local cell: any = ffi.new("int[1]", value)
+
+    return lib.nupp_net_setsockopt(fd, level, name, cell, ffi.sizeof("int")) == 0
+end
+
+local function setByte(fd: number, level: integer, name: integer, value: integer): boolean
+    local cell: any = ffi.new("uint8_t[1]", value)
+
+    return lib.nupp_net_setsockopt(fd, level, name, cell, 1) == 0
+end
+
+local function descriptor(raw: any): number?
+    if windows then
+        if raw == INVALID then
+            return nil
+        end
+
+        return tonumber(raw) as number
+    end
+    if raw < 0 then
+        return nil
+    end
+
+    return tonumber(raw) as number
+end
+
+local function makeNonblocking(fd: number): boolean
+    if windows then
+        local on: any = ffi.new("uint32_t[1]", 1)
+
+        return ws.nupp_net_ioctl(fd, 0x8004667e, on) == 0
+    end
+    local flags = lib.nupp_net_fcntl(fd, F_GETFL) as integer
+    if flags < 0 then
+        return false
+    end
+
+    return lib.nupp_net_fcntl(fd, F_SETFL, ffi.cast("int", bit.bor(flags, O_NONBLOCK))) == 0
+end
+
+local function prepare(fd: number): nil
+    if darwin then
+        setInt(fd, SOL_SOCKET, SO_NOSIGPIPE, 1)
+    end
+end
+
+--- Opens a nonblocking socket of `family` (`INET`, `INET6` or `UNIX`), stream or
+--- datagram.
+export function open(family: integer, datagram: boolean): (number?, string?)
+    local raw: any = lib.nupp_net_socket(nativeFamily(family), datagram and SOCK_DGRAM or SOCK_STREAM, 0)
+    local fd = descriptor(raw)
+    if fd == nil then
+        return nil, message(lastError())
+    end
+    if not makeNonblocking(fd as number) then
+        local code = lastError()
+        lib.nupp_net_close(fd)
+
+        return nil, message(code)
+    end
+    prepare(fd as number)
+    if windows and datagram then
+        -- An ICMP port-unreachable for an earlier send must not fail the next
+        -- receive (SIO_UDP_CONNRESET off).
+        local off: any = ffi.new("uint32_t[1]", 0)
+        local returned: any = ffi.new("uint32_t[1]")
+        ws.nupp_net_wsaioctl(fd, 0x9800000C, off, 4, nil, 0, returned, nil, nil)
+    end
+
+    return fd, nil
+end
+
+--- Closes a socket.
+export function close(fd: number): nil
+    lib.nupp_net_close(fd)
+end
+
+--- Sets SO_REUSEADDR, as listeners on POSIX do.
+export function reuseaddress(fd: number): nil
+    if not windows then
+        setInt(fd, SOL_SOCKET, SO_REUSEADDR, 1)
+    end
+end
+
+--- Sets load-balancing port reuse where the platform has it.
+export function reuseport(fd: number): (boolean, string?)
+    if not linux then
+        return false, "load-balancing port reuse is not supported on this platform"
+    end
+    if not setInt(fd, SOL_SOCKET, SO_REUSEPORT, 1) then
+        return false, message(lastError())
+    end
+
+    return true, nil
+end
+
+--- Binds to an endpoint.
+export function bind(fd: number, at: Endpoint): (boolean, string?)
+    if lib.nupp_net_bind(fd, at.storage, at.length) ~= 0 then
+        return false, message(lastError())
+    end
+
+    return true, nil
+end
+
+--- Starts listening.
+export function listen(fd: number, backlog: integer): (boolean, string?)
+    if lib.nupp_net_listen(fd, backlog) ~= 0 then
+        return false, message(lastError())
+    end
+
+    return true, nil
+end
+
+--- Whether an error code is a transient accept failure worth retrying later.
+local function transientAccept(code: integer): boolean
+    if windows then
+        return code == 10053 or code == 10054 or code == 10055 or code == 10024
+    end
+
+    return code == EINTR
+        or code == (linux and 103 or 53)
+        or code == (linux and 104 or 54)
+        or code == 24
+        or code == 23
+        or code == (linux and 105 or 55)
+        or code == 12
+        or code == (linux and 71 or 100)
+end
+
+--- Accepts one connection: a descriptor, nil when none is waiting (or a
+--- transient failure says to try later), or nil and why the listener failed.
+export function accept(fd: number): (number?, string?)
+    local raw: any = lib.nupp_net_accept(fd, nil, nil)
+    local accepted = descriptor(raw)
+    if accepted == nil then
+        local code = lastError()
+        if code == EAGAIN or transientAccept(code) then
+            return nil, nil
+        end
+
+        return nil, message(code)
+    end
+    makeNonblocking(accepted as number)
+    prepare(accepted as number)
+
+    return accepted, nil
+end
+
+--- Starts a connection: "done", "pending", or nil and why.
+export function connect(fd: number, to: Endpoint): (string?, string?)
+    if lib.nupp_net_connect(fd, to.storage, to.length) == 0 then
+        return "done", nil
+    end
+    local code = lastError()
+    if code == EINPROGRESS or code == EAGAIN or code == EALREADY or code == EINTR then
+        return "pending", nil
+    end
+
+    return nil, message(code)
+end
+
+--- The pending error on a socket (SO_ERROR), zero when there is none.
+export function pendingerror(fd: number): integer
+    local value: any = ffi.new("int[1]")
+    local length: any = ffi.new(windows and "int[1]" or "uint32_t[1]", ffi.sizeof("int"))
+    if lib.nupp_net_getsockopt(fd, SOL_SOCKET, SO_ERROR, value, length) ~= 0 then
+        return lastError()
+    end
+
+    return value[0] as integer
+end
+
+--- Receives into `buffer`: the count (zero at end of stream), nil when nothing
+--- is ready, or nil and why.
+export function recv(fd: number, buffer: any, size: integer): (integer?, string?)
+    local count = tonumber(lib.nupp_net_recv(fd, buffer, size, 0)) as integer
+    if count >= 0 then
+        return count, nil
+    end
+    local code = lastError()
+    if code == EAGAIN or code == EINTR then
+        return nil, nil
+    end
+
+    return nil, message(code)
+end
+
+--- Sends from a pointer: the count taken, nil when the socket is full, or nil
+--- and why.
+export function send(fd: number, pointer: any, size: integer): (integer?, string?)
+    local count = tonumber(lib.nupp_net_send(fd, pointer, size, MSG_NOSIGNAL)) as integer
+    if count >= 0 then
+        return count, nil
+    end
+    local code = lastError()
+    if code == EAGAIN or code == EINTR then
+        return nil, nil
+    end
+
+    return nil, message(code)
+end
+
+--- Formats a socket address as a host literal and port, or nil for a path or
+--- an unknown family.
+export function describe(storage: any): (string?, integer?)
+    local head: any = ffi.cast("NuppNetSockaddrHead *", storage)
+    local family = head.family as integer
+    local text: any = ffi.new("char[64]")
+    if family == AF_INET then
+        local address: any = ffi.cast("NuppNetSockaddrIn *", storage)
+        if lib.nupp_net_inet_ntop(AF_INET, address.address, text, 64) == nil then
+            return nil, nil
+        end
+
+        return ffi.string(text) as string, htons(address.port as integer)
+    elseif family == AF_INET6 then
+        local address: any = ffi.cast("NuppNetSockaddrIn6 *", storage)
+        if lib.nupp_net_inet_ntop(AF_INET6, address.address, text, 64) == nil then
+            return nil, nil
+        end
+        local host = ffi.string(text) as string
+        local scope = address.scope as integer
+        if scope ~= 0 then
+            host = host .. "%" .. scope
+        end
+
+        return host, htons(address.port as integer)
+    end
+
+    return nil, nil
+end
+
+--- Receives one datagram: its length, source host and port; nil when none is
+--- waiting; or nil and why. A datagram longer than `size` is cut short and
+--- reported at its full length where the platform says it.
+export function recvfrom(fd: number, buffer: any, size: integer): (integer?, string?, integer?, string?)
+    local storage: any = ffi.new("NuppNetStorage")
+    local length: any = ffi.new(windows and "int[1]" or "uint32_t[1]", 128)
+    local count = tonumber(lib.nupp_net_recvfrom(fd, buffer, size, 0, storage, length)) as integer
+    if count < 0 then
+        local code = lastError()
+        if code == EAGAIN or code == EINTR then
+            return nil, nil, nil, nil
+        end
+        if code ~= EMSGSIZE then
+            return nil, nil, nil, message(code)
+        end
+        count = size + 1
+    end
+    local host, port = describe(storage)
+
+    return count, host, port, nil
+end
+
+--- Sends a datagram: the count sent, nil when the socket is full, or nil and why.
+export function sendto(fd: number, pointer: any, size: integer, to: Endpoint): (integer?, string?)
+    local count = tonumber(lib.nupp_net_sendto(fd, pointer, size, MSG_NOSIGNAL, to.storage, to.length)) as integer
+    if count >= 0 then
+        return count, nil
+    end
+    local code = lastError()
+    if code == EAGAIN or code == EINTR then
+        return nil, nil
+    end
+
+    return nil, message(code)
+end
+
+--- Ends the sending half.
+export function shutdownwrite(fd: number): (boolean, string?)
+    if lib.nupp_net_shutdown(fd, SHUT_WR) ~= 0 then
+        return false, message(lastError())
+    end
+
+    return true, nil
+end
+
+--- The local or peer address of a socket as a host literal and port.
+export function address(fd: number, peer: boolean): (string?, integer?)
+    local storage: any = ffi.new("NuppNetStorage")
+    local length: any = ffi.new(windows and "int[1]" or "uint32_t[1]", 128)
+    local status = peer and lib.nupp_net_getpeername(fd, storage, length)
+        or lib.nupp_net_getsockname(fd, storage, length)
+    if status ~= 0 then
+        return nil, nil
+    end
+
+    return describe(storage)
+end
+
+--- The bound port, or -1.
+export function port(fd: number): integer
+    local _, value = address(fd, false)
+
+    return value or -1
+end
+
+--- Sets TCP_NODELAY.
+export function nodelay(fd: number, enable: boolean): (boolean, string?)
+    if not setInt(fd, IPPROTO_TCP, TCP_NODELAY, enable and 1 or 0) then
+        return false, message(lastError())
+    end
+
+    return true, nil
+end
+
+--- Sets keepalive and its idle delay.
+export function keepalive(fd: number, enable: boolean, delayms: integer): (boolean, string?)
+    if windows then
+        local values: any = ffi.new("NuppNetKeepalive")
+        values.enabled = enable and 1 or 0
+        values.time = delayms
+        values.interval = 1000
+        local returned: any = ffi.new("uint32_t[1]")
+        if ws.nupp_net_wsaioctl(
+            fd,
+            0x98000004,
+            values,
+            ffi.sizeof("NuppNetKeepalive"),
+            nil,
+            0,
+            returned,
+            nil,
+            nil
+        ) ~= 0 then
+            return false, message(lastError())
+        end
+
+        return true, nil
+    end
+    if not setInt(fd, SOL_SOCKET, SO_KEEPALIVE, enable and 1 or 0) then
+        return false, message(lastError())
+    end
+    if enable then
+        local seconds = math.max(1, (delayms + 999) // 1000)
+        if not setInt(fd, IPPROTO_TCP, TCP_KEEPIDLE, seconds) then
+            return false, message(lastError())
+        end
+    end
+
+    return true, nil
+end
+
+--- Sets SO_BROADCAST.
+export function broadcast(fd: number, enable: boolean): (boolean, string?)
+    if not setInt(fd, SOL_SOCKET, SO_BROADCAST, enable and 1 or 0) then
+        return false, message(lastError())
+    end
+
+    return true, nil
+end
+
+--- Sets the multicast hop limit for a socket of `family`.
+export function multicastttl(fd: number, family: integer, ttl: integer): (boolean, string?)
+    local ok: boolean
+    if family == INET6 then
+        ok = setInt(fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, ttl)
+    elseif darwin then
+        ok = setByte(fd, IPPROTO_IP, IP_MULTICAST_TTL, ttl)
+    else
+        ok = setInt(fd, IPPROTO_IP, IP_MULTICAST_TTL, ttl)
+    end
+    if not ok then
+        return false, message(lastError())
+    end
+
+    return true, nil
+end
+
+--- Sets multicast loopback for a socket of `family`.
+export function multicastloop(fd: number, family: integer, enable: boolean): (boolean, string?)
+    local ok: boolean
+    if family == INET6 then
+        ok = setInt(fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, enable and 1 or 0)
+    elseif darwin then
+        ok = setByte(fd, IPPROTO_IP, IP_MULTICAST_LOOP, enable and 1 or 0)
+    else
+        ok = setInt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, enable and 1 or 0)
+    end
+    if not ok then
+        return false, message(lastError())
+    end
+
+    return true, nil
+end
+
+--- Joins or leaves a multicast group. An empty interface address selects the
+--- default interface.
+export function membership(fd: number, group: string, interfaceAddress: string, join: boolean): (boolean, string?)
+    local target, why = endpoint(group, 0)
+    if target == nil then
+        return false, why
+    end
+    if target.family == INET then
+        local request: any = ffi.new("NuppNetMreq")
+        local groupAddress: any = ffi.cast("NuppNetSockaddrIn *", target.storage)
+        ffi.copy(request.group, groupAddress.address, 4)
+        if interfaceAddress ~= "" then
+            local local_, localWhy = endpoint(interfaceAddress, 0)
+            if local_ == nil or local_.family ~= INET then
+                return false, localWhy or "an IPv4 group needs an IPv4 interface address"
+            end
+            local source: any = ffi.cast("NuppNetSockaddrIn *", local_.storage)
+            ffi.copy(request.interface, source.address, 4)
+        end
+        if lib.nupp_net_setsockopt(
+            fd,
+            IPPROTO_IP,
+            join and IP_ADD_MEMBERSHIP or IP_DROP_MEMBERSHIP,
+            request,
+            ffi.sizeof("NuppNetMreq")
+        ) ~= 0 then
+            return false, message(lastError())
+        end
+
+        return true, nil
+    end
+    if interfaceAddress ~= "" then
+        return false, "an IPv6 group takes no IPv4 interface address"
+    end
+    local request: any = ffi.new("NuppNetMreq6")
+    local group6: any = ffi.cast("NuppNetSockaddrIn6 *", target.storage)
+    ffi.copy(request.group, group6.address, 16)
+    request.interface = group6.scope
+    if lib.nupp_net_setsockopt(
+        fd,
+        IPPROTO_IPV6,
+        join and IPV6_JOIN_GROUP or IPV6_LEAVE_GROUP,
+        request,
+        ffi.sizeof("NuppNetMreq6")
+    ) ~= 0 then
+        return false, message(lastError())
+    end
+
+    return true, nil
+end
+
+--- A reusable array of poll entries.
+export function pollset(count: integer): any
+    return ffi.new("NuppNetPollFd[?]", math.max(count, 1))
+end
+
+--- Polls `count` entries of `set` for at most `timeoutms` milliseconds,
+--- answering how many are ready (zero on interruption).
+export function poll(set: any, count: integer, timeoutms: integer): integer
+    if count == 0 then
+        return 0
+    end
+    local ready = lib.nupp_net_poll(set, count, timeoutms) as integer
+    if ready < 0 then
+        return 0
+    end
+
+    return ready
+end
+
+--- Whether descriptors are Winsock sockets, which `poll` cannot mix with the
+--- runtime's wake handle.
+export const WINSOCK = windows

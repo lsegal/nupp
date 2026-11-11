@@ -174,7 +174,7 @@ function M.unrelatedSourcesStayOutsideTheSimdSurface()
         "src/nupp/text.nupp",
         "src/nupp/runtime/tasks.nupp",
         "src/nupp/compiler/check/callexpr.nupp",
-        "native/crates/http/src/lib.rs",
+        "native/crates/abi/src/lib.rs",
         "tests/compiler/syntax/parsertest.lua",
         "bench/utf8simd/results/run.json",
         "bench/base64simd/compare.lua",

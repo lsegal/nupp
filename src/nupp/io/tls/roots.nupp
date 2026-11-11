@@ -1,0 +1,303 @@
+@!internal
+--[[The trust anchors a TLS client uses when it is given no authority.
+
+`SSL_CERT_FILE` and `SSL_CERT_DIR` come first, as they did for the Rust stack
+(#3): when either is set and not empty, the anchors are exactly what they name
+-- the file, and every regular file in the directory in sorted name order -- and
+the platform's store is not consulted. Otherwise the platform supplies them:
+the `ROOT` system store through crypt32 on Windows, and the system bundle
+file elsewhere (on macOS the one the system keeps at `/etc/ssl/cert.pem`).
+
+Anchors load once per process. A certificate the parser cannot use is skipped
+rather than failing the whole store, the way a native root store ignores the
+odd unusable entry.
+]]
+module nupp.io.tls.roots
+
+const x509 = require("nupp.io.tls.crypto.x509")
+const der = require("nupp.io.tls.crypto.der")
+const files = require("nupp.runtime.provider.nativefiles")
+const ffi = require("ffi")
+const bit = require("nupp.runtime.bitops")
+
+local function readFile(path: string): (string?, string?)
+    local file, why = io.open(path, "rb")
+    if file == nil then
+        return nil, why
+    end
+    local text = file:read("*a") as string?
+    file:close()
+
+    return text, nil
+end
+
+local function addPem(anchors: {x509.Certificate}, text: string): nil
+    local blocks = der.pem(text)
+    if blocks == nil then
+        return
+    end
+    for _, block in ipairs(blocks) do
+        if block.label == "CERTIFICATE" or block.label == "TRUSTED CERTIFICATE" then
+            local certificate = x509.parse(block.bytes)
+            if certificate ~= nil then
+                anchors[#anchors + 1] = certificate
+            end
+        end
+    end
+end
+
+local function configured(): ({x509.Certificate}?, string?)
+    local file = os.getenv("SSL_CERT_FILE")
+    local directory = os.getenv("SSL_CERT_DIR")
+    if file == "" then
+        file = nil
+    end
+    if directory == "" then
+        directory = nil
+    end
+    if file == nil and directory == nil then
+        return nil, nil
+    end
+    local anchors: {x509.Certificate} = {}
+    if file ~= nil then
+        local text, why = readFile(file as string)
+        if text == nil then
+            return nil, "the configured certificate file " .. (
+                file as string
+            ) .. " could not be read: " .. tostring(why)
+        end
+        addPem(anchors, text as string)
+    end
+    if directory ~= nil then
+        local entries, why = files.list(directory as string)
+        if entries == nil then
+            return nil, "the configured certificate directory " .. (
+                directory as string
+            ) .. " could not be read: " .. tostring(why)
+        end
+        local names: {string} = {}
+        for name, kind in entries as files.Entries do
+            if kind ~= "directory" then
+                names[#names + 1] = name
+            end
+        end
+        table.sort(names)
+        for _, name in ipairs(names) do
+            local text = readFile((directory as string) .. "/" .. name)
+            if text ~= nil then
+                addPem(anchors, text as string)
+            end
+        end
+    end
+
+    return anchors, nil
+end
+
+const BUNDLES: {
+    string
+} = {
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+    "/usr/local/share/certs/ca-root-nss.crt",
+    "/usr/local/etc/openssl/cert.pem",
+    "/etc/certs/ca-certificates.crt",
+}
+
+local function windowsStore(): {x509.Certificate}
+    -- Guarded: a second copy of this module (or another binding of crypt32)
+    -- may already have declared these.
+    pcall(
+        ffi.cdef,
+        [[
+    typedef struct NuppTlsCertContext {
+        uint32_t encodingType;
+        const uint8_t *encoded;
+        uint32_t length;
+        void *info;
+        void *store;
+    } NuppTlsCertContext;
+    void *nupp_tls_open_store(void *provider, const uint16_t *name) __asm__("CertOpenSystemStoreW");
+    const NuppTlsCertContext *nupp_tls_next_cert(void *store, const NuppTlsCertContext *previous)
+        __asm__("CertEnumCertificatesInStore");
+    int nupp_tls_close_store(void *store, uint32_t flags) __asm__("CertCloseStore");
+    ]]
+    )
+    local anchors: {x509.Certificate} = {}
+    local loaded, library: any = pcall(ffi.load, "crypt32")
+    if not loaded then
+        return anchors
+    end
+    -- `ROOT` holds the roots the user and machine trust; `AuthRoot` holds the
+    -- third-party roots Windows Update has delivered, which `ROOT` does not
+    -- list.
+    local seen: {[string]: boolean} = {}
+    for _, storeName in ipairs({"ROOT", "AuthRoot"}) do
+        local codes: {integer} = {storeName:byte(1, -1)}
+        codes[#codes + 1] = 0
+        local name: any = ffi.new("uint16_t[?]", #codes, codes)
+        local store: any = library.nupp_tls_open_store(nil, name)
+        if store ~= nil then
+            local context: any = library.nupp_tls_next_cert(store, nil)
+            while context ~= nil do
+                local bytes = ffi.string(context.encoded, context.length) as string
+                if not seen[bytes] then
+                    seen[bytes] = true
+                    local certificate = x509.parse(bytes)
+                    if certificate ~= nil then
+                        anchors[#anchors + 1] = certificate
+                    end
+                end
+                context = library.nupp_tls_next_cert(store, context)
+            end
+            library.nupp_tls_close_store(store, 0)
+        end
+    end
+
+    return anchors
+end
+
+local function platform(): ({x509.Certificate}?, string?)
+    if (ffi as any).os == "Windows" then
+        local anchors = windowsStore()
+        if #anchors == 0 then
+            return nil, "the system certificate store contains no usable certificates"
+        end
+
+        return anchors, nil
+    end
+    for _, path in ipairs(BUNDLES) do
+        local text = readFile(path)
+        if text ~= nil then
+            local anchors: {x509.Certificate} = {}
+            addPem(anchors, text as string)
+            if #anchors > 0 then
+                return anchors, nil
+            end
+        end
+    end
+
+    return nil, "the system certificate store could not be loaded: no certificates were found"
+end
+
+local cached: {x509.Certificate}? = nil
+local cachedWhy: string? = nil
+local loaded = false
+
+--- The process's default trust anchors, or nil and why there are none.
+export function system(): ({x509.Certificate}?, string?)
+    if not loaded then
+        loaded = true
+        local anchors, why = configured()
+        if anchors == nil and why == nil then
+            anchors, why = platform()
+        end
+        cached, cachedWhy = anchors, why
+    end
+
+    return cached, cachedWhy
+end
+
+-- Windows installs a root it trusts but has not delivered yet only when its
+-- own chain engine asks for one. Discovery asks that engine for the root of a
+-- peer's chain; validation then runs here as for any anchor.
+local function windowsDiscover(chain: {string}): x509.Certificate?
+    pcall(
+        ffi.cdef,
+        [[
+    typedef struct NuppTlsTrustStatus { uint32_t error; uint32_t info; } NuppTlsTrustStatus;
+    typedef struct NuppTlsChainElement {
+        uint32_t size;
+        const NuppTlsCertContext *certificate;
+        NuppTlsTrustStatus status;
+    } NuppTlsChainElement;
+    typedef struct NuppTlsSimpleChain {
+        uint32_t size;
+        NuppTlsTrustStatus status;
+        uint32_t count;
+        NuppTlsChainElement **elements;
+    } NuppTlsSimpleChain;
+    typedef struct NuppTlsChainContext {
+        uint32_t size;
+        NuppTlsTrustStatus status;
+        uint32_t count;
+        NuppTlsSimpleChain **chains;
+    } NuppTlsChainContext;
+    typedef struct NuppTlsEnhancedUsage { uint32_t count; const char **identifiers; } NuppTlsEnhancedUsage;
+    typedef struct NuppTlsUsageMatch { uint32_t kind; NuppTlsEnhancedUsage usage; } NuppTlsUsageMatch;
+    typedef struct NuppTlsChainPara { uint32_t size; NuppTlsUsageMatch requested; } NuppTlsChainPara;
+    const NuppTlsCertContext *nupp_tls_cert_create(uint32_t encoding, const uint8_t *bytes, uint32_t length)
+        __asm__("CertCreateCertificateContext");
+    int nupp_tls_cert_free(const NuppTlsCertContext *context) __asm__("CertFreeCertificateContext");
+    void *nupp_tls_store_open(const char *provider, uint32_t encoding, void *crypt, uint32_t flags, const void *para)
+        __asm__("CertOpenStore");
+    int nupp_tls_store_add(void *store, uint32_t encoding, const uint8_t *bytes, uint32_t length, uint32_t disposition,
+        void *added) __asm__("CertAddEncodedCertificateToStore");
+    int nupp_tls_chain_get(void *engine, const NuppTlsCertContext *certificate, void *time, void *additional,
+        const NuppTlsChainPara *para, uint32_t flags, void *reserved, const NuppTlsChainContext **chain)
+        __asm__("CertGetCertificateChain");
+    void nupp_tls_chain_free(const NuppTlsChainContext *chain) __asm__("CertFreeCertificateChain");
+    ]]
+    )
+    local loaded, library: any = pcall(ffi.load, "crypt32")
+    if not loaded or #chain == 0 then
+        return nil
+    end
+    local leaf: any = library.nupp_tls_cert_create(1, chain[1], #chain[1])
+    if leaf == nil then
+        return nil
+    end
+    -- CERT_STORE_PROV_MEMORY is provider number 2, passed as a pointer value.
+    local extra: any = library.nupp_tls_store_open(ffi.cast("const char *", 2), 0, nil, 0, nil)
+    if extra ~= nil then
+        for index = 2, #chain do
+            library.nupp_tls_store_add(extra, 1, chain[index], #chain[index], 4, nil)
+        end
+    end
+    local serverAuth: any = ffi.new("const char *[1]", {"1.3.6.1.5.5.7.3.1"})
+    local para: any = ffi.new("NuppTlsChainPara")
+    para.size = ffi.sizeof("NuppTlsChainPara") as integer
+    para.requested.kind = 0
+    para.requested.usage.count = 1
+    para.requested.usage.identifiers = serverAuth
+    local out: any = ffi.new("const NuppTlsChainContext *[1]")
+    local found: x509.Certificate? = nil
+    if library.nupp_tls_chain_get(nil, leaf, nil, extra, para, 0, nil, out) ~= 0 and out[0] ~= nil then
+        local context: any = out[0]
+        -- Untrusted root (0x20) or a partial chain (0x10000) means Windows has
+        -- no root for it either.
+        if bit.band(context.status.error, 0x10020) == 0 and context.count > 0 then
+            local simple: any = context.chains[0]
+            if simple.count > 0 then
+                local element: any = simple.elements[simple.count - 1]
+                local bytes = ffi.string(element.certificate.encoded, element.certificate.length) as string
+                found = x509.parse(bytes)
+            end
+        end
+        library.nupp_tls_chain_free(context)
+    end
+    library.nupp_tls_cert_free(leaf)
+    if extra ~= nil then
+        library.nupp_tls_close_store(extra, 0)
+    end
+
+    return found
+end
+
+--- Asks the platform for a trusted root of `chain` that the default anchors
+--- lack, adding it to them. Nil where the platform has no such facility or no
+--- such root.
+export function discover(chain: {string}): x509.Certificate?
+    if (ffi as any).os ~= "Windows" or cached == nil then
+        return nil
+    end
+    local root = windowsDiscover(chain)
+    if root ~= nil then
+        local anchors = cached as {x509.Certificate}
+        anchors[#anchors + 1] = root as x509.Certificate
+    end
+
+    return root
+end

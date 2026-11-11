@@ -1,25 +1,34 @@
 @!internal
 
 --[[
-Native reactor implementation bound to native targets.
+Native reactor implementation bound to native targets, written in Nupp.
 
 The table returned by this module implements the receiver-based protocol in
-[](io.net.internal.contracts). Listener, connection-request, stream, and datagram
-handles belong to the native runtime. The implementation retains scratch buffers
-within the current Lua state, and sleeps on the process-wide readiness
-generation every native family shares.
+[](io.net.internal.contracts) over nonblocking sockets from
+[](nupp.runtime.provider.nativesocket) (#3). Listener, connection-request,
+stream, and datagram handles are tables this module owns.
 
-Operations report readiness without running a private event loop. The public
-[](io.net) facade coordinates suspension and calls `run` through its `pump`
-operation. Accept and connect polling distinguish pending work from errors;
-stream reads report EOF through `ended`, and queued writes expose their pending
-byte count separately.
+Nothing here runs a thread. Each socket keeps bounded queues -- a megabyte of
+received bytes, a megabyte waiting to be sent, a thousand accepted connections,
+two hundred and fifty-six datagrams -- and every provider call, plus every
+`run` pass the public [](io.net) facade makes through `pump`, moves bytes
+between those queues and the sockets with nonblocking system calls. A socket
+whose queue is full stops being polled for it, so a peer nobody is reading
+cannot keep the reactor spinning. `run` with a timeout sleeps in one `poll`
+(`WSAPoll` on Windows) over every live socket and the runtime's wake handle, so
+a program waiting on a socket and on another native family at once wakes for
+either.
 
-The artifact requires native networking support. Every created handle has a
-matching release operation; closing a connect request and closing its resulting
-stream are separate responsibilities. Address values use
-[](io.net.Address), and TLS implementations that consume these stream handles
-must agree with their native representation.
+Name resolution is the exception to returning at once: a connect to a name
+resolves it with the platform resolver before its first attempt. Each address
+is then tried in turn under one deadline for the whole connect.
+
+Every created handle has a matching release operation; closing a connect
+request and closing its resulting stream are separate responsibilities. A
+stream whose sending half was ended before it was closed lingers for up to a
+second, draining what the peer still sends, so the peer reads the end of the
+stream rather than a reset. Address values use [](io.net.Address), and TLS
+sessions consume these stream handles through this same provider.
 ]]
 module nupp.runtime.provider.nativenet
 
@@ -27,164 +36,575 @@ local span = require("bytes.span")
 
 local contract = require("io.net.internal.contracts")
 local shared = require("nupp.io.net.types")
-local ffi = require("ffi")
-local ffiString: function(borrows source: const uint8[?], count: integer): string = ffi.string as any
-const READ_SIZE = 65536
-const HOST_SIZE = 64
-
+const socket = require("nupp.runtime.provider.nativesocket")
+const platform = require("nupp.runtime.provider.nativeplatform")
 const native = require("nupp.runtime.native")
+const storage = require("nupp.runtime.storage")
+const ffi: any = require("ffi")
 
-native.ffi.cdef[[
-typedef struct {
-    const uint8_t *data;
-    size_t length;
-} NuppNativeNetSlice;
-typedef struct {
-    NuppNativeNetSlice host;
-    uint16_t port;
-    uint32_t backlog;
-    int32_t reuse_port;
-} NuppNativeNetListenOptions;
-typedef struct {
-    NuppNativeNetSlice host;
-    uint16_t port;
-    uint64_t timeout_ms;
-} NuppNativeNetConnectOptions;
-typedef struct {
-    NuppNativeNetSlice path;
-    uint32_t backlog;
-} NuppNativeNetPathListenOptions;
-typedef struct {
-    NuppNativeNetSlice path;
-    uint64_t timeout_ms;
-} NuppNativeNetPathConnectOptions;
-typedef struct {
-    NuppNativeNetSlice host;
-    uint16_t port;
-    int32_t reuse_port;
-} NuppNativeNetDatagramOptions;
-typedef struct {
-    uint32_t size;
-    uint8_t family;
-    uint16_t port;
-    uint32_t scope_id;
-    uint32_t flowinfo;
-    uint8_t address[16];
-} NuppNativeNetEndpoint;
+const READ_SIZE = 65536
+const RECEIVE_HIGH_WATER = 1048576
+const SEND_HIGH_WATER = 1048576
+const ACCEPT_QUEUE_MAX = 1024
+const DATAGRAM_QUEUE_MAX = 256
+const DATAGRAM_MAX = 65536
+const DEFAULT_BACKLOG = 128
+const LINGER_MS = 1000
+-- The longest single sleep when the runtime has no wake handle to sleep on.
+const UNWAKEABLE_MS = 5
+-- Winsock cannot wait on a socket and an event at once, so a sleep there polls
+-- the wake event between slices this long.
+const WINDOWS_SLICE_MS = 5
 
-int32_t nuppNativeNetListenerCreate(const NuppNativeNetListenOptions *, uint64_t *);
-int32_t nuppNativeNetPathListenerCreate(const NuppNativeNetPathListenOptions *, uint64_t *);
-int32_t nuppNativeNetListenerPort(uint64_t, uint16_t *);
-int32_t nuppNativeNetListenerKind(uint64_t, uint32_t *);
-int32_t nuppNativeNetListenerAccept(uint64_t, uint32_t *, uint64_t *);
-int32_t nuppNativeNetListenerRelease(uint64_t);
-int32_t nuppNativeNetConnectCreate(const NuppNativeNetConnectOptions *, uint64_t *);
-int32_t nuppNativeNetPathConnectCreate(const NuppNativeNetPathConnectOptions *, uint64_t *);
-int32_t nuppNativeNetConnectPoll(uint64_t, uint32_t *, uint64_t *);
-int32_t nuppNativeNetConnectRelease(uint64_t);
-int32_t nuppNativeNetStreamRead(uint64_t, uint8_t *, size_t, uint32_t *, size_t *);
-int32_t nuppNativeNetStreamWrite(uint64_t, const uint8_t *, size_t, uint32_t *, size_t *);
-int32_t nuppNativeNetStreamPendingWrite(uint64_t, size_t *);
-int32_t nuppNativeNetStreamState(uint64_t, uint32_t *);
-int32_t nuppNativeNetStreamShutdownWrite(uint64_t);
-int32_t nuppNativeNetStreamLocalEndpoint(uint64_t, NuppNativeNetEndpoint *);
-int32_t nuppNativeNetStreamPeerEndpoint(uint64_t, NuppNativeNetEndpoint *);
-int32_t nuppNativeNetStreamSetNoDelay(uint64_t, int32_t);
-int32_t nuppNativeNetStreamSetKeepAliveMs(uint64_t, int32_t, uint64_t);
-int32_t nuppNativeNetStreamRelease(uint64_t);
-int32_t nuppNativeNetEndpointParse(NuppNativeNetSlice, uint16_t, NuppNativeNetEndpoint *);
-int32_t nuppNativeNetEndpointText(const NuppNativeNetEndpoint *, uint8_t *, size_t, size_t *);
-int32_t nuppNativeNetDatagramCreate(const NuppNativeNetDatagramOptions *, uint64_t *);
-int32_t nuppNativeNetDatagramPort(uint64_t, uint16_t *);
-int32_t nuppNativeNetDatagramReceiveEndpoint(
-    uint64_t, uint8_t *, size_t, uint32_t *, size_t *, NuppNativeNetEndpoint *, int32_t *);
-int32_t nuppNativeNetDatagramSendEndpoint(
-    uint64_t, const NuppNativeNetEndpoint *, const uint8_t *, size_t, uint32_t *, size_t *);
-int32_t nuppNativeNetDatagramSetBroadcast(uint64_t, int32_t);
-int32_t nuppNativeNetDatagramSetMulticastTtl(uint64_t, uint32_t);
-int32_t nuppNativeNetDatagramSetMulticastLoop(uint64_t, int32_t);
-int32_t nuppNativeNetDatagramMembership(
-    uint64_t, NuppNativeNetSlice, NuppNativeNetSlice, uint32_t, uint8_t, int32_t);
-int32_t nuppNativeNetDatagramRelease(uint64_t);
-]]
+const windows = socket.WINSOCK
 
-const C = native.C
-const NET_FEATURE = 256
-const NET_ENDPOINT_FEATURE = 8192
-const PENDING = 1
-const READ_EOF = 2
-const CONNECT_READY = 1
-const CONNECT_FAILED = 2
-const LISTENER_PATH = 1
-const DATAGRAM_MESSAGE = 0
-const DATAGRAM_SENT = 0
-const STREAM_READ_EOF = 1
-const STREAM_SHUTTING_DOWN = 8
-const STREAM_READ_FAILED = 16
-const STREAM_WRITE_FAILED = 32
+if windows then
+    pcall(
+        ffi.cdef,
+        [[
+    int32_t nupp_net_reset_event(void *) __asm__("ResetEvent");
+    uint32_t nupp_net_wait_one(void *, uint32_t) __asm__("WaitForSingleObject");
+    ]]
+    )
+else
+    pcall(ffi.cdef, [[
+    intptr_t nupp_net_read(int, void *, size_t) __asm__("read");
+    ]])
+end
+local C: any = ffi.C
+
+local function nowMs(): number
+    return (tonumber(platform.monotonic()) as number) / 1e6
+end
 
 local scratch: any = nil
 
-native.requireFeature(NET_FEATURE, "net")
-native.requireFeature(NET_ENDPOINT_FEATURE, "network endpoints")
-
-local function slice(text: string): any
-    local value = native.ffi.new("NuppNativeNetSlice")
-    -- The slice points into the Lua string; every caller hands it to C and returns
-    -- while `text` is still a live argument of its own, so the string outlives the
-    -- call.
-    @unsafe do
-        value.data = text
-    end
-    value.length = #text
-
-    return value
-end
-
-local function reason(prefix: string): string
-    return prefix .. ": " .. (native.ffi.string(C.nuppNativeLastError()) as string)
-end
-
-local function readBuffer(): any
+local function buffer(): any
     if scratch == nil then
-        scratch = native.ffi.new("uint8_t[?]", READ_SIZE)
+        scratch = ffi.new("uint8_t[?]", DATAGRAM_MAX + 1)
     end
 
     return scratch
 end
 
+local record Stream
+    @readonly fd: number
+    @readonly path: boolean
+    inbound: {string}
+    inboundBytes: integer
+    readEof: boolean
+    readError: string?
+    outbound: {string}
+    outboundBytes: integer
+    shuttingDown: boolean
+    writeClosed: boolean
+    writeError: string?
+    closed: boolean
+    lingerUntil: number?
+end
+
+local record Listener
+    @readonly fd: number
+    @readonly path: boolean
+    queue: {Stream}
+    failure: string?
+    closed: boolean
+end
+
+local record Connect
+    @readonly targets: {socket.Endpoint}
+    @readonly deadline: number?
+    index: integer
+    fd: number?
+    failure: string?
+    lastFailure: string?
+    collected: boolean
+    closed: boolean
+end
+
+local record Message
+    @readonly bytes: string
+    @readonly host: string
+    @readonly port: integer
+end
+
+local record Datagram
+    @readonly fd: number
+    @readonly family: integer
+    queue: {Message}
+    failure: string?
+    closed: boolean
+end
+
+-- Everything the reactor polls.
+local streams: {[Stream]: boolean} = {}
+local listeners: {[Listener]: boolean} = {}
+local connects: {[Connect]: boolean} = {}
+local datagrams: {[Datagram]: boolean} = {}
+
+local function newStream(fd: number, path: boolean): Stream
+    local stream = Stream(
+        fd = fd,
+        path = path,
+        inbound = {},
+        inboundBytes = 0,
+        readEof = false,
+        outbound = {},
+        outboundBytes = 0,
+        shuttingDown = false,
+        writeClosed = false,
+        closed = false
+    )
+    streams[stream] = true
+
+    return stream
+end
+
+local function closeStreamNow(stream: Stream): nil
+    if not stream.closed then
+        stream.closed = true
+        socket.close(stream.fd)
+    end
+    stream.inbound = {}
+    stream.inboundBytes = 0
+    stream.outbound = {}
+    stream.outboundBytes = 0
+    streams[stream] = nil
+end
+
+-- Moves what the socket has into the receive queue, up to its bound.
+local function fill(stream: Stream): boolean
+    local moved = false
+    while not stream.readEof and stream.readError == nil and stream.inboundBytes < RECEIVE_HIGH_WATER do
+        local into = buffer()
+        local count, why = socket.recv(stream.fd, into, READ_SIZE)
+        if count == nil then
+            if why ~= nil then
+                stream.readError = why
+                moved = true
+            end
+
+            break
+        end
+        moved = true
+        if count == 0 then
+            stream.readEof = true
+
+            break
+        end
+        if stream.lingerUntil == nil then
+            stream.inbound[#stream.inbound + 1] = ffi.string(into, count) as string
+            stream.inboundBytes = stream.inboundBytes + count
+        end
+    end
+
+    return moved
+end
+
+-- Sends what the send queue holds, ending the sending half once it drains
+-- after a shutdown was asked for.
+local function flush(stream: Stream): boolean
+    local moved = false
+    while stream.outboundBytes > 0 and stream.writeError == nil do
+        local chunk = stream.outbound[1]
+        local count, why = socket.send(stream.fd, chunk, #chunk)
+        if count == nil then
+            if why ~= nil then
+                stream.writeError = why
+                stream.outbound = {}
+                stream.outboundBytes = 0
+                stream.shuttingDown = false
+                moved = true
+            end
+
+            break
+        end
+        moved = true
+        stream.outboundBytes = stream.outboundBytes - count
+        if count == #chunk then
+            table.remove(stream.outbound, 1)
+        else
+            stream.outbound[1] = chunk:sub(count + 1)
+        end
+    end
+    if stream.shuttingDown and stream.outboundBytes == 0 and stream.writeError == nil then
+        local done, why = socket.shutdownwrite(stream.fd)
+        stream.shuttingDown = false
+        stream.writeClosed = true
+        if not done then
+            stream.writeError = why
+        end
+        moved = true
+    end
+
+    return moved
+end
+
+local function acceptInto(listener: Listener): boolean
+    local moved = false
+    while #listener.queue < ACCEPT_QUEUE_MAX and listener.failure == nil do
+        local fd, why = socket.accept(listener.fd)
+        if fd == nil then
+            if why ~= nil then
+                listener.failure = why
+                moved = true
+            end
+
+            break
+        end
+        listener.queue[#listener.queue + 1] = newStream(fd as number, listener.path)
+        moved = true
+    end
+
+    return moved
+end
+
+local function receiveInto(datagram: Datagram): boolean
+    local moved = false
+    while datagram.failure == nil do
+        local into = buffer()
+        local count, host, port, why = socket.recvfrom(datagram.fd, into, DATAGRAM_MAX)
+        if count == nil then
+            if why ~= nil then
+                datagram.failure = why
+                moved = true
+            end
+
+            break
+        end
+        moved = true
+        -- A full queue drops new datagrams, as a full socket buffer would.
+        if #datagram.queue < DATAGRAM_QUEUE_MAX and host ~= nil then
+            local landed = math.min(count as integer, DATAGRAM_MAX)
+            local bytes = ffi.string(into, landed) as string
+            if (count as integer) > DATAGRAM_MAX then
+                bytes = bytes .. "\0"
+            end
+            datagram.queue[#datagram.queue + 1] = Message(bytes = bytes, host = host as string, port = port as integer)
+        end
+    end
+
+    return moved
+end
+
+local function lingering(stream: Stream, now: number): boolean
+    if stream.lingerUntil == nil then
+        return false
+    end
+    if stream.readEof
+        or stream.readError ~= nil
+        or stream.writeError ~= nil
+        or now >= (stream.lingerUntil as number)
+    then
+        closeStreamNow(stream)
+    end
+
+    return true
+end
+
+-- One nonblocking pass over every socket, then an optional sleep of at most
+-- `timeoutms` when the pass moved nothing.
+local entries: any = nil
+local entryCapacity: integer = 0
+local entryOwners: {any} = {}
+
+local function pass(timeoutms: integer, wakeDescriptor: integer?): boolean
+    local count: integer = 0
+
+    local function ensure(size: integer): nil
+        if size > entryCapacity then
+            entryCapacity = math.max(size, entryCapacity * 2, 16)
+            entries = socket.pollset(entryCapacity)
+        end
+    end
+
+    local wanted: integer = 1
+    for _ in pairs(streams) do
+        wanted = wanted + 1
+    end
+    for _ in pairs(listeners) do
+        wanted = wanted + 1
+    end
+    for _ in pairs(connects) do
+        wanted = wanted + 1
+    end
+    for _ in pairs(datagrams) do
+        wanted = wanted + 1
+    end
+    ensure(wanted)
+
+    local function add(fd: number, events: integer, owner: any): nil
+        entries[count].fd = fd
+        entries[count].events = events
+        entries[count].revents = 0
+        count = count + 1
+        entryOwners[count] = owner
+    end
+
+    for stream in pairs(streams) do
+        local events: integer = 0
+        if not stream.readEof and stream.readError == nil and stream.inboundBytes < RECEIVE_HIGH_WATER then
+            events = events + socket.POLLIN
+        end
+        if stream.outboundBytes > 0 and stream.writeError == nil then
+            events = events + socket.POLLOUT
+        end
+        if events ~= 0 then
+            add(stream.fd, events, stream)
+        end
+    end
+    for listener in pairs(listeners) do
+        if #listener.queue < ACCEPT_QUEUE_MAX and listener.failure == nil then
+            add(listener.fd, socket.POLLIN, listener)
+        end
+    end
+    for request in pairs(connects) do
+        if request.fd ~= nil and request.failure == nil and not request.collected then
+            add(request.fd as number, socket.POLLOUT, request)
+        end
+    end
+    for datagram in pairs(datagrams) do
+        if #datagram.queue < DATAGRAM_QUEUE_MAX and datagram.failure == nil then
+            add(datagram.fd, socket.POLLIN, datagram)
+        end
+    end
+    local sockets = count
+    if wakeDescriptor ~= nil then
+        add(wakeDescriptor as integer, socket.POLLIN, false)
+    end
+    if count == 0 then
+        if timeoutms > 0 then
+            platform.sleep(timeoutms)
+        end
+
+        return false
+    end
+    local ready = socket.poll(entries, count, timeoutms)
+    if ready == 0 then
+        return false
+    end
+    local moved = false
+    local now = nowMs()
+    for index = 0, sockets - 1 do
+        local revents = entries[index].revents as integer
+        if revents ~= 0 then
+            local owner: any = entryOwners[index + 1]
+            if streams[owner] then
+                local stream = owner as Stream
+                if fill(stream) then
+                    moved = true
+                end
+                if stream.outboundBytes > 0 and flush(stream) then
+                    moved = true
+                end
+                lingering(stream, now)
+            elseif listeners[owner] then
+                if acceptInto(owner as Listener) then
+                    moved = true
+                end
+            elseif datagrams[owner] then
+                if receiveInto(owner as Datagram) then
+                    moved = true
+                end
+            elseif connects[owner] then
+                moved = true
+            end
+        end
+    end
+
+    return moved or ready > 0
+end
+
+local function serviceLingering(): nil
+    local now = nowMs()
+    for stream in pairs(streams) do
+        if stream.lingerUntil ~= nil then
+            fill(stream)
+            flush(stream)
+            lingering(stream, now)
+        end
+    end
+end
+
+local function sleep(timeoutms: integer): nil
+    local wake = native.wake()
+    if windows then
+        local event: any = nil
+        if wake ~= nil then
+            event = ffi.cast("void *", wake)
+            C.nupp_net_reset_event(event)
+            if not native.settle() then
+                return
+            end
+        else
+            native.settle()
+            timeoutms = math.min(timeoutms, UNWAKEABLE_MS) as integer
+        end
+        local deadline = nowMs() + timeoutms
+        while true do
+            local remaining = math.floor(deadline - nowMs()) as integer
+            if remaining <= 0 then
+                return
+            end
+            if pass(math.min(remaining, WINDOWS_SLICE_MS) as integer, nil) then
+                return
+            end
+            if event ~= nil and C.nupp_net_wait_one(event, 0) == 0 then
+                return
+            end
+        end
+    end
+    local descriptor: integer? = nil
+    if wake ~= nil then
+        descriptor = tonumber(wake) as integer
+        local drain = buffer()
+        while tonumber(C.nupp_net_read(descriptor, drain, 256)) > 0 do
+        end
+        if not native.settle() then
+            return
+        end
+    else
+        native.settle()
+        timeoutms = math.min(timeoutms, UNWAKEABLE_MS) as integer
+    end
+    pass(timeoutms, descriptor)
+end
+
+local function connectFailure(request: Connect): string
+    return "nupp: could not connect: " .. (request.failure as string)
+end
+
+-- Starts the next address of a connect request, recording why when none is
+-- left.
+local function attempt(request: Connect): nil
+    while request.failure == nil and request.fd == nil do
+        local target = request.targets[request.index]
+        if target == nil then
+            request.failure = request.lastFailure or "no address could be reached"
+
+            return
+        end
+        request.index = request.index + 1
+        local fd, why = socket.open(target.family, false)
+        if fd ~= nil then
+            local state, connectWhy = socket.connect(fd as number, target)
+            if state ~= nil then
+                request.fd = fd
+            else
+                socket.close(fd as number)
+                request.lastFailure = connectWhy
+            end
+        else
+            request.lastFailure = why
+        end
+    end
+end
+
+-- Checks a pending connect, answering a stream when one is established.
+local function progress(request: Connect): Stream?
+    while request.failure == nil do
+        if request.fd == nil then
+            attempt(request)
+            if request.fd == nil then
+                return nil
+            end
+        end
+        local fd = request.fd as number
+        local single = socket.pollset(1)
+        single[0].fd = fd
+        single[0].events = socket.POLLOUT
+        single[0].revents = 0
+        socket.poll(single, 1, 0)
+        local revents = single[0].revents as integer
+        local code = socket.pendingerror(fd)
+        if code ~= 0 then
+            socket.close(fd)
+            request.fd = nil
+            request.lastFailure = socket.message(code)
+        elseif revents ~= 0 then
+            request.fd = nil
+            request.collected = true
+
+            return newStream(fd, request.targets[1].family == socket.UNIX)
+        else
+            local deadline = request.deadline
+            if deadline ~= nil and nowMs() >= (deadline as number) then
+                socket.close(fd)
+                request.fd = nil
+                request.failure = "the connect did not finish before its deadline"
+            end
+
+            return nil
+        end
+    end
+
+    return nil
+end
+
+local function closedReason(prefix: string): string
+    return prefix .. ": the connection is closed"
+end
+
+local function take(stream: Stream, wanted: integer): string
+    local parts: {string} = {}
+    local taken: integer = 0
+    while taken < wanted and #stream.inbound > 0 do
+        local chunk = stream.inbound[1]
+        local room = wanted - taken
+        if #chunk <= room then
+            parts[#parts + 1] = chunk
+            taken = taken + #chunk
+            table.remove(stream.inbound, 1)
+        else
+            parts[#parts + 1] = chunk:sub(1, room)
+            stream.inbound[1] = chunk:sub(room + 1)
+            taken = wanted
+        end
+    end
+    stream.inboundBytes = stream.inboundBytes - taken
+
+    return table.concat(parts)
+end
+
+local function readInto(stream: Stream, wanted: integer): (string?, string?)
+    if stream.closed then
+        return nil, closedReason("nupp: could not read")
+    end
+    if stream.inboundBytes == 0 then
+        fill(stream)
+    end
+    if stream.inboundBytes > 0 then
+        return take(stream, math.min(wanted, READ_SIZE)), nil
+    end
+    if stream.readError ~= nil then
+        return nil, "nupp: could not read: " .. (stream.readError as string)
+    end
+
+    return "", nil
+end
+
+local function writeFrom(stream: Stream, bytes: string): (integer?, string?)
+    if stream.closed or stream.writeClosed or stream.shuttingDown then
+        return nil, closedReason("nupp: could not write")
+    end
+    if stream.writeError ~= nil then
+        return nil, "nupp: could not write: " .. (stream.writeError as string)
+    end
+    local room = SEND_HIGH_WATER - stream.outboundBytes
+    if room <= 0 or bytes == "" then
+        flush(stream)
+
+        return 0, nil
+    end
+    local taking = math.min(#bytes, room)
+    stream.outbound[#stream.outbound + 1] = taking == #bytes and bytes or bytes:sub(1, taking)
+    stream.outboundBytes = stream.outboundBytes + taking
+    flush(stream)
+
+    return taking, nil
+end
+
 local function create(): contract.Provider
-    const state = native.ffi.new("uint32_t[1]")
-    const flags = native.ffi.new("uint32_t[1]")
-    const handle = native.ffi.new("uint64_t[1]")
-    const count = native.ffi.new("size_t[1]")
-    const portOutput = native.ffi.new("uint16_t[1]")
-    const scalar = native.ffi.new("int32_t[1]")
-    -- An endpoint carries an IPv6 scope, so a link-local peer can be answered.
-    const endpoint = native.ffi.new("NuppNativeNetEndpoint[1]")
-    endpoint[0].size = native.ffi.sizeof("NuppNativeNetEndpoint")
-    const hostOutput = native.ffi.new("uint8_t[?]", HOST_SIZE)
-
-    local function streamFlags(stream: any): integer
-        if C.nuppNativeNetStreamState(stream, flags) ~= 0 then
-            return STREAM_READ_FAILED | STREAM_WRITE_FAILED
-        end
-
-        return tonumber(flags[0]) as integer
-    end
-
-    local function textAddress(value: any): (string?, integer?)
-        if value[0].family == 0 then
-            return nil
-        end
-        const status = C.nuppNativeNetEndpointText(value, hostOutput, HOST_SIZE, count)
-        if status ~= 0 then
-            return nil
-        end
-
-        return ffiString(hostOutput, tonumber(count[0]) as integer), tonumber(value[0].port) as integer
-    end
-
     return {
         listen = function(
             self: contract.Provider,
@@ -193,111 +613,175 @@ local function create(): contract.Provider
             backlog: integer,
             reusePort: boolean
         ): (any?, string?)
-
-            local options = native.ffi.new("NuppNativeNetListenOptions")
-            options.host = slice(host)
-            options.port = port
-            options.backlog = backlog
-            options.reuse_port = reusePort and 1 or 0
-            if C.nuppNativeNetListenerCreate(options, handle) ~= 0 then
-                return nil, reason("nupp: could not listen")
+            local at, why = socket.endpoint(host, port)
+            if at == nil then
+                return nil, "nupp: could not listen: invalid listen address: " .. tostring(why)
             end
+            local fd, openWhy = socket.open(at.family, false)
+            if fd == nil then
+                return nil, "nupp: could not listen: " .. tostring(openWhy)
+            end
+            socket.reuseaddress(fd as number)
+            if reusePort then
+                local reused, reuseWhy = socket.reuseport(fd as number)
+                if not reused then
+                    socket.close(fd as number)
 
-            return handle[0]
+                    return nil, "nupp: could not listen: " .. tostring(reuseWhy)
+                end
+            end
+            local bound, bindWhy = socket.bind(fd as number, at)
+            if bound then
+                bound, bindWhy = socket.listen(fd as number, backlog > 0 and backlog or DEFAULT_BACKLOG)
+            end
+            if not bound then
+                socket.close(fd as number)
+
+                return nil, "nupp: could not listen: " .. tostring(bindWhy)
+            end
+            local listener = Listener(fd = fd as number, path = false, queue = {}, closed = false)
+            listeners[listener] = true
+
+            return listener
         end,
 
         listenpath = function(self: contract.Provider, path: string, backlog: integer): (any?, string?)
-
-            local options = native.ffi.new("NuppNativeNetPathListenOptions")
-            options.path = slice(path)
-            options.backlog = backlog
-            if C.nuppNativeNetPathListenerCreate(options, handle) ~= 0 then
-                return nil, reason("nupp: could not listen")
+            local at, why = socket.pathendpoint(path)
+            if at == nil then
+                return nil, "nupp: could not listen: " .. tostring(why)
             end
+            local fd, openWhy = socket.open(socket.UNIX, false)
+            if fd == nil then
+                return nil, "nupp: could not listen: " .. tostring(openWhy)
+            end
+            local bound, bindWhy = socket.bind(fd as number, at)
+            if bound then
+                bound, bindWhy = socket.listen(fd as number, backlog > 0 and backlog or DEFAULT_BACKLOG)
+            end
+            if not bound then
+                socket.close(fd as number)
 
-            return handle[0]
+                return nil, "nupp: could not listen: " .. tostring(bindWhy)
+            end
+            local listener = Listener(fd = fd as number, path = true, queue = {}, closed = false)
+            listeners[listener] = true
+
+            return listener
         end,
 
         listenerport = function(self: contract.Provider, listener: any): integer
-            if C.nuppNativeNetListenerKind(listener, state) ~= 0 or state[0] == LISTENER_PATH then
-                return -1
-            end
-            if C.nuppNativeNetListenerPort(listener, portOutput) ~= 0 then
+            local held = listener as Listener
+            if held.closed or held.path then
                 return -1
             end
 
-            return tonumber(portOutput[0]) as integer
+            return socket.port(held.fd)
         end,
 
         accept = function(self: contract.Provider, listener: any): (any?, string?)
-            if C.nuppNativeNetListenerAccept(listener, state, handle) ~= 0 then
-                return nil, reason("nupp: could not accept")
+            local held = listener as Listener
+            if held.closed then
+                return nil, "nupp: could not accept: the listener is closed"
             end
-            if state[0] == PENDING then
-                return nil
+            if #held.queue == 0 then
+                acceptInto(held)
+            end
+            if #held.queue > 0 then
+                return table.remove(held.queue, 1)
+            end
+            if held.failure ~= nil then
+                return nil, "nupp: could not accept: " .. (held.failure as string)
             end
 
-            return handle[0]
+            return nil
         end,
 
         closelistener = function(self: contract.Provider, listener: any): nil
-            C.nuppNativeNetListenerRelease(listener)
+            local held = listener as Listener
+            if held.closed then
+                return
+            end
+            held.closed = true
+            socket.close(held.fd)
+            for _, stream in ipairs(held.queue) do
+                closeStreamNow(stream)
+            end
+            held.queue = {}
+            listeners[held] = nil
         end,
 
         connect = function(self: contract.Provider, host: string, port: integer, timeoutMs: integer): (any?, string?)
-
-            local options = native.ffi.new("NuppNativeNetConnectOptions")
-            options.host = slice(host)
-            options.port = port
-            options.timeout_ms = timeoutMs
-            if C.nuppNativeNetConnectCreate(options, handle) ~= 0 then
-                return nil, reason("nupp: could not connect")
+            local deadline = timeoutMs > 0 and nowMs() + timeoutMs or nil
+            local targets, why = socket.resolve(host, port)
+            local request = Connect(
+                targets = targets or {},
+                deadline = deadline,
+                index = 1,
+                failure = targets == nil and why or nil,
+                collected = false,
+                closed = false
+            )
+            if request.failure == nil and deadline ~= nil and nowMs() >= (deadline as number) then
+                request.failure = "the connect did not finish before its deadline"
             end
+            attempt(request)
+            connects[request] = true
 
-            return handle[0]
+            return request
         end,
 
         connectpath = function(self: contract.Provider, path: string, timeoutMs: integer): (any?, string?)
-
-            local options = native.ffi.new("NuppNativeNetPathConnectOptions")
-            options.path = slice(path)
-            options.timeout_ms = timeoutMs
-            if C.nuppNativeNetPathConnectCreate(options, handle) ~= 0 then
-                return nil, reason("nupp: could not connect")
+            local at, why = socket.pathendpoint(path)
+            if at == nil then
+                return nil, "nupp: could not connect: " .. tostring(why)
             end
+            local request = Connect(
+                targets = {at as socket.Endpoint},
+                deadline = timeoutMs > 0 and nowMs() + timeoutMs or nil,
+                index = 1,
+                collected = false,
+                closed = false
+            )
+            attempt(request)
+            connects[request] = true
 
-            return handle[0]
+            return request
         end,
 
         connectpoll = function(self: contract.Provider, request: any): (any?, string?)
-            if C.nuppNativeNetConnectPoll(request, state, handle) ~= 0 then
-                return nil, reason("nupp: could not connect")
+            local held = request as Connect
+            if held.closed then
+                return nil, "nupp: could not connect: the request is closed"
             end
-            if state[0] == CONNECT_FAILED then
-                return nil, reason("nupp: could not connect")
+            if held.collected then
+                return nil, "nupp: could not connect: the connection was already collected"
             end
-            if state[0] ~= CONNECT_READY then
-                return nil
+            local stream = progress(held)
+            if stream ~= nil then
+                return stream
+            end
+            if held.failure ~= nil then
+                return nil, connectFailure(held)
             end
 
-            return handle[0]
+            return nil
         end,
 
         closeconnect = function(self: contract.Provider, request: any): nil
-            C.nuppNativeNetConnectRelease(request)
+            local held = request as Connect
+            if held.closed then
+                return
+            end
+            held.closed = true
+            if held.fd ~= nil then
+                socket.close(held.fd as number)
+                held.fd = nil
+            end
+            connects[held] = nil
         end,
 
         read = function(self: contract.Provider, stream: any, wanted: integer): (string?, string?)
-            const taking = wanted < READ_SIZE and wanted or READ_SIZE
-            const into = readBuffer()
-            if C.nuppNativeNetStreamRead(stream, into, taking, state, count) ~= 0 then
-                return nil, reason("nupp: could not read")
-            end
-            if state[0] == PENDING or state[0] == READ_EOF then
-                return ""
-            end
-
-            return ffiString(into, tonumber(count[0]) as integer)
+            return readInto(stream as Stream, wanted)
         end,
 
         readspan = function(
@@ -305,38 +789,29 @@ local function create(): contract.Provider
             stream: any,
             exclusive destination: span.ByteWriteSpan
         ): (integer?, string?)
-            const taking = #destination
-            const into = destination:ref()
-            local readInto = C.nuppNativeNetStreamRead as function(
-                handle: any,
-                borrows pointer: uint8[?],
-                count: integer,
-                state: any,
-                length: any
-            ): integer
-            if readInto(stream, into, taking, state, count) ~= 0 then
-                return nil, reason("nupp: could not read")
+            local bytes, why = readInto(stream as Stream, #destination)
+            if bytes == nil then
+                return nil, why
             end
-            if state[0] == PENDING or state[0] == READ_EOF then
-                return 0
+            local text = bytes as string
+            for index = 1, #text do
+                destination[index] = text:byte(index)
             end
 
-            return tonumber(count[0]) as integer
+            return #text
         end,
 
         ended = function(self: contract.Provider, stream: any): boolean
-            return streamFlags(stream) & STREAM_READ_EOF ~= 0
+            local held = stream as Stream
+            if held.inboundBytes == 0 and not held.readEof and not held.closed then
+                fill(held)
+            end
+
+            return held.inboundBytes == 0 and (held.readEof or held.closed)
         end,
 
         write = function(self: contract.Provider, stream: any, bytes: string): (integer?, string?)
-            if C.nuppNativeNetStreamWrite(stream, bytes, #bytes, state, count) ~= 0 then
-                return nil, reason("nupp: could not write")
-            end
-            if state[0] == 2 then
-                return nil, "nupp: could not write: the connection is closed"
-            end
-
-            return tonumber(count[0]) as integer
+            return writeFrom(stream as Stream, bytes)
         end,
 
         writespan = function(
@@ -344,54 +819,55 @@ local function create(): contract.Provider
             stream: any,
             borrows source: span.Span<uint8>
         ): (integer?, string?)
-            local writeFrom = C.nuppNativeNetStreamWrite as function(
-                handle: any,
-                borrows pointer: const uint8[?],
-                count: integer,
-                state: any,
-                length: any
-            ): integer
-            if writeFrom(stream, source:ref(), #source, state, count) ~= 0 then
-                return nil, reason("nupp: could not write")
-            end
-            if state[0] == 2 then
-                return nil, "nupp: could not write: the connection is closed"
-            end
+            local pointer, count = source:ref()
 
-            return tonumber(count[0]) as integer
+            return writeFrom(stream as Stream, storage.string(pointer, count))
         end,
 
         pending = function(self: contract.Provider, stream: any): integer
-            if C.nuppNativeNetStreamPendingWrite(stream, count) ~= 0 then
-                return 0
+            local held = stream as Stream
+            if held.outboundBytes > 0 then
+                flush(held)
             end
 
-            return tonumber(count[0]) as integer
+            return held.outboundBytes
         end,
 
         writefailed = function(self: contract.Provider, stream: any): boolean
-            return streamFlags(stream) & STREAM_WRITE_FAILED ~= 0
+            local held = stream as Stream
+
+            return held.closed or held.writeError ~= nil
         end,
 
         shuttingdown = function(self: contract.Provider, stream: any): boolean
-            return streamFlags(stream) & STREAM_SHUTTING_DOWN ~= 0
+            local held = stream as Stream
+            if held.shuttingDown then
+                flush(held)
+            end
+
+            return held.shuttingDown
         end,
 
         shutdownwrite = function(self: contract.Provider, stream: any): (boolean, string?)
-            if C.nuppNativeNetStreamShutdownWrite(stream) ~= 0 then
-                return false, reason("nupp: could not end the sending half")
+            local held = stream as Stream
+            if held.closed then
+                return false, closedReason("nupp: could not end the sending half")
             end
+            if held.writeClosed or held.shuttingDown then
+                return true
+            end
+            held.shuttingDown = true
+            flush(held)
 
             return true
         end,
 
         address = function(self: contract.Provider, stream: any, peer: boolean): shared.Address?
-            const status = peer and C.nuppNativeNetStreamPeerEndpoint(stream, endpoint)
-            or C.nuppNativeNetStreamLocalEndpoint(stream, endpoint)
-            if status ~= 0 then
+            local held = stream as Stream
+            if held.closed or held.path then
                 return nil
             end
-            const host, port = textAddress(endpoint)
+            local host, port = socket.address(held.fd, peer)
             if host == nil or port == nil then
                 return nil
             end
@@ -400,8 +876,16 @@ local function create(): contract.Provider
         end,
 
         nodelay = function(self: contract.Provider, stream: any, enable: boolean): (boolean, string?)
-            if C.nuppNativeNetStreamSetNoDelay(stream, enable and 1 or 0) ~= 0 then
-                return false, reason("nupp: could not set the delay option")
+            local held = stream as Stream
+            if held.closed then
+                return false, closedReason("nupp: could not set the delay option")
+            end
+            if held.path then
+                return false, "nupp: could not set the delay option: not supported on a path connection"
+            end
+            local ok, why = socket.nodelay(held.fd, enable)
+            if not ok then
+                return false, "nupp: could not set the delay option: " .. tostring(why)
             end
 
             return true
@@ -413,32 +897,61 @@ local function create(): contract.Provider
             enable: boolean,
             delayms: integer
         ): (boolean, string?)
-            if C.nuppNativeNetStreamSetKeepAliveMs(stream, enable and 1 or 0, delayms) ~= 0 then
-                return false, reason("nupp: could not set the keepalive option")
+            local held = stream as Stream
+            if held.closed then
+                return false, closedReason("nupp: could not set the keepalive option")
+            end
+            if held.path then
+                return false, "nupp: could not set the keepalive option: not supported on a path connection"
+            end
+            if enable and delayms <= 0 then
+                return false, "nupp: could not set the keepalive option: the delay is invalid"
+            end
+            local ok, why = socket.keepalive(held.fd, enable, delayms)
+            if not ok then
+                return false, "nupp: could not set the keepalive option: " .. tostring(why)
             end
 
             return true
         end,
 
-        broadcast = function(self: contract.Provider, socket: any, enable: boolean): (boolean, string?)
-            if C.nuppNativeNetDatagramSetBroadcast(socket, enable and 1 or 0) ~= 0 then
-                return false, reason("nupp: could not set the broadcast option")
+        broadcast = function(self: contract.Provider, datagram: any, enable: boolean): (boolean, string?)
+            local held = datagram as Datagram
+            if held.closed then
+                return false, "nupp: could not set the broadcast option: the socket is closed"
+            end
+            local ok, why = socket.broadcast(held.fd, enable)
+            if not ok then
+                return false, "nupp: could not set the broadcast option: " .. tostring(why)
             end
 
             return true
         end,
 
-        multicastttl = function(self: contract.Provider, socket: any, ttl: integer): (boolean, string?)
-            if C.nuppNativeNetDatagramSetMulticastTtl(socket, ttl) ~= 0 then
-                return false, reason("nupp: could not set the multicast hop limit")
+        multicastttl = function(self: contract.Provider, datagram: any, ttl: integer): (boolean, string?)
+            local held = datagram as Datagram
+            if held.closed then
+                return false, "nupp: could not set the multicast hop limit: the socket is closed"
+            end
+            if ttl < 1 or ttl > 255 then
+                return false, "nupp: could not set the multicast hop limit: it must be 1 through 255"
+            end
+            local ok, why = socket.multicastttl(held.fd, held.family, ttl)
+            if not ok then
+                return false, "nupp: could not set the multicast hop limit: " .. tostring(why)
             end
 
             return true
         end,
 
-        multicastloop = function(self: contract.Provider, socket: any, enable: boolean): (boolean, string?)
-            if C.nuppNativeNetDatagramSetMulticastLoop(socket, enable and 1 or 0) ~= 0 then
-                return false, reason("nupp: could not set the multicast loop option")
+        multicastloop = function(self: contract.Provider, datagram: any, enable: boolean): (boolean, string?)
+            local held = datagram as Datagram
+            if held.closed then
+                return false, "nupp: could not set the multicast loop option: the socket is closed"
+            end
+            local ok, why = socket.multicastloop(held.fd, held.family, enable)
+            if not ok then
+                return false, "nupp: could not set the multicast loop option: " .. tostring(why)
             end
 
             return true
@@ -446,28 +959,41 @@ local function create(): contract.Provider
 
         membership = function(
             self: contract.Provider,
-            socket: any,
+            datagram: any,
             group: string,
             interfaceAddress: string,
             join: boolean
         ): (boolean, string?)
-            const interfaceKind = interfaceAddress == "" and 0 or 4
-            if C.nuppNativeNetDatagramMembership(
-                socket,
-                slice(group),
-                slice(interfaceAddress),
-                0,
-                interfaceKind,
-                join and 1 or 0
-            ) ~= 0 then
-                return false, reason("nupp: could not change the multicast group")
+            local held = datagram as Datagram
+            if held.closed then
+                return false, "nupp: could not change the multicast group: the socket is closed"
+            end
+            local ok, why = socket.membership(held.fd, group, interfaceAddress, join)
+            if not ok then
+                return false, "nupp: could not change the multicast group: " .. tostring(why)
             end
 
             return true
         end,
 
         closestream = function(self: contract.Provider, stream: any): nil
-            C.nuppNativeNetStreamRelease(stream)
+            local held = stream as Stream
+            if held.closed or held.lingerUntil ~= nil then
+                return
+            end
+            if (held.shuttingDown or held.writeClosed) and not held.readEof and held.readError == nil then
+                -- The sending half was ended on purpose: drain what the peer
+                -- still sends for a bounded time, so it reads the end of the
+                -- stream rather than a reset.
+                held.lingerUntil = nowMs() + LINGER_MS
+                held.inbound = {}
+                held.inboundBytes = 0
+                flush(held)
+                lingering(held, nowMs())
+
+                return
+            end
+            closeStreamNow(held)
         end,
 
         binddatagram = function(
@@ -476,79 +1002,129 @@ local function create(): contract.Provider
             port: integer,
             reusePort: boolean
         ): (any?, string?)
-
-            local options = native.ffi.new("NuppNativeNetDatagramOptions")
-            options.host = slice(host)
-            options.port = port
-            options.reuse_port = reusePort and 1 or 0
-            if C.nuppNativeNetDatagramCreate(options, handle) ~= 0 then
-                return nil, reason("nupp: could not bind")
+            local at, why = socket.endpoint(host, port)
+            if at == nil then
+                return nil, "nupp: could not bind: invalid bind address: " .. tostring(why)
             end
+            local fd, openWhy = socket.open(at.family, true)
+            if fd == nil then
+                return nil, "nupp: could not bind: " .. tostring(openWhy)
+            end
+            if reusePort then
+                local reused, reuseWhy = socket.reuseport(fd as number)
+                if not reused then
+                    socket.close(fd as number)
 
-            return handle[0]
+                    return nil, "nupp: could not bind: " .. tostring(reuseWhy)
+                end
+            end
+            local bound, bindWhy = socket.bind(fd as number, at)
+            if not bound then
+                socket.close(fd as number)
+
+                return nil, "nupp: could not bind: " .. tostring(bindWhy)
+            end
+            local datagram = Datagram(fd = fd as number, family = at.family, queue = {}, closed = false)
+            datagrams[datagram] = true
+
+            return datagram
         end,
 
-        datagramport = function(self: contract.Provider, socket: any): integer
-            if C.nuppNativeNetDatagramPort(socket, portOutput) ~= 0 then
+        datagramport = function(self: contract.Provider, datagram: any): integer
+            local held = datagram as Datagram
+            if held.closed then
                 return -1
             end
 
-            return tonumber(portOutput[0]) as integer
+            return socket.port(held.fd)
         end,
 
         receive = function(
             self: contract.Provider,
-            socket: any,
+            datagram: any,
             maximum: integer
         ): (string?, string?, integer?, boolean?, string?)
-            const taking = maximum < READ_SIZE and maximum or READ_SIZE
-            const into = readBuffer()
-            if C.nuppNativeNetDatagramReceiveEndpoint(socket, into, taking, state, count, endpoint, scalar) ~= 0 then
-                return nil, nil, nil, nil, reason("nupp: could not receive")
+            local held = datagram as Datagram
+            if held.closed then
+                return nil, nil, nil, nil, "nupp: could not receive: the socket is closed"
             end
-            if state[0] ~= DATAGRAM_MESSAGE then
+            if #held.queue == 0 then
+                receiveInto(held)
+            end
+            local message = table.remove(held.queue, 1)
+            if message == nil then
+                if held.failure ~= nil then
+                    return nil, nil, nil, nil, "nupp: could not receive: " .. (held.failure as string)
+                end
+
                 return nil
             end
-            const landed = tonumber(count[0]) as integer
-            const host, port = textAddress(endpoint)
-            if host == nil or port == nil then
-                return nil, nil, nil, nil, "nupp: could not read the datagram peer"
+            local bytes = message.bytes
+            local truncated = #bytes > maximum
+            if truncated then
+                bytes = bytes:sub(1, maximum)
             end
 
-            return ffiString(into, landed), host, port, scalar[0] ~= 0
+            return bytes, message.host, message.port, truncated
         end,
 
         sendto = function(
             self: contract.Provider,
-            socket: any,
+            datagram: any,
             host: string,
             port: integer,
             bytes: string
         ): (boolean, string?)
-            if C.nuppNativeNetEndpointParse(slice(host), port, endpoint) ~= 0 then
-                return false, reason("nupp: could not address the datagram")
+            local held = datagram as Datagram
+            if held.closed then
+                return false, "nupp: could not send: the socket is closed"
             end
-            if C.nuppNativeNetDatagramSendEndpoint(socket, endpoint, bytes, #bytes, state, count) ~= 0 then
-                return false, reason("nupp: could not send")
+            local to, why = socket.endpoint(host, port)
+            if to == nil then
+                return false, "nupp: could not address the datagram: " .. tostring(why)
+            end
+            local sent, sendWhy = socket.sendto(held.fd, bytes, #bytes, to as socket.Endpoint)
+            if sent == nil then
+                if sendWhy ~= nil then
+                    return false, "nupp: could not send: " .. sendWhy
+                end
+
+                return false
+            end
+            if sent ~= #bytes then
+                return false, "nupp: could not send: the datagram was sent short"
             end
 
-            return state[0] == DATAGRAM_SENT
+            return true
         end,
 
-        closedatagram = function(self: contract.Provider, socket: any): nil
-            C.nuppNativeNetDatagramRelease(socket)
+        closedatagram = function(self: contract.Provider, datagram: any): nil
+            local held = datagram as Datagram
+            if held.closed then
+                return
+            end
+            held.closed = true
+            socket.close(held.fd)
+            held.queue = {}
+            datagrams[held] = nil
         end,
 
         run = function(self: contract.Provider, timeoutMs: integer): nil
-            -- A zero timeout is the check's half: the snapshot a later sleep waits
-            -- from. Any native family's change since then ends the sleep, so a
-            -- program waiting on a socket and a child at once wakes for either.
-            if timeoutMs == 0 then
+            serviceLingering()
+            if timeoutMs <= 0 then
+                -- The check's half: take the snapshot a later sleep waits from,
+                -- then move whatever is ready.
                 native.snapshot()
+                pass(0, nil)
 
                 return
             end
-            native.sleep(timeoutMs)
+            if pass(0, nil) then
+                native.settle()
+
+                return
+            end
+            sleep(timeoutMs)
         end
     }
 end

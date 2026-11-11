@@ -60,9 +60,10 @@ The session owns the connection. There is no plaintext handle alongside it and
 no second reactor polling the same socket. Closing the session sends
 `close_notify`, drains it, and closes the transport.
 
-Compatible client and server configurations are cached in bounded native
-process state so Rustls can reuse its resumption state across sessions and
-worker lanes. It is not persistent across processes. Resumption never sends
+A client keeps one resumption ticket for each configuration -- host, port,
+offered protocols and trust material -- in bounded state of its Lua state, and
+a server seals its tickets under a key that belongs to its certificate, key and
+protocol order. Neither persists across processes or worker lanes. Resumption never sends
 application data before the handshake: TLS 1.3 early data is deliberately not
 enabled because accepting it requires an application-level replay policy.
 ]]

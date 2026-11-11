@@ -539,7 +539,7 @@ jobs:
           export NUPP_LUA_CORPUS="$compiler_root/.ci-corpus/teal/tl.lua"
           export NUPP_NATIVE_LIBRARY
           NUPP_NATIVE_LIBRARY=$(./scripts/toolchain \
-            native-rust base,http,net,tls,uri)
+            native-rust base,uri)
           # `tests/run` refuses to start on Windows without these, the same way
           # the whole-suite step below names them. This step reaches the runner
           # directly rather than through `nupp test`, so it has to name them

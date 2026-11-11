@@ -223,10 +223,11 @@ followed by `json.encodevalue(value)` selects the same feature without also sele
 UUID or UTF-8.
 Files and filesystem-backed path operations call the operating system through
 LuaJIT's FFI and stage no native artifact; whole-file transfers run in bounded
-steps on the calling Lua thread behind a bounded lane. Processes share the
-Rust-native provider's Tokio executor and use bounded queues. HTTP uses
-Reqwest over Tokio and Rustls, URI uses Rust's `url` parser, and UUID uses the
-Rust-native provider. Built-in message digests are
+steps on the calling Lua thread behind a bounded lane. Processes, sockets, TLS
+and HTTP call the operating system through FFI as well, with TLS and its
+cryptography and the HTTP/1.1 client written in Nupp; they take only the
+runtime's wake handle from the Rust-native provider. URI uses Rust's `url`
+parser. Built-in message digests are
 written in Nupp and stage no native artifact. The build binds builtin services
 to the selected target implementation; package descriptors do not replace them.
 The Rust facilities share the versioned `build/lib/nupp_native` sidecar.

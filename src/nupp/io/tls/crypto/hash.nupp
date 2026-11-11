@@ -1,0 +1,84 @@
+@!internal
+--[[One-shot SHA-2 digests, HMAC and HKDF (RFC 2104, RFC 5869) by hash name.
+
+The digests come from the standard library's own portable implementations;
+this module only names them the way TLS does and builds the keyed
+constructions on top.
+]]
+module nupp.io.tls.crypto.hash
+
+const streaming = require("nupp.digest.internal.streaming")
+const words = require("nupp.digest.internal.words")
+const bit = require("nupp.runtime.bitops")
+
+--- A SHA-2 function TLS names.
+export type Name = "sha256" | "sha384" | "sha512"
+
+--- Digest length in bytes.
+export function size(name: Name): integer
+    if name == "sha256" then
+        return 32
+    elseif name == "sha384" then
+        return 48
+    else
+        return 64
+    end
+end
+
+local function blocksize(name: Name): integer
+    return name == "sha256" and 64 or 128
+end
+
+--- Digests `message` with the named hash.
+export function digest(name: Name, message: string): string
+    if name == "sha256" then
+        return streaming.sha256():update(message):digest()
+    else
+        return words.create(name):update(message):digest()
+    end
+end
+
+local function xorPad(key: string, pad: integer): string
+    local bytes: {string} = {}
+    for index = 1, #key do
+        bytes[index] = string.char(bit.bxor(key:byte(index), pad))
+    end
+
+    return table.concat(bytes)
+end
+
+--- Computes HMAC of `message` under `key` with the named hash.
+export function hmac(name: Name, key: string, message: string): string
+    local block = blocksize(name)
+    if #key > block then
+        key = digest(name, key)
+    end
+    key = key .. string.rep("\0", block - #key)
+
+    return digest(name, xorPad(key, 0x5c) .. digest(name, xorPad(key, 0x36) .. message))
+end
+
+--- HKDF-Extract.
+export function extract(name: Name, salt: string, material: string): string
+    if salt == "" then
+        salt = string.rep("\0", size(name))
+    end
+
+    return hmac(name, salt, material)
+end
+
+--- HKDF-Expand to `length` bytes.
+export function expand(name: Name, prk: string, info: string, length: integer): string
+    local out: {string} = {}
+    local previous = ""
+    local total: integer = 0
+    local counter: integer = 1
+    while total < length do
+        previous = hmac(name, prk, previous .. info .. string.char(counter))
+        out[#out + 1] = previous
+        total = total + #previous
+        counter = counter + 1
+    end
+
+    return table.concat(out):sub(1, length)
+end

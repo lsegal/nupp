@@ -164,9 +164,9 @@ function M.browserGpu(response, memory)
     })(name)
 end
 
-function M.nativeHttp(native)
+function M.nativeHttp(substitutes)
     local name = "nupp.io.http.internal.transport"
-    return instance({[name] = true}, {["nupp.runtime.native"] = native})(name)
+    return instance({[name] = true}, substitutes)(name)
 end
 
 function M.nativeHttpProvider(transport)

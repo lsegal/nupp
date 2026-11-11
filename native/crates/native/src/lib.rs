@@ -11,12 +11,6 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "codegen")]
 mod codegen;
-#[cfg(feature = "http")]
-mod http;
-#[cfg(feature = "net")]
-mod net;
-#[cfg(feature = "tls")]
-mod tls;
 #[cfg(feature = "uri")]
 mod uri;
 
@@ -24,16 +18,13 @@ mod uri;
 static PANICKED: &std::ffi::CStr = c"native provider panicked";
 
 const FEATURE_BASE: u64 = 1 << 0;
-// Bit 1 was UUIDs, bit 2 the GPU provider, and bits 5 to 7 processes, files
-// and the file-transfer lane. Nupp provides all of them now. The bits stay
+// Bit 1 was UUIDs, bit 2 the GPU provider, bit 4 HTTP, bits 5 to 7 processes,
+// files and the file-transfer lane, bits 8 and 9 the network and TLS families
+// and bit 13 their endpoint calls. Nupp provides all of them now. The bits stay
 // unassigned, so an old caller asking for one reads its absence.
 const FEATURE_URI: u64 = 1 << 3;
-const FEATURE_HTTP: u64 = 1 << 4;
-const FEATURE_NET: u64 = 1 << 8;
-const FEATURE_TLS: u64 = 1 << 9;
 const FEATURE_CODEGEN: u64 = 1 << 11;
 const FEATURE_AOT_RUNTIME: u64 = 1 << 12;
-const FEATURE_NET_ENDPOINT: u64 = 1 << 13;
 const FEATURE_READINESS: u64 = 1 << 14;
 
 fn bytes() -> &'static Mutex<Arena<Box<[u8]>>> {
@@ -58,7 +49,7 @@ pub(crate) fn failed(status: Status, message: &str) -> i32 {
     status.code()
 }
 
-#[cfg(any(feature = "codegen", feature = "net", feature = "uri"))]
+#[cfg(any(feature = "codegen", feature = "uri"))]
 pub(crate) fn input<'a>(data: *const u8, length: usize) -> Result<&'a [u8], i32> {
     if length == 0 {
         return Ok(&[]);
@@ -86,21 +77,6 @@ pub extern "C" fn nuppNativeFeatures() -> u64 {
             } else {
                 0
             }
-            | if cfg!(feature = "http") {
-                FEATURE_HTTP
-            } else {
-                0
-            }
-            | if cfg!(feature = "net") {
-                FEATURE_NET
-            } else {
-                0
-            }
-            | if cfg!(feature = "tls") {
-                FEATURE_TLS
-            } else {
-                0
-            }
             | if cfg!(feature = "codegen") {
                 FEATURE_CODEGEN
             } else {
@@ -108,11 +84,6 @@ pub extern "C" fn nuppNativeFeatures() -> u64 {
             }
             | if cfg!(nupp_aot_runtime) {
                 FEATURE_AOT_RUNTIME
-            } else {
-                0
-            }
-            | if cfg!(feature = "net") {
-                FEATURE_NET_ENDPOINT
             } else {
                 0
             }
@@ -351,12 +322,8 @@ mod tests {
         for (name, value) in [
             ("BASE", FEATURE_BASE),
             ("URI", FEATURE_URI),
-            ("HTTP", FEATURE_HTTP),
-            ("NET", FEATURE_NET),
-            ("TLS", FEATURE_TLS),
             ("CODEGEN", FEATURE_CODEGEN),
             ("AOT_RUNTIME", FEATURE_AOT_RUNTIME),
-            ("NET_ENDPOINT", FEATURE_NET_ENDPOINT),
             ("READINESS", FEATURE_READINESS),
         ] {
             let define = format!(

@@ -335,12 +335,12 @@ local FEATURES: {[string]: native.Feature} = {
         portableRuntime = true,
         requires = {"runtime.io_internal_bytes"}
     },
-    [
-        "runtime.io_http_internal_transport"
-    ] = {
+    ["runtime.io_http_internal_transport"] = {
         name = "io_http_internal_transport",
         runtimeModule = "nupp.io.http.internal.transport",
-        requires = {"runtime.native", "native.time"}
+        -- HTTP/1.1 in Nupp over the network and TLS providers; a file body is
+        -- checked through the file provider.
+        requires = {"runtime.native", "native.time", "native.net", "native.tls", "native.files"}
     },
 
     ["runtime.test"] = {name = "test", module = "assert", runtimeModule = "assert", portableRuntime = true,},
@@ -757,13 +757,13 @@ local FEATURES: {[string]: native.Feature} = {
     ["native.net"] = {
         name = "net",
         -- The public surface, and only that: listening, connecting, and the
-        -- connections either produces. Rust owns every platform handle behind
-        -- the native ABI resource boundary.
+        -- connections either produces. The sockets are Nupp over the FFI; all
+        -- it takes from the provider is the wake handle it sleeps on.
         module = "nupp.runtime.provider.nativenet",
         runtimeModule = "nupp.runtime.provider.nativenet",
         provider = "nupp_native",
         providerDriver = "native-rust",
-        providerFeature = "net",
+        providerFeature = "base",
         host = "native-net",
         library = "nupp_native",
         binary = true,
@@ -777,18 +777,15 @@ local FEATURES: {[string]: native.Feature} = {
     },
     ["native.tls"] = {
         name = "tls",
-        -- Rustls encrypts a stream the Rust network provider already owns. TLS
-        -- therefore extends that same resource boundary instead of borrowing a
-        -- descriptor from a second native stack.
+        -- TLS and its cryptography are Nupp, wrapping streams from the network
+        -- provider; nothing here reaches the Rust provider.
         module = "nupp.runtime.provider.nativetls",
         runtimeModule = "nupp.runtime.provider.nativetls",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "tls",
         host = "native-tls",
-        library = "nupp_native",
+        -- Binary through the network provider's wake handle, and so a feature a
+        -- manifest may turn off by name.
         binary = true,
-        requires = {"runtime.tls_contract", "runtime.tls_types", "native.net", "runtime.suspension", "runtime.native"},
+        requires = {"runtime.tls_contract", "runtime.tls_types", "native.net", "runtime.suspension"},
     },
     ["native.process"] = {
         name = "process",
@@ -863,7 +860,7 @@ local FEATURES: {[string]: native.Feature} = {
         runtimeModule = "nupp.runtime.provider.nativehttp",
         provider = "nupp_native",
         providerDriver = "native-rust",
-        providerFeature = "http",
+        providerFeature = "base",
         library = "nupp_native",
         binary = true,
         -- A request that races its upload against the response head performs one

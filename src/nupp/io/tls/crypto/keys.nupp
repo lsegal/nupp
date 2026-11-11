@@ -1,0 +1,430 @@
+@!internal
+--[[Public and private keys: parsing, and signing and verifying by algorithm.
+
+Public keys come from X.509 SubjectPublicKeyInfo. Private keys come from PEM:
+PKCS #8 `PRIVATE KEY`, PKCS #1 `RSA PRIVATE KEY` and SEC 1 `EC PRIVATE KEY`.
+The algorithms are RSA, ECDSA on P-256 and P-384, and Ed25519 -- the set the
+Rust stack this replaces accepted (#3). Signatures are dispatched either by a
+TLS SignatureScheme code or by the algorithm identifier a certificate names.
+]]
+module nupp.io.tls.crypto.keys
+
+const der = require("nupp.io.tls.crypto.der")
+const bn = require("nupp.io.tls.crypto.bignum")
+const rsa = require("nupp.io.tls.crypto.rsa")
+const ecc = require("nupp.io.tls.crypto.ecc")
+const curve25519 = require("nupp.io.tls.crypto.curve25519")
+const hash = require("nupp.io.tls.crypto.hash")
+
+const RSA_OID = "1.2.840.113549.1.1.1"
+const PSS_OID = "1.2.840.113549.1.1.10"
+const EC_OID = "1.2.840.10045.2.1"
+const ED25519_OID = "1.3.101.112"
+const CURVES: {[string]: string} = {["1.2.840.10045.3.1.7"] = "p256", ["1.3.132.0.34"] = "p384",}
+
+--- What kind of key.
+export type Kind = "rsa" | "ec" | "ed25519"
+
+--- A public key.
+export record PublicKey
+    @readonly kind: Kind
+    @readonly rsa: rsa.PublicKey?
+    @readonly curve: string?
+    @readonly point: string?
+end
+
+--- A private key, carrying what signing needs.
+export record PrivateKey
+    @readonly kind: Kind
+    @readonly rsa: rsa.PrivateKey?
+    @readonly curve: string?
+    @readonly scalar: string?
+    @readonly seed: string?
+end
+
+local function oidOf(node: der.Node?): string?
+    if node == nil then
+        return nil
+    end
+
+    return der.oid(node)
+end
+
+local function rsaPublic(bytes: string): rsa.PublicKey?
+    local node = der.parse(bytes)
+    if node == nil or node.tag ~= der.SEQUENCE then
+        return nil
+    end
+    local parts = der.children(node)
+    if parts == nil or #parts ~= 2 then
+        return nil
+    end
+    local n = der.unsigned(parts[1])
+    local e = der.unsigned(parts[2])
+    if n == nil or e == nil then
+        return nil
+    end
+    local modulus = bn.frombytes(n)
+    if bn.bitlength(modulus) < 1024 or #modulus == 0 or modulus[1] % 2 == 0 then
+        return nil
+    end
+
+    return rsa.PublicKey(n = modulus, e = bn.frombytes(e))
+end
+
+--- Parses a DER SubjectPublicKeyInfo node, or answers nil and why.
+export function publicfromspki(node: der.Node): (PublicKey?, string?)
+    local parts = der.children(node)
+    if node.tag ~= der.SEQUENCE or parts == nil or #parts ~= 2 then
+        return nil, "malformed public key"
+    end
+    local algorithm = der.children(parts[1])
+    local key = der.bitstring(parts[2])
+    if algorithm == nil or #algorithm < 1 or key == nil then
+        return nil, "malformed public key"
+    end
+    local oid = oidOf(algorithm[1])
+    if oid == RSA_OID or oid == PSS_OID then
+        local public = rsaPublic(key)
+        if public == nil then
+            return nil, "unsupported RSA public key"
+        end
+
+        return PublicKey(kind = "rsa", rsa = public), nil
+    elseif oid == EC_OID then
+        local curveName = CURVES[oidOf(algorithm[2]) or ""]
+        if curveName == nil then
+            return nil, "unsupported elliptic curve"
+        end
+
+        return PublicKey(kind = "ec", curve = curveName, point = key), nil
+    elseif oid == ED25519_OID then
+        if #key ~= 32 then
+            return nil, "malformed Ed25519 public key"
+        end
+
+        return PublicKey(kind = "ed25519", point = key), nil
+    end
+
+    return nil, "unsupported public key algorithm"
+end
+
+local function rsaPrivate(bytes: string): PrivateKey?
+    local node = der.parse(bytes)
+    local parts = node ~= nil and der.children(node) or nil
+    if parts == nil or #parts < 9 then
+        return nil
+    end
+    local values: {bn.Int} = {}
+    for index = 2, 9 do
+        local magnitude = der.unsigned(parts[index])
+        if magnitude == nil then
+            return nil
+        end
+        values[index - 1] = bn.frombytes(magnitude)
+    end
+    if bn.bitlength(values[1]) < 2048 then
+        return nil
+    end
+
+    return PrivateKey(
+        kind = "rsa",
+        rsa = rsa.PrivateKey(
+            n = values[1],
+            e = values[2],
+            d = values[3],
+            p = values[4],
+            q = values[5],
+            dp = values[6],
+            dq = values[7],
+            qinv = values[8]
+        )
+    )
+end
+
+local function ecPrivate(bytes: string, curveName: string?): PrivateKey?
+    local node = der.parse(bytes)
+    local parts = node ~= nil and der.children(node) or nil
+    if parts == nil or #parts < 2 or parts[2].tag ~= der.OCTETSTRING then
+        return nil
+    end
+    local scalar = der.contents(parts[2])
+    for index = 3, #parts do
+        if parts[index].tag == 0xa0 then
+            local inner = der.children(parts[index])
+            if inner ~= nil and #inner == 1 then
+                curveName = curveName or CURVES[der.oid(inner[1]) or ""]
+            end
+        end
+    end
+    if curveName == nil then
+        return nil
+    end
+    local c = ecc.curve(curveName)
+    if c == nil or #scalar ~= c.size then
+        return nil
+    end
+
+    return PrivateKey(kind = "ec", curve = curveName, scalar = scalar)
+end
+
+local function pkcs8(bytes: string): PrivateKey?
+    local node = der.parse(bytes)
+    local parts = node ~= nil and der.children(node) or nil
+    if parts == nil or #parts < 3 or parts[3].tag ~= der.OCTETSTRING then
+        return nil
+    end
+    local algorithm = der.children(parts[2])
+    if algorithm == nil or #algorithm < 1 then
+        return nil
+    end
+    local oid = oidOf(algorithm[1])
+    local inner = der.contents(parts[3])
+    if oid == RSA_OID then
+        return rsaPrivate(inner)
+    elseif oid == EC_OID then
+        return ecPrivate(inner, CURVES[oidOf(algorithm[2]) or ""])
+    elseif oid == ED25519_OID then
+        local seed = der.parse(inner)
+        if seed == nil or seed.tag ~= der.OCTETSTRING or seed.last - seed.first ~= 32 then
+            return nil
+        end
+
+        return PrivateKey(kind = "ed25519", seed = der.contents(seed))
+    end
+
+    return nil
+end
+
+--- Reads the first private key in PEM text, or answers nil and why.
+export function privatefrompem(text: string): (PrivateKey?, string?)
+    local blocks, why = der.pem(text)
+    if blocks == nil then
+        return nil, why
+    end
+    for _, block in ipairs(blocks) do
+        local key: PrivateKey? = nil
+        if block.label == "PRIVATE KEY" then
+            key = pkcs8(block.bytes)
+        elseif block.label == "RSA PRIVATE KEY" then
+            key = rsaPrivate(block.bytes)
+        elseif block.label == "EC PRIVATE KEY" then
+            key = ecPrivate(block.bytes, nil)
+        end
+        if key ~= nil then
+            return key, nil
+        end
+        if block.label:find("PRIVATE KEY", 1, true) ~= nil then
+            return nil, "unsupported or malformed private key"
+        end
+    end
+
+    return nil, "no private key was found"
+end
+
+-- TLS SignatureScheme codes.
+export const RSA_PKCS1_SHA256 = 0x0401
+export const RSA_PKCS1_SHA384 = 0x0501
+export const RSA_PKCS1_SHA512 = 0x0601
+export const ECDSA_P256_SHA256 = 0x0403
+export const ECDSA_P384_SHA384 = 0x0503
+export const ECDSA_P521_SHA512 = 0x0603
+export const RSA_PSS_SHA256 = 0x0804
+export const RSA_PSS_SHA384 = 0x0805
+export const RSA_PSS_SHA512 = 0x0806
+export const ED25519 = 0x0807
+
+--- The schemes offered and accepted, in preference order.
+export const SCHEMES: {
+    integer
+} = {
+    ECDSA_P256_SHA256,
+    ECDSA_P384_SHA384,
+    ED25519,
+    RSA_PSS_SHA256,
+    RSA_PSS_SHA384,
+    RSA_PSS_SHA512,
+    RSA_PKCS1_SHA256,
+    RSA_PKCS1_SHA384,
+    RSA_PKCS1_SHA512,
+}
+
+local function schemeHash(scheme: integer): hash.Name?
+    local high = scheme // 256
+    local low = scheme % 256
+    if high == 0x08 then
+        if low == 0x04 then
+            return "sha256"
+        elseif low == 0x05 then
+            return "sha384"
+        elseif low == 0x06 then
+            return "sha512"
+        end
+
+        return nil
+    end
+    if low ~= 0x01 and low ~= 0x03 then
+        return nil
+    end
+    if high == 0x04 then
+        return "sha256"
+    elseif high == 0x05 then
+        return "sha384"
+    elseif high == 0x06 then
+        return "sha512"
+    end
+
+    return nil
+end
+
+--- Verifies `signature` over `message` with a TLS signature scheme. `tls13`
+--- refuses PKCS #1 v1.5, which TLS 1.3 forbids in handshake signatures.
+export function verifyscheme(
+    key: PublicKey,
+    scheme: integer,
+    message: string,
+    signature: string,
+    tls13: boolean
+): boolean
+    if scheme == ED25519 then
+        return key.kind == "ed25519" and curve25519.edverify(key.point as string, message, signature)
+    end
+    local hashName = schemeHash(scheme)
+    if hashName == nil then
+        return false
+    end
+    local digest = hash.digest(hashName, message)
+    local family = scheme % 256
+    if scheme // 256 == 0x08 then
+        return key.kind == "rsa"
+            and rsa.verifypss(key.rsa as rsa.PublicKey, hashName, digest, signature, hash.size(hashName))
+    elseif family == 0x01 then
+        return not tls13
+            and key.kind == "rsa"
+            and rsa.verifypkcs1(key.rsa as rsa.PublicKey, hashName, digest, signature)
+    elseif family == 0x03 then
+        if (key.kind as string) ~= "ec" then
+            return false
+        end
+        if tls13 then
+            local wanted = scheme == ECDSA_P256_SHA256 and "p256" or scheme == ECDSA_P384_SHA384 and "p384" or nil
+            if wanted ~= key.curve then
+                return false
+            end
+        end
+        local c = ecc.curve(key.curve as string)
+
+        return c ~= nil and ecc.verify(c, key.point as string, digest, signature)
+    end
+
+    return false
+end
+
+--- Whether a private key can sign with a scheme.
+export function cansign(key: PrivateKey, scheme: integer, tls13: boolean): boolean
+    if (key.kind as string) == "ed25519" then
+        return scheme == ED25519
+    elseif key.kind == "ec" then
+        if key.curve == "p256" then
+            return scheme == ECDSA_P256_SHA256
+        end
+
+        return scheme == ECDSA_P384_SHA384
+    end
+    if scheme == RSA_PSS_SHA256 or scheme == RSA_PSS_SHA384 or scheme == RSA_PSS_SHA512 then
+        return true
+    end
+
+    return not tls13 and (scheme == RSA_PKCS1_SHA256 or scheme == RSA_PKCS1_SHA384 or scheme == RSA_PKCS1_SHA512)
+end
+
+--- Signs `message` with a scheme the key can use.
+--- @raises string when the key cannot sign with the scheme
+export function signscheme(
+    key: PrivateKey,
+    scheme: integer,
+    message: string,
+    random: function(count: integer): string
+): string
+    if (key.kind as string) == "ed25519" then
+        return curve25519.edsign(key.seed as string, message)
+    end
+    local hashName = schemeHash(scheme)
+    if hashName == nil then
+        error("nupp: unsupported signature scheme", 2)
+    end
+    local digest = hash.digest(hashName, message)
+    if key.kind == "ec" then
+        return ecc.sign(ecc.curve(key.curve as string) as ecc.Curve, key.scalar as string, digest, hashName)
+    elseif scheme // 256 == 0x08 then
+        return rsa.signpss(key.rsa as rsa.PrivateKey, hashName, digest, random)
+    end
+
+    return rsa.signpkcs1(key.rsa as rsa.PrivateKey, hashName, digest)
+end
+
+local function pssHash(params: der.Node?): hash.Name?
+    -- RSASSA-PSS-params; the hash is the first [0] element's algorithm.
+    if params == nil or params.tag ~= der.SEQUENCE then
+        return nil
+    end
+    local fields = der.children(params)
+    if fields == nil then
+        return nil
+    end
+    for _, field in ipairs(fields) do
+        if field.tag == 0xa0 then
+            local inner = der.children(field)
+            local algorithm = inner ~= nil and inner[1] ~= nil and der.children(inner[1]) or nil
+            local oid = algorithm ~= nil and oidOf(algorithm[1]) or nil
+            if oid == "2.16.840.1.101.3.4.2.1" then
+                return "sha256"
+            elseif oid == "2.16.840.1.101.3.4.2.2" then
+                return "sha384"
+            elseif oid == "2.16.840.1.101.3.4.2.3" then
+                return "sha512"
+            end
+
+            return nil
+        end
+    end
+
+    return nil
+end
+
+--- Verifies a certificate's signature given its AlgorithmIdentifier node.
+export function verifyalgorithm(key: PublicKey, algorithm: der.Node, message: string, signature: string): boolean
+    local parts = der.children(algorithm)
+    if parts == nil or #parts < 1 then
+        return false
+    end
+    local oid = oidOf(parts[1])
+    if oid == "1.2.840.113549.1.1.11" then
+        return verifyscheme(key, RSA_PKCS1_SHA256, message, signature, false)
+    elseif oid == "1.2.840.113549.1.1.12" then
+        return verifyscheme(key, RSA_PKCS1_SHA384, message, signature, false)
+    elseif oid == "1.2.840.113549.1.1.13" then
+        return verifyscheme(key, RSA_PKCS1_SHA512, message, signature, false)
+    elseif oid == "1.2.840.10045.4.3.2" or oid == "1.2.840.10045.4.3.3" or oid == "1.2.840.10045.4.3.4" then
+        if (key.kind as string) ~= "ec" then
+            return false
+        end
+        local hashName: hash.Name = oid == "1.2.840.10045.4.3.2" and "sha256"
+            or oid == "1.2.840.10045.4.3.3" and "sha384"
+            or "sha512"
+        local c = ecc.curve(key.curve as string)
+
+        return c ~= nil and ecc.verify(c, key.point as string, hash.digest(hashName, message), signature)
+    elseif oid == ED25519_OID then
+        return verifyscheme(key, ED25519, message, signature, false)
+    elseif oid == PSS_OID then
+        local hashName = pssHash(parts[2])
+        if hashName == nil or key.kind ~= "rsa" then
+            return false
+        end
+
+        return rsa.verifypss(key.rsa as rsa.PublicKey, hashName, hash.digest(hashName, message), signature, -1)
+    end
+
+    return false
+end

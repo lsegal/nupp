@@ -1,0 +1,412 @@
+@!internal
+--[[Unsigned arbitrary-precision integers for RSA and elliptic-curve arithmetic.
+
+A value is a little-endian array of 24-bit limbs held in ordinary numbers, so a
+limb product (48 bits) plus the running sum stays exact in a double. Values are
+normalised: no zero limbs above the most significant one, and zero is the empty
+array. Modular work goes through a Montgomery context built once per modulus;
+everything else here is the plain arithmetic that context needs and the byte
+conversions at the edges.
+]]
+module nupp.io.tls.crypto.bignum
+
+const BASE = 16777216
+const BITS = 24
+
+--- A non-negative integer as little-endian 24-bit limbs.
+export type Int = {integer}
+
+local function normalise(value: Int): Int
+    local top = #value
+    while top > 0 and value[top] == 0 do
+        value[top] = nil
+        top = top - 1
+    end
+
+    return value
+end
+
+--- Reads a big-endian unsigned byte string.
+export function frombytes(bytes: string): Int
+    local value: Int = {}
+    local limb: integer = 0
+    local shift: integer = 1
+    local count: integer = 0
+    for index = #bytes, 1, -1 do
+        limb = limb + bytes:byte(index) * shift
+        shift = shift * 256
+        count = count + 1
+        if count == 3 then
+            value[#value + 1] = limb
+            limb, shift, count = 0, 1, 0
+        end
+    end
+    if count > 0 then
+        value[#value + 1] = limb
+    end
+
+    return normalise(value)
+end
+
+--- Writes `value` big-endian, left-padded with zeros to `length` bytes, or as
+--- few bytes as it needs when `length` is omitted.
+--- @raises string when the value does not fit in `length` bytes
+export function tobytes(value: Int, length: integer?): string
+    local bytes: {integer} = {}
+    for index = 1, #value do
+        local limb = value[index]
+        bytes[#bytes + 1] = limb % 256
+        bytes[#bytes + 1] = (limb // 256) % 256
+        bytes[#bytes + 1] = limb // 65536
+    end
+    while #bytes > 0 and bytes[#bytes] == 0 do
+        bytes[#bytes] = nil
+    end
+    local wanted = length or #bytes
+    if #bytes > wanted then
+        error("nupp: the integer does not fit in " .. wanted .. " bytes", 2)
+    end
+    local out: {string} = {}
+    for index = wanted, 1, -1 do
+        out[#out + 1] = string.char(bytes[index] or 0)
+    end
+
+    return table.concat(out)
+end
+
+--- Builds a value from a small non-negative integer.
+export function fromint(number: integer): Int
+    local value: Int = {}
+    while number > 0 do
+        value[#value + 1] = number % BASE
+        number = number // BASE
+    end
+
+    return value
+end
+
+--- Copies a value.
+export function copy(value: Int): Int
+    local out: Int = {}
+    for index = 1, #value do
+        out[index] = value[index]
+    end
+
+    return out
+end
+
+--- Answers -1, 0 or 1 as `a` is below, equal to or above `b`.
+export function compare(a: Int, b: Int): integer
+    if #a ~= #b then
+        return #a < #b and -1 or 1
+    end
+    for index = #a, 1, -1 do
+        if a[index] ~= b[index] then
+            return a[index] < b[index] and -1 or 1
+        end
+    end
+
+    return 0
+end
+
+--- Reports whether a value is zero.
+export function iszero(value: Int): boolean
+    return #value == 0
+end
+
+--- The number of significant bits.
+export function bitlength(value: Int): integer
+    local top = #value
+    if top == 0 then
+        return 0
+    end
+    local limb = value[top]
+    local bits: integer = 0
+    while limb > 0 do
+        bits = bits + 1
+        limb = limb // 2
+    end
+
+    return (top - 1) * BITS + bits
+end
+
+--- Reads bit `index`, counting from zero at the least significant end.
+export function bit(value: Int, index: integer): integer
+    local limb = value[index // BITS + 1]
+    if limb == nil then
+        return 0
+    end
+
+    return (limb // (2 ^ (index % BITS)) as integer) % 2
+end
+
+--- Returns `a + b`.
+export function add(a: Int, b: Int): Int
+    local out: Int = {}
+    local carry: integer = 0
+    for index = 1, math.max(#a, #b) do
+        local sum = (a[index] or 0) + (b[index] or 0) + carry
+        if sum >= BASE then
+            out[index] = sum - BASE
+            carry = 1
+        else
+            out[index] = sum
+            carry = 0
+        end
+    end
+    if carry > 0 then
+        out[#out + 1] = carry
+    end
+
+    return out
+end
+
+--- Returns `a - b`.
+--- @raises string when `b` exceeds `a`
+export function sub(a: Int, b: Int): Int
+    local out: Int = {}
+    local borrow: integer = 0
+    for index = 1, #a do
+        local difference = a[index] - (b[index] or 0) - borrow
+        if difference < 0 then
+            out[index] = difference + BASE
+            borrow = 1
+        else
+            out[index] = difference
+            borrow = 0
+        end
+    end
+    if borrow ~= 0 or #b > #a then
+        error("nupp: integer subtraction went negative", 2)
+    end
+
+    return normalise(out)
+end
+
+--- Returns `a * b`.
+export function mul(a: Int, b: Int): Int
+    local out: Int = {}
+    local na, nb = #a, #b
+    for index = 1, na + nb do
+        out[index] = 0
+    end
+    for i = 1, na do
+        local carry: integer = 0
+        local ai = a[i]
+        for j = 1, nb do
+            local sum = out[i + j - 1] + ai * b[j] + carry
+            carry = sum // BASE
+            out[i + j - 1] = sum - carry * BASE
+        end
+        local at = i + nb
+        while carry > 0 do
+            local sum = out[at] + carry
+            carry = sum // BASE
+            out[at] = sum - carry * BASE
+            at = at + 1
+        end
+    end
+
+    return normalise(out)
+end
+
+-- Doubles `value` in place and returns it.
+local function double(value: Int): Int
+    local carry: integer = 0
+    for index = 1, #value do
+        local sum = value[index] * 2 + carry
+        if sum >= BASE then
+            value[index] = sum - BASE
+            carry = 1
+        else
+            value[index] = sum
+            carry = 0
+        end
+    end
+    if carry > 0 then
+        value[#value + 1] = carry
+    end
+
+    return value
+end
+
+--- Returns `value mod modulus` by binary long division.
+--- @raises string when the modulus is zero
+export function mod(value: Int, modulus: Int): Int
+    if #modulus == 0 then
+        error("nupp: modulus is zero", 2)
+    end
+    if compare(value, modulus) < 0 then
+        return copy(value)
+    end
+    local remainder: Int = {}
+    for index = bitlength(value) - 1, 0, -1 do
+        remainder = double(remainder)
+        if bit(value, index) == 1 then
+            if #remainder == 0 then
+                remainder[1] = 1
+            else
+                remainder[1] = remainder[1] + 1
+            end
+        end
+        if compare(remainder, modulus) >= 0 then
+            remainder = sub(remainder, modulus)
+        end
+    end
+
+    return remainder
+end
+
+--- A modulus prepared for Montgomery multiplication. It must be odd.
+export record Montgomery
+    @readonly modulus: Int
+    @readonly limbs: integer
+    @readonly inverse: integer
+    @readonly rsquared: Int
+    @readonly one: Int
+end
+
+--- Prepares an odd modulus.
+--- @raises string when the modulus is even
+export function montgomery(modulus: Int): Montgomery
+    local low = modulus[1] or 0
+    if low % 2 == 0 then
+        error("nupp: a Montgomery modulus must be odd", 2)
+    end
+    -- Newton's iteration for low^-1 mod 2^24, then negated.
+    local inverse: integer = 1
+    for _ = 1, 5 do
+        local product = (low * inverse) % BASE
+        inverse = (inverse * ((2 - product) % BASE)) % BASE
+    end
+    inverse = (BASE - inverse) % BASE
+    local limbs = #modulus
+    -- R mod m, then R^2 mod m by doubling R mod m another limbs*24 times.
+    local r: Int = {}
+    for index = 1, limbs do
+        r[index] = 0
+    end
+    r[limbs + 1] = 1
+    local one = mod(r, modulus)
+    local squared = copy(one)
+    for _ = 1, limbs * BITS do
+        squared = double(squared)
+        if compare(squared, modulus) >= 0 then
+            squared = sub(squared, modulus)
+        end
+    end
+
+    return Montgomery(modulus = modulus, limbs = limbs, inverse = inverse, rsquared = squared, one = one)
+end
+
+--- Returns `a * b * R^-1 mod m` for `a, b < m`.
+export function montmul(context: Montgomery, a: Int, b: Int): Int
+    local n = context.limbs
+    local m = context.modulus
+    local inverse = context.inverse
+    local t: {integer} = {}
+    for index = 1, n + 2 do
+        t[index] = 0
+    end
+    for i = 1, n do
+        local bi = b[i] or 0
+        local carry: integer = 0
+        for j = 1, n do
+            local sum = t[j] + (a[j] or 0) * bi + carry
+            carry = sum // BASE
+            t[j] = sum - carry * BASE
+        end
+        local sum = t[n + 1] + carry
+        carry = sum // BASE
+        t[n + 1] = sum - carry * BASE
+        t[n + 2] = carry
+        local factor = (t[1] * inverse) % BASE
+        sum = t[1] + factor * m[1]
+        carry = sum // BASE
+        for j = 2, n do
+            sum = t[j] + factor * m[j] + carry
+            carry = sum // BASE
+            t[j - 1] = sum - carry * BASE
+        end
+        sum = t[n + 1] + carry
+        carry = sum // BASE
+        t[n] = sum - carry * BASE
+        t[n + 1] = t[n + 2] + carry
+        t[n + 2] = 0
+    end
+    t[n + 2] = nil
+    local out = normalise(t)
+    if compare(out, m) >= 0 then
+        out = sub(out, m)
+    end
+
+    return out
+end
+
+--- Converts `a < m` into Montgomery form.
+export function tomont(context: Montgomery, a: Int): Int
+    return montmul(context, a, context.rsquared)
+end
+
+--- Converts out of Montgomery form.
+export function frommont(context: Montgomery, a: Int): Int
+    return montmul(context, a, {1})
+end
+
+--- Returns `base ^ exponent mod m` for `base < m`, in plain form.
+export function modexp(context: Montgomery, base: Int, exponent: Int): Int
+    local bits = bitlength(exponent)
+    if bits == 0 then
+        return mod({1}, context.modulus)
+    end
+    local x = tomont(context, base)
+    -- A sixteen-entry window: four bits of exponent a multiplication.
+    local table: {Int} = {}
+    table[1] = context.one
+    table[2] = x
+    for index = 3, 16 do
+        table[index] = montmul(context, table[index - 1], x)
+    end
+    local result = context.one
+    local top = ((bits + 3) // 4) * 4 - 1
+    local index: integer = top
+    while index >= 0 do
+        for _ = 1, 4 do
+            result = montmul(context, result, result)
+        end
+        local window = bit(
+            exponent,
+            index
+        ) * 8 + bit(exponent, index - 1) * 4 + bit(exponent, index - 2) * 2 + bit(exponent, index - 3)
+        if window ~= 0 then
+            result = montmul(context, result, table[window + 1])
+        end
+        index = index - 4
+    end
+
+    return frommont(context, result)
+end
+
+--- Returns `(a + b) mod m` for `a, b < m`.
+export function modadd(modulus: Int, a: Int, b: Int): Int
+    local sum = add(a, b)
+    if compare(sum, modulus) >= 0 then
+        return sub(sum, modulus)
+    end
+
+    return sum
+end
+
+--- Returns `(a - b) mod m` for `a, b < m`.
+export function modsub(modulus: Int, a: Int, b: Int): Int
+    if compare(a, b) >= 0 then
+        return sub(a, b)
+    end
+
+    return sub(add(a, modulus), b)
+end
+
+--- Returns the inverse of `a` modulo the prime `m`.
+export function modinverse(context: Montgomery, a: Int): Int
+    return modexp(context, a, sub(context.modulus, {2}))
+end

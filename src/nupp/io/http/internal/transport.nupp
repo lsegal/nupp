@@ -1,12 +1,37 @@
 @!internal
 
+--[[
+The HTTP/1.1 client transport under [](nupp.runtime.provider.nativehttp),
+written in Nupp over the native network and TLS providers (#3).
+
+A client keeps a pool of keep-alive connections and drives every transfer in
+flight from `poll`, which never blocks: it connects (directly, or through an
+HTTP or SOCKS5 proxy), wraps `https` in TLS, writes the request head and body,
+and parses the response head and body as far as the sockets allow, then wakes
+the waiters whatever moved. `wait` sleeps on the network reactor, so the checked
+layer's suspension source parks on the same sockets these transfers use.
+
+The transport carries the rules the Reqwest transport it replaces had:
+
+- the transport never follows a redirect; the checked layer routes each hop;
+- framing is the transport's: a caller's `Transfer-Encoding` is refused, and a
+  `Content-Length` must match the body, no body counting as zero;
+- an upload of unknown length goes out chunked, through a bounded window;
+- `gzip` and `deflate` responses are decoded when the client asks for
+  compression, and lose their `Content-Encoding` and `Content-Length`;
+- one deadline covers a request from admission to its last body byte, a stall
+  timeout bounds how long a body may make no progress, and `maxbytes` bounds
+  the decoded body;
+- `maxconnections` and `maxconnectionsperhost` bound the transfers using a
+  connection at once, and `maxpendingrequests` the transfers admitted at all.
+]]
 module nupp.io.http.internal.transport
 
 export interface NativeTransfer
     onHead: function(self: NativeTransfer, wake: function()): function()
     onBody: function(self: NativeTransfer, wake: function()): function()
     onUpload: function(self: NativeTransfer, wake: function()): function()
-    -- The version is the wire number, 10, 11 or 20, rather than the text form.
+    -- The version is the wire number, 10 or 11, rather than the text form.
     -- `http.Version` is derived from it at the one place a caller sees a response.
     head: function(self: NativeTransfer): (string, integer?, integer?, string?, string?, string?)
     cancel: @nosuspend function(self: NativeTransfer): nil
@@ -19,6 +44,7 @@ end
 
 export interface NativeClient
     poll: function(self: NativeClient): integer
+    wait: function(self: NativeClient, timeoutms: integer): nil
     onAdmission: function(self: NativeClient, wake: function()): function()
     now: function(self: NativeClient): number
     send: function(self: NativeClient, descriptor: any): (NativeTransfer?, string?, boolean?)
@@ -26,180 +52,29 @@ export interface NativeClient
     close: @nosuspend function(self: NativeClient): nil
 end
 
-const native = require("nupp.runtime.native")
-
-native.ffi.cdef[[
-typedef struct { const uint8_t *data; size_t length; } NuppNativeHttpSlice;
-typedef struct { NuppNativeHttpSlice name; NuppNativeHttpSlice value; } NuppNativeHttpHeader;
-
-typedef struct {
-    uint64_t connect_timeout_ms;
-    uint32_t max_redirects;
-    uint32_t max_pending_requests;
-    uint32_t max_connections;
-    uint32_t max_connections_per_host;
-    int compressed;
-    int has_insecure_hosts;
-    int proxy_mode;
-    NuppNativeHttpSlice proxy;
-    int no_proxy_set;
-    NuppNativeHttpSlice no_proxy;
-    NuppNativeHttpSlice proxy_credentials;
-} NuppNativeHttpClientOptions;
-
-typedef struct {
-    NuppNativeHttpSlice url;
-    NuppNativeHttpSlice method;
-    const NuppNativeHttpHeader *headers;
-    size_t header_count;
-    NuppNativeHttpSlice body;
-    uint32_t body_kind;
-    int64_t body_length;
-    uint64_t timeout_ms;
-    uint64_t stall_timeout_ms;
-    uint64_t max_bytes;
-    int insecure;
-} NuppNativeHttpRequest;
-
-typedef struct {
-    uint32_t state;
-    uint16_t status;
-    uint8_t version;
-    size_t url_length;
-    size_t headers_length;
-} NuppNativeHttpHead;
-
-typedef struct { uint64_t transfer; uint32_t tokens; } NuppNativeHttpReady;
-
-int32_t nuppNativeHttpClientCreate(const NuppNativeHttpClientOptions *, uint64_t *);
-int32_t nuppNativeHttpClientRelease(uint64_t);
-int32_t nuppNativeHttpClientSend(uint64_t, const NuppNativeHttpRequest *, uint64_t *);
-int32_t nuppNativeHttpClientPending(uint64_t, size_t *);
-int32_t nuppNativeHttpTransferCancel(uint64_t);
-int32_t nuppNativeHttpTransferRelease(uint64_t);
-int32_t nuppNativeHttpTransferOffer(uint64_t, const uint8_t *, size_t, int32_t, int32_t *);
-int32_t nuppNativeHttpTransferPollHead(
-    uint64_t, NuppNativeHttpHead *, uint8_t *, size_t, uint8_t *, size_t);
-int32_t nuppNativeHttpTransferError(uint64_t, uint8_t *, size_t, size_t *);
-int32_t nuppNativeHttpTransferTakeBody(uint64_t, uint64_t *);
-int32_t nuppNativeHttpBodyArm(uint64_t);
-int32_t nuppNativeHttpBodyRead(uint64_t, uint8_t *, size_t, uint32_t *, size_t *);
-int32_t nuppNativeHttpBodyError(uint64_t, uint8_t *, size_t, size_t *);
-int32_t nuppNativeHttpClientPoll(
-    uint64_t, NuppNativeHttpReady *, size_t, size_t *, int32_t *);
-]]
-
-local ffi = native.ffi
-const C = native.C
-
--- Immediate ABI statuses: a client refusing admission, and a query or copy
--- whose output needs more room.
-const ABI_CAPACITY = 2
-const ABI_BUFFER_TOO_SMALL = 6
-
--- What polling the headers answers.
-const HEAD_PENDING = 0
-const HEAD_FAILED = 2
-
--- What peeking at the body answers.
-const BODY_PENDING = 2
-const BODY_EOF = 3
-const BODY_FAILED = 4
-const BODY_CLOSED = 5
-
--- Which of a transfer's waiters a readiness event should wake. A bit set, because one
--- event commonly moves more than one of them.
-const TOKEN_HEADERS = 1
-const TOKEN_BODY = 2
-const TOKEN_UPLOAD = 4
-const TOKEN_FAILED = 8
+const contract = require("io.net.internal.contracts")
+const net = require("nupp.runtime.provider.nativenet") as contract.Provider
+const tls = require("nupp.runtime.provider.nativetls") as contract.TlsProvider
+const inflate = require("nupp.compression.inflate")
+const files = require("nupp.runtime.provider.nativefiles")
+const ffi: any = require("ffi")
 
 -- How a request body is supplied.
 export const BODY_INLINE = 1
 export const BODY_UPLOAD = 2
 export const BODY_FILE = 3
 
--- What offering upload bytes answers.
-const UPLOAD_BACKPRESSURE = 0
-const UPLOAD_ACCEPTED = 1
-
--- How many readiness events one poll collects.
-const READY_SLOTS = 256
-
--- A read may ask for an arbitrary upper bound. Keep the FFI scratch allocation
--- proportional to the transport's largest body segment rather than that bound.
+const MAX_HEADER_BYTES = 262144
+const RESPONSE_WINDOW = 1048576
+const UPLOAD_WINDOW = 1048576
+const MAX_UPLOAD_OFFER = 524288
+const READ_CHUNK = 65536
+const FILE_CHUNK = 65536
 const BODY_READ_BYTES = 64 * 1024
 
 ----------------------------------------------------------------------------
--- Slices and dispatch
+-- Waiters
 ----------------------------------------------------------------------------
-
---- Fills the borrowed byte span the native transport reads its strings through.
----
---- A pointer and a length are passed when the bytes are not a Lua string; otherwise
---- the string itself is the pointer. Nothing is copied either way, so the value has to
---- outlive the call, which it does, because every caller holds it across one.
-local function slice(value: any, pointer: any?, length: integer?): any
-    local out = native.ffi.new("NuppNativeHttpSlice")
-    if pointer ~= nil then
-        out.data = pointer
-        out.length = length
-    elseif value ~= nil then
-        out.data = value
-        out.length = #(value as string)
-    end
-
-    return out
-end
-
-local function raw(handle: any): any
-    return handle[0]
-end
-
-local function outputHandle(): any
-    return ffi.new<uint64[1]>()
-end
-
-local function releaseTransfer(handle: any): nil
-    if handle[0] ~= 0 then
-        C.nuppNativeHttpTransferRelease(handle[0])
-        handle[0] = 0
-    end
-end
-
-local function releaseClient(handle: any): nil
-    if handle[0] ~= 0 then
-        C.nuppNativeHttpClientRelease(handle[0])
-        handle[0] = 0
-    end
-end
-
-local function lastError(): string
-    return ffi.string(C.nuppNativeLastError())
-end
-
---- Copies an error retained by a transfer or body.
-local function copiedError(call: any, handle: any, fallback: string): string
-    local length = ffi.new("size_t[1]")
-    call(raw(handle), nil, 0, length)
-    if length[0] == 0 then
-        return fallback
-    end
-    local output = ffi.new("uint8_t[?]", length[0])
-    if call(raw(handle), output, length[0], length) ~= 0 then
-        return lastError()
-    end
-    local text = ffi.string(output, length[0])
-
-    return text ~= "" and text or fallback
-end
-
-local function pending(handle: any): integer
-    local output = ffi.new("size_t[1]")
-    native.succeeded(C.nuppNativeHttpClientPending(raw(handle), output), 3)
-
-    return tonumber(output[0]) as integer
-end
 
 --- Wakes everything waiting on a channel.
 ---
@@ -271,241 +146,669 @@ local function addWaiter(self: any, field: string, wake: function()): function()
 end
 
 ----------------------------------------------------------------------------
--- A transfer in flight
+-- Text helpers
 ----------------------------------------------------------------------------
 
---- A request in flight.
----
---- `_client` is deliberately loose: the client's own record names this one, so typing
---- the back-pointer would have the two name each other.
+const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function base64(text: string): string
+    local out: {string} = {}
+    for at = 1, #text, 3 do
+        local a, b, c = text:byte(at, at + 2)
+        local value = a * 65536 + (b or 0) * 256 + (c or 0)
+        local d1 = value // 262144 % 64
+        local d2 = value // 4096 % 64
+        local d3 = value // 64 % 64
+        local d4 = value % 64
+        out[
+            #out + 1
+        ] = BASE64:sub(
+            d1 + 1,
+            d1 + 1
+        ) .. BASE64:sub(
+            d2 + 1,
+            d2 + 1
+        ) .. (b ~= nil and BASE64:sub(d3 + 1, d3 + 1) or "=") .. (c ~= nil and BASE64:sub(d4 + 1, d4 + 1) or "=")
+    end
+
+    return table.concat(out)
+end
+
+local function decodePercent(text: string): string
+    return (text:gsub("%%(%x%x)", function(hex: string): string
+        return string.char(tonumber(hex, 16) as integer)
+    end))
+end
+
+local function bareHost(host: string): string
+    if host:sub(1, 1) == "[" and host:sub(-1) == "]" then
+        return host:sub(2, -2)
+    end
+
+    return host
+end
+
+local function authorityHost(host: string): string
+    if host:find(":", 1, true) ~= nil and host:sub(1, 1) ~= "[" then
+        return "[" .. host .. "]"
+    end
+
+    return host
+end
+
+-- A request URL taken apart.
+local record Target
+    @readonly scheme: string
+    @readonly host: string
+    @readonly port: integer
+    @readonly path: string
+    @readonly authority: string
+    @readonly text: string
+end
+
+local function target(uri: any): (Target?, string?)
+    local scheme = (uri:scheme() as string):lower()
+    if scheme ~= "http" and scheme ~= "https" then
+        return nil, "request URL must use http or https"
+    end
+    local host = uri:host() as string?
+    if host == nil or host == "" then
+        return nil, "request URL has no host"
+    end
+    local bare = bareHost(host as string)
+    local explicit = uri:port() as integer?
+    local defaultPort = scheme == "https" and 443 or 80
+    local port = explicit or defaultPort
+    local path = uri:path() as string
+    if path == "" then
+        path = "/"
+    end
+    local query = uri:query() as string?
+    if query ~= nil then
+        path = path .. "?" .. (query as string)
+    end
+    local authority = authorityHost(bare)
+    if port ~= defaultPort then
+        authority = authority .. ":" .. port
+    end
+    local text = scheme .. "://" .. authority .. path
+
+    return Target(scheme = scheme, host = bare, port = port, path = path, authority = authority, text = text), nil
+end
+
+----------------------------------------------------------------------------
+-- Proxies
+----------------------------------------------------------------------------
+
+local record Proxy
+    @readonly kind: "http" | "socks5" | "socks5h"
+    @readonly host: string
+    @readonly port: integer
+    @readonly username: string?
+    @readonly password: string?
+end
+
+local function parseProxy(text: string, credentials: string?): (Proxy?, string?)
+    local scheme, rest = text:match("^(%a[%w+.-]*)://(.*)$")
+    if scheme == nil then
+        scheme, rest = "http", text
+    end
+    local kind = (scheme as string):lower()
+    if kind == "https" then
+        return nil, "an https proxy is not supported"
+    end
+    if kind ~= "http" and kind ~= "socks5" and kind ~= "socks5h" then
+        return nil, "unsupported proxy scheme " .. kind
+    end
+    local authority = (rest as string):match("^([^/?#]*)") as string
+    local username: string? = nil
+    local password: string? = nil
+    local at = authority:find("@", 1, true)
+    if at ~= nil then
+        local userinfo = authority:sub(1, at - 1)
+        authority = authority:sub(at + 1)
+        local colon = userinfo:find(":", 1, true)
+        if colon ~= nil then
+            username = decodePercent(userinfo:sub(1, colon - 1))
+            password = decodePercent(userinfo:sub(colon + 1))
+        else
+            username = decodePercent(userinfo)
+            password = ""
+        end
+    end
+    if credentials ~= nil and credentials ~= "" then
+        local colon = (credentials as string):find(":", 1, true)
+        if colon ~= nil then
+            username = (credentials as string):sub(1, colon - 1)
+            password = (credentials as string):sub(colon + 1)
+        else
+            username = credentials
+            password = ""
+        end
+    end
+    local host: string
+    local portText: string?
+    if authority:sub(1, 1) == "[" then
+        local close = authority:find("]", 1, true)
+        if close == nil then
+            return nil, "malformed proxy address " .. text
+        end
+        host = authority:sub(2, close - 1)
+        portText = authority:sub(close + 1):match("^:(%d+)$")
+    else
+        local h, p = authority:match("^([^:]+):(%d+)$")
+        if h ~= nil then
+            host, portText = h as string, p
+        else
+            host = authority
+        end
+    end
+    if host == "" then
+        return nil, "malformed proxy address " .. text
+    end
+    local port = portText ~= nil and tonumber(portText) as integer or (kind == "http" and 80 or 1080)
+
+    return Proxy(
+        kind = kind as "http" | "socks5" | "socks5h",
+        host = host,
+        port = port,
+        username = username,
+        password = password
+    ), nil
+end
+
+local function environment(name: string): string?
+    local value = os.getenv(name) or os.getenv(name:lower())
+    if value == "" then
+        return nil
+    end
+
+    return value
+end
+
+-- One NO_PROXY rule list.
+local function bypassed(rules: string?, host: string): boolean
+    if rules == nil then
+        return false
+    end
+    local lowered = host:lower()
+    for entry in (rules as string):gmatch("[^,%s]+") do
+        local rule = entry:lower()
+        if rule == "*" then
+            return true
+        end
+        rule = bareHost(rule)
+        if rule:sub(1, 1) == "." then
+            if lowered:sub(-#rule) == rule or lowered == rule:sub(2) then
+                return true
+            end
+        elseif lowered == rule or lowered:sub(-#rule - 1) == "." .. rule then
+            return true
+        end
+    end
+
+    return false
+end
+
+----------------------------------------------------------------------------
+-- Connections
+----------------------------------------------------------------------------
+
+local record Connection
+    @readonly key: string
+    @readonly hostKey: string
+    phase: string
+    request: any
+    stream: any
+    session: any
+    eof: boolean
+    failure: string?
+    input: string
+    output: string
+    proxyStep: integer
+    reusable: boolean
+    closed: boolean
+end
+
+local function connectionRead(conn: Connection): string?
+    if conn.session ~= nil then
+        local bytes, why = tls:read(conn.session, READ_CHUNK)
+        if why ~= nil then
+            conn.failure = why
+
+            return nil
+        end
+        if bytes == "" then
+            conn.eof = true
+
+            return ""
+        end
+
+        return bytes or ""
+    end
+    local bytes, why = net:read(conn.stream, READ_CHUNK)
+    if bytes == nil then
+        conn.failure = why
+
+        return nil
+    end
+    if bytes == "" and net:ended(conn.stream) then
+        conn.eof = true
+    end
+
+    return bytes
+end
+
+-- Moves the connection's output queue to the socket, answering whether
+-- anything moved.
+local function connectionFlush(conn: Connection): boolean
+    local moved = false
+    while #conn.output > 0 and conn.failure == nil do
+        local taken: integer?
+        local why: string?
+        if conn.session ~= nil then
+            taken, why = tls:write(conn.session, conn.output)
+        else
+            taken, why = net:write(conn.stream, conn.output)
+        end
+        if why ~= nil then
+            conn.failure = why
+
+            return true
+        end
+        if taken == nil or taken == 0 then
+            break
+        end
+        moved = true
+        conn.output = conn.output:sub((taken as integer) + 1)
+    end
+
+    return moved
+end
+
+local function connectionBusy(conn: Connection): boolean
+    if #conn.output > 0 then
+        return true
+    end
+    if conn.session ~= nil then
+        local done = tls:flushed(conn.session)
+
+        return not done
+    end
+
+    return net:pending(conn.stream) >= UPLOAD_WINDOW
+end
+
+local function connectionClose(conn: Connection): nil
+    if conn.closed then
+        return
+    end
+    conn.closed = true
+    if conn.request ~= nil then
+        net:closeconnect(conn.request)
+        conn.request = nil
+    end
+    if conn.session ~= nil then
+        tls:destroy(conn.session)
+        conn.session = nil
+        conn.stream = nil
+    elseif conn.stream ~= nil then
+        net:closestream(conn.stream)
+        conn.stream = nil
+    end
+end
+
+----------------------------------------------------------------------------
+-- Transfers
+----------------------------------------------------------------------------
+
+local record Header
+    @readonly name: string
+    @readonly value: string
+end
+
 local record Transfer is NativeTransfer
     _client: any
-    _handle: any
-    _body: any
+    _target: Target
+    _proxy: Proxy?
+    _method: string
+    _headers: {Header}
+    _bodyKind: integer
+    _inline: string?
+    _filePath: string?
+    _file: any
+    _fileLeft: integer
+    _declared: integer?
+    _chunked: boolean
+    _uploadQueue: {string}
+    _uploadBytes: integer
+    _uploadSent: integer
+    _uploadFinished: boolean
+    _uploadClosed: boolean
+    _deadline: number
+    _stallMs: integer
+    _maxBytes: integer
+    _insecure: boolean
+    _phase: string
+    _connection: Connection?
+    _permit: boolean
+    _requestSent: boolean
+    _headFailure: string?
+    _status: integer?
+    _version: integer?
+    _packed: string?
+    _responseHeaders: {Header}
+    _framing: string
+    _remaining: integer
+    _chunkState: string
+    _decoder: any
+    _body: {string}
+    _bodyBytes: integer
+    _received: integer
+    _bodyDone: boolean
+    _bodyFailure: string?
+    _bodyTaken: boolean
+    _lastProgress: number
     _closed: boolean
+    _terminal: boolean
     _headWaiters: {function()}?
     _bodyWaiters: {function()}?
     _uploadWaiters: {function()}?
 
-    --- Wakes whatever this event moved, and returns how many waiters that was.
-    --- @raises any whatever a woken waiter raised first, after every ready channel
-    ---     is drained
-    function _ready(self: Transfer, tokens: integer): integer
-        local moved: integer = 0
-        local failure: any = nil
-        local count: integer
-        local problem: any
-        -- A failure is reported as the headers arriving, because that is where the
-        -- caller is waiting and the head call is what will report it.
-        if bit.band(tokens, TOKEN_HEADERS + TOKEN_FAILED) ~= 0 then
-            count, problem = dispatch(self, "_headWaiters")
-            moved = moved + count
-            failure = problem
-        end
-        if bit.band(tokens, TOKEN_BODY) ~= 0 then
-            count, problem = dispatch(self, "_bodyWaiters")
-            moved = moved + count
-            if problem ~= nil and failure == nil then
-                failure = problem
-            end
-        end
-        if bit.band(tokens, TOKEN_UPLOAD) ~= 0 then
-            count, problem = dispatch(self, "_uploadWaiters")
-            moved = moved + count
-            if problem ~= nil and failure == nil then
-                failure = problem
-            end
-        end
-        if failure ~= nil then
-            error(failure, 0)
-        end
-
-        return moved
-    end
-
-    function onHead(self: Transfer, wake: function()): function()
+    function onHead(self, wake: function()): function()
         return addWaiter(self, "_headWaiters", wake)
     end
 
-    function onBody(self: Transfer, wake: function()): function()
-        local forget = addWaiter(self, "_bodyWaiters", wake)
-        -- Arming is what tells the native transport somebody is waiting on body bytes;
-        -- without it a body that is already complete never produces another readiness
-        -- event.
-        if self._body ~= nil then
-            C.nuppNativeHttpBodyArm(raw(self._body))
-        end
-
-        return forget
+    function onBody(self, wake: function()): function()
+        return addWaiter(self, "_bodyWaiters", wake)
     end
 
-    function onUpload(self: Transfer, wake: function()): function()
+    function onUpload(self, wake: function()): function()
         return addWaiter(self, "_uploadWaiters", wake)
     end
 
-    function head(self: Transfer): (string, integer?, integer?, string?, string?, string?)
-        local out = native.ffi.new("NuppNativeHttpHead[1]")
-        local status = C.nuppNativeHttpTransferPollHead(raw(self._handle), out, nil, 0, nil, 0)
-        local state = tonumber(out[0].state) as integer
-        if status ~= 0 and status ~= ABI_BUFFER_TOO_SMALL then
-            return "failed", nil, nil, nil, nil, lastError()
+    function head(self): (string, integer?, integer?, string?, string?, string?)
+        if self._headFailure ~= nil then
+            return "failed", nil, nil, nil, nil, self._headFailure
         end
-        if state == HEAD_PENDING then
+        if self._packed == nil then
             return "pending", nil, nil, nil, nil, nil
         end
-        if state == HEAD_FAILED then
-            return "failed", nil, nil, nil, nil, copiedError(
-                C.nuppNativeHttpTransferError,
-                self._handle,
-                "HTTP transfer failed"
-            )
-        end
-        local head = out[0]
-        local urlLength = tonumber(head.url_length) as integer
-        local headersLength = tonumber(head.headers_length) as integer
-        local urlOutput = urlLength > 0 and ffi.new("uint8_t[?]", urlLength) or nil
-        local headersOutput = headersLength > 0 and ffi.new("uint8_t[?]", headersLength) or nil
-        status = C.nuppNativeHttpTransferPollHead(
-            raw(self._handle),
-            out,
-            urlOutput,
-            urlLength,
-            headersOutput,
-            headersLength
-        )
-        if status ~= 0 then
-            return "failed", nil, nil, nil, nil, lastError()
-        end
-        local url = urlLength > 0 and ffi.string(urlOutput, urlLength) or nil
-        local headers = headersLength > 0 and ffi.string(headersOutput, headersLength) or ""
 
-        return "ready", tonumber(head.status) as integer, tonumber(head.version) as integer, url, headers, nil
+        return "ready", self._status, self._version, nil, self._packed, nil
     end
 
-    function offer(self: Transfer, value: any, count: integer?): string
+    function offer(self, value: any, count: integer?): string
         local bytes = value as string
         local length = count or #bytes
         if length < 0 or length > #bytes then
             error("nupp: HTTP upload offer is outside its bytes", 2)
         end
-        local answer = ffi.new<int32[1]>()
-        local status = C.nuppNativeHttpTransferOffer(raw(self._handle), bytes, length, 0, answer)
-        if status ~= 0 then
+        if self._bodyKind ~= BODY_UPLOAD or self._uploadFinished or self._uploadClosed or self._terminal then
             return "closed"
         end
-        if answer[0] == UPLOAD_ACCEPTED then
-            return "accepted"
+        if length < 1 or length > MAX_UPLOAD_OFFER then
+            self:_failBeforeHead("an HTTP upload chunk must contain 1 through 524288 bytes")
+
+            return "closed"
         end
-        if answer[0] == UPLOAD_BACKPRESSURE then
+        local declared = self._declared
+        if declared ~= nil and self._uploadSent + self._uploadBytes + length > (declared as integer) then
+            self:_failBeforeHead("the upload is longer than its declared " .. (declared as integer) .. " bytes")
+
+            return "closed"
+        end
+        if self._uploadBytes >= UPLOAD_WINDOW then
             return "backpressure"
         end
+        self._uploadQueue[#self._uploadQueue + 1] = length == #bytes and bytes or bytes:sub(1, length)
+        self._uploadBytes = self._uploadBytes + length
+        self._client:_drive(self)
 
-        return "closed"
+        return "accepted"
     end
 
-    function finishUpload(self: Transfer): string
-        local answer = ffi.new<int32[1]>()
-        local status = C.nuppNativeHttpTransferOffer(raw(self._handle), nil, 0, 1, answer)
-        if status == 0 and answer[0] == UPLOAD_ACCEPTED then
-            return "accepted"
+    function finishUpload(self): string
+        if self._bodyKind ~= BODY_UPLOAD or self._uploadClosed or self._terminal then
+            return "closed"
         end
+        local declared = self._declared
+        if declared ~= nil and self._uploadSent + self._uploadBytes ~= (declared as integer) then
+            self:_failBeforeHead(
+                "the upload ended after " .. (
+                    self._uploadSent + self._uploadBytes
+                ) .. " of its declared " .. (declared as integer) .. " bytes"
+            )
 
-        return "closed"
+            return "closed"
+        end
+        self._uploadFinished = true
+        self._client:_drive(self)
+
+        return "accepted"
     end
 
-    function takeBody(self: Transfer): (boolean?, string?)
-        if self._body == nil then
-            local handle = outputHandle()
-            if C.nuppNativeHttpTransferTakeBody(raw(self._handle), handle) ~= 0 then
-                return nil, lastError()
-            end
-            self._body = ffi.gc(handle, releaseTransfer)
+    function takeBody(self): (boolean?, string?)
+        if self._packed == nil then
+            return nil, self._headFailure or "the response headers have not arrived"
         end
+        self._bodyTaken = true
 
         return true, nil
     end
 
-    --- Reads body bytes, into a buffer when one was given and as a string otherwise.
-    ---
-    --- The versioned ABI copies and consumes only what fits in this call's buffer.
-    function bodyRead(self: Transfer, count: integer): (string, any?, string?)
-        local capacity = math.min(count, BODY_READ_BYTES)
-        local data = ffi.new("uint8_t[?]", capacity)
-        local length = ffi.new("size_t[1]")
-        local state = ffi.new<uint32[1]>()
-        if C.nuppNativeHttpBodyRead(raw(self._body), data, capacity, state, length) ~= 0 then
-            return "failed", nil, lastError()
-        end
-        local kind = tonumber(state[0])
-        if kind == BODY_PENDING then
-            return "pending", nil, nil
-        end
-        if kind == BODY_EOF then
-            return "eof", nil, nil
-        end
-        if kind == BODY_FAILED then
-            return "failed", nil, copiedError(C.nuppNativeHttpBodyError, self._body, "HTTP response body failed")
-        end
-        if kind == BODY_CLOSED then
+    function bodyRead(self, count: integer): (string, any?, string?)
+        if self._closed then
             return "closed", nil, "the body is closed"
         end
-        local bytes = ffi.string(data, length[0])
+        if #self._body > 0 then
+            local wanted = math.min(count, BODY_READ_BYTES)
+            local parts: {string} = {}
+            local taken: integer = 0
+            while taken < wanted and #self._body > 0 do
+                local chunk = self._body[1]
+                local room = wanted - taken
+                if #chunk <= room then
+                    parts[#parts + 1] = chunk
+                    taken = taken + #chunk
+                    table.remove(self._body, 1)
+                else
+                    parts[#parts + 1] = chunk:sub(1, room)
+                    self._body[1] = chunk:sub(room + 1)
+                    taken = wanted
+                end
+            end
+            self._bodyBytes = self._bodyBytes - taken
+            -- Room in the window is room to read more from the socket.
+            self._client:_drive(self)
 
-        return "data", bytes, nil
+            return "data", table.concat(parts), nil
+        end
+        if self._bodyFailure ~= nil then
+            return "failed", nil, self._bodyFailure
+        end
+        if self._bodyDone then
+            return "eof", nil, nil
+        end
+
+        return "pending", nil, nil
     end
 
-    function cancel(self: Transfer): nil
-        if self._handle ~= nil then
-            C.nuppNativeHttpTransferCancel(raw(self._handle))
+    function cancel(self): nil
+        if not self._terminal then
+            if self._packed == nil then
+                self:_failBeforeHead("the request was cancelled")
+            else
+                self:_failBody("the body is closed")
+            end
         end
     end
 
-    --- Releases the transfer and its body.
-    ---
-    --- The finalizer is cleared before each destroy so the collector does not free a
-    --- handle this call already freed. A transfer with no body taken is cancelled
-    --- first, because the native transport keeps producing for one that was not.
-    function close(self: Transfer): nil
+    --- Releases the transfer, its connection and its admission slot.
+    function close(self): nil
         if self._closed then
             return
         end
-        self._closed = true
-        self._client._byHandle[tostring(raw(self._handle))] = nil
-        if self._body ~= nil then
-            local body = self._body
-            self._body = nil
-            ffi.gc(body, nil)
-            releaseTransfer(body)
-        else
-            C.nuppNativeHttpTransferCancel(raw(self._handle))
+        if not self._terminal then
+            self:cancel()
         end
-        local handle = self._handle
-        self._handle = nil
-        ffi.gc(handle, nil)
-        releaseTransfer(handle)
+        self._closed = true
+        self._body = {}
+        self._bodyBytes = 0
+        self._client:_forget(self)
+    end
+
+    -- Failure before the head arrived, which is where a caller is waiting.
+    function _failBeforeHead(self, why: string): nil
+        if self._terminal then
+            return
+        end
+        if self._packed ~= nil then
+            self:_failBody(why)
+
+            return
+        end
+        self._headFailure = why
+        self._uploadClosed = true
+        self:_finish(false)
+    end
+
+    function _failBody(self, why: string): nil
+        if self._terminal then
+            return
+        end
+        self._bodyFailure = why
+        self:_finish(false)
+    end
+
+    -- Ends the transfer's use of its connection and slot.
+    function _finish(self, reusable: boolean): nil
+        if self._terminal then
+            return
+        end
+        self._terminal = true
+        self._uploadClosed = true
+        if self._file ~= nil then
+            self._file:close()
+            self._file = nil
+        end
+        local conn = self._connection
+        self._connection = nil
+        self._client:_release(self, conn, reusable)
     end
 end
 
+local function headerValue(headers: {Header}, wanted: string): string?
+    for _, header in ipairs(headers) do
+        if header.name:lower() == wanted then
+            return header.value
+        end
+    end
+
+    return nil
+end
+
+local function u32le(value: integer): string
+    return string.char(value % 256, (value // 256) % 256, (value // 65536) % 256, (value // 16777216) % 256)
+end
+
+-- The packed head the checked layer reads: a count, sixteen-byte entries of
+-- offsets and lengths, then the bytes. Names are lowercase and repeated names
+-- sit together, the way an HTTP header map lists them.
+local function packHeaders(headers: {Header}): (string?, string?)
+    local order: {string} = {}
+    local grouped: {[string]: {string}} = {}
+    for _, header in ipairs(headers) do
+        local name = header.name:lower()
+        if grouped[name] == nil then
+            grouped[name] = {}
+            order[#order + 1] = name
+        end
+        local list = grouped[name] as {string}
+        list[#list + 1] = header.value
+    end
+    local entries: {{string}} = {}
+    for _, name in ipairs(order) do
+        for _, value in ipairs(grouped[name] as {string}) do
+            entries[#entries + 1] = {name, value}
+        end
+    end
+    local tableBytes = 4 + #entries * 16
+    local table_: {string} = {u32le(#entries)}
+    local data: {string} = {}
+    local offset = tableBytes
+    for _, entry in ipairs(entries) do
+        local name, value = entry[1], entry[2]
+        table_[#table_ + 1] = u32le(offset) .. u32le(#name) .. u32le(offset + #name) .. u32le(#value)
+        data[#data + 1] = name .. value
+        offset = offset + #name + #value
+        if offset > MAX_HEADER_BYTES then
+            return nil, "response headers exceeded 262144 bytes"
+        end
+    end
+
+    return table.concat(table_) .. table.concat(data), nil
+end
+
+local function validToken(text: string): boolean
+    return text ~= "" and text:find("[^!#$%%&'*+%-.^_`|~%w]") == nil
+end
+
+local function validValue(text: string): boolean
+    return text:find("[%z\r\n]") == nil
+end
+
 ----------------------------------------------------------------------------
--- The native client
+-- The client
 ----------------------------------------------------------------------------
 
---- A connection pool, and the transfers it is carrying.
 local record Client is NativeClient
-    _handle: any
     _closed: boolean
-
-    --- Every live transfer, keyed by its generational handle, because a readiness event
-    --- names the handle and this is what turns that back into the object.
-    _byHandle: {[string]: Transfer}
-
+    _options: any
+    _transfers: {Transfer}
+    _queued: {Transfer}
+    _idle: {[string]: {Connection}}
+    _active: integer
+    _perHost: {[string]: integer}
     _admissionWaiters: {function()}?
     _maxPending: integer
-    _ready: any
-    _more: any
+    _maxConnections: integer
+    _maxPerHost: integer
+    _connectTimeout: integer
+    _compressed: boolean
+    _proxyMode: integer
+    _proxy: Proxy?
+    _proxyError: string?
+    _noProxy: string?
 
-    function onAdmission(self: Client, wake: function()): function()
-        if self._closed or pending(self._handle) < self._maxPending then
+    function now(self): number
+        return os.monotonic()
+    end
+
+    function pending(self): integer
+        if self._closed then
+            return 0
+        end
+
+        return self:_admitted()
+    end
+
+    -- Transfers still holding an admission slot: every one not yet finished,
+    -- so an unread body larger than its window keeps its slot until it is read
+    -- or released.
+    function _admitted(self): integer
+        local count: integer = 0
+        for _, transfer in ipairs(self._transfers) do
+            if not transfer._terminal then
+                count = count + 1
+            end
+        end
+
+        return count
+    end
+
+    function onAdmission(self, wake: function()): function()
+        if self._closed or self:_admitted() < self._maxPending then
             wake()
 
             return function(): nil
@@ -515,129 +818,1077 @@ local record Client is NativeClient
         return addWaiter(self, "_admissionWaiters", wake)
     end
 
-    function send(self: Client, descriptor: any): (NativeTransfer?, string?, boolean?)
-        local headers = descriptor.headers or {}
-        local count = #headers
-        local packed = count > 0 and native.ffi.new("NuppNativeHttpHeader[?]", count) or nil
-        for index = 1, count do
-            local item = headers[index]
-            packed[index - 1].name = slice(item[1])
-            packed[index - 1].value = slice(item[2])
-        end
-        local bodyPointer: any = nil
-        local bodyLength: integer = 0
-        local value = descriptor.body
-        if descriptor.bodyKind == BODY_INLINE then
-            bodyPointer = value
-            bodyLength = #(value as string)
-        elseif descriptor.bodyKind == BODY_FILE then
-            -- The path, which the native transport opens for itself.
-            bodyPointer = value
-            bodyLength = #(value as string)
-        end
-        local request = native.ffi.new("NuppNativeHttpRequest")
-        request.url = slice(descriptor.uri:tostring())
-        request.method = slice(descriptor.method)
-        request.headers = packed
-        request.header_count = count
-        request.body = slice(nil, bodyPointer, bodyLength)
-        request.body_kind = descriptor.bodyKind
-        request.body_length = descriptor.bodyLength or -1
-        request.timeout_ms = descriptor.timeoutMs
-        request.stall_timeout_ms = descriptor.stallTimeoutMs
-        request.max_bytes = descriptor.maxBytes
-        request.insecure = descriptor.insecure and 1 or 0
-        local handle = outputHandle()
-        local status = C.nuppNativeHttpClientSend(raw(self._handle), request, handle)
-        if status ~= 0 then
-            local why = lastError()
+    function wait(self, timeoutms: integer): nil
+        net:run(timeoutms)
+    end
 
-            return nil, why, status == ABI_CAPACITY
+    -- Which proxy, if any, a target goes through.
+    function _proxyFor(self, destination: Target): (Proxy?, string?)
+        if self._proxyMode == 1 then
+            return nil, nil
         end
-        handle = ffi.gc(handle, releaseTransfer)
-        local transfer = Transfer(_client = self, _handle = handle, _body = nil, _closed = false)
-        self._byHandle[tostring(raw(handle))] = transfer
+        if bypassed(self._noProxy, destination.host) then
+            return nil, nil
+        end
+        if self._proxyMode == 2 then
+            return self._proxy, self._proxyError
+        end
+        local text: string? = nil
+        if destination.scheme == "https" then
+            text = environment("HTTPS_PROXY")
+        elseif os.getenv("REQUEST_METHOD") == nil then
+            -- Under CGI the client's HTTP_PROXY is a request header, not a choice.
+            text = environment("HTTP_PROXY")
+        end
+        text = text or environment("ALL_PROXY")
+        if text == nil then
+            return nil, nil
+        end
+
+        return parseProxy(text as string, nil)
+    end
+
+    function send(self, descriptor: any): (NativeTransfer?, string?, boolean?)
+        if self._closed then
+            return nil, "the HTTP client is closed", nil
+        end
+        if self:_admitted() >= self._maxPending then
+            return nil, "the HTTP client has reached maxPendingRequests", true
+        end
+        local destination, why = target(descriptor.uri)
+        if destination == nil then
+            return nil, why, nil
+        end
+        local method = descriptor.method as string
+        if not validToken(method) then
+            return nil, "invalid HTTP method", nil
+        end
+        local headers: {Header} = {}
+        for _, item in ipairs(descriptor.headers or {}) do
+            local name = item[1] as string
+            local value = item[2] as string
+            if not validToken(name) then
+                return nil, "invalid HTTP header name", nil
+            end
+            if not validValue(value) then
+                return nil, "failed to parse header value", nil
+            end
+            -- One value per name, the last one given, as a header map keeps them.
+            local replaced = false
+            for index, existing in ipairs(headers) do
+                if existing.name:lower() == name:lower() then
+                    headers[index] = Header(name = name, value = value)
+                    replaced = true
+                end
+            end
+            if not replaced then
+                headers[#headers + 1] = Header(name = name, value = value)
+            end
+        end
+        local declared: integer? = nil
+        local declaredText = headerValue(headers, "content-length")
+        if declaredText ~= nil then
+            if (declaredText as string):find("^%d+$") == nil then
+                return nil, "Content-Length must contain decimal digits", nil
+            end
+            declared = tonumber(declaredText) as integer
+        end
+        if headerValue(headers, "transfer-encoding") ~= nil then
+            return nil, "Transfer-Encoding is chosen by the transport", nil
+        end
+        local kind = (descriptor.bodyKind or 0) as integer
+        local inline: string? = nil
+        local filePath: string? = nil
+        local length: integer? = nil
+        if kind == BODY_INLINE then
+            inline = descriptor.body as string
+            length = #(inline as string)
+        elseif kind == BODY_UPLOAD then
+            local given = descriptor.bodyLength as integer?
+            if given ~= nil and (given as integer) < -1 then
+                return nil, "request body length must be -1 or non-negative", nil
+            end
+            if given ~= nil and (given as integer) >= 0 then
+                length = given
+            end
+        elseif kind == BODY_FILE then
+            filePath = descriptor.body as string
+            if filePath == "" then
+                return nil, "request body file path is empty", nil
+            end
+            local given = descriptor.bodyLength as integer?
+            if given ~= nil and (given as integer) >= 0 then
+                length = given
+            end
+        elseif kind ~= 0 then
+            return nil, "request body kind is invalid", nil
+        end
+        if kind == 0 and declared ~= nil and declared ~= 0 then
+            return nil, "Content-Length does not match the request body", nil
+        end
+        if length ~= nil and declared ~= nil and length ~= declared then
+            return nil, "Content-Length does not match the request body", nil
+        end
+        local limit = length or declared
+        if limit ~= nil and declaredText == nil and kind ~= BODY_FILE then
+            headers[#headers + 1] = Header(name = "content-length", value = tostring(limit))
+        end
+        if self._compressed
+            and headerValue(headers, "accept-encoding") == nil
+            and headerValue(headers, "range") == nil
+        then
+            headers[#headers + 1] = Header(name = "accept-encoding", value = "gzip, deflate")
+        end
+        if headerValue(headers, "accept") == nil then
+            headers[#headers + 1] = Header(name = "accept", value = "*/*")
+        end
+        local proxy, proxyWhy = self:_proxyFor(destination as Target)
+        if proxyWhy ~= nil then
+            return nil, proxyWhy, nil
+        end
+        local now = os.monotonic()
+        local transfer = Transfer(
+            _client = self,
+            _target = destination as Target,
+            _proxy = proxy,
+            _method = method,
+            _headers = headers,
+            _bodyKind = kind,
+            _inline = inline,
+            _filePath = filePath,
+            _fileLeft = 0,
+            _declared = limit,
+            _chunked = kind == BODY_UPLOAD and limit == nil,
+            _uploadQueue = {},
+            _uploadBytes = 0,
+            _uploadSent = 0,
+            _uploadFinished = false,
+            _uploadClosed = false,
+            _deadline = now + (descriptor.timeoutMs as integer),
+            _stallMs = (descriptor.stallTimeoutMs or 0) as integer,
+            _maxBytes = (descriptor.maxBytes or 0) as integer,
+            _insecure = descriptor.insecure == true,
+            _phase = "queued",
+            _permit = false,
+            _requestSent = false,
+            _responseHeaders = {},
+            _framing = "",
+            _remaining = 0,
+            _chunkState = "size",
+            _body = {},
+            _bodyBytes = 0,
+            _received = 0,
+            _bodyDone = false,
+            _bodyTaken = false,
+            _lastProgress = now,
+            _closed = false,
+            _terminal = false
+        )
+        self._transfers[#self._transfers + 1] = transfer
+        self._queued[#self._queued + 1] = transfer
+        self:_drive(transfer)
 
         return transfer, nil, nil
     end
 
-    --- Collects readiness events and wakes what they moved, without blocking.
-    ---
-    --- A wake is run under `pcall` so that one waiter raising still lets every event
-    --- in the batch be released and its waiters woken; the native transport is
-    --- holding each transfer until its release, and leaking the rest of the batch
-    --- would outlast the error. The first raise is kept and re-raised at the end.
-    --- @raises any whatever a woken waiter raised first, once the whole batch has
-    ---     been released
-    function poll(self: Client): integer
-        local count = ffi.new("size_t[1]")
-        local moved: integer = 0
-        local status = C.nuppNativeHttpClientPoll(raw(self._handle), self._ready, READY_SLOTS, count, self._more)
-        if status ~= 0 then
-            error("nupp: " .. lastError(), 2)
-        end
-        local failure: any = nil
-        for index = 0, (tonumber(count[0]) as integer) - 1 do
-            local item = self._ready[index]
-            local transfer = self._byHandle[tostring(item.transfer)]
-            if transfer ~= nil then
-                local ok, problem = pcall(function(): nil
-                    moved = moved + transfer:_ready(tonumber(item.tokens) as integer)
-                end)
-                if not ok and failure == nil then
-                    failure = problem
-                end
+    -- Forgets a closed transfer.
+    function _forget(self, transfer: Transfer): nil
+        for index, candidate in ipairs(self._transfers) do
+            if candidate == transfer then
+                table.remove(self._transfers, index)
+
+                break
             end
         end
-        if failure ~= nil then
-            error(failure, 0)
+        for index, candidate in ipairs(self._queued) do
+            if candidate == transfer then
+                table.remove(self._queued, index)
+
+                break
+            end
         end
-        if self._admissionWaiters ~= nil and (pending(self._handle)) < self._maxPending then
-            moved = moved + dispatchOne(self, "_admissionWaiters")
+    end
+
+    -- Returns a finished transfer's connection and permits.
+    function _release(self, transfer: Transfer, conn: Connection?, reusable: boolean): nil
+        if transfer._permit then
+            transfer._permit = false
+            self._active = self._active - 1
+            local hostKey = transfer._target.host:lower()
+            self._perHost[hostKey] = (self._perHost[hostKey] or 1) - 1
+        end
+        for index, candidate in ipairs(self._queued) do
+            if candidate == transfer then
+                table.remove(self._queued, index)
+
+                break
+            end
+        end
+        if conn ~= nil then
+            if reusable and not self._closed and conn.failure == nil and not conn.eof and #conn.input == 0 then
+                local list = self._idle[conn.key] or {}
+                if #list < self._maxPerHost then
+                    list[#list + 1] = conn
+                    self._idle[conn.key] = list
+
+                    return
+                end
+            end
+            connectionClose(conn)
+        end
+    end
+
+    function _poolKey(self, transfer: Transfer): string
+        local destination = transfer._target
+        local proxy = transfer._proxy
+        local via = proxy ~= nil and ((proxy.kind as string) .. "://" .. proxy.host .. ":" .. proxy.port) or "direct"
+
+        return destination.scheme
+            .. "://"
+            .. destination.host:lower()
+            .. ":"
+            .. destination.port
+            .. "|"
+            .. via
+            .. "|"
+            .. (
+                transfer._insecure and "insecure" or "verify"
+            )
+    end
+
+    -- Takes an idle pooled connection that is still open.
+    function _idleConnection(self, key: string): Connection?
+        local list = self._idle[key]
+        while list ~= nil and #list > 0 do
+            local conn = table.remove(list) as Connection
+            -- A pooled connection the server has since closed reads as EOF.
+            connectionRead(conn)
+            if conn.failure == nil and not conn.eof and #conn.input == 0 then
+                return conn
+            end
+            connectionClose(conn)
+        end
+
+        return nil
+    end
+
+    function _open(self, transfer: Transfer): Connection
+        local destination = transfer._target
+        local proxy = transfer._proxy
+        local host = destination.host
+        local port = destination.port
+        if proxy ~= nil then
+            host, port = proxy.host, proxy.port
+        end
+        local conn = Connection(
+            key = self:_poolKey(transfer),
+            hostKey = destination.host:lower(),
+            phase = "connecting",
+            eof = false,
+            input = "",
+            output = "",
+            proxyStep = 0,
+            reusable = true,
+            closed = false
+        )
+        local request, why = net:connect(host, port, self._connectTimeout)
+        if request == nil then
+            conn.failure = why
+        else
+            conn.request = request
+        end
+
+        return conn
+    end
+
+    -- Advances a connection through proxying and TLS to "ready".
+    function _establish(self, transfer: Transfer, conn: Connection): boolean
+        local moved = false
+        local destination = transfer._target
+        local proxy = transfer._proxy
+        while conn.failure == nil and conn.phase ~= "ready" do
+            if conn.phase == "connecting" then
+                local stream, why = net:connectpoll(conn.request)
+                if why ~= nil then
+                    conn.failure = why
+
+                    return true
+                end
+                if stream == nil then
+                    return moved
+                end
+                net:closeconnect(conn.request)
+                conn.request = nil
+                conn.stream = stream
+                net:nodelay(stream, true)
+                moved = true
+                if proxy ~= nil and proxy.kind ~= "http" then
+                    conn.phase = "socks"
+                elseif proxy ~= nil and destination.scheme == "https" then
+                    conn.phase = "tunnel"
+                    local request = "CONNECT " .. authorityHost(
+                        destination.host
+                    ) .. ":" .. destination.port .. " HTTP/1.1\r\nHost: " .. authorityHost(
+                        destination.host
+                    ) .. ":" .. destination.port .. "\r\n"
+                    if proxy.username ~= nil then
+                        request = request .. "Proxy-Authorization: Basic " .. base64(
+                            (proxy.username as string) .. ":" .. (proxy.password or "")
+                        ) .. "\r\n"
+                    end
+                    conn.output = request .. "\r\n"
+                else
+                    conn.phase = destination.scheme == "https" and "tls" or "ready"
+                end
+            elseif conn.phase == "tunnel" then
+                if connectionFlush(conn) then
+                    moved = true
+                end
+                local bytes = connectionRead(conn)
+                if bytes == nil then
+                    return true
+                end
+                conn.input = conn.input .. bytes
+                local finish = conn.input:find("\r\n\r\n", 1, true)
+                if finish == nil then
+                    if conn.eof then
+                        conn.failure = "the proxy closed the connection during CONNECT"
+                    elseif #conn.input > MAX_HEADER_BYTES then
+                        conn.failure = "the proxy's CONNECT response is too large"
+                    end
+
+                    return moved or bytes ~= ""
+                end
+                local status = tonumber(conn.input:match("^HTTP/1%.%d (%d%d%d)") or "") as integer?
+                if status == nil or (status as integer) < 200 or (status as integer) > 299 then
+                    conn.failure = "the proxy refused the tunnel: " .. (conn.input:match("^([^\r\n]*)") or "")
+                    if status == 407 then
+                        conn.failure = "proxy authentication required"
+                    end
+
+                    return true
+                end
+                conn.input = conn.input:sub(finish + 4)
+                conn.phase = "tls"
+                moved = true
+            elseif conn.phase == "socks" then
+                if not self:_socks(transfer, conn) then
+                    return moved
+                end
+                moved = true
+            elseif conn.phase == "tls" then
+                if conn.session == nil then
+                    local session, why = tls:wrap(
+                        conn.stream,
+                        false,
+                        destination.host,
+                        "",
+                        "",
+                        nil,
+                        "http/1.1\0",
+                        not transfer._insecure
+                    )
+                    conn.stream = nil
+                    if session == nil then
+                        conn.failure = why
+
+                        return true
+                    end
+                    conn.session = session
+                end
+                local done, why = tls:handshake(conn.session)
+                if done == nil then
+                    conn.failure = why
+
+                    return true
+                end
+                if not done then
+                    return moved
+                end
+                conn.phase = "ready"
+                moved = true
+            end
+        end
+
+        return moved or conn.failure ~= nil
+    end
+
+    -- Runs the SOCKS5 exchange (RFC 1928, RFC 1929) one step at a time.
+    function _socks(self, transfer: Transfer, conn: Connection): boolean
+        local proxy = transfer._proxy as Proxy
+        local destination = transfer._target
+        connectionFlush(conn)
+        if conn.proxyStep == 0 then
+            conn.output = proxy.username ~= nil and "\5\2\0\2" or "\5\1\0"
+            conn.proxyStep = 1
+            connectionFlush(conn)
+        end
+        local bytes = connectionRead(conn)
+        if bytes == nil then
+            return true
+        end
+        conn.input = conn.input .. bytes
+        if conn.eof and #conn.input < 2 then
+            conn.failure = "the SOCKS proxy closed the connection"
+
+            return true
+        end
+        if conn.proxyStep == 1 then
+            if #conn.input < 2 then
+                return false
+            end
+            local method = conn.input:byte(2)
+            conn.input = conn.input:sub(3)
+            if method == 2 and proxy.username ~= nil then
+                local user = proxy.username as string
+                local pass = proxy.password or ""
+                conn.output = "\1" .. string.char(#user) .. user .. string.char(#pass) .. pass
+                conn.proxyStep = 2
+            elseif method == 0 then
+                conn.proxyStep = 3
+            else
+                conn.failure = "the SOCKS proxy accepts no offered authentication"
+
+                return true
+            end
+        end
+        if conn.proxyStep == 2 then
+            if #conn.input < 2 then
+                connectionFlush(conn)
+
+                return false
+            end
+            if conn.input:byte(2) ~= 0 then
+                conn.failure = "the SOCKS proxy refused the credentials"
+
+                return true
+            end
+            conn.input = conn.input:sub(3)
+            conn.proxyStep = 3
+        end
+        if conn.proxyStep == 3 then
+            local address: string
+            local four = destination.host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+            if four ~= nil and proxy.kind ~= "socks5h" or four ~= nil then
+                local a, b, c, d = destination.host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+                address = "\1" .. string.char(
+                    tonumber(a) as integer,
+                    tonumber(b) as integer,
+                    tonumber(c) as integer,
+                    tonumber(d) as integer
+                )
+            else
+                address = "\3" .. string.char(#destination.host) .. destination.host
+            end
+            conn.output = "\5\1\0" .. address .. string.char(destination.port // 256, destination.port % 256)
+            conn.proxyStep = 4
+            connectionFlush(conn)
+
+            return false
+        end
+        if conn.proxyStep == 4 then
+            if #conn.input < 5 then
+                return false
+            end
+            if conn.input:byte(2) ~= 0 then
+                conn.failure = "the SOCKS proxy could not connect (reply " .. conn.input:byte(2) .. ")"
+
+                return true
+            end
+            local atyp = conn.input:byte(4)
+            local size = atyp == 1 and 10 or atyp == 4 and 22 or 7 + conn.input:byte(5)
+            if #conn.input < size then
+                return false
+            end
+            conn.input = conn.input:sub(size + 1)
+            conn.phase = destination.scheme == "https" and "tls" or "ready"
+
+            return true
+        end
+
+        return false
+    end
+
+    -- The request line and headers.
+    function _requestHead(self, transfer: Transfer): string
+        local destination = transfer._target
+        local proxy = transfer._proxy
+        local requestTarget = destination.path
+        local throughProxy = proxy ~= nil and proxy.kind == "http" and destination.scheme == "http"
+        if throughProxy then
+            requestTarget = destination.text
+        end
+        local lines: {string} = {transfer._method .. " " .. requestTarget .. " HTTP/1.1"}
+        if headerValue(transfer._headers, "host") == nil then
+            lines[#lines + 1] = "host: " .. destination.authority
+        end
+        for _, header in ipairs(transfer._headers) do
+            lines[#lines + 1] = header.name .. ": " .. header.value
+        end
+        if transfer._chunked then
+            lines[#lines + 1] = "transfer-encoding: chunked"
+        end
+        if throughProxy and (proxy as Proxy).username ~= nil then
+            local p = proxy as Proxy
+            lines[
+                #lines + 1
+            ] = "proxy-authorization: Basic " .. base64((p.username as string) .. ":" .. (p.password or ""))
+        end
+
+        return table.concat(lines, "\r\n") .. "\r\n\r\n"
+    end
+
+    -- Queues request body bytes while the connection has room.
+    function _sendBody(self, transfer: Transfer, conn: Connection): boolean
+        local moved = false
+        while not transfer._uploadClosed and not connectionBusy(conn) do
+            local piece: string? = nil
+            if transfer._bodyKind == BODY_INLINE then
+                piece = transfer._inline
+                transfer._inline = nil
+                if piece == nil or piece == "" then
+                    transfer._uploadClosed = true
+                    piece = nil
+                end
+            elseif transfer._bodyKind == BODY_FILE then
+                if transfer._fileLeft <= 0 then
+                    transfer._uploadClosed = true
+                else
+                    local chunk = transfer._file:read(math.min(FILE_CHUNK, transfer._fileLeft)) as string?
+                    if chunk == nil or chunk == "" then
+                        transfer:_failBeforeHead("request body file length changed while it was sent")
+
+                        return true
+                    end
+                    transfer._fileLeft = transfer._fileLeft - #(chunk as string)
+                    piece = chunk
+                end
+            elseif transfer._bodyKind == BODY_UPLOAD then
+                if #transfer._uploadQueue > 0 then
+                    local chunk = table.remove(transfer._uploadQueue, 1) as string
+                    transfer._uploadBytes = transfer._uploadBytes - #chunk
+                    transfer._uploadSent = transfer._uploadSent + #chunk
+                    piece = transfer._chunked and string.format("%x\r\n", #chunk) .. chunk .. "\r\n" or chunk
+                    -- The window has room again.
+                    dispatch(transfer, "_uploadWaiters")
+                elseif transfer._uploadFinished then
+                    if transfer._chunked then
+                        piece = "0\r\n\r\n"
+                    end
+                    transfer._uploadClosed = true
+                else
+                    break
+                end
+            else
+                transfer._uploadClosed = true
+            end
+            if piece ~= nil then
+                conn.output = conn.output .. (piece as string)
+                connectionFlush(conn)
+                moved = true
+            end
         end
 
         return moved
     end
 
-    function pending(self: Client): integer
-        if self._closed then
-            return 0
-        end
+    -- Opens the request body file, checking it is a regular file of the
+    -- expected length.
+    function _openFile(self, transfer: Transfer): boolean
+        local path = transfer._filePath as string
+        local kind, size = files.stat(path, true)
+        if kind ~= nil and kind ~= "file" then
+            transfer:_failBeforeHead("request body " .. path .. " is not a regular file")
 
-        return pending(self._handle)
+            return false
+        end
+        local opened, why = io.open(path, "rb")
+        if opened == nil then
+            transfer:_failBeforeHead("cannot open request body " .. path .. ": " .. tostring(why))
+
+            return false
+        end
+        -- Held as a plain handle: the transfer, not a lexical scope, owns it, and
+        -- closes it when the transfer finishes.
+        local file: any = @unsafe own.release(opened)
+        local length = (size or file:seek("end")) as integer
+        file:seek("set", 0)
+        local expected = transfer._declared
+        if expected ~= nil and expected ~= length then
+            file:close()
+            transfer:_failBeforeHead("request body file length changed before it was opened")
+
+            return false
+        end
+        if expected == nil then
+            transfer._headers[#transfer._headers + 1] = Header(name = "content-length", value = tostring(length))
+        end
+        transfer._file = file
+        transfer._fileLeft = length
+
+        return true
     end
 
-    -- A request deadline is comparable with a process deadline and with a task
-    -- deadline because all three read this one clock. It used to read a clock
-    -- exported for HTTP alone, which happened to be the same reading and promised
-    -- nothing of the sort.
-    function now(self: Client): number
-        return os.monotonic()
+    -- Parses the response head out of the connection's input.
+    function _parseHead(self, transfer: Transfer, conn: Connection): boolean
+        while true do
+            local finish = conn.input:find("\r\n\r\n", 1, true)
+            if finish == nil then
+                if #conn.input > MAX_HEADER_BYTES then
+                    transfer:_failBeforeHead("response headers exceeded 262144 bytes")
+
+                    return true
+                end
+
+                return false
+            end
+            local head = conn.input:sub(1, finish + 1)
+            conn.input = conn.input:sub(finish + 4)
+            local version, status = head:match("^HTTP/1%.(%d) (%d%d%d)[^\r\n]*\r\n")
+            if version == nil then
+                transfer:_failBeforeHead("invalid HTTP response")
+
+                return true
+            end
+            local headers: {Header} = {}
+            for line in head:gmatch("[^\r\n]+\r\n") do
+                local name, value = line:match("^([^:%s]+):[ \t]*(.-)[ \t]*\r\n$")
+                if name ~= nil then
+                    headers[#headers + 1] = Header(name = name as string, value = value as string)
+                end
+            end
+            local code = tonumber(status) as integer
+            if code >= 100 and code < 200 and code ~= 101 then
+                -- An interim response; the real one follows.
+            else
+                transfer._status = code
+                transfer._version = version == "0" and 10 or 11
+                transfer._responseHeaders = headers
+                return true
+            end
+        end
+    end
+
+    -- Decides how the response body is framed and prepares its decoding.
+    function _startBody(self, transfer: Transfer, conn: Connection): nil
+        local headers = transfer._responseHeaders
+        local status = transfer._status as integer
+        local connection = (headerValue(headers, "connection") or ""):lower()
+        if transfer._version == 10 then
+            conn.reusable = connection:find("keep-alive", 1, true) ~= nil
+        else
+            conn.reusable = connection:find("close", 1, true) == nil
+        end
+        local encoding = (headerValue(headers, "transfer-encoding") or ""):lower()
+        local lengthText = headerValue(headers, "content-length")
+        if transfer._method == "HEAD" or status == 204 or status == 304 or (status >= 100 and status < 200) then
+            transfer._framing = "none"
+        elseif encoding:find("chunked", 1, true) ~= nil then
+            transfer._framing = "chunked"
+        elseif lengthText ~= nil and (lengthText as string):find("^%s*%d+%s*$") ~= nil then
+            transfer._framing = "length"
+            transfer._remaining = tonumber(lengthText) as integer
+        else
+            transfer._framing = "close"
+            conn.reusable = false
+        end
+        local content = (headerValue(headers, "content-encoding") or ""):lower()
+        local decoded = false
+        if self._compressed and transfer._framing ~= "none" then
+            if content == "gzip" or content == "x-gzip" then
+                transfer._decoder = inflate.create(inflate.GZIP, true)
+                decoded = true
+            elseif content == "deflate" then
+                transfer._decoder = "deflate"
+                decoded = true
+            end
+        end
+        local visible: {Header} = {}
+        for _, header in ipairs(headers) do
+            local name = header.name:lower()
+            if not (decoded and (name == "content-encoding" or name == "content-length")) then
+                visible[#visible + 1] = header
+            end
+        end
+        local packed, why = packHeaders(visible)
+        if packed == nil then
+            transfer:_failBeforeHead(why as string)
+
+            return
+        end
+        -- Offers stop once the head is visible: the request body is over as far
+        -- as anybody can tell.
+        transfer._uploadClosed = true
+        transfer._packed = packed
+        transfer._lastProgress = os.monotonic()
+        if transfer._framing == "none" or (transfer._framing == "length" and transfer._remaining == 0) then
+            transfer._bodyDone = true
+            transfer:_finish(conn.reusable and transfer._requestSent)
+        end
+    end
+
+    -- Hands decoded body bytes to the window, enforcing maxbytes.
+    function _deliver(self, transfer: Transfer, bytes: string): nil
+        if bytes == "" then
+            return
+        end
+        transfer._received = transfer._received + #bytes
+        if transfer._maxBytes ~= 0 and transfer._received > transfer._maxBytes then
+            transfer:_failBody("response body exceeded " .. transfer._maxBytes .. " bytes")
+
+            return
+        end
+        transfer._body[#transfer._body + 1] = bytes
+        transfer._bodyBytes = transfer._bodyBytes + #bytes
+        transfer._lastProgress = os.monotonic()
+    end
+
+    -- Decodes wire body bytes and delivers what they produce.
+    function _decode(self, transfer: Transfer, bytes: string, final: boolean): nil
+        local decoder: any = transfer._decoder
+        if decoder == nil then
+            self:_deliver(transfer, bytes)
+
+            return
+        elseif decoder == "deflate" then
+            -- zlib-wrapped as the standard says, or raw as many servers send it.
+            local first = bytes:byte(1)
+            local wrapped = first ~= nil and first % 16 == 8 and (first * 256 + (bytes:byte(2) or 0)) % 31 == 0
+            decoder = inflate.create(wrapped and inflate.ZLIB or inflate.RAW, false)
+            transfer._decoder = decoder
+        end
+        local input = bytes
+        while true do
+            local _, written, status, problem = inflate.read(decoder, input, 65536)
+            input = ""
+            if problem ~= nil then
+                transfer:_failBody("error decoding response body: " .. tostring(problem))
+
+                return
+            end
+            if (written as number) > 0 then
+                self:_deliver(transfer, ffi.string(decoder.output, written) as string)
+                if transfer._terminal then
+                    return
+                end
+            end
+            if status ~= inflate.NEED_OUTPUT then
+                break
+            end
+        end
+        if final then
+            while true do
+                local written, status, problem = inflate.finishinput(decoder, 65536)
+                if problem ~= nil then
+                    transfer:_failBody("error decoding response body: " .. tostring(problem))
+
+                    return
+                end
+                if (written as number) > 0 then
+                    self:_deliver(transfer, ffi.string(decoder.output, written) as string)
+                end
+                if status == inflate.FINISHED then
+                    break
+                end
+                if status ~= inflate.NEED_OUTPUT then
+                    transfer:_failBody("error decoding response body: the compressed stream is truncated")
+
+                    return
+                end
+            end
+        end
+    end
+
+    -- Moves response body bytes from the connection input through framing.
+    function _readBody(self, transfer: Transfer, conn: Connection): nil
+        while not transfer._terminal and #conn.input > 0 and transfer._bodyBytes < RESPONSE_WINDOW do
+            if transfer._framing == "length" then
+                local piece = conn.input:sub(1, transfer._remaining)
+                conn.input = conn.input:sub(#piece + 1)
+                transfer._remaining = transfer._remaining - #piece
+                self:_decode(transfer, piece, transfer._remaining == 0)
+                if transfer._remaining == 0 and not transfer._terminal then
+                    transfer._bodyDone = true
+                    transfer:_finish(conn.reusable and transfer._requestSent)
+                end
+            elseif transfer._framing == "close" then
+                local piece = conn.input
+                conn.input = ""
+                self:_decode(transfer, piece, false)
+            else
+                local state = transfer._chunkState
+                if state == "size" then
+                    local lineEnd = conn.input:find("\r\n", 1, true)
+                    if lineEnd == nil then
+                        if #conn.input > 4096 then
+                            transfer:_failBody("invalid chunk size line")
+                        end
+
+                        return
+                    end
+                    local sizeText = conn.input:sub(1, lineEnd - 1):match("^(%x+)")
+                    conn.input = conn.input:sub(lineEnd + 2)
+                    if sizeText == nil then
+                        transfer:_failBody("invalid chunk size line")
+
+                        return
+                    end
+                    transfer._remaining = tonumber(sizeText, 16) as integer
+                    transfer._chunkState = transfer._remaining == 0 and "trailers" or "data"
+                elseif state == "data" then
+                    local piece = conn.input:sub(1, transfer._remaining)
+                    conn.input = conn.input:sub(#piece + 1)
+                    transfer._remaining = transfer._remaining - #piece
+                    self:_decode(transfer, piece, false)
+                    if transfer._remaining == 0 then
+                        transfer._chunkState = "crlf"
+                    end
+                elseif state == "crlf" then
+                    if #conn.input < 2 then
+                        return
+                    end
+                    if conn.input:sub(1, 2) ~= "\r\n" then
+                        transfer:_failBody("invalid chunk terminator")
+
+                        return
+                    end
+                    conn.input = conn.input:sub(3)
+                    transfer._chunkState = "size"
+                else
+                    local lineEnd = conn.input:find("\r\n", 1, true)
+                    if lineEnd == nil then
+                        return
+                    end
+                    local line = conn.input:sub(1, lineEnd - 1)
+                    conn.input = conn.input:sub(lineEnd + 2)
+                    if line == "" then
+                        self:_decode(transfer, "", true)
+                        if not transfer._terminal then
+                            transfer._bodyDone = true
+                            transfer:_finish(conn.reusable and transfer._requestSent)
+                        end
+                    end
+                end
+            end
+        end
+        if not transfer._terminal and conn.eof and #conn.input == 0 then
+            if transfer._framing == "close" then
+                self:_decode(transfer, "", true)
+                if not transfer._terminal then
+                    transfer._bodyDone = true
+                    transfer:_finish(false)
+                end
+            else
+                transfer:_failBody("error reading response body: the connection closed before the body ended")
+            end
+        end
+    end
+
+    -- Drives one transfer as far as it will go without blocking, answering
+    -- whether anything moved.
+    function _step(self, transfer: Transfer): boolean
+        if transfer._terminal then
+            return false
+        end
+        local now = os.monotonic()
+        if now >= transfer._deadline then
+            if transfer._packed == nil then
+                transfer:_failBeforeHead("request timed out")
+            else
+                transfer:_failBody("request timed out while its response body was unread")
+            end
+
+            return true
+        end
+        local moved = false
+        if transfer._phase == "queued" then
+            local hostKey = transfer._target.host:lower()
+            if self._active >= self._maxConnections or (self._perHost[hostKey] or 0) >= self._maxPerHost then
+                return false
+            end
+            for index, candidate in ipairs(self._queued) do
+                if candidate == transfer then
+                    table.remove(self._queued, index)
+
+                    break
+                end
+            end
+            transfer._permit = true
+            self._active = self._active + 1
+            self._perHost[hostKey] = (self._perHost[hostKey] or 0) + 1
+            if transfer._bodyKind == BODY_FILE and not self:_openFile(transfer) then
+                return true
+            end
+            local key = self:_poolKey(transfer)
+            transfer._connection = self:_idleConnection(key) or self:_open(transfer)
+            transfer._phase = "connecting"
+            moved = true
+        end
+        local conn = transfer._connection
+        if conn == nil then
+            return moved
+        end
+        if transfer._phase == "connecting" then
+            if self:_establish(transfer, conn as Connection) then
+                moved = true
+            end
+            if (conn as Connection).failure ~= nil then
+                transfer:_failBeforeHead(
+                    "error sending request for url (" .. transfer._target.text .. "): " .. tostring(
+                        (conn as Connection).failure
+                    )
+                )
+
+                return true
+            end
+            if (conn as Connection).phase ~= "ready" then
+                return moved
+            end
+            (conn as Connection).output = (conn as Connection).output .. self:_requestHead(transfer)
+            transfer._phase = "exchanging"
+        end
+        local c = conn as Connection
+        if connectionFlush(c) then
+            moved = true
+        end
+        if self:_sendBody(transfer, c) then
+            moved = true
+        end
+        if transfer._uploadClosed and #c.output == 0 then
+            transfer._requestSent = true
+        end
+        -- Read whatever the server has, early responses included.
+        while not transfer._terminal and c.failure == nil and not c.eof and #c.input < RESPONSE_WINDOW do
+            if transfer._packed ~= nil and transfer._bodyBytes >= RESPONSE_WINDOW then
+                break
+            end
+            local bytes = connectionRead(c)
+            if bytes == nil or bytes == "" then
+                break
+            end
+            c.input = c.input .. bytes
+            moved = true
+        end
+        if transfer._terminal then
+            return true
+        end
+        if transfer._packed == nil and transfer._status == nil then
+            if self:_parseHead(transfer, c) then
+                moved = true
+                if not transfer._terminal then
+                    self:_startBody(transfer, c)
+                    -- An early response ends the upload; the connection cannot be
+                    -- reused once a request body was cut short.
+                    if not transfer._requestSent then
+                        c.reusable = false
+                    end
+                end
+            elseif c.failure ~= nil or c.eof then
+                transfer:_failBeforeHead(
+                    "error sending request for url (" .. transfer._target.text .. "): " .. (
+                        c.failure or "connection closed before message completed"
+                    )
+                )
+
+                return true
+            end
+        end
+        if transfer._packed ~= nil and not transfer._terminal then
+            local before = transfer._received
+            self:_readBody(transfer, c)
+            if transfer._received ~= before then
+                moved = true
+            end
+            if not transfer._terminal and c.failure ~= nil then
+                transfer:_failBody("error decoding response body: " .. tostring(c.failure))
+                moved = true
+            end
+            if not transfer._terminal
+                and transfer._stallMs > 0
+                and now - transfer._lastProgress >= transfer._stallMs
+            then
+                if transfer._bodyBytes >= RESPONSE_WINDOW then
+                    transfer:_failBody("response stalled while its body queue was full")
+                else
+                    transfer:_failBody("response made no progress for " .. transfer._stallMs .. " milliseconds")
+                end
+                moved = true
+            end
+        end
+
+        return moved
+    end
+
+    -- Drives one transfer to quiescence, then wakes what moved.
+    function _drive(self, transfer: Transfer): nil
+        local guard: integer = 0
+        while self:_step(transfer) and guard < 64 do
+            guard = guard + 1
+        end
+    end
+
+    --- Drives every transfer and wakes what moved, without blocking.
+    --- @raises any whatever a woken waiter raised first, once every transfer
+    ---     has been driven
+    function poll(self): integer
+        local moved: integer = 0
+        local failure: any = nil
+        local list: {Transfer} = {}
+        for index, transfer in ipairs(self._transfers) do
+            list[index] = transfer
+        end
+        for _, transfer in ipairs(list) do
+            self:_drive(transfer)
+            local count: integer
+            local problem: any
+            if transfer._packed ~= nil or transfer._headFailure ~= nil or transfer._terminal then
+                count, problem = dispatch(transfer, "_headWaiters")
+                moved = moved + count
+                failure = failure or problem
+            end
+            if #transfer._body > 0 or transfer._bodyDone or transfer._bodyFailure ~= nil or transfer._terminal then
+                count, problem = dispatch(transfer, "_bodyWaiters")
+                moved = moved + count
+                failure = failure or problem
+            end
+            if transfer._uploadBytes < UPLOAD_WINDOW or transfer._uploadClosed then
+                count, problem = dispatch(transfer, "_uploadWaiters")
+                moved = moved + count
+                failure = failure or problem
+            end
+        end
+        if self._admissionWaiters ~= nil and self:_admitted() < self._maxPending then
+            moved = moved + dispatchOne(self, "_admissionWaiters")
+        end
+        if failure ~= nil then
+            error(failure, 0)
+        end
+
+        return moved
     end
 
     --- Closes every transfer still in flight, then the pool.
-    ---
-    --- The transfers are listed before any is closed, because closing one takes it out
-    --- of the table being walked.
     --- @raises any whatever an admission waiter raised first, after every resource
     ---     is closed
-    function close(self: Client): nil
+    function close(self): nil
         if self._closed then
             return
         end
         self._closed = true
         local _, failure = dispatch(self, "_admissionWaiters")
-        local transfers: {Transfer} = {}
-        for _, transfer in pairs(self._byHandle) do
-            transfers[#transfers + 1] = transfer
+        local list: {Transfer} = {}
+        for index, transfer in ipairs(self._transfers) do
+            list[index] = transfer
         end
-        for index = 1, #transfers do
-            transfers[index]:close()
+        for _, transfer in ipairs(list) do
+            transfer:close()
         end
-        local handle = self._handle
-        self._handle = nil
-        ffi.gc(handle, nil)
-        releaseClient(handle)
+        for _, conns in pairs(self._idle) do
+            for _, conn in ipairs(conns) do
+                connectionClose(conn)
+            end
+        end
+        self._idle = {}
         if failure ~= nil then
             error(failure, 0)
         end
@@ -646,35 +1897,45 @@ end
 
 --- Opens a connection pool.
 export function newClient(options: any): (NativeClient?, string?)
+    if (options.connectTimeoutMs or 0) <= 0
+        or (options.maxPendingRequests or 0) <= 0
+        or (options.maxConnections or 0) <= 0
+        or (options.maxConnectionsPerHost or 0) <= 0
+    then
+        return nil, "HTTP connection timeouts and limits must be positive"
+    end
     -- Three proxy modes rather than two: unset means take the environment's, and empty
     -- means deliberately none, which is not the same answer.
     local proxyMode = options.proxy == nil and 0 or (options.proxy == "" and 1 or 2)
-    native.requireFeature(16, "HTTP support")
-    local settings = native.ffi.new("NuppNativeHttpClientOptions")
-    settings.connect_timeout_ms = options.connectTimeoutMs
-    settings.max_redirects = options.maxRedirects
-    settings.max_pending_requests = options.maxPendingRequests
-    settings.max_connections = options.maxConnections
-    settings.max_connections_per_host = options.maxConnectionsPerHost
-    settings.compressed = options.compressed and 1 or 0
-    settings.has_insecure_hosts = next(options.insecureHosts) and 1 or 0
-    settings.proxy_mode = proxyMode
-    settings.proxy = slice(options.proxy or "")
-    settings.no_proxy_set = options.noProxy ~= nil and 1 or 0
-    settings.no_proxy = slice(options.noProxy or "")
-    settings.proxy_credentials = slice(options.proxyCredentials or "")
-    local handle = outputHandle()
-    if C.nuppNativeHttpClientCreate(settings, handle) ~= 0 then
-        return nil, lastError()
+    local proxy: Proxy? = nil
+    local proxyError: string? = nil
+    if proxyMode == 2 then
+        proxy, proxyError = parseProxy(options.proxy as string, options.proxyCredentials as string?)
+        if proxy == nil then
+            return nil, proxyError
+        end
+    end
+    local noProxy: string? = options.noProxy as string?
+    if noProxy == nil then
+        noProxy = environment("NO_PROXY")
     end
 
     return Client(
-        _handle = ffi.gc(handle, releaseClient),
         _closed = false,
-        _byHandle = {},
-        _admissionWaiters = nil,
-        _maxPending = options.maxPendingRequests,
-        _ready = native.ffi.new("NuppNativeHttpReady[?]", READY_SLOTS),
-        _more = ffi.new<int32[1]>()
+        _options = options,
+        _transfers = {},
+        _queued = {},
+        _idle = {},
+        _active = 0,
+        _perHost = {},
+        _maxPending = options.maxPendingRequests as integer,
+        _maxConnections = options.maxConnections as integer,
+        _maxPerHost = options.maxConnectionsPerHost as integer,
+        _connectTimeout = options.connectTimeoutMs as integer,
+        _compressed = options.compressed == true,
+        _proxyMode = proxyMode,
+        _proxy = proxy,
+        _proxyError = proxyError,
+        _noProxy = noProxy
     ), nil
 end
