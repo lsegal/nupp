@@ -25,6 +25,7 @@ local record worker
     evaluate: function(string, string, any, any, any, any?): (string?, worker.Failure?, any)
     evaluateTypeFunction: function(any, {any}, string, any?): (any, worker.Failure?)
     evaluateDeriveProvider: function(any, any, any, string?, string, any?): (any, worker.Failure?)
+    stop: function(): nil
 end
 
 -- Both directions, said here rather than inherited from whichever JSON runtime the
@@ -528,6 +529,17 @@ local function stopService(force: boolean?): nil
     local current = service
     service, serviceExecutable = nil, nil
     workerchannel.close(current, force)
+end
+
+--- Stops the persistent service, if one is running.
+---
+--- A compiler run that ends its process ends the service with it. A process that
+--- hosts a compiler session and keeps running -- an embedding host closing its
+--- reload session -- has to stop it here instead, while the state the child is
+--- driven through is still whole: left to the child's finalizer, it would be torn
+--- down while that state is closing, waiting on an exit nothing can report.
+function worker.stop(): nil
+    stopService()
 end
 
 local function startService(executable: string, host: any?): any, worker.Failure?
