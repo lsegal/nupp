@@ -313,6 +313,9 @@ function targetLayout.of(t: any, key: string): any?, string?
             if other and (other.tag == "ptr" or other.tag == "cstring" or other.tag == "voidptr") then
                 return model.pointer
             end
+        elseif subject.tag == "const" then
+            -- A read-only view is laid out as what it views.
+            return layoutType(subject.inner)
         elseif subject.tag == "carray" then
             if not subject.count or subject.count < 0 then
                 return nil, "an unsized C array has no compile-time layout"

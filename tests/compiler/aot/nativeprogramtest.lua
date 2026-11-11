@@ -902,23 +902,16 @@ end
     assert(output:find("native: a native program reads a cdef struct's fields, not the whole struct", 1, true), output)
 end
 
-function M.anArrayFieldIsRefused()
+function M.anArrayOfUnknownSizeIsRefused()
     local executable, output = link([[
-cdef struct Buffer
-    bytes: uint8[4]
-end
-
-cdef function calloc(count: uint64, size: uint64): voidptr
+local scratch: int32[?]
 
 local function main(): int32
-    local buffer = calloc(1, 64) as Buffer*
-    @unsafe do
-        return math.i32.wrap(buffer.bytes[0])
-    end
+    return 0
 end
 ]])
     test.eq(executable, nil)
-    assert(output:find("native: field bytes of cdef struct Buffer is a C array", 1, true), output)
+    assert(output:find("native: module data scratch is not a C array of a fixed size", 1, true), output)
 end
 function M.aTopLevelStatementIsRefusedWhereItIsWritten()
     local executable, output = link([[
@@ -1234,7 +1227,10 @@ local function main(): int32
 end
 ]])
     test.eq(executable, nil)
-    assert(output:find("host.nupp:1:22: native: module state start starts as a literal, nil or a const", 1, true), output)
+    assert(
+        output:find("host.nupp:1:22: native: module state start starts as a literal, nil, a const, a function", 1, true),
+        output
+    )
 end
 
 -- A refusal in a module the program requires names that module's file.
@@ -1257,6 +1253,343 @@ end
     })
     test.eq(executable, nil)
     assert(output:find("helper.nupp:4:15: native: a native program cannot evaluate tableExpr expressions", 1, true), output)
+end
+
+
+--[[
+C arrays and module data. What each lowers to is read from the module text, so
+these cases need no code generator; the programs after them are run, and the
+library's data read through LuaJIT's FFI, where one is available.
+]]
+
+local parser = require("nupp.compiler.syntax.parser")
+local fragment = require("helpers.fragment")
+local sharedEnv = require("nupp.compiler.project.env").new(require("helpers.paths").tests .. "/..")
+
+local TRIPLE = "x86_64-unknown-linux-gnu"
+
+--- The module `source` lowers to for x86-64 Linux, or nil and the refusal's
+--- message.
+local function lower(source)
+    local tree = parser.parse(source, "host.nupp")
+    if #tree.errors > 0 then
+        error("syntax: " .. tree.errors[1].message, 2)
+    end
+    local diagnostics = fragment.check(tree, "host.nupp", sharedEnv)
+    for _, diagnostic in ipairs(diagnostics) do
+        if diagnostic.severity == nil or diagnostic.severity == "error" then
+            error("check: " .. diagnostic.code .. " " .. tostring(diagnostic.msg), 2)
+        end
+    end
+    local native = require("nupp.compiler.aot.llvm.native")
+    local ir, problem = native.program({{name = "", tree = tree.root}}, TRIPLE, "", {library = true})
+    if ir == nil then
+        return nil, problem.message
+    end
+
+    return ir
+end
+
+local function contains(ir, fragmentText)
+    assert(ir:find(fragmentText, 1, true), "expected `" .. fragmentText .. "` in:\n" .. ir)
+end
+
+local ARRAYS = [[
+module host
+
+local ffi = require("ffi")
+
+cdef struct Header
+    tag: int8
+    words: uint64[4]
+    grid: float[3][2]
+    flags: boolean[2]
+end
+
+local function twice(n: int32): int32
+    return math.i32.wrap(n * 2)
+end
+
+const HEADER_SIZE = ffi.sizeof(Header)
+const POWERS = ffi.new<const uint64[4]>({1ULL, 10ULL, 18446744073709551615ULL})
+const HALVES: number[2] = ffi.new<number[2]>({0.5, -1.5})
+const TABLE = ffi.new<const voidptr[5]>({
+    7 as voidptr,
+    HEADER_SIZE as voidptr,
+    ffi.offsetof(Header, "grid") as voidptr,
+    ffi.alignof(Header) as voidptr,
+    twice as voidptr
+})
+const MATRIX = ffi.new<const int16[3][2]>({{1, 2, 3}, {4}})
+local counts: int32[3]
+local seen = ffi.new<boolean[2]>({true})
+]]
+
+-- An array of `const` elements is read-only data, and any other a writable
+-- global, whether its binding is `const` or not; each has its elements in order
+-- and the rest zero, a layout query is the target's answer, and a function as
+-- an address is its symbol.
+function M.constantArraysAndArrayStateLowerToData()
+    local ir = assert(lower(ARRAYS .. [[
+
+export function nupp_native_read(i: int32): number
+    counts[i] = math.i32.wrap(counts[i] + 1)
+    seen[1] = counts[0] > 0
+    return MATRIX[1][0] + HALVES[1]
+end
+
+export function nupp_native_power(i: int32): uint64
+    return POWERS[i]
+end
+]]))
+    contains(ir, "@nupp.POWERS = internal constant [4 x i64] [i64 1, i64 10, i64 18446744073709551615, i64 0], align 8")
+    contains(ir, "@nupp.HALVES = internal global [2 x double] [double 0x3FE0000000000000, double 0xBFF8000000000000], align 8")
+    contains(
+        ir,
+        "@nupp.TABLE = internal constant [5 x ptr] [ptr inttoptr (i64 7 to ptr), ptr inttoptr (i64 72 to ptr), "
+            .. "ptr inttoptr (i64 40 to ptr), ptr inttoptr (i64 8 to ptr), ptr @nupp.twice], align 8"
+    )
+    contains(
+        ir,
+        "@nupp.MATRIX = internal constant [2 x [3 x i16]] [[3 x i16] [i16 1, i16 2, i16 3], "
+            .. "[3 x i16] [i16 4, i16 0, i16 0]], align 2"
+    )
+    contains(ir, "@nupp.counts = internal global [3 x i32] zeroinitializer, align 4")
+    contains(ir, "@nupp.seen = internal global [2 x i8] [i8 1, i8 0], align 1")
+    contains(ir, "getelementptr i64, ptr @nupp.POWERS")
+    contains(ir, "getelementptr [3 x i16], ptr @nupp.MATRIX")
+end
+
+-- A C array field is indexed in place, a nested one row by row, and a
+-- `boolean` element is a byte as a field is.
+function M.cArrayFieldsAreIndexedInPlace()
+    local ir = assert(lower(ARRAYS .. [[
+
+export function nupp_native_fill(header: Header*, i: int32): number
+    @unsafe do
+        header.words[i] = 5ULL
+        header.words[3] += 1ULL
+        header.grid[1][2] = 1.5
+        header.flags[1] = true
+        if header.flags[1] then
+            return header.grid[1][2]
+        end
+    end
+    return 0
+end
+]]))
+    -- `words` sits at offset 8, `grid` at 40 and `flags` at 64.
+    contains(ir, "getelementptr i8, ptr %")
+    contains(ir, ", i64 8")
+    contains(ir, ", i64 40")
+    contains(ir, ", i64 64")
+    contains(ir, "getelementptr [3 x float], ptr %")
+    contains(ir, "zext i1 true to i8")
+end
+
+-- Exported data, an array or a struct `ffi.new` makes, is a C data symbol under
+-- its own name, read-only when its type is `const` and with the visibility
+-- `@visibility` gives it.
+function M.exportedDataIsASymbolWithItsVisibility()
+    local ir = assert(lower([[
+module runtime
+
+local ffi = require("ffi")
+
+cdef struct Header
+    count: int32
+end
+
+local function first(n: int32): int32
+    return n
+end
+
+export const runtime_table = ffi.new<const voidptr[2]>({1 as voidptr, first as voidptr})
+
+@visibility("hidden")
+export const runtime_hidden = ffi.new<const uint32[2]>({3, 4})
+
+export const runtime_calls = ffi.new<int32[1]>({2})
+
+@visibility("hidden")
+export const runtime_scratch = ffi.new<uint8[16]>()
+
+export const runtime_header = ffi.new<Header>()
+
+@visibility("hidden")
+export function runtime_bump(): int32
+    runtime_calls[0] = math.i32.wrap(runtime_calls[0] + runtime_hidden[1])
+    runtime_header.count = runtime_calls[0]
+    return runtime_calls[0]
+end
+]]))
+    contains(ir, "@runtime_table = constant [2 x ptr] [ptr inttoptr (i64 1 to ptr), ptr @nupp.first], align 8")
+    contains(ir, "@runtime_hidden = hidden constant [2 x i32] [i32 3, i32 4], align 4")
+    contains(ir, "@runtime_calls = global [1 x i32] [i32 2], align 4")
+    contains(ir, "@runtime_scratch = hidden global [16 x i8] zeroinitializer, align 1")
+    contains(ir, "@runtime_header = global [4 x i8] zeroinitializer, align 4")
+    contains(ir, "define hidden i32 @runtime_bump(")
+end
+
+function M.aConstantArrayIsNeverWritten()
+    local ir, message = lower(ARRAYS .. [[
+
+export function nupp_native_write(i: int32): nil
+    POWERS[i] = 2ULL
+end
+]])
+    test.eq(ir, nil)
+    test.eq(message, "POWERS is read-only data, which is never written")
+end
+
+function M.aWholeArrayIsNeverAssigned()
+    local ir, message = lower([[
+module host
+
+cdef struct Pair
+    words: int32[2]
+end
+
+export function nupp_native_copy(a: Pair*, b: Pair*): nil
+    @unsafe do
+        a.words = b.words
+    end
+end
+]])
+    test.eq(ir, nil)
+    test.eq(message, "a native program assigns a C array's elements, not the whole array")
+end
+
+function M.anArrayHoldsNoMoreThanItsCount()
+    local ir, message = lower([[
+local values = ffi.new<int32[2]>({1, 2, 3})
+]])
+    test.eq(ir, nil)
+    test.eq(message, "module data values holds 2 elements, not 3")
+end
+
+function M.visibilityIsForAnExport()
+    local ir, message = lower([[
+@visibility("hidden")
+local function helper(): int32
+    return 1
+end
+]])
+    test.eq(ir, nil)
+    test.eq(message, "@visibility applies to what a native program exports")
+end
+
+-- The same program run: arrays read and written, layout queries in a body,
+-- and C array fields filled through a pointer.
+function M.arraysAndLayoutQueriesRunAsWritten()
+    requireCodegen()
+    local executable, output = link(ARRAYS .. [[
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+
+local function main(): int32
+    local header = calloc(1, HEADER_SIZE) as Header*
+    local total: number = 0
+    @unsafe do
+        for i = 0, 3 do
+            header.words[i] = POWERS[i]
+        end
+        header.grid[1][2] = HALVES[0]
+        header.flags[1] = seen[0]
+        if not header.flags[1] or header.words[2] ~= 18446744073709551615ULL then
+            return 1
+        end
+        total = header.grid[1][2] + MATRIX[1][0] + MATRIX[0][2]
+    end
+    free(header as voidptr)
+    counts[2] = 30
+    -- 0.5 + 4 + 3, a size of 72, an offset of 40 and 30.
+    return math.i32.wrap(math.floor(total) + ffi.sizeof(Header) - ffi.offsetof(Header, "grid") + counts[2])
+end
+]])
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 69, ran)
+end
+
+pcall(ffi.cdef, [[
+extern const uint64_t nupp_native_powers[3];
+extern const uint64_t nupp_native_hidden_powers[3];
+extern int32_t nupp_native_calls[1];
+]])
+
+local DATA_LIBRARY = [[
+module host
+
+export const nupp_native_powers = ffi.new<const uint64[3]>({1ULL, 10ULL, 100ULL})
+
+@visibility("hidden")
+export const nupp_native_hidden_powers = ffi.new<const uint64[3]>({2ULL, 20ULL, 200ULL})
+
+export const nupp_native_calls = ffi.new<int32[1]>({4})
+
+export function nupp_native_twice(n: int32): int32
+    nupp_native_calls[0] = math.i32.wrap(nupp_native_calls[0] + 1)
+    return math.i32.wrap(n * 2 + nupp_native_hidden_powers[0])
+end
+]]
+
+-- A C consumer, here LuaJIT's FFI, reads a shared library's exported data by
+-- name; a hidden symbol stays inside the library, and `--exports` lists data as
+-- it lists functions.
+function M.aSharedLibraryExportsItsData()
+    requireCodegen()
+    local built, output = library(DATA_LIBRARY, "shared-library", "libdata" .. SHARED)
+    assert(built ~= nil, output)
+    local loaded = ffi.load(built)
+    test.eq(tonumber(loaded.nupp_native_powers[2]), 100)
+    test.eq(loaded.nupp_native_calls[0], 4)
+    test.eq(loaded.nupp_native_twice(20), 42)
+    test.eq(loaded.nupp_native_calls[0], 5)
+    assert(not pcall(function()
+        return loaded.nupp_native_hidden_powers
+    end), "a hidden symbol was exported")
+
+    local dir = project(DATA_LIBRARY)
+    local list = assert(io.open(dir .. "/host.exports", "wb"))
+    list:write("nupp_native_powers\n")
+    list:close()
+    local listed
+    listed, output = library(DATA_LIBRARY, "shared-library", "libdatalisted" .. SHARED, "--exports " .. quote(dir .. "/host.exports"))
+    assert(listed ~= nil, output)
+    loaded = ffi.load(listed)
+    test.eq(tonumber(loaded.nupp_native_powers[1]), 10)
+    assert(not pcall(function()
+        return loaded.nupp_native_calls
+    end), "a symbol the export list leaves out was exported")
+end
+
+-- A static archive's data links into a program by name, as its functions do.
+function M.aStaticLibrarysDataLinksIntoAProgram()
+    requireCodegen()
+    local archive, output = library(DATA_LIBRARY, "static-library", "libdata.a")
+    assert(archive ~= nil, output)
+    local dir = project([[
+cdef function nupp_native_twice(n: int32): int32
+
+local function main(): int32
+    return nupp_native_twice(20)
+end
+]])
+    local executable = executableName(dir)
+    local status
+    status, output = run(
+        ("cd %s && NO_COLOR= %s aot --emit executable --archive %s --output %s host.nupp"):format(
+            quote(dir),
+            quote(NUPP),
+            quote(archive),
+            quote(executable)
+        )
+    )
+    test.eq(status, 0, output)
+    local ran
+    status, ran = run(quote(executable))
+    test.eq(status, 42, ran)
 end
 
 return M
