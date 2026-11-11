@@ -278,7 +278,7 @@ cdef function free(borrows p: voidptr)
 cdef struct Handlers
     tag: int8
     panic: function(L: voidptr): int32
-    fallback: function(L: voidptr): int32?
+    fallback: (function(L: voidptr): int32)?
     after: int8
 end
 
@@ -303,10 +303,15 @@ local function main(): int32
         if handlers.panic(L) ~= 7 then
             failed += 1
         end
-        if handlers.fallback(L) ~= 9 then
-            failed += 2
+        local fallback = handlers.fallback
+        if fallback ~= nil then
+            if fallback(L) ~= 9 then
+                failed += 2
+            end
+            handlers.panic = fallback
+        else
+            failed += 16
         end
-        handlers.panic = handlers.fallback
         local copied = handlers.panic
         if copied(L) ~= 9 then
             failed += 4
@@ -314,7 +319,7 @@ local function main(): int32
         if handlers.tag ~= 3 or handlers.after ~= 5 then
             failed += 8
         end
-        free(handlers)
+        free(handlers as voidptr)
     end
     lua_close(L)
     return math.i32.wrap(failed)

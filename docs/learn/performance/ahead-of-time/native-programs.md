@@ -178,6 +178,37 @@ end
 The program exits with status 2. A function type whose parameters or result
 have no C representation, such as a table, is refused where it is called.
 
+A field of a [`cdef struct`](#c-structs) can have a function type too, and is
+laid out as a pointer, as C lays out the same declaration. That is how a
+program mirrors a C table of callbacks: it writes a function to the field and
+calls through it.
+
+```nupp
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+
+cdef struct Handlers
+    panic: function(code: int32): int32
+end
+
+local function doubled(code: int32): int32
+    return code * 2
+end
+
+local function main(): int32
+    local handlers = calloc(1, 8) as Handlers*
+    local status: int32 = 0
+    @unsafe do
+        handlers.panic = doubled
+        status = handlers.panic(3)
+    end
+    free(handlers as voidptr)
+    return status
+end
+```
+
+The program exits with status 6.
+
 ## C structs
 
 A `cdef struct` is laid out for the target triple by the same model the

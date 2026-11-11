@@ -309,12 +309,15 @@ function targetLayout.of(t: any, key: string): any?, string?
             return model.number
         elseif subject.tag == "int64" or subject.tag == "uint64" then
             return model.int64
-        elseif subject.tag == "cstring" or subject.tag == "voidptr" or subject.tag == "ptr" or inCdef and subject.tag == "func" then
+        elseif subject.tag == "cstring"
+            or subject.tag == "voidptr"
+            or subject.tag == "ptr"
+            or inCdef and subject.tag == "func"
+        then
             return model.pointer
         elseif subject.tag == "union" and subject.hasNil and #subject.members == 2 then
             local other = subject.members[1].tag == "nil" and subject.members[2] or subject.members[1]
-            if
-                other
+            if other
                 and (
                     other.tag == "ptr"
                     or other.tag == "cstring"

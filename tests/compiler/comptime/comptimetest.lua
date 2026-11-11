@@ -532,7 +532,7 @@ local FUNCTION_FIELDS_SOURCE = [[
 cdef struct Handlers
     tag: int8
     panic: function(L: voidptr): int32
-    fallback: function(L: voidptr): int32?
+    fallback: (function(L: voidptr): int32)?
     after: int8
 end
 return comptime do
@@ -583,20 +583,30 @@ function M.aCdefStructsFunctionFieldIsLaidOutAsAPointer()
 end
 
 -- Outside a `cdef` declaration a function-typed field is a Lua function, which
--- has no runtime layout.
-function M.aStructsFunctionFieldOutsideCdefHasNoLayout()
-    local _, invalid = compile(
-        [[
-local struct Handlers
-    tag: int8
-    panic: function(L: voidptr): int32
-end
-return comptime do return types.sizeof(Handlers) end
-]],
-        layoutEnv("x86_64-unknown-linux-gnu")
-    )
-    testAssert.eq(invalid[1].code, "NUPP2419", "a Lua function has no C layout")
-    assert(invalid[1].msg:find('field "panic" func has no runtime layout', 1, true), invalid[1].msg)
+-- has no runtime layout, even nested in a `cdef struct` by value.
+function M.aFunctionFieldOutsideCdefHasNoLayout()
+    local targetLayout = require("nupp.compiler.targetlayout")
+    local func = {tag = "func", params = {{tag = "voidptr"}}, rets = {{tag = "int32"}}}
+    local plain = {
+        tag = "nominal",
+        declKind = "struct",
+        name = "Plain",
+        fieldOrder = {"tag", "panic"},
+        byname = {tag = {tag = "int8"}, panic = func},
+    }
+    local _, why = targetLayout.of(plain, "x86_64-unknown-linux-gnu")
+    assert(why and why:find('field "panic" func has no runtime layout', 1, true), tostring(why))
+
+    local outer = {
+        tag = "nominal",
+        declKind = "struct",
+        name = "Outer",
+        cdefName = "Outer",
+        fieldOrder = {"inner"},
+        byname = {inner = plain},
+    }
+    local _, nested = targetLayout.of(outer, "x86_64-unknown-linux-gnu")
+    assert(nested and nested:find('field "panic" func has no runtime layout', 1, true), tostring(nested))
 end
 
 function M.layoutNamesRespectShadowedTypesAtRuntimeAndComptime()
