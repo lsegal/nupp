@@ -923,6 +923,7 @@ build_rust_native() {
     filename=$(rust_library_filename)
     RUST_NATIVE_OUT="$out/target/release/$filename"
     RUST_NATIVE_STATIC_OUT="$out/target/release/libnupp_native.a"
+    RUST_NATIVE_LIBS_OUT="$out/native-static-libs"
 
     take_lock "rust-native-$digest" "$out/.complete" || return 0
     [ -f "$out/.complete" ] && [ -f "$RUST_NATIVE_OUT" ] \
@@ -932,16 +933,14 @@ build_rust_native() {
     note "building the Rust native provider with $RUSTC"
     rm -rf "$out"
     mkdir -p "$out"
-    cargo_action=build
-    [ "$PLATFORM" = darwin ] && cargo_action=rustc
-    set -- "$CARGO" "$cargo_action" \
+    set -- "$CARGO" rustc \
         --manifest-path "$ROOT/Cargo.toml" \
         --package nupp-native \
         --release \
         --locked \
         --no-default-features \
-        --target-dir "$out/target"
-    [ "$PLATFORM" = darwin ] && set -- "$@" --lib
+        --target-dir "$out/target" \
+        --lib
     if offline; then
         set -- "$@" --offline
     fi
@@ -962,11 +961,21 @@ EOF
     # that cache path after the library was staged or packaged elsewhere. The
     # debug map's object paths carry it too, and ld64 hashes them into
     # LC_UUID, so they go relative to it.
+    # The Nupp host links the static archive, so it also needs the native
+    # libraries rustc would have linked for it: libstdc++ and LLVM's system
+    # libraries under the code generator, and Rust's own. rustc reports them.
+    set -- "$@" -- --print native-static-libs
     if [ "$PLATFORM" = darwin ]; then
-        set -- "$@" -- -C "link-arg=-Wl,-install_name,@rpath/$filename" \
+        set -- "$@" -C "link-arg=-Wl,-install_name,@rpath/$filename" \
             -C "link-arg=-Wl,-oso_prefix,$out/target/"
     fi
-    CC="$CC" CXX="$CXX" RUSTC="$RUSTC" "$@" >&2
+    if ! CC="$CC" CXX="$CXX" RUSTC="$RUSTC" "$@" 2> "$out/cargo.log"; then
+        cat "$out/cargo.log" >&2
+        die "Cargo could not build nupp-native"
+    fi
+    cat "$out/cargo.log" >&2
+    sed -n 's/^note: native-static-libs: //p' "$out/cargo.log" | tail -n 1 | tr ' ' '\n' \
+        | sed '/^$/d' > "$out/native-static-libs"
     [ -f "$RUST_NATIVE_OUT" ] \
         || die "Cargo built nupp-native but did not write $RUST_NATIVE_OUT"
     [ -f "$RUST_NATIVE_STATIC_OUT" ] \
@@ -1814,6 +1823,7 @@ build_nupp_host() {
     case ",$nh_features," in *,native-panic-probe,*) nh_provider="$nh_provider,panic-probe" ;; esac
     build_rust_native "$nh_provider"
     nh_provider_archive=$RUST_NATIVE_STATIC_OUT
+    nh_provider_libraries=$RUST_NATIVE_LIBS_OUT
     nh_digest=$(printf '%s|%s|%s|%s|%s' \
         nupp-host "$nh_features" "$(host_program_digest)" "$nh_provider_archive" "$KEY" \
         | sha256_stdin | cut -c1-16)
@@ -1848,6 +1858,7 @@ build_nupp_host() {
         [ -z "$nh_flag" ] || set -- "$@" "$nh_flag"
     done <<EOF
 $(host_system_flags "$nh_features")
+$(cat "$nh_provider_libraries" 2>/dev/null)
 $(host_stub_export_flags "$nh_out" "$nh_features" "$nh_luajit")
 EOF
     "$@" >&2 || die "cannot link the Nupp host"
