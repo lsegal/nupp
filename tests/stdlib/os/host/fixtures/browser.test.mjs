@@ -112,6 +112,7 @@ async function runGuest(name, host) {
   const child = spawn(LUAJIT, [GUEST, ROOT, SCENARIOS, name], {stdio: ["pipe", "pipe", "pipe"], env: process.env});
   let stderr = "";
   child.stderr.on("data", (data) => { stderr += data; });
+  const stderrClosed = new Promise((resolve) => child.stderr.on("close", resolve));
   const lines = createInterface({input: child.stdout, crlfDelay: Infinity})[Symbol.asyncIterator]();
   // The emulator's clock is wall time, where the guest bridge reads the page's
   // performance clock; deadlines must be measured on the one the guest uses.
@@ -124,6 +125,9 @@ async function runGuest(name, host) {
       const message = JSON.parse(next.value);
       if (message.type === "done") {
         closeHostChannel(options);
+        // The guest exits after its answer, but the two pipes are read
+        // independently: on Windows its last stderr can arrive after it.
+        await stderrClosed;
         return {...message, frames, stderr};
       }
       frames++;
