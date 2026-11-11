@@ -423,11 +423,7 @@ function M.gpuConformanceIsValidPosixShell()
     assert(typedGemm:find('os.monotonic', 1, true), "GPU conformance omits its packaged clock dependency")
     assert(gemm:find("generated.now()", 1, true), "GPU conformance does not use its packaged benchmark clock")
     for name, script in pairs({linux = linux, windows = windows}) do
-        assert(
-            script:find('"$root/bin/nupp" test gpudevicetest', 1, true)
-                or script:find('"$root/bin/nupp" test --shard=gpudevicetest', 1, true),
-            name .. " does not cross wgpu-native"
-        )
+        assert(script:find('"$root/bin/nupp" test gpudevicetest', 1, true), name .. " does not cross wgpu-native")
         assert(script:find("counted-wgsl.lua", 1, true), name .. " does not execute the emitted WGSL")
         assert(script:find("NUPP_WGPU_LIBRARY", 1, true), name .. " leaves LuaJIT without wgpu-native")
         assert(
