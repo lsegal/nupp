@@ -517,162 +517,6 @@ local function decodeEnum(id, entry)
     return {kind = "enum", id = id, name = entry.name, bits = (entry.size or 4) * 8, values = values,}
 end
 
--- Content caching also prevents a second consumer from redeclaring the same C text in
--- LuaJIT's process-global ctype registry.
-local inspectCache = {}
-
--- `prelude` is a list of declarations, or one string holding a single declaration;
--- either way the cache key is the same text.
-local function preludeList(prelude)
-    if type(prelude) == "table" then
-        return prelude
-    end
-    if type(prelude) == "string" and #prelude > 0 then
-        return {prelude}
-    end
-
-    return {}
-end
-
--- `text` is one blob to take or leave, or a list of declarations to take what parses
--- of. A blob is what a `cheader` pins, where a header that will not parse is the
--- answer; a list is what import-c ejects, where it is one entry.
-local function targetUnits(text)
-    if type(text) == "table" then
-        return text, true
-    end
-    return {text}, false
-end
-
-export function inspect(text: string | {string}, prelude: (string | {string})?): Inspection?, string?
-    local declarations = preludeList(prelude)
-    local units, perUnit = targetUnits(text)
-    local key = table.concat(declarations, "\n") .. "\0" .. table.concat(units, "\n")
-    local hit = inspectCache[key]
-    if hit then
-        return hit
-    end
-
-    -- A filtered header can depend on typedefs from its include closure. Declare that
-    -- vocabulary before the snapshot so it is available while parsing but cannot become
-    -- an exported declaration of the target.
-    --
-    -- One at a time, and a failure is dropped rather than fatal. A system header's
-    -- vocabulary is a chain, and the chain runs through spellings this vocabulary does
-    -- not carry, as Darwin reaches `__darwin_mbstate_t` through a `union` body, so an
-    -- unresolvable link costs the declarations that needed it and nothing else.
-    -- Redeclaring a name LuaJIT already holds fails the same way and is equally
-    -- harmless: the registry is global and process-wide, so a second import of an
-    -- overlapping header meets its own earlier work.
-    for _, declaration in ipairs(declarations) do
-        pcall(ffi.cdef, declaration)
-    end
-
-    local before = {}
-    local top: integer = 0
-    for id, entry in ctypes() do
-        before[id] = entryFingerprint(entry)
-        top = id
-    end
-
-    -- Which names the target itself spells, for the same reason `cdecl.declare` keeps
-    -- them: the registry is process-wide, so a header whose types something else in
-    -- this process already declared introduces no new ctype and the diff below finds
-    -- nothing. Left at that, importing a header a `cheader` had already pinned
-    -- produced an empty module rather than the header's declarations, and said so
-    -- nowhere -- the declarations were not rejected, they were simply not new.
-    --
-    -- The prelude's names are held back. That vocabulary is the include closure's, it
-    -- is declared here only so the target parses, and claiming it would export the
-    -- neighbours a header names rather than what it declares.
-    local preludeNames: {[string]: boolean} = {}
-    for _, declaration in ipairs(declarations) do
-        for word in declaration:gmatch("[%a_][%w_]*") do
-            preludeNames[word] = true
-        end
-    end
-    local spelled: {[string]: boolean} = {}
-    for _, unit in ipairs(units) do
-        for word in unit:gmatch("[%a_][%w_]*") do
-            if not preludeNames[word] then
-                spelled[word] = true
-            end
-        end
-    end
-
-    -- What LuaJIT will not parse is set aside rather than taken as the answer for the
-    -- whole header. One declaration commonly fails for a reason local to itself, as a
-    -- struct laid out from a type whose definition lives in a header that was filtered
-    -- away, and the rest of the file is unaffected and worth having. The caller is
-    -- told what it lost.
-    --
-    -- Each new registry entry is attributed to the declaration that introduced it, so
-    -- a consumer can say where in the header a declaration came from. The registry is
-    -- dense, so the entries one declaration added are the ones past the old top.
-    local rejected = {}
-    local unitOf: {[integer]: integer} = {}
-    for index, unit in ipairs(units) do
-        local ok, err = pcall(ffi.cdef, unit)
-        while info(top + 1) do
-            top = top + 1
-            unitOf[top] = index
-        end
-        if not ok then
-            rejected[#rejected + 1] = {
-                text = unit,
-                -- LuaJIT prefixes its own chunk name and line
-                reason = tostring(err):gsub("^.-:%d+:%s*", ""),
-                unit = index,
-            }
-        end
-    end
-    if not perUnit and #rejected > 0 then
-        return nil, rejected[1].reason
-    end
-
-    local structs, functions, enums = {}, {}, {}
-    local anonymousStructs = {}
-    for id, entry in ctypes() do
-        -- A checked program's declaration is read back under the name it spelled, but
-        -- it is that program's, not this header's.
-        if before[id] ~= entryFingerprint(entry) or (entry.name ~= nil and spelled[entry.name] and not entry.cname) then
-            local kind = kindOf(entry.info)
-            -- An enum carries its constants whether or not it is named: `typedef enum {
-            -- ... } Mode;` names the type and nothing else, and its members are the
-            -- point of declaring it.
-            if kind == CT_ENUM then
-                local declaration = decodeEnum(id, entry)
-                declaration.unit = unitOf[id]
-                enums[#enums + 1] = declaration
-            elseif kind == CT_TYPEDEF and entry.name then
-                local rid, target = resolve(refOf(entry.info))
-                if target and kindOf(target.info) == CT_STRUCT and not target.name and not anonymousStructs[rid] then
-                    local declaration = decodeStruct(rid, target)
-                    declaration.name = entry.name
-                    declaration.typedefName = true
-                    declaration.unit = unitOf[rid] or unitOf[id]
-                    structs[#structs + 1] = declaration
-                    anonymousStructs[rid] = true
-                end
-            elseif entry.name then
-                if kind == CT_STRUCT then
-                    local declaration = decodeStruct(id, entry)
-                    declaration.unit = unitOf[id]
-                    structs[#structs + 1] = declaration
-                elseif kind == CT_FUNC then
-                    local declaration = decodeFunction(entry)
-                    declaration.unit = unitOf[id]
-                    functions[#functions + 1] = declaration
-                end
-            end
-        end
-    end
-    local result = {structs = structs, functions = functions, enums = enums, rejected = rejected, declared = #units,}
-    inspectCache[key] = result
-
-    return result
-end
-
 -- The names checked blocks have declared, as tags (after `struct`, `union` or `enum`)
 -- and as ordinary identifiers (typedefs, functions, externs, enum constants). C keeps
 -- the two apart, and so does the renaming: `typedef struct Foo Foo;` names the
@@ -1026,11 +870,229 @@ local function rename(text: string, tags: {[string]: boolean}, names: {[string]:
     return table.concat(out)
 end
 
+-- Adds the tags and ordinary names `text` declares to `tags` and `names`.
+local function scanDeclared(text: string, tags: {[string]: boolean}, names: {[string]: boolean})
+    local words = lex(text)
+    local i: integer = 1
+    while i <= #words do
+        i = scanDeclaration(words, i, tags, names)
+    end
+end
+
+local function keepIn(into: {[string]: boolean}, words: {[string]: boolean})
+    for word in pairs(words) do
+        into[word] = true
+    end
+end
+
+-- Keeps the names a block declared once LuaJIT took it: a name from text LuaJIT refused
+-- would send later lookups after a declaration that is not there.
+local function keepChecked(tags: {[string]: boolean}, names: {[string]: boolean})
+    keepIn(checkedTags, tags)
+    keepIn(checkedNames, names)
+end
+
+-- Tag and name sets for one pass of declarations. Their own keys are what that pass
+-- declares; every name an earlier checked block declared reads through.
+local function scope(): ({[string]: boolean}, {[string]: boolean})
+    return setmetatable({}, {__index = checkedTags}), setmetatable({}, {__index = checkedNames})
+end
+
 --- A type string as a checked program means it: a name some checked block declared
 --- stands for that block's declaration, wherever else the process declared the same
 --- name.
 export function checked(spec: string): string
     return rename(spec, checkedTags, checkedNames)
+end
+
+-- Content caching also prevents a second consumer from redeclaring the same C text in
+-- LuaJIT's process-global ctype registry.
+local inspectCache = {}
+
+-- `prelude` is a list of declarations, or one string holding a single declaration;
+-- either way the cache key is the same text.
+local function preludeList(prelude)
+    if type(prelude) == "table" then
+        return prelude
+    end
+    if type(prelude) == "string" and #prelude > 0 then
+        return {prelude}
+    end
+
+    return {}
+end
+
+-- `text` is one blob to take or leave, or a list of declarations to take what parses
+-- of. A blob is what a `cheader` pins, where a header that will not parse is the
+-- answer; a list is what import-c ejects, where it is one entry.
+local function targetUnits(text)
+    if type(text) == "table" then
+        return text, true
+    end
+    return {text}, false
+end
+
+export function inspect(text: string | {string}, prelude: (string | {string})?): Inspection?, string?
+    local declarations = preludeList(prelude)
+    local units, perUnit = targetUnits(text)
+    local key = table.concat(declarations, "\n") .. "\0" .. table.concat(units, "\n")
+    local hit = inspectCache[key]
+    if hit then
+        return hit
+    end
+
+    -- A filtered header can depend on typedefs from its include closure. Declare that
+    -- vocabulary before the snapshot so it is available while parsing but cannot become
+    -- an exported declaration of the target.
+    --
+    -- One at a time, and a failure is dropped rather than fatal. A system header's
+    -- vocabulary is a chain, and the chain runs through spellings this vocabulary does
+    -- not carry, as Darwin reaches `__darwin_mbstate_t` through a `union` body, so an
+    -- unresolvable link costs the declarations that needed it and nothing else.
+    -- Redeclaring a name LuaJIT already holds fails the same way and is equally
+    -- harmless: the registry is global and process-wide, so a second import of an
+    -- overlapping header meets its own earlier work.
+    --
+    -- The header and its prelude are a checked program's, as much as a literal
+    -- `ffi.cdef` block is, so what they declare goes in under the checked suffix the
+    -- same way (`declare`). Otherwise a header that reached `struct stat` or a typedef
+    -- first would decide what the compiler's own runtime got when it declared that
+    -- name later. Every entry still reads back under the name the header spelled.
+    local tags, names = scope()
+    local preludeDeclared = {}
+    for index, declaration in ipairs(declarations) do
+        local own: {[string]: boolean} = {}
+        local ownNames: {[string]: boolean} = {}
+        scanDeclared(declaration, own, ownNames)
+        preludeDeclared[index] = {own, ownNames}
+        keepIn(tags, own)
+        keepIn(names, ownNames)
+    end
+    local unitDeclared = {}
+    for index, unit in ipairs(units) do
+        local own: {[string]: boolean} = {}
+        local ownNames: {[string]: boolean} = {}
+        scanDeclared(unit, own, ownNames)
+        unitDeclared[index] = {own, ownNames}
+        keepIn(tags, own)
+        keepIn(names, ownNames)
+    end
+    for index, declaration in ipairs(declarations) do
+        if pcall(ffi.cdef, rename(declaration, tags, names)) then
+            keepChecked(preludeDeclared[index][1], preludeDeclared[index][2])
+        end
+    end
+
+    local before = {}
+    local top: integer = 0
+    for id, entry in ctypes() do
+        before[id] = entryFingerprint(entry)
+        top = id
+    end
+
+    -- Which names the target itself spells, for the same reason `cdecl.declare` keeps
+    -- them: the registry is process-wide, so a header whose types something else in
+    -- this process already declared introduces no new ctype and the diff below finds
+    -- nothing. Left at that, importing a header a `cheader` had already pinned
+    -- produced an empty module rather than the header's declarations, and said so
+    -- nowhere -- the declarations were not rejected, they were simply not new.
+    --
+    -- The prelude's names are held back. That vocabulary is the include closure's, it
+    -- is declared here only so the target parses, and claiming it would export the
+    -- neighbours a header names rather than what it declares.
+    local preludeNames: {[string]: boolean} = {}
+    for _, declaration in ipairs(declarations) do
+        for word in declaration:gmatch("[%a_][%w_]*") do
+            preludeNames[word] = true
+        end
+    end
+    local spelled: {[string]: boolean} = {}
+    for _, unit in ipairs(units) do
+        for word in unit:gmatch("[%a_][%w_]*") do
+            if not preludeNames[word] then
+                spelled[word] = true
+            end
+        end
+    end
+
+    -- What LuaJIT will not parse is set aside rather than taken as the answer for the
+    -- whole header. One declaration commonly fails for a reason local to itself, as a
+    -- struct laid out from a type whose definition lives in a header that was filtered
+    -- away, and the rest of the file is unaffected and worth having. The caller is
+    -- told what it lost.
+    --
+    -- Each new registry entry is attributed to the declaration that introduced it, so
+    -- a consumer can say where in the header a declaration came from. The registry is
+    -- dense, so the entries one declaration added are the ones past the old top.
+    local rejected = {}
+    local unitOf: {[integer]: integer} = {}
+    for index, unit in ipairs(units) do
+        local ok, err = pcall(ffi.cdef, rename(unit, tags, names))
+        while info(top + 1) do
+            top = top + 1
+            unitOf[top] = index
+        end
+        if ok then
+            keepChecked(unitDeclared[index][1], unitDeclared[index][2])
+        else
+            rejected[#rejected + 1] = {
+                text = unit,
+                -- LuaJIT prefixes its own chunk name and line
+                reason = tostring(err):gsub("^.-:%d+:%s*", ""):gsub(CHECKED_SUFFIX, ""),
+                unit = index,
+            }
+        end
+    end
+    if not perUnit and #rejected > 0 then
+        return nil, rejected[1].reason
+    end
+
+    local structs, functions, enums = {}, {}, {}
+    local anonymousStructs = {}
+    for id, entry in ctypes() do
+        local kind = kindOf(entry.info)
+        -- A name is claimed back as the target meant it. One the renaming above gave
+        -- the checked suffix means the checked entry, so the process's own entry of
+        -- that name is the runtime's and not this header's; any other means the
+        -- process's.
+        local renamed = (kind == CT_STRUCT or kind == CT_ENUM) and tags or names
+        if before[id] ~= entryFingerprint(entry)
+            or (entry.name ~= nil and spelled[entry.name] and (entry.cname ~= nil) == (renamed[entry.name] == true))
+        then
+            -- An enum carries its constants whether or not it is named: `typedef enum {
+            -- ... } Mode;` names the type and nothing else, and its members are the
+            -- point of declaring it.
+            if kind == CT_ENUM then
+                local declaration = decodeEnum(id, entry)
+                declaration.unit = unitOf[id]
+                enums[#enums + 1] = declaration
+            elseif kind == CT_TYPEDEF and entry.name then
+                local rid, target = resolve(refOf(entry.info))
+                if target and kindOf(target.info) == CT_STRUCT and not target.name and not anonymousStructs[rid] then
+                    local declaration = decodeStruct(rid, target)
+                    declaration.name = entry.name
+                    declaration.typedefName = true
+                    declaration.unit = unitOf[rid] or unitOf[id]
+                    structs[#structs + 1] = declaration
+                    anonymousStructs[rid] = true
+                end
+            elseif entry.name then
+                if kind == CT_STRUCT then
+                    local declaration = decodeStruct(id, entry)
+                    declaration.unit = unitOf[id]
+                    structs[#structs + 1] = declaration
+                elseif kind == CT_FUNC then
+                    local declaration = decodeFunction(entry)
+                    declaration.unit = unitOf[id]
+                    functions[#functions + 1] = declaration
+                end
+            end
+        end
+    end
+    local result = {structs = structs, functions = functions, enums = enums, rejected = rejected, declared = #units,}
+    inspectCache[key] = result
+
+    return result
 end
 
 --- Declares a block to the FFI and returns which functions *this block* named.
@@ -1050,13 +1112,8 @@ end
 --- declaration, so a function an earlier checked block declared is claimed back by
 --- name instead. Only a checked one: the compiler's own `isatty` is not the program's.
 export function declare(text: string): boolean, string?, {[string]: boolean}?
-    local tags: {[string]: boolean} = setmetatable({}, {__index = checkedTags})
-    local names: {[string]: boolean} = setmetatable({}, {__index = checkedNames})
-    local words = lex(text)
-    local i: integer = 1
-    while i <= #words do
-        i = scanDeclaration(words, i, tags, names)
-    end
+    local tags, names = scope()
+    scanDeclared(text, tags, names)
     local before = {}
     for id in ctypes() do
         before[id] = true
@@ -1065,14 +1122,7 @@ export function declare(text: string): boolean, string?, {[string]: boolean}?
     if not ok then
         return false, (tostring(err):gsub(CHECKED_SUFFIX, ""))
     end
-    -- Kept only once the block declared: a name from text LuaJIT refused would send
-    -- later lookups after a declaration that is not there.
-    for tag in pairs(tags) do
-        checkedTags[tag] = true
-    end
-    for name in pairs(names) do
-        checkedNames[name] = true
-    end
+    keepChecked(tags, names)
     local spelled: {[string]: boolean} = {}
     for word in text:gmatch("[%a_][%w_]*") do
         spelled[word] = true
@@ -1108,15 +1158,18 @@ local layoutCache: {[string]: Layout} = {}
 --- sequence of C member declarations. This is the other half of a layout check: a
 --- consumer that renders a declaration in its own words asks how those words lay out,
 --- and compares the answer with the declaration's own.
+---
+--- The members are read as a checked program means them (`checked`), since the
+--- declaration they render came from one.
 export function layout(kind: string, body: string): Layout?, string?
     local key = kind .. "\0" .. body
     local hit = layoutCache[key]
     if hit then
         return hit
     end
-    local ok, ct = pcall(ffi.typeof, kind .. " { " .. body .. " }")
+    local ok, ct = pcall(ffi.typeof, kind .. " { " .. checked(body) .. " }")
     if not ok then
-        return nil, (tostring(ct):gsub("^.-:%d+:%s*", ""))
+        return nil, (tostring(ct):gsub("^.-:%d+:%s*", ""):gsub(CHECKED_SUFFIX, ""))
     end
     local rid, entry = resolve(tonumber(ct))
     if not entry or kindOf(entry.info) ~= CT_STRUCT then
