@@ -1,0 +1,51 @@
+--- Little-endian reads and byte comparisons over raw memory.
+module nupphost.bytes
+
+--- The little-endian unsigned integer of `width` bytes at `at`.
+export function nuppHostBytesLe(borrows bytes: uint8*, at: integer, width: integer): uint64
+    local value: uint64 = 0ULL
+    local index: integer = width - 1
+    @unsafe do
+        while index >= 0 do
+            value = (value << 8) | (bytes[at + index] as uint64)
+            index = index - 1
+        end
+    end
+
+    return value
+end
+
+--- Whether the `count` bytes at `left` and `right` are the same.
+export function nuppHostBytesSame(borrows left: uint8*, borrows right: uint8*, count: integer): boolean
+    local index: integer = 0
+    @unsafe do
+        while index < count do
+            if left[index] ~= right[index] then
+                return false
+            end
+            index = index + 1
+        end
+    end
+
+    return true
+end
+
+--- Whether every one of the `count` bytes at `at` is zero.
+export function nuppHostBytesZero(borrows bytes: uint8*, at: integer, count: integer): boolean
+    local index: integer = 0
+    @unsafe do
+        while index < count do
+            if bytes[at + index] ~= 0 then
+                return false
+            end
+            index = index + 1
+        end
+    end
+
+    return true
+end
+
+--- `bytes` advanced by `count`.
+export function nuppHostBytesOffset(borrows bytes: uint8*, count: integer): uint8*
+    return ((bytes as int64) + (count as int64)) as uint8*
+end

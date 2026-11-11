@@ -1,0 +1,1200 @@
+--- Messages and the bounded queues, endpoints and registries that carry them
+--- between worker lanes.
+---
+--- A queue is a bounded FIFO. A send transfers ownership only on acceptance.
+--- Closing ingress drains accepted messages; closing the receiver discards
+--- them. Both wake every blocked side.
+---
+--- An endpoint is one direction of an application channel, with one live
+--- capability generation. Moving it invalidates every old wrapper, including
+--- wrappers a dynamically typed caller retained. Lua holds endpoints only as
+--- opaque, never-reused registry keys, validated before any storage is
+--- touched.
+module nupphost.channel
+
+const sys = require("nupphost.sys")
+const map = require("nupphost.map")
+const region = require("nupphost.region")
+
+cdef function calloc(count: uint64, size: uint64): voidptr?
+cdef function malloc(size: uint64): voidptr?
+cdef function free(borrows p: voidptr)
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, count: uint64): voidptr
+cdef function __atomic_fetch_add_8(borrows p: int64*, v: int64, order: int32): int64
+cdef function __atomic_fetch_sub_8(borrows p: int64*, v: int64, order: int32): int64
+cdef function __atomic_load_8(borrows p: int64*, order: int32): int64
+cdef function __atomic_store_8(borrows p: int64*, v: int64, order: int32)
+
+--- An attachment's kinds, as the Lua surface names them.
+export const ATTACHMENT_REGION = 0
+
+export const ATTACHMENT_MOVED = 1
+export const ATTACHMENT_ENDPOINT = 2
+
+--- What a send reports, and what readiness a wait reports.
+export const SENT = 0
+
+export const FULL = 1
+export const CLOSED = 2
+export const OVERSIZED = 3
+export const INVALID = 4
+export const READY = 0
+export const WAITING = 1
+
+--- What a receive reports.
+export const RECEIVED = 0
+
+export const EMPTY = 1
+
+-- What Rust's `size_of` gave a message and an attachment, which a control
+-- queue's byte bound counts.
+const MESSAGE_OVERHEAD = 120ULL
+const ATTACHMENT_OVERHEAD = 32ULL
+const ATTACHMENT_BYTES = 32ULL
+const SATURATED = 18446744073709551615ULL
+
+cdef struct Message
+    kind: int32
+    id: int64
+    number: number
+    first: uint64
+    firstLength: uint64
+    second: uint64
+    secondLength: uint64
+    value: uint64
+    valueLength: uint64
+    attachments: uint64
+    attachmentCount: int64
+end
+
+--- One attachment of a message. `kind` is -1 once taken.
+cdef struct Attachment
+    kind: int32
+    block: uint64
+    first: uint64
+    length: uint64
+end
+
+cdef struct Queue
+    references: int64
+    mutex: uint64
+    arrived: uint64
+    space: uint64
+    slots: uint64
+    capacity: int64
+    head: int64
+    count: int64
+    bytes: uint64
+    closed: int32
+    messageLimit: int64
+    byteLimit: uint64
+    payloadMeasure: int32
+end
+
+cdef struct Slot
+    item: uint64
+    bytes: uint64
+end
+
+cdef struct Capability
+    references: int64
+    queue: uint64
+    generation: int64
+    sender: int32
+end
+
+cdef struct Endpoint
+    references: int64
+    capability: uint64
+    generation: int64
+end
+
+-- Registries -------------------------------------------------------------------
+
+local registryLock: uint64 = 0ULL
+local endpoints: uint64 = 0ULL
+local pending: uint64 = 0ULL
+local nextEndpoint: uint64 = 1ULL
+local nextPending: uint64 = 1ULL
+
+--- Prepares the registries. The main thread calls it before any worker
+--- exists, so it needs no lock of its own.
+export function nuppHostChannelInitialize(): boolean
+    if registryLock ~= 0ULL then
+        return true
+    end
+    endpoints = map.nuppHostMapNew()
+    pending = map.nuppHostMapNew()
+    local lock = sys.nuppHostSysMutexNew()
+    if lock == nil or endpoints == 0ULL or pending == 0ULL then
+        return false
+    end
+    registryLock = lock as uint64
+
+    return true
+end
+
+local function lockRegistry()
+    sys.nuppHostSysLock(registryLock as voidptr)
+end
+
+local function unlockRegistry()
+    sys.nuppHostSysUnlock(registryLock as voidptr)
+end
+
+-- Bytes ------------------------------------------------------------------------
+
+--- A copy of the `length` bytes at `data`, or 0 without memory.
+local function copyBytes(data: uint64, length: uint64): uint64
+    local copy = malloc(length + 1ULL)
+    if copy == nil then
+        return 0ULL
+    end
+    if length ~= 0ULL then
+        memcpy(copy as voidptr, data as voidptr, length)
+    end
+
+    return copy as uint64
+end
+
+local function saturatingAdd(left: uint64, right: uint64): uint64
+    local sum = left + right
+    if sum < left then
+        return SATURATED
+    end
+
+    return sum
+end
+
+-- Messages ---------------------------------------------------------------------
+
+local function attachmentAt(message: uint64, index: integer): Attachment*
+    @unsafe do
+        return ((message as Message*).attachments + (index as uint64) * ATTACHMENT_BYTES) as Attachment*
+    end
+end
+
+--- A message's size as the adapter's control queues count it.
+export function nuppHostMessageMeasured(message: uint64): uint64
+    local m = message as Message*
+    @unsafe do
+        local bytes = saturatingAdd(MESSAGE_OVERHEAD, m.firstLength)
+        bytes = saturatingAdd(bytes, m.secondLength)
+        bytes = saturatingAdd(bytes, m.valueLength)
+        return saturatingAdd(bytes, (m.attachmentCount as uint64) * ATTACHMENT_OVERHEAD)
+    end
+end
+
+local function layoutWidth(layout: uint64): uint64
+    if layout == 1ULL or layout == 2ULL then
+        return 1ULL
+    elseif layout == 3ULL or layout == 4ULL then
+        return 2ULL
+    elseif layout == 5ULL or layout == 6ULL or layout == 9ULL then
+        return 4ULL
+    elseif layout == 7ULL or layout == 8ULL or layout == 10ULL then
+        return 8ULL
+    end
+
+    return 0ULL
+end
+
+--- A message's size as an application channel's byte bound counts it: its
+--- bytes and what its attachments carry. An endpoint is never small enough.
+export function nuppHostMessagePayload(message: uint64): uint64
+    local m = message as Message*
+    @unsafe do
+        local bytes = m.firstLength
+        for index = 0, (m.attachmentCount as integer) - 1 do
+            local attachment = attachmentAt(message, index)
+            if attachment.kind == ATTACHMENT_REGION then
+                bytes = saturatingAdd(bytes, region.nuppHostRegionLength(attachment.block))
+            elseif attachment.kind == ATTACHMENT_MOVED then
+                local width = layoutWidth(attachment.length)
+                local size = SATURATED
+                if width ~= 0ULL then
+                    size = attachment.first * width
+                    if attachment.first ~= 0ULL and size // width ~= attachment.first then
+                        size = SATURATED
+                    end
+                end
+                if size < 1ULL then
+                    size = 1ULL
+                end
+                bytes = saturatingAdd(bytes, size)
+            elseif attachment.kind == ATTACHMENT_ENDPOINT then
+                bytes = SATURATED
+            end
+        end
+        return bytes
+    end
+end
+
+local function releaseAttachment(kind: int32, block: uint64)
+    if block == 0ULL then
+        return
+    end
+    if kind == ATTACHMENT_REGION then
+        region.nuppHostRegionRelease(block)
+    elseif kind == ATTACHMENT_MOVED then
+        free(block as voidptr)
+    elseif kind == ATTACHMENT_ENDPOINT then
+        nuppHostEndpointRelease(block)
+    end
+end
+
+--- Releases every attachment of an array of `count`, then the array.
+export function nuppHostAttachmentsRelease(attachments: uint64, count: int64): nil
+    if attachments == 0ULL then
+        return
+    end
+    @unsafe do
+        for index = 0, (count as integer) - 1 do
+            local attachment = (attachments + (index as uint64) * ATTACHMENT_BYTES) as Attachment*
+            local kind = attachment.kind
+            local block = attachment.block
+            attachment.kind = -1
+            attachment.block = 0ULL
+            releaseAttachment(kind, block)
+        end
+    end
+    free(attachments as voidptr)
+end
+
+export function nuppHostMessageDestroy(message: uint64): nil
+    local m = message as Message*
+    @unsafe do
+        if m.first ~= 0ULL then
+            free(m.first as voidptr)
+        end
+        if m.second ~= 0ULL then
+            free(m.second as voidptr)
+        end
+        if m.value ~= 0ULL then
+            free(m.value as voidptr)
+        end
+        nuppHostAttachmentsRelease(m.attachments, m.attachmentCount)
+    end
+    free(message as voidptr)
+end
+
+--- A new message holding copies of three byte strings and owning the `count`
+--- attachments of the array `attachments`, which it frees. 0 without memory,
+--- after releasing what the attachments own.
+export function nuppHostMessageNew(
+    kind: int32,
+    id: int64,
+    value: number,
+    first: uint64,
+    firstLength: uint64,
+    second: uint64,
+    secondLength: uint64,
+    third: uint64,
+    thirdLength: uint64,
+    attachments: uint64,
+    count: int64
+): uint64
+    local record = calloc(1ULL, 96ULL)
+    if record == nil then
+        nuppHostAttachmentsRelease(attachments, count)
+        return 0ULL
+    end
+    local message = record as uint64
+    local m = record as Message*
+    @unsafe do
+        m.kind = kind
+        m.id = id
+        m.number = value
+        m.attachments = attachments
+        m.attachmentCount = count
+        m.first = copyBytes(first, firstLength)
+        m.firstLength = firstLength
+        m.second = copyBytes(second, secondLength)
+        m.secondLength = secondLength
+        m.value = copyBytes(third, thirdLength)
+        m.valueLength = thirdLength
+        if m.first == 0ULL or m.second == 0ULL or m.value == 0ULL then
+            nuppHostMessageDestroy(message)
+            return 0ULL
+        end
+    end
+
+    return message
+end
+
+export function nuppHostMessageKind(message: uint64): int32
+    @unsafe do
+        return (message as Message*).kind
+    end
+end
+
+export function nuppHostMessageId(message: uint64): int64
+    @unsafe do
+        return (message as Message*).id
+    end
+end
+
+export function nuppHostMessageNumber(message: uint64): number
+    @unsafe do
+        return (message as Message*).number
+    end
+end
+
+--- One of the message's byte strings, 0, 1 or 2, with its length in
+--- `length[0]`.
+export function nuppHostMessageBytes(message: uint64, which: int32, borrows length: uint64*): uint64
+    local m = message as Message*
+    @unsafe do
+        if which == 0 then
+            length[0] = m.firstLength
+            return m.first
+        elseif which == 1 then
+            length[0] = m.secondLength
+            return m.second
+        end
+        length[0] = m.valueLength
+        return m.value
+    end
+end
+
+export function nuppHostMessageAttachmentCount(message: uint64): int64
+    @unsafe do
+        return (message as Message*).attachmentCount
+    end
+end
+
+--- The kind of attachment `index`, or -1 when there is none or it was taken.
+export function nuppHostMessageAttachmentKind(message: uint64, index: integer): int32
+    @unsafe do
+        if index < 0 or index >= ((message as Message*).attachmentCount as integer) then
+            return -1
+        end
+        return attachmentAt(message, index).kind
+    end
+end
+
+--- Takes attachment `index`, writing its kind, owner, first and length to
+--- `out[0..3]`. A region's owner moves to the caller; an endpoint is
+--- registered and its key given, with first saying whether it sends; a moved
+--- block's pointer moves to the caller. False when there is none to take.
+export function nuppHostMessageTakeAttachment(message: uint64, index: integer, borrows out: uint64*): boolean
+    @unsafe do
+        if index < 0 or index >= ((message as Message*).attachmentCount as integer) then
+            return false
+        end
+        local attachment = attachmentAt(message, index)
+        local kind = attachment.kind
+        local block = attachment.block
+        if kind < 0 or block == 0ULL then
+            return false
+        end
+        attachment.kind = -1
+        attachment.block = 0ULL
+        local first = attachment.first
+        if kind == ATTACHMENT_ENDPOINT then
+            if nuppHostEndpointIsSender(block) then
+                first = 1ULL
+            else
+                first = 0ULL
+            end
+            block = nuppHostEndpointRegister(block)
+            if block == 0ULL then
+                return false
+            end
+        end
+        out[0] = kind as uint64
+        out[1] = block
+        out[2] = first
+        out[3] = attachment.length
+    end
+
+    return true
+end
+
+-- Queues -----------------------------------------------------------------------
+
+local function lockQueue(queue: uint64)
+    @unsafe do
+        sys.nuppHostSysLock((queue as Queue*).mutex as voidptr)
+    end
+end
+
+local function unlockQueue(queue: uint64)
+    @unsafe do
+        sys.nuppHostSysUnlock((queue as Queue*).mutex as voidptr)
+    end
+end
+
+local function broadcast(queue: uint64)
+    @unsafe do
+        sys.nuppHostSysBroadcast((queue as Queue*).arrived as voidptr)
+        sys.nuppHostSysBroadcast((queue as Queue*).space as voidptr)
+    end
+end
+
+local function freePrimitives(slots: voidptr?, mutex: voidptr?, arrived: voidptr?, space: voidptr?)
+    if slots ~= nil then
+        free(slots as voidptr)
+    end
+    if mutex ~= nil then
+        sys.nuppHostSysMutexFree(mutex as voidptr)
+    end
+    if arrived ~= nil then
+        sys.nuppHostSysCondFree(arrived as voidptr)
+    end
+    if space ~= nil then
+        sys.nuppHostSysCondFree(space as voidptr)
+    end
+end
+
+--- A new queue bounded at `messages` entries and `bytes` bytes, holding one
+--- owner, or 0.
+local function queueNew(messages: int64, bytes: uint64, payloadMeasure: boolean): uint64
+    local record = calloc(1ULL, 112ULL)
+    local slots = calloc(8ULL, 16ULL)
+    local mutex = sys.nuppHostSysMutexNew()
+    local arrived = sys.nuppHostSysCondNew()
+    local space = sys.nuppHostSysCondNew()
+    if record == nil or slots == nil or mutex == nil or arrived == nil or space == nil then
+        freePrimitives(slots, mutex, arrived, space)
+        if record ~= nil then
+            free(record as voidptr)
+        end
+        return 0ULL
+    end
+    local q = record as Queue*
+    @unsafe do
+        q.references = 1LL
+        q.slots = slots as uint64
+        q.capacity = 8LL
+        q.mutex = mutex as uint64
+        q.arrived = arrived as uint64
+        q.space = space as uint64
+        q.messageLimit = messages
+        q.byteLimit = bytes
+        if payloadMeasure then
+            q.payloadMeasure = 1
+        end
+    end
+
+    return record as uint64
+end
+
+local function slotAt(queue: uint64, index: int64): Slot*
+    local q = queue as Queue*
+    @unsafe do
+        local at = (q.head + index) % q.capacity
+        return (q.slots + (at as uint64) * 16ULL) as Slot*
+    end
+end
+
+--- Takes the head entry with the queue's lock held, or 0 when empty.
+local function takeLocked(queue: uint64): uint64
+    local q = queue as Queue*
+    @unsafe do
+        if q.count == 0LL then
+            return 0ULL
+        end
+        local slot = slotAt(queue, 0LL)
+        local item = slot.item
+        local bytes = slot.bytes
+        slot.item = 0ULL
+        q.head = (q.head + 1LL) % q.capacity
+        q.count = q.count - 1LL
+        if q.bytes > bytes then
+            q.bytes = q.bytes - bytes
+        else
+            q.bytes = 0ULL
+        end
+        return item
+    end
+end
+
+local function measure(queue: uint64, item: uint64): uint64
+    @unsafe do
+        if (queue as Queue*).payloadMeasure ~= 0 then
+            return nuppHostMessagePayload(item)
+        end
+    end
+
+    return nuppHostMessageMeasured(item)
+end
+
+local function roomFor(queue: uint64, bytes: uint64): boolean
+    local q = queue as Queue*
+    @unsafe do
+        if q.count >= q.messageLimit then
+            return false
+        end
+        local sum = q.bytes + bytes
+        return sum >= q.bytes and sum <= q.byteLimit
+    end
+end
+
+--- Appends with the lock held, growing the ring as needed.
+local function appendLocked(queue: uint64, item: uint64, bytes: uint64): boolean
+    local q = queue as Queue*
+    @unsafe do
+        if q.count == q.capacity then
+            local capacity = q.capacity * 2LL
+            local grown = calloc(capacity as uint64, 16ULL)
+            if grown == nil then
+                return false
+            end
+            for index = 0, (q.count as integer) - 1 do
+                local from = slotAt(queue, index as int64)
+                local to = ((grown as uint64) + (index as uint64) * 16ULL) as Slot*
+                to.item = from.item
+                to.bytes = from.bytes
+            end
+            free(q.slots as voidptr)
+            q.slots = grown as uint64
+            q.capacity = capacity
+            q.head = 0LL
+        end
+        local slot = slotAt(queue, q.count)
+        slot.item = item
+        slot.bytes = bytes
+        q.count = q.count + 1LL
+        q.bytes = q.bytes + bytes
+        sys.nuppHostSysSignal(q.arrived as voidptr)
+    end
+
+    return true
+end
+
+--- Accepts `item` if there is room, with the lock held: SENT, FULL or CLOSED.
+local function tryPushLocked(queue: uint64, item: uint64): int32
+    local bytes = measure(queue, item)
+    @unsafe do
+        if (queue as Queue*).closed ~= 0 then
+            return CLOSED
+        end
+    end
+    if not roomFor(queue, bytes) or not appendLocked(queue, item, bytes) then
+        return FULL
+    end
+
+    return SENT
+end
+
+--- Destroys every message of a detached ring of `count` slots from `head`.
+local function destroySlots(slots: uint64, capacity: int64, head: int64, count: int64)
+    if slots == 0ULL then
+        return
+    end
+    @unsafe do
+        for index = 0, (count as integer) - 1 do
+            local at = (head + (index as int64)) % capacity
+            local item = ((slots + (at as uint64) * 16ULL) as Slot*).item
+            if item ~= 0ULL then
+                nuppHostMessageDestroy(item)
+            end
+        end
+    end
+    free(slots as voidptr)
+end
+
+-- Control channels -------------------------------------------------------------
+
+--- A worker control channel: a queue of 1024 messages and 256 MiB, measured
+--- the way the adapter measures them.
+export function nuppHostQueueNew(): uint64
+    return queueNew(1024LL, 268435456ULL, false)
+end
+
+export function nuppHostQueueRetain(queue: uint64): nil
+    @unsafe do
+        __atomic_fetch_add_8(queue as int64*, 1LL, 0)
+    end
+end
+
+export function nuppHostQueueRelease(queue: uint64): nil
+    local q = queue as Queue*
+    @unsafe do
+        if __atomic_fetch_sub_8(queue as int64*, 1LL, 4) ~= 1LL then
+            return
+        end
+        destroySlots(q.slots, q.capacity, q.head, q.count)
+        sys.nuppHostSysMutexFree(q.mutex as voidptr)
+        sys.nuppHostSysCondFree(q.arrived as voidptr)
+        sys.nuppHostSysCondFree(q.space as voidptr)
+    end
+    free(queue as voidptr)
+end
+
+--- Accepts `message`, owned by the queue on SENT, if there is room.
+export function nuppHostQueueTryPush(queue: uint64, message: uint64): int32
+    lockQueue(queue)
+    local status = tryPushLocked(queue, message)
+    unlockQueue(queue)
+    return status
+end
+
+--- Waits for room, then accepts `message`. False when closed, or when the
+--- message can never fit; the caller keeps it then.
+export function nuppHostQueuePushWait(queue: uint64, message: uint64): boolean
+    local q = queue as Queue*
+    local bytes = measure(queue, message)
+    @unsafe do
+        if bytes > q.byteLimit then
+            return false
+        end
+        lockQueue(queue)
+        while q.closed == 0 and not roomFor(queue, bytes) do
+            sys.nuppHostSysWait(q.space as voidptr, q.mutex as voidptr)
+        end
+        if q.closed ~= 0 then
+            unlockQueue(queue)
+            return false
+        end
+        local accepted = appendLocked(queue, message, bytes)
+        unlockQueue(queue)
+        return accepted
+    end
+end
+
+--- Takes the head message, waiting `timeout` milliseconds for one: none when
+--- 0, forever when negative. 0 when none arrived or the queue closed empty.
+export function nuppHostQueuePop(queue: uint64, timeout: int64): uint64
+    local q = queue as Queue*
+    lockQueue(queue)
+    @unsafe do
+        if timeout < 0LL then
+            while q.count == 0LL and q.closed == 0 do
+                sys.nuppHostSysWait(q.arrived as voidptr, q.mutex as voidptr)
+            end
+        elseif timeout > 0LL then
+            local deadline = sys.nuppHostSysMonotonicNs() + (timeout as uint64) * 1000000ULL
+            while q.count == 0LL and q.closed == 0 do
+                local now = sys.nuppHostSysMonotonicNs()
+                if now >= deadline then
+                    break
+                end
+                local remaining = ((deadline - now + 999999ULL) // 1000000ULL) as int64
+                if sys.nuppHostSysWaitMs(q.arrived as voidptr, q.mutex as voidptr, remaining) then
+                    break
+                end
+            end
+        end
+        local item = takeLocked(queue)
+        if item ~= 0ULL then
+            sys.nuppHostSysSignal(q.space as voidptr)
+        end
+        unlockQueue(queue)
+        return item
+    end
+end
+
+export function nuppHostQueueClose(queue: uint64): nil
+    lockQueue(queue)
+    @unsafe do
+        local q = queue as Queue*
+        q.closed = 1
+    end
+    broadcast(queue)
+    unlockQueue(queue)
+end
+
+--- Closes the queue and destroys what it still held, after letting go of its
+--- lock: a message's attachments may close other queues.
+export function nuppHostQueueCloseAndDiscard(queue: uint64): nil
+    local q = queue as Queue*
+    local fresh = calloc(8ULL, 16ULL)
+    local slots: uint64 = 0ULL
+    local capacity: int64 = 0LL
+    local head: int64 = 0LL
+    local count: int64 = 0LL
+    lockQueue(queue)
+    @unsafe do
+        q.closed = 1
+        if fresh ~= nil then
+            slots = q.slots
+            capacity = q.capacity
+            head = q.head
+            count = q.count
+            q.slots = fresh as uint64
+            q.capacity = 8LL
+            q.head = 0LL
+            q.count = 0LL
+            q.bytes = 0ULL
+        end
+    end
+    broadcast(queue)
+    unlockQueue(queue)
+    destroySlots(slots, capacity, head, count)
+end
+
+export function nuppHostQueueClosed(queue: uint64): boolean
+    lockQueue(queue)
+    local closed = false
+    @unsafe do
+        closed = (queue as Queue*).closed ~= 0
+    end
+    unlockQueue(queue)
+
+    return closed
+end
+
+export function nuppHostQueueCount(queue: uint64): int64
+    lockQueue(queue)
+    local count: int64 = 0LL
+    @unsafe do
+        count = (queue as Queue*).count
+    end
+    unlockQueue(queue)
+
+    return count
+end
+
+-- Endpoints --------------------------------------------------------------------
+
+local function capabilityOf(endpoint: uint64): uint64
+    @unsafe do
+        return (endpoint as Endpoint*).capability
+    end
+end
+
+local function queueOf(endpoint: uint64): uint64
+    @unsafe do
+        return (capabilityOf(endpoint) as Capability*).queue
+    end
+end
+
+local function generationOf(endpoint: uint64): int64
+    @unsafe do
+        return (endpoint as Endpoint*).generation
+    end
+end
+
+local function liveGeneration(endpoint: uint64): int64
+    @unsafe do
+        return __atomic_load_8((capabilityOf(endpoint) + 16ULL) as int64*, 2)
+    end
+end
+
+local function setGeneration(endpoint: uint64, generation: int64)
+    @unsafe do
+        __atomic_store_8((capabilityOf(endpoint) + 16ULL) as int64*, generation, 3)
+    end
+end
+
+--- A new endpoint of `capability` at `generation`, holding one owner of each.
+local function endpointNew(capability: uint64, generation: int64): uint64
+    local record = calloc(1ULL, 24ULL)
+    if record == nil then
+        return 0ULL
+    end
+    local e = record as Endpoint*
+    @unsafe do
+        e.references = 1LL
+        e.capability = capability
+        e.generation = generation
+        __atomic_fetch_add_8(capability as int64*, 1LL, 0)
+    end
+
+    return record as uint64
+end
+
+local function capabilityRelease(capability: uint64)
+    @unsafe do
+        if __atomic_fetch_sub_8(capability as int64*, 1LL, 4) ~= 1LL then
+            return
+        end
+        nuppHostQueueRelease((capability as Capability*).queue)
+    end
+    free(capability as voidptr)
+end
+
+export function nuppHostEndpointIsLive(endpoint: uint64): boolean
+    return liveGeneration(endpoint) == generationOf(endpoint)
+end
+
+export function nuppHostEndpointIsSender(endpoint: uint64): boolean
+    @unsafe do
+        return (capabilityOf(endpoint) as Capability*).sender ~= 0
+    end
+end
+
+export function nuppHostEndpointByteLimit(endpoint: uint64): uint64
+    @unsafe do
+        return (queueOf(endpoint) as Queue*).byteLimit
+    end
+end
+
+--- A new direction of `queue`, whose owner it takes, or 0.
+local function capabilityNew(queue: uint64, sender: boolean): uint64
+    local record = calloc(1ULL, 32ULL)
+    if record == nil then
+        nuppHostQueueRelease(queue)
+        return 0ULL
+    end
+    local c = record as Capability*
+    @unsafe do
+        c.queue = queue
+        c.generation = 1LL
+        if sender then
+            c.sender = 1
+        end
+    end
+
+    return record as uint64
+end
+
+--- The two directions of a new application channel bounded at `messages`
+--- entries and `bytes` bytes, the receiver written to `receiver[0]`. 0 when a
+--- limit is zero or without memory.
+export function nuppHostEndpointPair(messages: int64, bytes: uint64, borrows receiver: uint64*): uint64
+    if messages <= 0LL or bytes == 0ULL then
+        return 0ULL
+    end
+    local queue = queueNew(messages, bytes, true)
+    if queue == 0ULL then
+        return 0ULL
+    end
+    nuppHostQueueRetain(queue)
+    local sending = capabilityNew(queue, true)
+    local receiving = capabilityNew(queue, false)
+    local sender: uint64 = 0ULL
+    local other: uint64 = 0ULL
+    if sending ~= 0ULL then
+        sender = endpointNew(sending, 1LL)
+    end
+    if receiving ~= 0ULL then
+        other = endpointNew(receiving, 1LL)
+    end
+    if sender == 0ULL or other == 0ULL then
+        if sender ~= 0ULL then
+            nuppHostEndpointRelease(sender)
+        elseif sending ~= 0ULL then
+            capabilityRelease(sending)
+        end
+        if other ~= 0ULL then
+            nuppHostEndpointRelease(other)
+        elseif receiving ~= 0ULL then
+            capabilityRelease(receiving)
+        end
+        return 0ULL
+    end
+    @unsafe do
+        receiver[0] = other
+    end
+
+    return sender
+end
+
+--- Closes this generation of the direction, if it is still the live one: the
+--- sender's close lets the receiver drain, the receiver's discards what is
+--- queued. Explicit close, a failed transfer and finalization are idempotent,
+--- and an old generation cannot close its successor.
+export function nuppHostEndpointClose(endpoint: uint64): nil
+    local queue = queueOf(endpoint)
+    lockQueue(queue)
+    local mine = liveGeneration(endpoint) == generationOf(endpoint)
+    if mine then
+        setGeneration(endpoint, 0LL)
+    end
+    unlockQueue(queue)
+    if not mine then
+        return
+    end
+    if nuppHostEndpointIsSender(endpoint) then
+        nuppHostQueueClose(queue)
+    else
+        nuppHostQueueCloseAndDiscard(queue)
+    end
+end
+
+--- Another owner of `endpoint`.
+local function endpointRetain(endpoint: uint64)
+    @unsafe do
+        __atomic_fetch_add_8(endpoint as int64*, 1LL, 0)
+    end
+end
+
+--- Gives one owner back; the last closes the endpoint and frees it.
+export function nuppHostEndpointRelease(endpoint: uint64): nil
+    @unsafe do
+        if __atomic_fetch_sub_8(endpoint as int64*, 1LL, 4) ~= 1LL then
+            return
+        end
+    end
+    nuppHostEndpointClose(endpoint)
+    capabilityRelease(capabilityOf(endpoint))
+    free(endpoint as voidptr)
+end
+
+--- The next generation of this direction, invalidating this one, or 0 when
+--- this one is no longer live. Generation changes and queue operations share
+--- the lock, so a stale operation cannot accept or consume once the successor
+--- starts.
+export function nuppHostEndpointTransfer(endpoint: uint64): uint64
+    local queue = queueOf(endpoint)
+    lockQueue(queue)
+    local generation = generationOf(endpoint)
+    if liveGeneration(endpoint) ~= generation or generation >= 9223372036854775807LL then
+        unlockQueue(queue)
+        return 0ULL
+    end
+    local successor = endpointNew(capabilityOf(endpoint), generation + 1LL)
+    if successor ~= 0ULL then
+        setGeneration(endpoint, generation + 1LL)
+        broadcast(queue)
+    end
+    unlockQueue(queue)
+
+    return successor
+end
+
+--- Sends `message`, which the queue owns on SENT and the caller keeps on any
+--- other answer.
+export function nuppHostEndpointTrySend(endpoint: uint64, message: uint64): int32
+    if not nuppHostEndpointIsLive(endpoint) or not nuppHostEndpointIsSender(endpoint) then
+        return INVALID
+    end
+    local queue = queueOf(endpoint)
+    @unsafe do
+        if nuppHostMessagePayload(message) > (queue as Queue*).byteLimit then
+            return OVERSIZED
+        end
+    end
+    lockQueue(queue)
+    if not nuppHostEndpointIsLive(endpoint) then
+        unlockQueue(queue)
+        return INVALID
+    end
+    local status = tryPushLocked(queue, message)
+    unlockQueue(queue)
+
+    return status
+end
+
+--- Takes the head message, writing RECEIVED, EMPTY, CLOSED or INVALID to
+--- `status[0]`. Testing closure and taking the head share the queue lock, so a
+--- final accepted message cannot be skipped in favor of end of stream.
+export function nuppHostEndpointTryReceive(endpoint: uint64, borrows status: int32*): uint64
+    @unsafe do
+        if not nuppHostEndpointIsLive(endpoint) or nuppHostEndpointIsSender(endpoint) then
+            status[0] = INVALID
+            return 0ULL
+        end
+        local queue = queueOf(endpoint)
+        lockQueue(queue)
+        if not nuppHostEndpointIsLive(endpoint) then
+            unlockQueue(queue)
+            status[0] = INVALID
+            return 0ULL
+        end
+        local item = takeLocked(queue)
+        if item ~= 0ULL then
+            sys.nuppHostSysBroadcast((queue as Queue*).space as voidptr)
+            status[0] = RECEIVED
+        elseif (queue as Queue*).closed ~= 0 then
+            status[0] = CLOSED
+        else
+            status[0] = EMPTY
+        end
+        unlockQueue(queue)
+        return item
+    end
+end
+
+local function readinessLocked(endpoint: uint64, bytes: uint64): int32
+    if not nuppHostEndpointIsLive(endpoint) then
+        return INVALID
+    end
+    local queue = queueOf(endpoint)
+    local q = queue as Queue*
+    @unsafe do
+        if nuppHostEndpointIsSender(endpoint) then
+            if bytes > q.byteLimit then
+                return OVERSIZED
+            elseif q.closed ~= 0 then
+                return CLOSED
+            elseif roomFor(queue, bytes) then
+                return READY
+            end
+            return WAITING
+        end
+        if q.count > 0LL then
+            return READY
+        elseif q.closed ~= 0 then
+            return CLOSED
+        end
+    end
+
+    return WAITING
+end
+
+export function nuppHostEndpointReadiness(endpoint: uint64, bytes: uint64): int32
+    local queue = queueOf(endpoint)
+    lockQueue(queue)
+    local answer = readinessLocked(endpoint, bytes)
+    unlockQueue(queue)
+
+    return answer
+end
+
+--- Waits at most `timeout` milliseconds for the endpoint to stop waiting.
+export function nuppHostEndpointWaitReady(endpoint: uint64, bytes: uint64, timeout: int64): int32
+    local queue = queueOf(endpoint)
+    local q = queue as Queue*
+    local sender = nuppHostEndpointIsSender(endpoint)
+    lockQueue(queue)
+    local deadline = sys.nuppHostSysMonotonicNs() + (timeout as uint64) * 1000000ULL
+    while readinessLocked(endpoint, bytes) == WAITING do
+        local now = sys.nuppHostSysMonotonicNs()
+        if now >= deadline then
+            break
+        end
+        local remaining = ((deadline - now + 999999ULL) // 1000000ULL) as int64
+        local timedOut = false
+        @unsafe do
+            if sender then
+                timedOut = sys.nuppHostSysWaitMs(q.space as voidptr, q.mutex as voidptr, remaining)
+            else
+                timedOut = sys.nuppHostSysWaitMs(q.arrived as voidptr, q.mutex as voidptr, remaining)
+            end
+        end
+        if timedOut then
+            break
+        end
+    end
+    local answer = readinessLocked(endpoint, bytes)
+    unlockQueue(queue)
+
+    return answer
+end
+
+--- The owning scope tears storage down after joining its children. Its
+--- authority belongs to the queue, independently of endpoint generations.
+export function nuppHostEndpointAbort(endpoint: uint64): nil
+    nuppHostQueueCloseAndDiscard(queueOf(endpoint))
+end
+
+-- The endpoint registry --------------------------------------------------------
+
+--- Registers `endpoint`, whose owner moves to the registry, under a new key.
+--- 0 without memory, after releasing the endpoint.
+export function nuppHostEndpointRegister(endpoint: uint64): uint64
+    lockRegistry()
+    local key = nextEndpoint
+    nextEndpoint = nextEndpoint + 1ULL
+    local stored = map.nuppHostMapPut(endpoints, key, endpoint)
+    unlockRegistry()
+    if not stored then
+        nuppHostEndpointRelease(endpoint)
+        return 0ULL
+    end
+
+    return key
+end
+
+--- Another owner of the endpoint registered under `key`, or 0.
+export function nuppHostEndpointBorrow(key: uint64): uint64
+    if key == 0ULL then
+        return 0ULL
+    end
+    lockRegistry()
+    local endpoint = map.nuppHostMapGet(endpoints, key)
+    if endpoint ~= 0ULL then
+        endpointRetain(endpoint)
+    end
+    unlockRegistry()
+
+    return endpoint
+end
+
+--- Registers another owner of the endpoint under `key` under a key of its own,
+--- or 0.
+export function nuppHostEndpointAnchor(key: uint64): uint64
+    local endpoint = nuppHostEndpointBorrow(key)
+    if endpoint == 0ULL then
+        return 0ULL
+    end
+
+    return nuppHostEndpointRegister(endpoint)
+end
+
+--- Removes the endpoint under `key` from the registry and closes it.
+export function nuppHostEndpointDiscard(key: uint64): nil
+    if key == 0ULL then
+        return
+    end
+    lockRegistry()
+    local endpoint = map.nuppHostMapRemove(endpoints, key)
+    unlockRegistry()
+    if endpoint ~= 0ULL then
+        nuppHostEndpointClose(endpoint)
+        nuppHostEndpointRelease(endpoint)
+    end
+end
+
+-- Pending messages -------------------------------------------------------------
+
+--- Holds `message` under a new key until it is offered, taken or released. 0
+--- without memory, after destroying the message.
+export function nuppHostPendingPut(message: uint64): uint64
+    lockRegistry()
+    local key = nextPending
+    nextPending = nextPending + 1ULL
+    local stored = map.nuppHostMapPut(pending, key, message)
+    unlockRegistry()
+    if not stored then
+        nuppHostMessageDestroy(message)
+        return 0ULL
+    end
+
+    return key
+end
+
+--- Takes the message held under `key`, or 0.
+export function nuppHostPendingTake(key: uint64): uint64
+    if key == 0ULL then
+        return 0ULL
+    end
+    lockRegistry()
+    local message = map.nuppHostMapRemove(pending, key)
+    unlockRegistry()
+
+    return message
+end
+
+--- The payload size of the message held under `key`, or the saturated size.
+export function nuppHostPendingSize(key: uint64): uint64
+    lockRegistry()
+    local message = map.nuppHostMapGet(pending, key)
+    local size = SATURATED
+    if message ~= 0ULL then
+        size = nuppHostMessagePayload(message)
+    end
+    unlockRegistry()
+
+    return size
+end
+
+--- Offers the message held under `key` to the endpoint under `endpointKey`. On
+--- SENT the key is spent; on any other answer the message stays held.
+export function nuppHostPendingOffer(endpointKey: uint64, key: uint64): int32
+    local endpoint = nuppHostEndpointBorrow(endpointKey)
+    if endpoint == 0ULL then
+        return INVALID
+    end
+    local message = nuppHostPendingTake(key)
+    if message == 0ULL then
+        nuppHostEndpointRelease(endpoint)
+        return INVALID
+    end
+    local status = nuppHostEndpointTrySend(endpoint, message)
+    if status ~= SENT then
+        lockRegistry()
+        local stored = map.nuppHostMapPut(pending, key, message)
+        unlockRegistry()
+        if not stored then
+            nuppHostMessageDestroy(message)
+        end
+    end
+    nuppHostEndpointRelease(endpoint)
+
+    return status
+end

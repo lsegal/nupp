@@ -40,6 +40,7 @@ local groups = {
         "httpnativetest",
         "nativefoundationstest",
         "netnativetest",
+        "nupphosttest",
         "processnativetest",
         "processprovidertest",
         "rustabitest",
@@ -238,7 +239,7 @@ runnertest testtimingstest buildprogresstest buildtest
 end
 for name in (
     [[
-hostbinarytest hostembeddingtest spitest bootstraptest bundletest
+hostbinarytest hostembeddingtest nupphosttest spitest bootstraptest bundletest
 compilerpacktest releasetest rocktest spipackagetest worktreetest
 rusttoolchaintest toolchaintest
 ]]
@@ -796,31 +797,31 @@ packages["tools/bench"] = {cache = false, reason = "Builds benchmark projects ag
 packages["tools/packaging"] = {cache = false, reason = "Release and external packaging/toolchain state."}
 packages[
     "tools/packaging/bundle/buffers"
-] = {cache = false, reason = "Runs a toolchain-produced Rust host; external toolchain inputs."}
+] = {cache = false, reason = "Runs a toolchain-produced host; external toolchain inputs."}
 packages[
     "tools/packaging/bundle/channels"
-] = {cache = false, reason = "Runs a toolchain-produced Rust host; external toolchain inputs."}
+] = {cache = false, reason = "Runs a toolchain-produced host; external toolchain inputs."}
 packages[
     "tools/packaging/bundle/dedicated"
-] = {cache = false, reason = "Runs a toolchain-produced Rust host; external toolchain inputs."}
+] = {cache = false, reason = "Runs a toolchain-produced host; external toolchain inputs."}
 packages[
     "tools/packaging/bundle/failure"
-] = {cache = false, reason = "Runs a toolchain-produced Rust host; external toolchain inputs."}
+] = {cache = false, reason = "Runs a toolchain-produced host; external toolchain inputs."}
 packages[
     "tools/packaging/bundle/forking"
-] = {cache = false, reason = "Runs a toolchain-produced Rust host; external toolchain inputs."}
+] = {cache = false, reason = "Runs a toolchain-produced host; external toolchain inputs."}
 packages[
     "tools/packaging/bundle/lifetime"
-] = {cache = false, reason = "Runs a toolchain-produced Rust host; external toolchain inputs."}
+] = {cache = false, reason = "Runs a toolchain-produced host; external toolchain inputs."}
 packages[
     "tools/packaging/bundle/region"
-] = {cache = false, reason = "Runs a toolchain-produced Rust host; external toolchain inputs."}
+] = {cache = false, reason = "Runs a toolchain-produced host; external toolchain inputs."}
 packages[
     "tools/packaging/bundle/scheduler"
-] = {cache = false, reason = "Runs a toolchain-produced Rust host; external toolchain inputs."}
+] = {cache = false, reason = "Runs a toolchain-produced host; external toolchain inputs."}
 packages[
     "tools/packaging/bundle/scope"
-] = {cache = false, reason = "Runs a toolchain-produced Rust host; external toolchain inputs."}
+] = {cache = false, reason = "Runs a toolchain-produced host; external toolchain inputs."}
 packages["tools/repository"] = {cache = false, reason = "Git branches, index and worktree state are test inputs."}
 packages["tools/toolchain"] = {cache = false, reason = "External compiler installations and provisioning state."}
 

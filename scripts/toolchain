@@ -43,7 +43,7 @@ Components: luajit luarocks lpeg lpeg-source stage0 migration-stage0 llvm wgpu
             browser-sources browser-emulator browser-guest
             native-rust FEATURES
             rust-vendor OUTPUT
-            host FEATURES, host-rust, host-library FEATURES
+            host FEATURES, host-library FEATURES
             kit FEATURES, kit-archive FEATURES OUTPUT
             prebuilt-codegen [PLATFORM], prebuilt-kit [PLATFORM]
             codegen-archive OUTPUT
@@ -632,8 +632,6 @@ LOCK=""
 HOST_OUT=""
 NATIVE_OUT=""
 RUST_NATIVE_OUT=""
-RUST_HOST_OUT=""
-RUST_HOST_STATIC_OUT=""
 RUST_EMBED_DYNAMIC_OUT=""
 RUST_EMBED_IMPORT_OUT=""
 release_lock() { [ -n "$LOCK" ] && rm -rf "$LOCK"; LOCK=""; return 0; }
@@ -923,6 +921,7 @@ build_rust_native() {
     filename=$(rust_library_filename)
     RUST_NATIVE_OUT="$out/target/release/$filename"
     RUST_NATIVE_STATIC_OUT="$out/target/release/libnupp_native.a"
+    RUST_NATIVE_LIBS_OUT="$out/native-static-libs"
 
     take_lock "rust-native-$digest" "$out/.complete" || return 0
     [ -f "$out/.complete" ] && [ -f "$RUST_NATIVE_OUT" ] \
@@ -932,16 +931,14 @@ build_rust_native() {
     note "building the Rust native provider with $RUSTC"
     rm -rf "$out"
     mkdir -p "$out"
-    cargo_action=build
-    [ "$PLATFORM" = darwin ] && cargo_action=rustc
-    set -- "$CARGO" "$cargo_action" \
+    set -- "$CARGO" rustc \
         --manifest-path "$ROOT/Cargo.toml" \
         --package nupp-native \
         --release \
         --locked \
         --no-default-features \
-        --target-dir "$out/target"
-    [ "$PLATFORM" = darwin ] && set -- "$@" --lib
+        --target-dir "$out/target" \
+        --lib
     if offline; then
         set -- "$@" --offline
     fi
@@ -962,11 +959,21 @@ EOF
     # that cache path after the library was staged or packaged elsewhere. The
     # debug map's object paths carry it too, and ld64 hashes them into
     # LC_UUID, so they go relative to it.
+    # The Nupp host links the static archive, so it also needs the native
+    # libraries rustc would have linked for it: libstdc++ and LLVM's system
+    # libraries under the code generator, and Rust's own. rustc reports them.
+    set -- "$@" -- --print native-static-libs
     if [ "$PLATFORM" = darwin ]; then
-        set -- "$@" -- -C "link-arg=-Wl,-install_name,@rpath/$filename" \
+        set -- "$@" -C "link-arg=-Wl,-install_name,@rpath/$filename" \
             -C "link-arg=-Wl,-oso_prefix,$out/target/"
     fi
-    CC="$CC" CXX="$CXX" RUSTC="$RUSTC" "$@" >&2
+    if ! CC="$CC" CXX="$CXX" RUSTC="$RUSTC" "$@" 2> "$out/cargo.log"; then
+        cat "$out/cargo.log" >&2
+        die "Cargo could not build nupp-native"
+    fi
+    cat "$out/cargo.log" >&2
+    sed -n 's/^note: native-static-libs: //p' "$out/cargo.log" | tail -n 1 | tr ' ' '\n' \
+        | sed '/^$/d' > "$out/native-static-libs"
     [ -f "$RUST_NATIVE_OUT" ] \
         || die "Cargo built nupp-native but did not write $RUST_NATIVE_OUT"
     [ -f "$RUST_NATIVE_STATIC_OUT" ] \
@@ -1013,62 +1020,6 @@ select_host_features() {
     host_cargo_features=$(normalize_rust_features "${host_cargo_features#,}")
 }
 
-# The archives of LLVM, lld, the glue around them and libstdc++, as one
-# colon-separated --exclude-libs value (-Wl splits its argument at commas).
-# Empty without the code generator.
-codegen_archive_exclusions() {
-    case ",$host_cargo_features," in
-        *,native-codegen,*) ;;
-        *) return 0 ;;
-    esac
-    excluded=libstdc++.a:libnupp_codegen_glue.a
-    for archive in "$LLVM_OUT"/lib/lib*.a; do
-        [ -f "$archive" ] && excluded="$excluded:${archive##*/}"
-    done
-    printf '%s\n' "$excluded"
-}
-
-# The host exports what LuaJIT's FFI resolves by name in its own process:
-# the C surface of the runtime, Lua and the providers. Nothing looks for LLVM
-# or lld by name, and exporting them costs twice -- a symbol table the size of
-# the rest of the binary, and every one of their functions kept live against
-# dead stripping. macOS also drops local symbols; Linux keeps them, because a
-# crashed worker's core dump is read back through them.
-host_export_arguments() {
-    excluded=$(codegen_archive_exclusions)
-    case "$PLATFORM" in
-        darwin)
-            # The host crate's build script hands ld64 the committed list,
-            # host/include/nupp.exports, which names every export and so
-            # leaves LLVM, lld, C++ and Rust symbols out without naming them.
-            printf '%s\n' '-C' 'link-arg=-Wl,-x'
-            # ld64 hashes the debug map's object paths and the output's leaf
-            # name into LC_UUID. Both carry the target directory -- the leaf
-            # is Cargo's hashed deps/ name -- so without these the same
-            # sources linked in two checkouts differ in their UUID.
-            printf '%s\n' '-C' "link-arg=-Wl,-oso_prefix,$out/target/"
-            printf '%s\n' '-C' 'link-arg=-Wl,-final_output,nupp-host-rust'
-            ;;
-        windows)
-            # A PE image also holds at most 65535 exports, which LLVM's alone
-            # would pass.
-            printf '%s\n' '-C' 'link-arg=-Wl,--export-all-symbols'
-            [ -z "$excluded" ] || printf '%s\n' '-C' "link-arg=-Wl,--exclude-libs=$excluded"
-            ;;
-        *)
-            # --exclude-libs cannot keep LLVM out here: rustc bundles its
-            # archives into the codegen crate's rlib, so the linker never sees
-            # them by name. Hidden by pattern instead, as C++, Rust and LLVM's
-            # C API. Exported, they also take the place of the LLVM a
-            # dlopen()ed library brings: Mesa's llvmpipe Vulkan driver then
-            # calls this LLVM and crashes in vkCreateDevice.
-            printf '%s\n' '{ global: *; local: _Z*; _R*; LLVM*; llvm_*; };' > "$out/host-exports.map"
-            printf '%s\n' '-C' 'link-arg=-Wl,-E'
-            printf '%s\n' '-C' "link-arg=-Wl,--version-script=$out/host-exports.map"
-            ;;
-    esac
-}
-
 # A host that links libnupp.a is an executable, and LuaJIT's ffi.C finds the
 # provider's nuppNative* symbols only among what that executable exports. macOS
 # executables export them already; a Linux one needs -rdynamic, and a Windows
@@ -1085,93 +1036,6 @@ embedding_library_filename() {
         windows) printf '%s\n' nupp.dll ;;
         *) printf '%s\n' libnupp.so ;;
     esac
-}
-
-build_rust_host() {
-    host_kind=${1:-binary}
-    # Reject a mismatched Windows Rust/MinGW family before provisioning the C
-    # dependencies whose archives that Rust host would be unable to consume.
-    select_rust_tools
-    select_host_features "${2:-}"
-    llvm_for_features "$host_cargo_features"
-    rust_environment=$(rust_environment_material)
-    digest=$({
-        printf '%s|%s|%s|%s|%s|%s\n' \
-            nupp-native-host "$host_kind" "$host_cargo_features" \
-            "$RUST_TOOL_MATERIAL" "$(rust_sources_digest)|$KEY" "$RUST_LLVM_MATERIAL"
-        printf '%s\n' "$rust_environment"
-    } | sha256_stdin | cut -c1-16)
-    out="$RUST_BUILD_ROOT/host-$host_kind/$digest"
-    executable=nupp-host-rust
-    [ "$PLATFORM" = windows ] && executable=nupp-host-rust.exe
-    RUST_HOST_OUT="$out/target/release/$executable"
-    RUST_HOST_STATIC_OUT="$out/target/release/libnupp.a"
-
-    expected=$RUST_HOST_OUT
-    [ "$host_kind" = application ] && expected=$RUST_HOST_STATIC_OUT
-    take_lock "rust-host-$host_kind-$digest" "$out/.complete" || return 0
-    [ -f "$out/.complete" ] && [ -f "$expected" ] \
-        && { release_lock; return 0; }
-
-    note "building the Rust $host_kind host with $RUSTC"
-    rm -rf "$out"
-    mkdir -p "$out"
-    set -- "$CARGO" rustc \
-        --manifest-path "$ROOT/Cargo.toml" \
-        --package nupp-native-host \
-        --release \
-        --locked \
-        --no-default-features \
-        --target-dir "$out/target"
-    if [ "$host_kind" = application ]; then
-        host_cargo_features=$(normalize_rust_features \
-            "${host_cargo_features:+$host_cargo_features,}application-entry")
-        set -- "$@" --lib
-    else
-        set -- "$@" --bin nupp-host-rust
-    fi
-    if offline; then
-        set -- "$@" --offline
-    fi
-    vendor_arguments=$(rust_vendor_arguments)
-    if [ -n "$vendor_arguments" ]; then
-        while IFS= read -r config; do
-            set -- "$@" --config "$config"
-        done <<EOF
-$vendor_arguments
-EOF
-    fi
-    set -- "$@" --config "$(rust_remap_arguments)"
-    [ -z "$host_cargo_features" ] || set -- "$@" --features "$host_cargo_features"
-    # Cargo may discard exports reached only through LuaJIT FFI. A binary's
-    # linker roots dead stripping at its exports, which are exactly those, so
-    # it strips; Windows keeps every function until its linker is shown to root
-    # --export-all-symbols the same way, and the static application archive
-    # has no exports of its own until it is linked.
-    set -- "$@" --
-    if [ "$host_kind" = application ] || [ "$PLATFORM" = windows ]; then
-        set -- "$@" -C link-dead-code
-    fi
-    if [ "$host_kind" != application ]; then
-        while IFS= read -r argument; do
-            set -- "$@" "$argument"
-        done <<EOF
-$(host_export_arguments)
-EOF
-    fi
-    NUPP_CC="$CC" \
-        NUPP_LUAJIT_PREFIX="$PREFIX/luajit" NUPP_LPEG_PREFIX="$host_lpeg_prefix" \
-        RUSTC="$RUSTC" "$@" >&2
-    [ -f "$expected" ] \
-        || die "Cargo built nupp-native-host but did not write $expected"
-    # rustc re-signs the stripped executable ad hoc under that same hashed
-    # deps/ name. One identifier everywhere keeps the signature the same too.
-    if [ "$PLATFORM" = darwin ] && [ "$host_kind" != application ]; then
-        codesign --force --sign - --identifier nupp-host-rust "$expected" >&2 \
-            || die "cannot sign $expected"
-    fi
-    printf 'done\n' > "$out/.complete"
-    release_lock
 }
 
 build_rust_embedding() {
@@ -1624,8 +1488,262 @@ host_system_flags() {
     esac
 }
 
-# Stages the Rust executable and static application entry, or the Rust embedding
-# SDK, for one exact compiler-selected feature set.
+# --- The Nupp host ------------------------------------------------------------
+
+# The host executable and the kit's runtime archive are a native Nupp program,
+# host/program: modules every platform shares, and one `nupphost.sys` per
+# platform beside them. A build generates the entry and `nupphost.build`, the
+# module that says which features this host was built with, and compiles them
+# with this tree's compiler into a static archive.
+
+host_program_platform() {
+    case "$PLATFORM-$UNAME" in
+        darwin-*) echo darwin ;;
+        windows-*) echo windows ;;
+        posix-Linux) echo linux ;;
+        *) die "no Nupp host for $PLATFORM on $UNAME" ;;
+    esac
+}
+
+# The Nupp host's own inputs: its sources, and the parts of the compiler that
+# decide what a native program lowers and links to.
+host_program_digest() {
+    {
+        (cd "$ROOT" && find host/program -type f -name '*.nupp' 2>/dev/null) || true
+        for file in scripts/toolchain host/include/nupp.exports \
+            src/nupp/compiler/aot/llvm/native.nupp src/nupp/tools/build/program.nupp \
+            src/nupp/tools/build/aotllvm.nupp src/nupp/tools/cli/aot.nupp; do
+            [ -f "$ROOT/$file" ] && printf '%s\n' "$file"
+        done
+    } | LC_ALL=C sort | while IFS= read -r file; do
+        printf '%s ' "$file"
+        sha256 "$ROOT/$file"
+    done | sha256_stdin | cut -c1-16
+}
+
+# LuaJIT's own `jit/NAME.lua`, which every host preloads.
+host_jit_module() {
+    for candidate in "$1/share/luajit-2.1/jit/$2.lua" "$1/bin/lua/jit/$2.lua"; do
+        [ -f "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    die "the staged LuaJIT at $1 has no jit/$2.lua"
+}
+
+# A file's text as one Nupp string literal.
+host_string_literal() {
+    printf '"'
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' "$1" | awk '{ printf "%s\\n", $0 }'
+    printf '"'
+}
+
+# Writes the generated half of a host program into DIRECTORY: its manifest, its
+# entry, which defines the C `main`, and `nupphost.build`. The features are the
+# host crate's names as `select_host_features` normalized them.
+write_host_program() {
+    hp_directory=$1
+    hp_features=$2
+    hp_luajit=$3
+    hp_platform=$(host_program_platform)
+    mkdir -p "$hp_directory/nupphost"
+    # The compiler resolves a relative include against the manifest's own
+    # directory, and on Windows wants a drive-qualified path.
+    hp_common=$(native_path "$ROOT/host/program/common")
+    hp_system=$(native_path "$ROOT/host/program/$hp_platform")
+    printf 'return { include = { ".", "%s", "%s" } }\n' "$hp_common" "$hp_system" > "$hp_directory/nupp.lua"
+    {
+        printf 'module main\n\n'
+        printf 'const {nuppHostCliMain as run} = require("nupphost.cli")\n\n'
+        printf 'export function main(argc: int32, argv: cstring*): int32\n'
+        printf '    return run(argc, argv)\n'
+        printf 'end\n'
+    } > "$hp_directory/main.nupp"
+    hp_list="native-checksum,native-time"
+    hp_lpeg=false
+    hp_workers=false
+    for hp_feature in $(printf '%s' "$hp_features" | tr ',' ' '); do
+        case "$hp_feature" in
+            lpeg) hp_lpeg=true; hp_list="$hp_list,lpeg" ;;
+            workers) hp_workers=true ;;
+            native-panic-probe) ;;
+            *) hp_list="$hp_list,$hp_feature" ;;
+        esac
+    done
+    {
+        printf -- '--- What this host was built with: generated by scripts/toolchain.\n'
+        printf 'module nupphost.build\n\n'
+        [ "$hp_lpeg" = false ] || printf 'cdef function luaopen_lpeg(borrows L: voidptr): int32\n\n'
+        printf 'export const FEATURES = "%s"\n' "$hp_list"
+        printf 'export const LPEG = %s\n' "$hp_lpeg"
+        printf 'export const WORKERS = %s\n\n' "$hp_workers"
+        printf 'export function nuppHostBuildOpenLpeg(L: voidptr): int32\n'
+        if [ "$hp_lpeg" = true ]; then
+            printf '    return luaopen_lpeg(L)\n'
+        else
+            printf '    return 0\n'
+        fi
+        printf 'end\n\n'
+        printf 'export const VMDEF = '
+        host_string_literal "$(host_jit_module "$hp_luajit" vmdef)"
+        printf '\nexport const ZONE = '
+        host_string_literal "$(host_jit_module "$hp_luajit" zone)"
+        printf '\nexport const BC = '
+        host_string_literal "$(host_jit_module "$hp_luajit" bc)"
+        printf '\n'
+    } > "$hp_directory/nupphost/build.nupp"
+}
+
+# Merges static archives into one, members whole, with the platform's own
+# archiver: libtool on macOS, an ar MRI script elsewhere.
+merge_static_archives() {
+    ma_output=$1
+    shift
+    rm -f "$ma_output"
+    if [ "$PLATFORM" = darwin ]; then
+        libtool -static -o "$ma_output" "$@" 2>/dev/null >&2 \
+            || die "cannot merge the host's static archives"
+        return 0
+    fi
+    ma_script="$ma_output.mri"
+    {
+        printf 'create %s\n' "$(native_path "$ma_output")"
+        for ma_archive in "$@"; do
+            printf 'addlib %s\n' "$(native_path "$ma_archive")"
+        done
+        printf 'save\nend\n'
+    } > "$ma_script"
+    "${AR:-ar}" -M < "$ma_script" >&2 || die "cannot merge the host's static archives"
+    rm -f "$ma_script"
+    "${AR:-ar}" s "$ma_output" || die "cannot index the host's static archive"
+}
+
+# The symbols the stub executable exports by name, one per line: the LuaJIT C
+# API, the native provider and the code generator, which LuaJIT's FFI resolves
+# in its own process. That is host/include/nupp.exports for this feature list,
+# less the embedding API, which only the embedding SDK defines.
+host_stub_exports() {
+    hx_features=$1
+    hx_luajit=$2
+    hx_include=$(cat "$hx_luajit/.include")
+    hx_version=$(sed -n 's/^#define LUAJIT_VERSION_SYM[ 	]*//p' "$hx_include/luajit.h" | tr -d '\r')
+    hx_applies=false
+    while IFS= read -r hx_line; do
+        hx_line=$(printf '%s' "$hx_line" | tr -d '\r' | sed 's/^[ 	]*//; s/[ 	]*$//')
+        case "$hx_line" in
+            ''|'#'*) continue ;;
+            '['*']')
+                hx_applies=false
+                for hx_section in $(printf '%s' "$hx_line" | tr -d '[]'); do
+                    case ",always,$hx_features," in
+                        *,"$hx_section",*) hx_applies=true ;;
+                    esac
+                done
+                continue
+                ;;
+            nupp_*) continue ;;
+        esac
+        [ "$hx_applies" = true ] || continue
+        [ "$hx_line" = LUAJIT_VERSION_SYM ] && hx_line=$hx_version
+        printf '%s\n' "$hx_line"
+    done < "$ROOT/host/include/nupp.exports"
+}
+
+# What the stub executable exports, and nothing of LLVM, lld or C++: exported,
+# those cost a symbol table the size of the rest of the binary, and every one
+# of their functions kept live against dead stripping. macOS and Windows are
+# given the list itself; a PE image also holds at most 65535 exports, which
+# LLVM's alone would pass. Linux hides by pattern instead.
+host_stub_export_flags() {
+    he_out=$1
+    he_features=$2
+    he_luajit=$3
+    case "$PLATFORM" in
+        darwin)
+            host_stub_exports "$he_features" "$he_luajit" | sed 's/^/_/' > "$he_out/nupp-host.exports"
+            # macOS also drops local symbols; Linux keeps them, because a
+            # crashed worker's core dump is read back through them.
+            printf '%s\n' -Wl,-x "-Wl,-exported_symbols_list,$he_out/nupp-host.exports"
+            ;;
+        windows)
+            {
+                printf 'EXPORTS\n'
+                host_stub_exports "$he_features" "$he_luajit" | sed 's/^/    /'
+            } > "$he_out/nupp-host.def"
+            native_path "$he_out/nupp-host.def"
+            ;;
+        *)
+            # C++, Rust and LLVM's C API. Exported, LLVM would also take the
+            # place of the one a dlopen()ed library brings: Mesa's llvmpipe
+            # Vulkan driver then calls this LLVM and crashes in vkCreateDevice.
+            printf '%s\n' '{ global: *; local: _Z*; _R*; LLVM*; llvm_*; };' > "$he_out/nupp-host.map"
+            printf '%s\n' -Wl,-E "-Wl,--version-script=$he_out/nupp-host.map"
+            ;;
+    esac
+}
+
+# Builds the Nupp host for one normalized feature list into NUPP_HOST_OUT: the
+# static archive the kit's runtime is (the host with its C `main`, the native
+# provider, LuaJIT and LPeg) and the stub executable linked from it.
+build_nupp_host() {
+    nh_features=$1
+    nh_lpeg=$2
+    nh_luajit=$3
+    nh_provider="base"
+    case ",$nh_features," in *,native-codegen,*) nh_provider="$nh_provider,codegen" ;; esac
+    case ",$nh_features," in *,native-panic-probe,*) nh_provider="$nh_provider,panic-probe" ;; esac
+    build_rust_native "$nh_provider"
+    nh_provider_archive=$RUST_NATIVE_STATIC_OUT
+    nh_provider_libraries=$RUST_NATIVE_LIBS_OUT
+    nh_digest=$(printf '%s|%s|%s|%s|%s' \
+        nupp-host "$nh_features" "$(host_program_digest)" "$nh_provider_archive" "$KEY" \
+        | sha256_stdin | cut -c1-16)
+    nh_out="$PREFIX/nupp-host/$nh_digest"
+    NUPP_HOST_OUT=$nh_out
+    nh_stub=nupp-host
+    [ "$PLATFORM" = windows ] && nh_stub=nupp-host.exe
+    take_lock "nupp-host-$nh_digest" "$nh_out/.complete" || return 0
+    [ -f "$nh_out/.complete" ] && [ -f "$nh_out/$nh_stub" ] && { release_lock; return 0; }
+
+    note "building the Nupp host"
+    rm -rf "$nh_out"
+    mkdir -p "$nh_out/src"
+    write_host_program "$nh_out/src" "$nh_features" "$nh_luajit"
+    "$ROOT/bin/nupp" aot --emit static-library --output "$(native_path "$nh_out/libnupphost.a")" \
+        "$(native_path "$nh_out/src/main.nupp")" >&2 \
+        || die "cannot compile the Nupp host"
+    set -- "$nh_out/libnupphost.a" "$nh_provider_archive" "$nh_luajit/lib/libluajit-5.1.a"
+    [ -z "$nh_lpeg" ] || set -- "$@" "$nh_lpeg/lib/liblpeg.a"
+    merge_static_archives "$nh_out/libnupp-host-merged.a" "$@"
+    stage_application_archive "$nh_out/libnupp-host-merged.a" "$nh_out/libnupp-host.a" \
+        "$nh_out/libnupp-host-imports.a"
+    rm -f "$nh_out/libnupp-host-merged.a" "$nh_out/libnupphost.a"
+
+    if [ "$PLATFORM" = darwin ]; then
+        # ld64 hashes the debug map's object paths, which name this build's
+        # directory, into LC_UUID.
+        set -- "$CC" -o "$nh_out/$nh_stub" "-Wl,-force_load,$nh_out/libnupp-host.a" \
+            "-Wl,-oso_prefix,$nh_out/"
+    else
+        set -- "$CC" -o "$nh_out/$nh_stub" -Wl,--whole-archive "$nh_out/libnupp-host.a" -Wl,--no-whole-archive
+        [ "$PLATFORM" = windows ] && set -- "$@" "$nh_out/libnupp-host-imports.a"
+    fi
+    while IFS= read -r nh_flag; do
+        [ -z "$nh_flag" ] || set -- "$@" "$nh_flag"
+    done <<EOF
+$(host_system_flags "$nh_features")
+$(cat "$nh_provider_libraries" 2>/dev/null)
+$(host_stub_export_flags "$nh_out" "$nh_features" "$nh_luajit")
+EOF
+    "$@" >&2 || die "cannot link the Nupp host"
+    if [ "$PLATFORM" = darwin ]; then
+        codesign --force --sign - --identifier nupp-host "$nh_out/$nh_stub" >&2 \
+            || die "cannot sign $nh_out/$nh_stub"
+    fi
+    printf 'done\n' > "$nh_out/.complete"
+    release_lock
+}
+
+# Stages the Nupp executable and static application entry, or the Rust
+# embedding SDK, for one exact compiler-selected feature set.
 build_host() {
     kind=$1
     features=${2:-}
@@ -1691,12 +1809,10 @@ EOF
         return 0
     fi
 
-    build_rust_host binary "$features"
-    rust_executable=$RUST_HOST_OUT
-    build_rust_host application "$features"
-    rust_application=$RUST_HOST_STATIC_OUT
-    out=$stage_out
-    digest=$stage_digest
+    build_nupp_host "$selected_cargo_features" "$selected_lpeg_prefix" "$luajit_prefix"
+    nupp_host=$NUPP_HOST_OUT
+    digest=$(printf '%s|%s' "$stage_digest" "$(basename "$nupp_host")" | sha256_stdin | cut -c1-16)
+    out="$PREFIX/host/$digest"
     HOST_OUT=$out
 
     take_lock "host-$digest" "$out/.complete" || return 0
@@ -1707,12 +1823,16 @@ EOF
             return 0
         fi
     fi
-    note "staging the Rust application host"
+    note "staging the application host"
     rm -rf "$out"
     mkdir -p "$out"
-    cp "$rust_executable" "$out/nupp-host"
-    stage_application_archive \
-        "$rust_application" "$out/libnupp-host.a" "$out/libnupp-host-imports.a"
+    if [ "$PLATFORM" = windows ]; then
+        cp "$nupp_host/nupp-host.exe" "$out/nupp-host"
+        cp "$nupp_host/libnupp-host-imports.a" "$out/libnupp-host-imports.a"
+    else
+        cp "$nupp_host/nupp-host" "$out/nupp-host"
+    fi
+    cp "$nupp_host/libnupp-host.a" "$out/libnupp-host.a"
     chmod +x "$out/nupp-host" 2>/dev/null || true
     printf 'done\n' > "$out/.complete"
     release_lock
@@ -2421,11 +2541,6 @@ case "$1" in
     host)
         build_host stub "${2:-}"
         native_path "$HOST_OUT/nupp-host"
-        exit 0
-        ;;
-    host-rust)
-        build_rust_host binary "${2:-}"
-        native_path "$RUST_HOST_OUT"
         exit 0
         ;;
     host-library)

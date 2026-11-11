@@ -333,6 +333,15 @@ lock_holder_alive() {
     kill -0 "$holder" 2>/dev/null
 }
 
+# Whether the lock is held by a command this one runs beneath. A build that
+# reaches a toolchain step which compiles with this tree -- the Nupp host a
+# binary target is stamped onto -- runs this script again while it holds the
+# lock, and waiting for that holder would be waiting for itself. The holder
+# exports its pid; what it already built is what the nested command uses.
+lock_held_above() {
+    [ -n "${NUPP_BUILD_LOCK_OWNER:-}" ] && [ "$holder" = "$NUPP_BUILD_LOCK_OWNER" ]
+}
+
 # Says that this command is waiting for another build of this tree and whose:
 # once after a short grace, then once a minute. Waiting in silence read as a
 # hang for up to BUILD_LOCK_WAIT. Only on a terminal, so captured output stays
@@ -360,6 +369,8 @@ take_build_lock() {
         if mkdir "$BUILD_LOCK" 2>/dev/null; then
             printf '%s\n' "$$" > "$BUILD_LOCK/pid"
             BUILD_LOCK_HELD=yes
+            NUPP_BUILD_LOCK_OWNER=$$
+            export NUPP_BUILD_LOCK_OWNER
             trap 'release_build_lock' EXIT
             trap 'release_build_lock; exit 130' INT
             trap 'release_build_lock; exit 143' TERM
@@ -368,6 +379,10 @@ take_build_lock() {
         if ! lock_holder_alive; then
             rm -rf "$BUILD_LOCK"
             continue
+        fi
+        if lock_held_above; then
+            [ "$lock_mode" = share ] && return 1
+            return 0
         fi
         sleep 1
         waited=$((waited + 1))
@@ -392,7 +407,7 @@ take_build_lock() {
 # Cheap when nothing holds the lock, which is every ordinary invocation.
 await_build() {
     waited=0
-    while [ -d "$BUILD_LOCK" ] && lock_holder_alive; do
+    while [ -d "$BUILD_LOCK" ] && lock_holder_alive && ! lock_held_above; do
         sleep 1
         waited=$((waited + 1))
         say_waiting_for_build

@@ -206,24 +206,11 @@ unsafe extern "C" {
         value: *mut RawLuaValue,
         error: *mut LuaError,
     ) -> c_int;
-    fn nupp_lua_install_worker_modules(
-        state: *mut LuaState,
-        host: *const c_void,
-        error: *mut LuaError,
-    ) -> c_int;
     fn nupp_lua_worker_host_installed(
         state: *mut LuaState,
         installed: *mut c_int,
         error: *mut LuaError,
     ) -> c_int;
-    fn nupp_lua_set_worker_context(
-        state: *mut LuaState,
-        inbox: *const c_void,
-        outbox: *const c_void,
-        tasks: *const c_void,
-        error: *mut LuaError,
-    ) -> c_int;
-    fn nupp_lua_clear_worker_context(state: *mut LuaState, error: *mut LuaError) -> c_int;
     fn nupp_lua_install_host_channel(
         state: *mut LuaState,
         channel: *const c_void,
@@ -453,17 +440,6 @@ impl Lua {
         })
     }
 
-    pub(crate) fn install_worker_modules(&self, host: *const c_void) -> Result<(), String> {
-        // SAFETY: `host` remains owned by `HostRuntime` while the Lua state can
-        // invoke worker callbacks; the shim only stores it as lightuserdata.
-        self.protected(|error| unsafe {
-            nupp_lua_install_worker_modules(self.state.as_ptr(), host, error)
-        })
-    }
-
-    /// Whether this state already carries the worker adapter, whoever put it
-    /// there. A runtime attached to a state a stamped binary built finds it
-    /// installed without having installed it.
     pub(crate) fn worker_host_installed(&self) -> Result<bool, String> {
         let mut installed: c_int = 0;
         // SAFETY: `installed` is written only on success, below a protected
@@ -474,29 +450,6 @@ impl Lua {
         Ok(installed != 0)
     }
 
-    pub(crate) fn set_worker_context(
-        &self,
-        inbox: *const c_void,
-        outbox: *const c_void,
-        tasks: *const c_void,
-    ) -> Result<(), String> {
-        // SAFETY: the worker lane owns Arc strong references for all three
-        // pointers until its Lua state stops invoking callbacks; C stores only
-        // non-owning lightuserdata and never dereferences it itself.
-        self.protected(|error| unsafe {
-            nupp_lua_set_worker_context(self.state.as_ptr(), inbox, outbox, tasks, error)
-        })
-    }
-
-    pub(crate) fn clear_worker_context(&self) -> Result<(), String> {
-        // SAFETY: this state is live and owner-thread-affine. The C shim uses
-        // protected raw global writes, so no metatable callback can retain or
-        // observe the soon-to-be-invalid Rust ownership pointers.
-        self.protected(|error| unsafe { nupp_lua_clear_worker_context(self.state.as_ptr(), error) })
-    }
-
-    /// Hands `os.host` requests in this state to `channel`, unless another
-    /// runtime's channel already has them; answers whether this one does.
     pub(crate) fn install_host_channel(&self, channel: *const c_void) -> Result<bool, String> {
         let mut installed: c_int = 0;
         // SAFETY: `channel` stays owned by the embedding runtime until it clears

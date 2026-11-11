@@ -1,28 +1,14 @@
-//! Rust-owned Nupp host and LuaJIT embedding boundary.
+//! The Rust embedding SDK's LuaJIT boundary.
 //!
-//! The host owns one LuaJIT state on the creating thread. Native work never
-//! enters Lua: each provider reports its own readiness, which a suspension
-//! source polls. Appended payload discovery is Rust-owned, and all Lua
-//! operations that may fail remain beneath the protected C shim so LuaJIT
-//! cannot unwind through Rust.
+//! A runtime owns or attaches to one LuaJIT state on the creating thread.
+//! Native work never enters Lua: each provider reports its own readiness,
+//! which a suspension source polls. Every Lua operation that may fail remains
+//! beneath the protected C shim, so LuaJIT cannot unwind through Rust. The host
+//! executable is a native Nupp program, host/program.
 
-mod channels;
-#[doc(hidden)]
-pub mod cli;
-mod clock;
 mod embed;
 mod host_channel;
 mod lua;
-mod mcode;
-mod payload;
-mod sharedbytes;
-mod worker_adapter;
-mod workers;
-mod xxh64;
-
-pub use payload::{Error as PayloadError, Payload, read as read_payload};
-pub use sharedbytes::{BuilderError as SharedBytesBuilderError, SharedBytes, SharedBytesBuilder};
-pub use workers::{TaskId, Worker, WorkerError, WorkerEvent, WorkerJob, WorkerLimits};
 
 pub use lua::{LuaFunction, LuaState};
 
@@ -173,7 +159,7 @@ enum Phase {
     Closed,
 }
 
-/// Everything but `shutdown` and `enable_workers` takes `&self`: a host
+/// Everything but `shutdown` takes `&self`: a host
 /// callback may call back into the runtime that is calling it, so the tables
 /// live in cells, and no borrow of one is held across a call into Lua.
 pub struct HostRuntime {
@@ -188,7 +174,6 @@ pub struct HostRuntime {
     next_reload: Cell<u64>,
     reloads: RefCell<HashMap<u64, ReloadState>>,
     frozen: Cell<bool>,
-    worker_host: Option<Box<worker_adapter::WorkersHost>>,
     // The raw LuaJIT state may not move to or be observed from another
     // thread.
     _thread_affine: PhantomData<Rc<()>>,
@@ -197,35 +182,6 @@ pub struct HostRuntime {
 impl HostRuntime {
     pub fn new(executable: &Path) -> Result<Self, HostError> {
         Self::owned(true, Some(executable))
-    }
-
-    /// Reserves a nearby address-space window before any isolated worker state
-    /// is made. The first worker releases it immediately before initialization.
-    pub fn reserve_worker_mcode() {
-        mcode::reserve();
-    }
-
-    /// Starts an isolated LuaJIT lane whose state is created, used, and closed
-    /// on its native worker thread. Each submitted job is one Lua chunk; the
-    /// worker reports Lua failures as task failures without entering or
-    /// borrowing the caller's Lua state.
-    #[cfg(test)]
-    pub fn spawn_isolated_worker(
-        name: impl Into<String>,
-        executable: Option<PathBuf>,
-        limits: WorkerLimits,
-    ) -> Result<Worker, WorkerError> {
-        mcode::reserve();
-        Worker::spawn(name, limits, move || {
-            let runtime = HostRuntime::owned(true, executable.as_deref())
-                .map_err(|error| error.to_string())?;
-            Ok(move |job: WorkerJob| {
-                match runtime.run_buffer(job.bytes.as_slice(), "=nupp-worker-task", &[]) {
-                    Ok(()) => Ok(SharedBytes::default()),
-                    Err(error) => Err(error.to_string()),
-                }
-            })
-        })
     }
 
     pub fn owned(open_libraries: bool, executable: Option<&Path>) -> Result<Self, HostError> {
@@ -271,7 +227,6 @@ impl HostRuntime {
             next_reload: Cell::new(1),
             reloads: RefCell::new(HashMap::new()),
             frozen: Cell::new(false),
-            worker_host: None,
             _thread_affine: PhantomData,
         }
     }
@@ -383,53 +338,6 @@ impl HostRuntime {
         if let Ok(lua) = self.lua() {
             let _ = lua.clear_host_channel(channel);
         }
-    }
-
-    /// Installs the Rust-owned native worker and shared-byte adapters for one
-    /// stamped payload. The payload is copied once and shared by every isolated
-    /// worker state created by this runtime.
-    pub fn enable_workers(&mut self, payload: &[u8]) -> Result<(), HostError> {
-        self.lua()?;
-        if self.frozen()? {
-            return Err(HostError::Lua(
-                "Nupp host features freeze when the first component loads".to_owned(),
-            ));
-        }
-        if self.worker_host.is_some() {
-            return Err(HostError::Lua(
-                "the Nupp worker adapter is already installed".to_owned(),
-            ));
-        }
-        // The other half of the exclusion `reload_session` states. A worker
-        // runs its own state from the stamped payload, so a commit into this
-        // state never reaches one; refusing both orders keeps that from being
-        // something a caller can arrange by sequencing.
-        if !self.reloads.borrow().is_empty() {
-            return Err(HostError::Lua(
-                "a Nupp reload session is open: a commit reaches this state only, so \
-                 worker tasks would keep running the payload they started from"
-                    .to_owned(),
-            ));
-        }
-        worker_adapter::install_shim();
-        let host = Box::new(worker_adapter::WorkersHost::new(payload, None));
-        let context = (&*host as *const worker_adapter::WorkersHost).cast();
-        self.worker_host = Some(host);
-        self.lua()?
-            .install_worker_modules(context)
-            .map_err(HostError::Lua)?;
-        self.add_feature("workers")
-    }
-
-    pub(crate) fn set_worker_context(
-        &self,
-        inbox: *const std::ffi::c_void,
-        outbox: *const std::ffi::c_void,
-        tasks: *const std::ffi::c_void,
-    ) -> Result<(), HostError> {
-        self.lua()?
-            .set_worker_context(inbox, outbox, tasks)
-            .map_err(HostError::Lua)
     }
 
     pub fn load_component(&self, bytes: &[u8], name: &str) -> Result<Component, HostError> {
@@ -933,18 +841,7 @@ impl HostRuntime {
             }
         }
 
-        // An attached runtime does not close its caller's Lua state, so its C
-        // worker module may remain reachable after this HostRuntime is gone.
-        // Clear every non-owning lightuserdata before dropping the Rust owners;
-        // owned states take the same path to keep teardown ordering uniform.
-        if self.worker_host.is_some()
-            && let Some(lua) = self.lua.as_ref()
-        {
-            lua.clear_worker_context().map_err(HostError::Lua)?;
-        }
-
         drop(self.lua.take());
-        self.worker_host = None;
         self.phase.set(Phase::Closed);
         Ok(())
     }
@@ -979,12 +876,6 @@ impl Drop for HostRuntime {
             // state. Explicit shutdown reports the cause.
             if let Some(lua) = self.lua.take() {
                 std::mem::forget(lua);
-            }
-            // The state's worker context was not cleared on this path, so an
-            // attached state can still reach the workers host through it; the
-            // host leaks with the state rather than being freed under it.
-            if let Some(host) = self.worker_host.take() {
-                std::mem::forget(host);
             }
         }
     }
@@ -1212,24 +1103,16 @@ end
 "#;
 
     #[test]
-    fn a_reload_session_and_native_workers_exclude_each_other() {
+    fn a_reload_session_refuses_a_state_that_runs_native_workers() {
+        // The stamped Nupp host marks a state that runs workers with
+        // `__nuppWorkerHost`. A worker runs the payload it was spawned from, so
+        // a session committing into that state would report a generation part
+        // of the process is not running.
         let mut runtime = HostRuntime::owned(true, None).unwrap();
         runtime.run_buffer(STUB_SESSION, "=stub", &[]).unwrap();
-        let reload = runtime.reload_open(None, None, "app.main").unwrap();
-
-        // A worker runs the payload it was spawned from, so enabling one under
-        // an open session would leave part of the process on a generation the
-        // session never published.
-        let refused = runtime.enable_workers(b"return nil").unwrap_err();
-        assert!(
-            refused.to_string().contains("only, so worker tasks"),
-            "{refused}"
-        );
-
-        // Closing the session reopens the door, which is what makes this an
-        // exclusion rather than a one-way latch.
-        runtime.reload_close(reload, true).unwrap();
-        runtime.enable_workers(b"return nil").unwrap();
+        runtime
+            .run_buffer(b"__nuppWorkerHost = true", "=marked", &[])
+            .unwrap();
         let refused = runtime
             .reload_open(None, None, "app.main")
             .unwrap_err();
@@ -1246,7 +1129,9 @@ end
         // embedding ABI. This runtime installed no adapter itself, so only the
         // state's own marker can answer for it.
         let mut owner = HostRuntime::owned(true, None).unwrap();
-        owner.enable_workers(b"return nil").unwrap();
+        owner
+            .run_buffer(b"__nuppWorkerHost = true", "=marked", &[])
+            .unwrap();
         let state = owner.lua_state();
         let mut attached = unsafe { HostRuntime::attach(state, false) }.unwrap();
         attached.run_buffer(STUB_SESSION, "=stub", &[]).unwrap();
@@ -1278,7 +1163,6 @@ end
         // is asking now.
         assert!(attached.add_feature("late").is_err());
         assert!(attached.add_resource("late", b"").is_err());
-        assert!(attached.enable_workers(b"return nil").is_err());
         attached.shutdown().unwrap();
         owner.shutdown().unwrap();
 
@@ -1332,22 +1216,12 @@ end
         let mut owner = HostRuntime::owned(true, None).unwrap();
         let state = owner.lua_state();
         let mut attached = unsafe { HostRuntime::attach(state, false) }.unwrap();
-        attached.enable_workers(b"return nil").unwrap();
         attached
             .run_buffer(b"attached_value=21", "=attached", &[])
             .unwrap();
         attached.shutdown().unwrap();
         owner
-            .run_buffer(
-                br#"
-assert(attached_value * 2 == 42)
-local workers = require("nupp.workers.native")
-local worker, problem = workers.workerSpawn(nil, nil)
-assert(worker == nil and problem:find("stamped Nupp payload", 1, true))
-"#,
-                "=owner",
-                &[],
-            )
+            .run_buffer(b"assert(attached_value * 2 == 42)", "=owner", &[])
             .unwrap();
         owner.shutdown().unwrap();
     }

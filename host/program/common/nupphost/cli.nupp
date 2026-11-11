@@ -1,0 +1,208 @@
+--- The host executable: it runs the payload stamped onto it, or, carrying
+--- none, the Lua file its first argument names.
+module nupphost.cli
+
+const build = require("nupphost.build")
+const sys = require("nupphost.sys")
+const state = require("nupphost.state")
+const workers = require("nupphost.workers")
+const {nuppHostPayloadFind as find, FOUND, DAMAGED} = require("nupphost.payload")
+
+cdef function malloc(size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, count: uint64): voidptr
+cdef function strlen(borrows s: cstring): uint64
+cdef function snprintf(borrows buffer: voidptr, size: uint64, borrows format: cstring, ...): int32
+
+const EXIT_FAILURE = 1
+const EXIT_USAGE = 2
+const MESSAGE_BYTES = 4096ULL
+
+local function say(borrows text: cstring)
+    sys.nuppHostSysWriteError(text as voidptr, strlen(text))
+end
+
+local function sayLine(borrows bytes: voidptr, count: uint64)
+    sys.nuppHostSysWriteError(bytes, count)
+    say("\n")
+end
+
+--- `prefix` and `text` joined, NUL-terminated and allocated, or nil.
+local function joined(borrows prefix: cstring, borrows text: voidptr, count: uint64): voidptr?
+    local head = strlen(prefix)
+    local answer = malloc(head + count + 1ULL)
+    if answer == nil then
+        return nil
+    end
+    memcpy(answer as voidptr, prefix as voidptr, head)
+    memcpy(((answer as uint64) + head) as voidptr, text, count)
+    @unsafe do
+        (answer as uint8*)[(head + count) as integer] = 0
+    end
+
+    return answer
+end
+
+--- Reports a state's failure and frees its record.
+local function failed(record: uint64, borrows prefix: cstring): int32
+    local length = malloc(8ULL) as uint64*
+    if length ~= nil then
+        local text = state.nuppHostStateCallError(record, length)
+        say(prefix)
+        @unsafe do
+            if text ~= 0ULL then
+                sayLine(text as voidptr, length[0])
+            else
+                say("\n")
+            end
+        end
+        free(length as voidptr)
+    end
+    state.nuppHostStateCallFree(record)
+
+    return EXIT_FAILURE
+end
+
+export function nuppHostCliMain(argc: int32, borrows argv: cstring*): int32
+    local message = malloc(MESSAGE_BYTES)
+    local slots = malloc(32ULL) as voidptr*
+    if message == nil or slots == nil then
+        say("nupp: out of memory\n")
+        return EXIT_FAILURE
+    end
+    local executable = sys.nuppHostSysExecutable()
+    if executable == nil then
+        say("nupp: cannot locate this executable\n")
+        return EXIT_FAILURE
+    end
+    local count = sys.nuppHostSysArguments(argc, argv, slots, ((slots as uint64) + 8ULL) as voidptr*)
+    if count < 0 then
+        say("nupp: out of memory\n")
+        return EXIT_FAILURE
+    end
+    local texts = @unsafe(slots[0] as voidptr*)
+    local lengths = @unsafe(slots[1] as uint64*)
+
+    local sizes = malloc(24ULL) as int64*
+    if sizes == nil then
+        say("nupp: out of memory\n")
+        return EXIT_FAILURE
+    end
+    local image = sys.nuppHostSysReadFile(executable as cstring, sizes, message as voidptr, MESSAGE_BYTES)
+    if image == nil then
+        say("nupp: cannot read this executable ")
+        say(executable as cstring)
+        say(": ")
+        say(message as cstring)
+        say("\n")
+        return EXIT_FAILURE
+    end
+    local size: integer = 0
+    @unsafe do
+        size = sizes[0] as integer
+    end
+
+    local chunk: voidptr = image as voidptr
+    local chunkLength: uint64 = 0ULL
+    local name: voidptr? = nil
+    local first: integer = 1
+    local stamped = false
+    local found = find(image as uint8*, size, sizes, message as voidptr, MESSAGE_BYTES)
+    if found == DAMAGED then
+        say("nupp: ")
+        say(message as cstring)
+        say("\n")
+        return EXIT_FAILURE
+    end
+    if found == FOUND then
+        @unsafe do
+            chunk = ((image as uint64) + (sizes[0] as uint64)) as voidptr
+            chunkLength = sizes[1] as uint64
+        end
+        name = joined("@", executable as voidptr, strlen(executable as cstring))
+        stamped = true
+    else
+        if count < 2 then
+            say("nupp-host: no payload; usage: ")
+            @unsafe do
+                if count > 0 then
+                    sys.nuppHostSysWriteError(texts[0], lengths[0])
+                else
+                    say(executable as cstring)
+                end
+            end
+            say(" <file.lua> [args...]\n")
+            return EXIT_USAGE
+        end
+        local file: voidptr? = nil
+        @unsafe do
+            file = joined("", texts[1], lengths[1])
+        end
+        if file == nil then
+            say("nupp: out of memory\n")
+            return EXIT_FAILURE
+        end
+        local source = sys.nuppHostSysReadFile(file as cstring, sizes, message as voidptr, MESSAGE_BYTES)
+        if source == nil then
+            say("nupp-host: cannot read ")
+            say(file as cstring)
+            say("\n")
+            return EXIT_FAILURE
+        end
+        chunk = source as voidptr
+        @unsafe do
+            chunkLength = sizes[0] as uint64
+        end
+        name = joined("@", file as voidptr, strlen(file as cstring))
+        first = 2
+    end
+    if name == nil then
+        say("nupp: out of memory\n")
+        return EXIT_FAILURE
+    end
+
+    sys.nuppHostSysMcodeReserve()
+    local record = state.nuppHostStateCall()
+    if record == 0ULL then
+        say("nupp: out of memory\n")
+        return EXIT_FAILURE
+    end
+    local L = state.nuppHostStateOpen(record, executable as uint64)
+    if L == nil then
+        return failed(record, "nupp: ")
+    end
+    local lua = L as voidptr
+    local enabled = false
+    if build.WORKERS and stamped then
+        local host = workers.nuppHostWorkersHost(chunk as uint64, chunkLength)
+        if host == 0ULL or workers.nuppHostWorkersEnable(lua, record, host) ~= 0 then
+            return failed(record, "nupp: ")
+        end
+        enabled = true
+    end
+    local forwarded = math.i32.wrap(count - first)
+    if forwarded < 0 then
+        forwarded = 0
+    end
+    local argumentTexts = (texts as uint64) + (first as uint64) * 8ULL
+    local argumentLengths = (lengths as uint64) + (first as uint64) * 8ULL
+    if state.nuppHostStateRun(
+        lua,
+        record,
+        chunk as uint64,
+        chunkLength,
+        name as uint64,
+        argumentTexts,
+        argumentLengths,
+        forwarded
+    ) ~= 0 then
+        return failed(record, "")
+    end
+    if enabled and state.nuppHostStateClearWorkerContext(lua, record) ~= 0 then
+        return failed(record, "nupp: ")
+    end
+    state.nuppHostStateClose(lua)
+    state.nuppHostStateCallFree(record)
+
+    return 0
+end

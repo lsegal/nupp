@@ -1,0 +1,422 @@
+--- The operating system beneath the host, on macOS: locks, condition
+--- variables, threads, the monotonic clock, files and the address-space
+--- reservation LuaJIT's worker states need. Every platform's `nupphost.sys`
+--- exports the same functions.
+module nupphost.sys
+
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function malloc(size: uint64): voidptr
+cdef function realloc(borrows p: voidptr, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, count: uint64): voidptr
+cdef function strlen(borrows s: cstring): uint64
+cdef function snprintf(borrows buffer: voidptr, size: uint64, borrows format: cstring, ...): int32
+cdef function strerror(code: int32): cstring
+cdef function __error(): int32*
+cdef function clock_gettime_nsec_np(clock: int32): uint64
+cdef function _NSGetExecutablePath(borrows buffer: voidptr?, borrows size: uint32*): int32
+
+cdef function pthread_mutex_init(borrows mutex: voidptr, borrows attributes: voidptr?): int32
+cdef function pthread_mutex_destroy(borrows mutex: voidptr): int32
+cdef function pthread_mutex_lock(borrows mutex: voidptr): int32
+cdef function pthread_mutex_unlock(borrows mutex: voidptr): int32
+cdef function pthread_cond_init(borrows condition: voidptr, borrows attributes: voidptr?): int32
+cdef function pthread_cond_destroy(borrows condition: voidptr): int32
+cdef function pthread_cond_wait(borrows condition: voidptr, borrows mutex: voidptr): int32
+cdef function pthread_cond_timedwait(
+    borrows condition: voidptr,
+    borrows mutex: voidptr,
+    borrows deadline: voidptr
+): int32
+cdef function pthread_cond_signal(borrows condition: voidptr): int32
+cdef function pthread_cond_broadcast(borrows condition: voidptr): int32
+cdef function pthread_create(
+    borrows thread: voidptr,
+    borrows attributes: voidptr?,
+    start: function(arg: uint64): voidptr?,
+    arg: uint64
+): int32
+cdef function pthread_join(thread: uint64, borrows result: voidptr?): int32
+cdef function clock_gettime(clock: int32, borrows time: voidptr): int32
+cdef function nanosleep(borrows request: voidptr, borrows remaining: voidptr?): int32
+cdef function sysconf(name: int32): int64
+cdef function fopen(borrows path: cstring, borrows mode: cstring): voidptr?
+cdef function fread(borrows buffer: voidptr, size: uint64, count: uint64, borrows file: voidptr): uint64
+cdef function ferror(borrows file: voidptr): int32
+cdef function fclose(borrows file: voidptr): int32
+cdef function dladdr(borrows address: voidptr, borrows info: voidptr): int32
+cdef function mmap(
+    borrows address: voidptr?,
+    length: uint64,
+    protection: int32,
+    flags: int32,
+    fd: int32,
+    offset: int64
+): voidptr
+cdef function munmap(borrows address: voidptr, length: uint64): int32
+cdef function luaL_newstate(): voidptr
+
+cdef struct Timespec
+    seconds: int64
+    nanoseconds: int64
+end
+
+-- Darwin's pthread_mutex_t is 64 bytes and pthread_cond_t 48; a lock or
+-- condition owns a generously sized block of its own.
+const PRIMITIVE_BYTES = 128ULL
+const CLOCK_REALTIME = 0
+-- mach_absolute_time, in nanoseconds: the clock nativeplatform reads.
+const CLOCK_UPTIME_RAW = 8
+const SC_NPROCESSORS_ONLN = 58
+const ETIMEDOUT = 60
+
+const ARENA_BYTES = 25165824ULL
+const ARENA_MIN = 4194304ULL
+const MCODE_RANGE = 65011712ULL
+const ATTEMPTS = 64
+const STEP = 1048576ULL
+const MAP_PRIVATE = 2
+const MAP_ANONYMOUS = 4096
+
+local arenaAddress: uint64 = 0ULL
+local arenaSize: uint64 = 0ULL
+local arenaLock: voidptr? = nil
+
+--- A new lock, or nil without memory.
+export function nuppHostSysMutexNew(): voidptr?
+    local mutex = calloc(1ULL, PRIMITIVE_BYTES)
+    if mutex == nil then
+        return nil
+    end
+    pthread_mutex_init(mutex as voidptr, nil)
+
+    return mutex
+end
+
+export function nuppHostSysMutexFree(borrows mutex: voidptr): nil
+    pthread_mutex_destroy(mutex)
+    free(mutex)
+end
+
+export function nuppHostSysLock(borrows mutex: voidptr): nil
+    pthread_mutex_lock(mutex)
+end
+
+export function nuppHostSysUnlock(borrows mutex: voidptr): nil
+    pthread_mutex_unlock(mutex)
+end
+
+--- A new condition variable, or nil without memory.
+export function nuppHostSysCondNew(): voidptr?
+    local condition = calloc(1ULL, PRIMITIVE_BYTES)
+    if condition == nil then
+        return nil
+    end
+    pthread_cond_init(condition as voidptr, nil)
+
+    return condition
+end
+
+export function nuppHostSysCondFree(borrows condition: voidptr): nil
+    pthread_cond_destroy(condition)
+    free(condition)
+end
+
+export function nuppHostSysWait(borrows condition: voidptr, borrows mutex: voidptr): nil
+    pthread_cond_wait(condition, mutex)
+end
+
+--- Waits at most `milliseconds` for `condition`. True when the wait timed out.
+export function nuppHostSysWaitMs(borrows condition: voidptr, borrows mutex: voidptr, milliseconds: int64): boolean
+    local deadline = calloc(1ULL, 16ULL) as Timespec*
+    if deadline == nil then
+        return true
+    end
+    clock_gettime(CLOCK_REALTIME, deadline as voidptr)
+    @unsafe do
+        local nanoseconds = deadline.nanoseconds + (milliseconds % 1000LL) * 1000000LL
+        deadline.seconds = deadline.seconds + milliseconds // 1000LL + nanoseconds // 1000000000LL
+        deadline.nanoseconds = nanoseconds % 1000000000LL
+    end
+    local status = pthread_cond_timedwait(condition, mutex, deadline as voidptr)
+    free(deadline as voidptr)
+
+    return status == ETIMEDOUT
+end
+
+export function nuppHostSysSignal(borrows condition: voidptr): nil
+    pthread_cond_signal(condition)
+end
+
+export function nuppHostSysBroadcast(borrows condition: voidptr): nil
+    pthread_cond_broadcast(condition)
+end
+
+--- Starts a thread running `entry(argument)`, or nil when it cannot.
+export function nuppHostSysThreadStart(entry: function(arg: uint64): voidptr?, argument: uint64): voidptr?
+    local thread = calloc(1ULL, 8ULL)
+    if thread == nil then
+        return nil
+    end
+    if pthread_create(thread as voidptr, nil, entry, argument) ~= 0 then
+        free(thread as voidptr)
+        return nil
+    end
+
+    return thread
+end
+
+--- Waits for a thread `nuppHostSysThreadStart` started to end, and frees it.
+export function nuppHostSysThreadJoin(borrows thread: voidptr): nil
+    @unsafe do
+        pthread_join((thread as uint64*)[0], nil)
+    end
+    free(thread)
+end
+
+--- Nanoseconds on the monotonic clock `nupp.runtime.provider.nativeplatform`
+--- reads, so worker deadlines computed there compare against it.
+export function nuppHostSysMonotonicNs(): uint64
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+end
+
+export function nuppHostSysSleepMs(milliseconds: int64): nil
+    local time = calloc(1ULL, 16ULL) as Timespec*
+    if time == nil then
+        return
+    end
+    @unsafe do
+        time.seconds = milliseconds // 1000LL
+        time.nanoseconds = (milliseconds % 1000LL) * 1000000LL
+    end
+    nanosleep(time as voidptr, nil)
+    free(time as voidptr)
+end
+
+--- How many threads can run at once: the CPUs online.
+export function nuppHostSysParallelism(): int64
+    local online = sysconf(SC_NPROCESSORS_ONLN)
+    if online < 1LL then
+        return 1LL
+    end
+
+    return online
+end
+
+--- The text of the last failed call's error, as Rust's `io::Error` shows it.
+export function nuppHostSysLastError(borrows buffer: voidptr, capacity: uint64): nil
+    local code: int32 = 0
+    @unsafe do
+        code = __error()[0]
+    end
+    snprintf(buffer, capacity, "%s (os error %d)", strerror(code), code)
+end
+
+--- This executable's path, NUL-terminated and allocated, or nil.
+export function nuppHostSysExecutable(): voidptr?
+    local size = calloc(1ULL, 8ULL) as uint32*
+    if size == nil then
+        return nil
+    end
+    -- The first call says how much room the path and its NUL need.
+    _NSGetExecutablePath(nil, size)
+    local capacity: uint64 = @unsafe(size[0] as uint64)
+    local buffer = malloc(capacity)
+    if buffer == nil or _NSGetExecutablePath(buffer as voidptr, size) ~= 0 then
+        free(size as voidptr)
+        if buffer ~= nil then
+            free(buffer as voidptr)
+        end
+        return nil
+    end
+    free(size as voidptr)
+
+    return buffer
+end
+
+--- The bytes of the file at `path`, allocated, with their count written to
+--- `length[0]`; or nil, with the reason written to `message`.
+export function nuppHostSysReadFile(
+    borrows path: cstring,
+    borrows length: int64*,
+    borrows message: voidptr,
+    capacity: uint64
+): voidptr?
+    local file = fopen(path, "rb")
+    if file == nil then
+        nuppHostSysLastError(message, capacity)
+        return nil
+    end
+    local size: uint64 = 0ULL
+    local reserved: uint64 = 65536ULL
+    local buffer = malloc(reserved)
+    while buffer ~= nil do
+        if size == reserved then
+            local grown = realloc(buffer as voidptr, reserved * 2ULL)
+            if grown == nil then
+                free(buffer as voidptr)
+                buffer = nil
+                break
+            end
+            buffer = grown
+            reserved = reserved * 2ULL
+        end
+        local target = ((buffer as uint64) + size) as voidptr
+        local read = fread(target, 1ULL, reserved - size, file as voidptr)
+        size = size + read
+        if read == 0ULL then
+            break
+        end
+    end
+    if buffer == nil then
+        fclose(file as voidptr)
+        snprintf(message, capacity, "out of memory")
+        return nil
+    end
+    if ferror(file as voidptr) ~= 0 then
+        nuppHostSysLastError(message, capacity)
+        fclose(file as voidptr)
+        free(buffer as voidptr)
+        return nil
+    end
+    fclose(file as voidptr)
+    @unsafe do
+        length[0] = size as int64
+    end
+
+    return buffer
+end
+
+--- The address LuaJIT's interpreter is loaded at, rounded down to 64 KiB, or 0.
+local function interpreterAnchor(): uint64
+    local info = calloc(1ULL, 64ULL) as uint64*
+    if info == nil then
+        return 0ULL
+    end
+    local base: uint64 = 0ULL
+    if dladdr(luaL_newstate as voidptr, info as voidptr) ~= 0 then
+        @unsafe do
+            base = info[1] & (0ULL - 65536ULL)
+        end
+    end
+    free(info as voidptr)
+
+    return base
+end
+
+local function reserveWithin(size: uint64, low: uint64, high: uint64): uint64
+    local hint = low
+    for _ = 1, ATTEMPTS do
+        local address = mmap(hint as voidptr, size, 0, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0LL) as uint64
+        if address == 0ULL - 1ULL then
+            return 0ULL
+        end
+        if address >= low and address + size <= high then
+            return address
+        end
+        munmap(address as voidptr, size)
+        if address > hint then
+            hint = address
+        end
+        hint = hint + STEP
+        if hint >= high then
+            return 0ULL
+        end
+    end
+
+    return 0ULL
+end
+
+--- Holds address space near the interpreter so LuaJIT's arm64 traces stay
+--- branch-reachable from it once a worker creates its state. Best effort.
+export function nuppHostSysMcodeReserve(): nil
+    if arenaLock == nil then
+        arenaLock = nuppHostSysMutexNew()
+        if arenaLock == nil then
+            return
+        end
+    end
+    local lock = arenaLock as voidptr
+    nuppHostSysLock(lock)
+    if arenaAddress ~= 0ULL then
+        nuppHostSysUnlock(lock)
+        return
+    end
+    local target = interpreterAnchor()
+    if target == 0ULL then
+        nuppHostSysUnlock(lock)
+        return
+    end
+    local low: uint64 = 0ULL
+    if target > MCODE_RANGE then
+        low = target - MCODE_RANGE
+    end
+    local high = target + MCODE_RANGE
+    local size = ARENA_BYTES
+    while size >= ARENA_MIN do
+        local address = reserveWithin(size, low, high)
+        if address ~= 0ULL then
+            arenaAddress = address
+            arenaSize = size
+            nuppHostSysUnlock(lock)
+            return
+        end
+        size = size // 2ULL
+    end
+    nuppHostSysUnlock(lock)
+end
+
+--- Gives the reserved window back, immediately before a worker's state is made.
+export function nuppHostSysMcodeRelease(): nil
+    if arenaLock == nil then
+        return
+    end
+    local lock = arenaLock as voidptr
+    nuppHostSysLock(lock)
+    if arenaAddress ~= 0ULL then
+        munmap(arenaAddress as voidptr, arenaSize)
+        arenaAddress = 0ULL
+        arenaSize = 0ULL
+    end
+    nuppHostSysUnlock(lock)
+end
+
+cdef function write(fd: int32, borrows buffer: voidptr, count: uint64): int64
+
+--- Writes `count` bytes to standard error.
+export function nuppHostSysWriteError(borrows bytes: voidptr, count: uint64): nil
+    local written: uint64 = 0ULL
+    while written < count do
+        local step = write(2, ((bytes as uint64) + written) as voidptr, count - written)
+        if step <= 0LL then
+            return
+        end
+        written = written + (step as uint64)
+    end
+end
+
+--- The process's arguments as byte strings: their addresses in `texts[0]` and
+--- their lengths in `lengths[0]`, both allocated. The count, or -1.
+export function nuppHostSysArguments(
+    argc: int32,
+    borrows argv: cstring*,
+    borrows texts: voidptr*,
+    borrows lengths: voidptr*
+): int32
+    local count = argc as uint64
+    local addresses = calloc(count + 1ULL, 8ULL) as voidptr*
+    local sizes = calloc(count + 1ULL, 8ULL) as uint64*
+    if addresses == nil or sizes == nil then
+        return -1
+    end
+    @unsafe do
+        for index = 0, argc - 1 do
+            addresses[index] = argv[index] as voidptr
+            sizes[index] = strlen(argv[index])
+        end
+        texts[0] = addresses as voidptr
+        lengths[0] = sizes as voidptr
+    end
+
+    return argc
+end

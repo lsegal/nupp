@@ -2,7 +2,7 @@ local fixture = require("helpers.bundlefixture")
 local NUPP = fixture.NUPP
 local tempProject = fixture.tempProject
 local run = fixture.run
-local stampRustHost = fixture.stampRustHost
+local stampNativeHost = fixture.stampNativeHost
 
 local M = {}
 
@@ -57,7 +57,7 @@ print(total == expected, total)
     })
     local built, builtOk = run(dir, "'" .. NUPP .. "' build")
     assert(builtOk, "the forking binary builds: " .. built)
-    local output, ranOk = run(dir, stampRustHost(dir, dir .. "/build/app.payload.lua"))
+    local output, ranOk = run(dir, stampNativeHost(dir, dir .. "/build/app.payload.lua"))
     assert(ranOk and output:match("^true\t%d+\n$"), "children forking on a full scope all answered: " .. output)
     os.execute("rm -rf '" .. dir .. "'")
 end

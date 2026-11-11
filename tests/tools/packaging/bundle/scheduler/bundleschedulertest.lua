@@ -3,7 +3,7 @@ local NUPP = fixture.NUPP
 local tempProject = fixture.tempProject
 local readFile = fixture.readFile
 local run = fixture.run
-local stampRustHost = fixture.stampRustHost
+local stampNativeHost = fixture.stampNativeHost
 
 local M = {}
 
@@ -420,10 +420,10 @@ end
     assert(ranOk, "the native worker binary runs: " .. output)
     local expected = "36\t36\t49\t10\tdone\t16\t18\ttrue\tkept\t1\t6\tnative string\t9\tschema\ttrue\ttrue\tdynamic\ttrue\t11\ttrue\tspare\ttrue\t13\ttrue\ttrue\theld\t112\tregion:17:99:true\tregion\n84\ntrue\ttrue\nfalse\ttrue\nfalse\ttrue\n64\t200\n45\nhi!\ntrue\ttrue\ntrue\n"
     assert(output == expected, "results, records, captures, and failures cross structured cleanup: " .. output)
-    local rustExecutable = stampRustHost(dir, dir .. "/build/app.payload.lua")
-    local rustOutput, rustRanOk = run(dir, rustExecutable .. " check-stack")
-    assert(rustRanOk, "the Rust worker host runs the Nupp payload: " .. rustOutput)
-    assert(rustOutput == expected, "the Rust host preserves structured worker and shared-byte results: " .. rustOutput)
+    local hostExecutable = stampNativeHost(dir, dir .. "/build/app.payload.lua")
+    local hostOutput, hostRanOk = run(dir, hostExecutable .. " check-stack")
+    assert(hostRanOk, "the stamped host runs the Nupp payload: " .. hostOutput)
+    assert(hostOutput == expected, "the stamped host preserves structured worker and shared-byte results: " .. hostOutput)
     os.execute("rm -rf '" .. dir .. "'")
 end
 

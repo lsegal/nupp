@@ -95,9 +95,10 @@ to every command, against a tool whose design goal is that an unchanged project
 answers in about the time it takes to start. XXH64 answers the same question in
 under a millisecond.
 
-`src/nupp/compiler/hash.nupp` writes it and the Rust base provider
-checks it. They are one contract with two spellings, and the input is read
-little-endian in both so a binary stamped on one machine verifies on another.
+`src/nupp/compiler/hash.nupp` writes it and the host,
+`host/program/common/nupphost/xxh64.nupp`, checks it. They are one contract
+with two spellings, and the input is read little-endian in both so a binary
+stamped on one machine verifies on another.
 
 ### Compiler host ABI
 
@@ -412,7 +413,7 @@ built by another release is refused by exact version rather than adapted.
 | Native provider ABI | 2 | exact major | `native/include/nupp_native.h` `NUPP_NATIVE_ABI_VERSION` |
 | Embedding ABI | 2 | exact, config `size` at least the struct | `native/crates/host/src/embed.rs` `EMBED_ABI_VERSION` |
 | Compiler host ABI | 1 | exact | `src/nupp/tools/build/package.nupp` `hostAbiVersion` |
-| Payload trailer | 1 | exact | `native/crates/host/src/payload.rs` `FORMAT_VERSION` |
+| Payload trailer | 1 | exact | `host/program/common/nupphost/payload.nupp` `FORMAT_VERSION` |
 | AOT runtime ABI | 1 | exact | `native/crates/native/c/ks_rt.c` `KS_RT_ABI_VERSION` |
 | Browser application manifest | 1 | exact | `runtime/luajit/app-runtime.mjs` `schema` |
 | AOT units manifest | 3 | exact | `src/nupp/tools/build/aot.nupp` `UNITS_SCHEMA_VERSION` |

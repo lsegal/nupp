@@ -18,7 +18,6 @@ fn main() {
     println!("cargo:rerun-if-changed=../../../scripts/toolchain");
     println!("cargo:rerun-if-changed=../../../scripts/toolchain.pins");
     println!("cargo:rerun-if-changed=c/lua_shim.c");
-    println!("cargo:rerun-if-changed=c/worker_shim.c");
     println!("cargo:rerun-if-changed=c/host_shim.c");
     println!("cargo:rerun-if-changed=../../../host/include/nupp.exports");
     println!("cargo:rerun-if-env-changed={EXPORT_LIST_ENV}");
@@ -194,7 +193,6 @@ fn compile_shim(manifest: &Path, prefix: &Path, target: &str) {
     assert!(!include.is_empty(), "{} is empty", include_file.display());
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets it"));
     let object = output.join("lua_shim.o");
-    let worker_object = output.join("worker_shim.o");
     let host_object = output.join("host_shim.o");
     let archive = output.join("libnupp_lua_shim.a");
     let compiler = env::var_os("NUPP_CC")
@@ -249,25 +247,6 @@ fn compile_shim(manifest: &Path, prefix: &Path, target: &str) {
         .arg("-Werror=return-type")
         .arg(format!("-I{include}"))
         .arg("-o")
-        .arg(&worker_object)
-        .arg(manifest.join("c/worker_shim.c"))
-        .status()
-        .unwrap_or_else(|error| panic!("cannot run {:?}: {error}", compiler));
-    assert!(status.success(), "the worker Lua shim did not compile");
-
-    let status = Command::new(&compiler)
-        .args(&extra)
-        .arg("-c")
-        .arg("-std=c11")
-        .arg("-O2")
-        .arg("-fPIC")
-        .arg("-Wall")
-        .arg("-Wextra")
-        .arg("-Werror=implicit-function-declaration")
-        .arg("-Werror=incompatible-pointer-types")
-        .arg("-Werror=return-type")
-        .arg(format!("-I{include}"))
-        .arg("-o")
         .arg(&host_object)
         .arg(manifest.join("c/host_shim.c"))
         .status()
@@ -279,7 +258,6 @@ fn compile_shim(manifest: &Path, prefix: &Path, target: &str) {
         .arg("rcs")
         .arg(&archive)
         .arg(&object)
-        .arg(&worker_object)
         .arg(&host_object)
         .status()
         .unwrap_or_else(|error| panic!("cannot run {:?}: {error}", archiver));

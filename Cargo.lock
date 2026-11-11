@@ -523,7 +523,6 @@ dependencies = [
 name = "nupp-native-host"
 version = "0.1.0"
 dependencies = [
- "libc",
  "nupp-native",
  "nupp-native-runtime",
 ]

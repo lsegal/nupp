@@ -1,0 +1,95 @@
+--- XXH64, for the digest an executable's payload trailer carries.
+---
+--- The packager writes that digest with `nupp.compiler.hash`, so this has to
+--- agree with it byte for byte.
+module nupphost.xxh64
+
+const P1 = 11400714785074694791ULL
+const P2 = 14029467366897019727ULL
+const P3 = 1609587929392839161ULL
+const P4 = 9650029242287828579ULL
+const P5 = 2870177450012600261ULL
+
+local function rotate(value: uint64, by: int32): uint64
+    return (value << by) | (value >> (64 - by))
+end
+
+local function read64(borrows bytes: uint8*, at: integer): uint64
+    local value: uint64 = 0ULL
+    @unsafe do
+        for index = 7, 0, -1 do
+            value = (value << 8) | (bytes[at + index] as uint64)
+        end
+    end
+
+    return value
+end
+
+local function read32(borrows bytes: uint8*, at: integer): uint64
+    local value: uint64 = 0ULL
+    @unsafe do
+        for index = 3, 0, -1 do
+            value = (value << 8) | (bytes[at + index] as uint64)
+        end
+    end
+
+    return value
+end
+
+local function round(lane: uint64, input: uint64): uint64
+    return rotate(lane + input * P2, 31) * P1
+end
+
+local function merge(hash: uint64, lane: uint64): uint64
+    return (hash ~ round(0ULL, lane)) * P1 + P4
+end
+
+--- The seed-zero XXH64 of `length` bytes at `bytes`.
+export function nuppHostXxh64(borrows bytes: uint8*, length: integer): uint64
+    local at: integer = 0
+    local hash: uint64 = 0ULL
+    if length >= 32 then
+        local v1: uint64 = P1 + P2
+        local v2: uint64 = P2
+        local v3: uint64 = 0ULL
+        local v4: uint64 = 0ULL - P1
+        while at <= length - 32 do
+            v1 = round(v1, read64(bytes, at))
+            v2 = round(v2, read64(bytes, at + 8))
+            v3 = round(v3, read64(bytes, at + 16))
+            v4 = round(v4, read64(bytes, at + 24))
+            at = at + 32
+        end
+        hash = rotate(v1, 1) + rotate(v2, 7) + rotate(v3, 12) + rotate(v4, 18)
+        hash = merge(hash, v1)
+        hash = merge(hash, v2)
+        hash = merge(hash, v3)
+        hash = merge(hash, v4)
+    else
+        hash = P5
+    end
+    hash = hash + (length as uint64)
+    while at + 8 <= length do
+        hash = hash ~ round(0ULL, read64(bytes, at))
+        hash = rotate(hash, 27) * P1 + P4
+        at = at + 8
+    end
+    if at + 4 <= length then
+        hash = hash ~ (read32(bytes, at) * P1)
+        hash = rotate(hash, 23) * P2 + P3
+        at = at + 4
+    end
+    @unsafe do
+        while at < length do
+            hash = hash ~ ((bytes[at] as uint64) * P5)
+            hash = rotate(hash, 11) * P1
+            at = at + 1
+        end
+    end
+    hash = hash ~ (hash >> 33)
+    hash = hash * P2
+    hash = hash ~ (hash >> 29)
+    hash = hash * P3
+
+    return hash ~ (hash >> 32)
+end
