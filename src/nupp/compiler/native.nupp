@@ -777,18 +777,11 @@ local FEATURES: {[string]: native.Feature} = {
     },
     ["native.tls"] = {
         name = "tls",
-        -- Rustls encrypts a stream the Rust network provider already owns. TLS
-        -- therefore extends that same resource boundary instead of borrowing a
-        -- descriptor from a second native stack.
+        -- TLS and its cryptography are Nupp, wrapping streams from the network
+        -- provider; nothing here reaches the Rust provider.
         module = "nupp.runtime.provider.nativetls",
         runtimeModule = "nupp.runtime.provider.nativetls",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "tls",
-        host = "native-tls",
-        library = "nupp_native",
-        binary = true,
-        requires = {"runtime.tls_contract", "runtime.tls_types", "native.net", "runtime.suspension", "runtime.native"},
+        requires = {"runtime.tls_contract", "runtime.tls_types", "native.net", "runtime.suspension"},
     },
     ["native.process"] = {
         name = "process",

@@ -1,0 +1,106 @@
+@!internal
+--[[Byte encoding for TLS messages: big-endian integers and length-prefixed
+vectors, and a bounds-checked reader over a received message.
+
+A reader raises `DecodeError` rather than answering nil, so a parser reads as
+the structure it walks; the engine turns the raise into a decode_error alert.
+]]
+module nupp.io.tls.wire
+
+--- What a malformed message raises.
+export record DecodeError
+    @readonly message: string
+end
+
+--- Raises a decode error.
+export function fail(message: string): never
+    error(DecodeError(message = message), 0)
+end
+
+--- Encodes an unsigned integer in `width` big-endian bytes.
+export function uint(value: integer, width: integer): string
+    local bytes: {string} = {}
+    for index = width, 1, -1 do
+        bytes[index] = string.char(value % 256)
+        value = value // 256
+    end
+
+    return table.concat(bytes)
+end
+
+--- Encodes `body` behind a big-endian length of `width` bytes.
+export function vector(body: string, width: integer): string
+    return uint(#body, width) .. body
+end
+
+--- Reads big-endian bytes as an unsigned integer.
+export function touint(bytes: string): integer
+    local value: integer = 0
+    for index = 1, #bytes do
+        value = value * 256 + bytes:byte(index)
+    end
+
+    return value
+end
+
+--- A cursor over received bytes.
+export record Reader
+    @readonly source: string
+    position: integer
+    limit: integer
+
+    --- Reports whether every byte has been consumed.
+    function done(self): boolean
+        return self.position > self.limit
+    end
+
+    --- The bytes not yet consumed.
+    function remaining(self): integer
+        return self.limit - self.position + 1
+    end
+
+    --- Reads `count` raw bytes.
+    function bytes(self, count: integer): string
+        if count < 0 or self.position + count - 1 > self.limit then
+            fail("truncated message")
+        end
+        local value = self.source:sub(self.position, self.position + count - 1)
+        self.position = self.position + count
+
+        return value
+    end
+
+    --- Reads an unsigned integer of `width` bytes.
+    function uint(self, width: integer): integer
+        return touint(self:bytes(width))
+    end
+
+    --- Reads a vector whose length takes `width` bytes.
+    function vector(self, width: integer): string
+        return self:bytes(self:uint(width))
+    end
+
+    --- Reads a vector and returns a reader over it.
+    function sub(self, width: integer): Reader
+        local length = self:uint(width)
+        if self.position + length - 1 > self.limit then
+            fail("truncated message")
+        end
+        local inner = Reader(source = self.source, position = self.position, limit = self.position + length - 1)
+        self.position = self.position + length
+
+        return inner
+    end
+
+    --- Raises unless every byte was consumed.
+    function finish(self): nil
+        if not self:done() then
+            fail("trailing bytes in message")
+        end
+    end
+end
+
+--- A reader over a whole string.
+export function reader(text: string): Reader
+    return Reader(source = text, position = 1, limit = #text)
+end

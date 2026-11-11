@@ -1,0 +1,181 @@
+@!internal
+--[[The trust anchors a TLS client uses when it is given no authority.
+
+`SSL_CERT_FILE` and `SSL_CERT_DIR` come first, as they did for the Rust stack
+(#3): when either is set and not empty, the anchors are exactly what they name
+-- the file, and every regular file in the directory in sorted name order -- and
+the platform's store is not consulted. Otherwise the platform supplies them:
+the `ROOT` system store through crypt32 on Windows, and the system bundle
+file elsewhere (on macOS the one the system keeps at `/etc/ssl/cert.pem`).
+
+Anchors load once per process. A certificate the parser cannot use is skipped
+rather than failing the whole store, the way a native root store ignores the
+odd unusable entry.
+]]
+module nupp.io.tls.roots
+
+const x509 = require("nupp.io.tls.crypto.x509")
+const der = require("nupp.io.tls.crypto.der")
+const files = require("nupp.runtime.provider.nativefiles")
+const ffi = require("ffi")
+
+local function readFile(path: string): (string?, string?)
+    local file, why = io.open(path, "rb")
+    if file == nil then
+        return nil, why
+    end
+    local text = file:read("*a") as string?
+    file:close()
+
+    return text, nil
+end
+
+local function addPem(anchors: {x509.Certificate}, text: string): nil
+    local blocks = der.pem(text)
+    if blocks == nil then
+        return
+    end
+    for _, block in ipairs(blocks) do
+        if block.label == "CERTIFICATE" or block.label == "TRUSTED CERTIFICATE" then
+            local certificate = x509.parse(block.bytes)
+            if certificate ~= nil then
+                anchors[#anchors + 1] = certificate
+            end
+        end
+    end
+end
+
+local function configured(): ({x509.Certificate}?, string?)
+    local file = os.getenv("SSL_CERT_FILE")
+    local directory = os.getenv("SSL_CERT_DIR")
+    if file == "" then
+        file = nil
+    end
+    if directory == "" then
+        directory = nil
+    end
+    if file == nil and directory == nil then
+        return nil, nil
+    end
+    local anchors: {x509.Certificate} = {}
+    if file ~= nil then
+        local text, why = readFile(file as string)
+        if text == nil then
+            return nil, "the configured certificate file " .. (file as string) .. " could not be read: " .. tostring(why)
+        end
+        addPem(anchors, text as string)
+    end
+    if directory ~= nil then
+        local entries, why = files.list(directory as string)
+        if entries == nil then
+            return nil,
+                "the configured certificate directory " .. (directory as string) .. " could not be read: "
+                    .. tostring(why)
+        end
+        local names: {string} = {}
+        for name, kind in entries as files.Entries do
+            if kind ~= "directory" then
+                names[#names + 1] = name
+            end
+        end
+        table.sort(names)
+        for _, name in ipairs(names) do
+            local text = readFile((directory as string) .. "/" .. name)
+            if text ~= nil then
+                addPem(anchors, text as string)
+            end
+        end
+    end
+
+    return anchors, nil
+end
+
+const BUNDLES: {string} = {
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+    "/usr/local/share/certs/ca-root-nss.crt",
+    "/usr/local/etc/openssl/cert.pem",
+    "/etc/certs/ca-certificates.crt",
+}
+
+local function windowsStore(): {x509.Certificate}
+    ffi.cdef[[
+    typedef struct NuppTlsCertContext {
+        uint32_t encodingType;
+        const uint8_t *encoded;
+        uint32_t length;
+        void *info;
+        void *store;
+    } NuppTlsCertContext;
+    void *nupp_tls_open_store(void *provider, const uint16_t *name) __asm__("CertOpenSystemStoreW");
+    const NuppTlsCertContext *nupp_tls_next_cert(void *store, const NuppTlsCertContext *previous)
+        __asm__("CertEnumCertificatesInStore");
+    int nupp_tls_close_store(void *store, uint32_t flags) __asm__("CertCloseStore");
+    ]]
+    local anchors: {x509.Certificate} = {}
+    local loaded, library: any = pcall(ffi.load, "crypt32")
+    if not loaded then
+        return anchors
+    end
+    local name: any = ffi.new("uint16_t[5]", {82, 79, 79, 84, 0})
+    local store: any = library.nupp_tls_open_store(nil, name)
+    if store == nil then
+        return anchors
+    end
+    local context: any = library.nupp_tls_next_cert(store, nil)
+    while context ~= nil do
+        local bytes = ffi.string(context.encoded, context.length) as string
+        local certificate = x509.parse(bytes)
+        if certificate ~= nil then
+            anchors[#anchors + 1] = certificate
+        end
+        context = library.nupp_tls_next_cert(store, context)
+    end
+    library.nupp_tls_close_store(store, 0)
+
+    return anchors
+end
+
+local function platform(): ({x509.Certificate}?, string?)
+    if (ffi as any).os == "Windows" then
+        local anchors = windowsStore()
+        if #anchors == 0 then
+            return nil, "the system certificate store contains no usable certificates"
+        end
+
+        return anchors, nil
+    end
+    for _, path in ipairs(BUNDLES) do
+        local text = readFile(path)
+        if text ~= nil then
+            local anchors: {x509.Certificate} = {}
+            addPem(anchors, text as string)
+            if #anchors > 0 then
+                return anchors, nil
+            end
+        end
+    end
+
+    return nil, "the system certificate store could not be loaded: no certificates were found"
+end
+
+local cached: {x509.Certificate}? = nil
+local cachedWhy: string? = nil
+local loaded = false
+
+--- The process's default trust anchors, or nil and why there are none.
+export function system(): ({x509.Certificate}?, string?)
+    if not loaded then
+        loaded = true
+        local anchors, why = configured()
+        if anchors == nil and why == nil then
+            anchors, why = platform()
+        end
+        cached, cachedWhy = anchors, why
+    end
+
+    return cached, cachedWhy
+end

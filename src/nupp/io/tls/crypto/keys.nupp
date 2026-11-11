@@ -295,7 +295,7 @@ export function verifyscheme(key: PublicKey, scheme: integer, message: string, s
     elseif family == 0x01 then
         return not tls13 and key.kind == "rsa" and rsa.verifypkcs1(key.rsa as rsa.PublicKey, hashName, digest, signature)
     elseif family == 0x03 then
-        if key.kind ~= "ec" then
+        if (key.kind as string) ~= "ec" then
             return false
         end
         if tls13 then
@@ -314,7 +314,7 @@ end
 
 --- Whether a private key can sign with a scheme.
 export function cansign(key: PrivateKey, scheme: integer, tls13: boolean): boolean
-    if key.kind == "ed25519" then
+    if (key.kind as string) == "ed25519" then
         return scheme == ED25519
     elseif key.kind == "ec" then
         if key.curve == "p256" then
@@ -333,7 +333,7 @@ end
 --- Signs `message` with a scheme the key can use.
 --- @raises string when the key cannot sign with the scheme
 export function signscheme(key: PrivateKey, scheme: integer, message: string, random: function(count: integer): string): string
-    if key.kind == "ed25519" then
+    if (key.kind as string) == "ed25519" then
         return curve25519.edsign(key.seed as string, message)
     end
     local hashName = schemeHash(scheme)
@@ -393,7 +393,7 @@ export function verifyalgorithm(key: PublicKey, algorithm: der.Node, message: st
     elseif oid == "1.2.840.113549.1.1.13" then
         return verifyscheme(key, RSA_PKCS1_SHA512, message, signature, false)
     elseif oid == "1.2.840.10045.4.3.2" or oid == "1.2.840.10045.4.3.3" or oid == "1.2.840.10045.4.3.4" then
-        if key.kind ~= "ec" then
+        if (key.kind as string) ~= "ec" then
             return false
         end
         local hashName: hash.Name = oid == "1.2.840.10045.4.3.2" and "sha256"

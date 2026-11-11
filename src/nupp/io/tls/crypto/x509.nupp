@@ -327,7 +327,7 @@ local function ipBytes(text: string): string?
         end
         for group in (part .. ":"):gmatch("([^:]*):") do
             if group:find("%.") ~= nil then
-                local v4 = ipBytes(group)
+                local v4: string? = ipBytes(group)
                 if v4 == nil or #v4 ~= 4 then
                     return nil
                 end

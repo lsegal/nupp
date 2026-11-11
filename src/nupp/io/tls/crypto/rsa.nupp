@@ -85,7 +85,7 @@ end
 
 local function pkcs1Encoding(hashName: hash.Name, digest: string, k: integer): string?
     local info = DIGEST_INFO[hashName]
-    local t = info .. digest
+    local t = (info as string) .. digest
     if k < #t + 11 then
         return nil
     end

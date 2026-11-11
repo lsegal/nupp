@@ -216,6 +216,19 @@ local RESOURCES = {
         source = "src/nupp/runtime/provider/nativetls.nupp",
         output = "nupp/compiler/nupp/runtime/provider/nativetls.nupp"
     },
+    {source = "src/nupp/io/tls/wire.nupp", output = "nupp/compiler/nupp/io/tls/wire.nupp"},
+    {source = "src/nupp/io/tls/engine.nupp", output = "nupp/compiler/nupp/io/tls/engine.nupp"},
+    {source = "src/nupp/io/tls/roots.nupp", output = "nupp/compiler/nupp/io/tls/roots.nupp"},
+    {source = "src/nupp/io/tls/crypto/aes.nupp", output = "nupp/compiler/nupp/io/tls/crypto/aes.nupp"},
+    {source = "src/nupp/io/tls/crypto/chacha.nupp", output = "nupp/compiler/nupp/io/tls/crypto/chacha.nupp"},
+    {source = "src/nupp/io/tls/crypto/hash.nupp", output = "nupp/compiler/nupp/io/tls/crypto/hash.nupp"},
+    {source = "src/nupp/io/tls/crypto/bignum.nupp", output = "nupp/compiler/nupp/io/tls/crypto/bignum.nupp"},
+    {source = "src/nupp/io/tls/crypto/der.nupp", output = "nupp/compiler/nupp/io/tls/crypto/der.nupp"},
+    {source = "src/nupp/io/tls/crypto/ecc.nupp", output = "nupp/compiler/nupp/io/tls/crypto/ecc.nupp"},
+    {source = "src/nupp/io/tls/crypto/curve25519.nupp", output = "nupp/compiler/nupp/io/tls/crypto/curve25519.nupp"},
+    {source = "src/nupp/io/tls/crypto/rsa.nupp", output = "nupp/compiler/nupp/io/tls/crypto/rsa.nupp"},
+    {source = "src/nupp/io/tls/crypto/keys.nupp", output = "nupp/compiler/nupp/io/tls/crypto/keys.nupp"},
+    {source = "src/nupp/io/tls/crypto/x509.nupp", output = "nupp/compiler/nupp/io/tls/crypto/x509.nupp"},
     {
         source = "src/nupp/runtime/provider/nativetime.nupp",
         output = "nupp/compiler/nupp/runtime/provider/nativetime.nupp"

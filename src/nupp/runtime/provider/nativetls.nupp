@@ -1,115 +1,232 @@
 @!internal
 
 --[[
-Native TLS session implementation bound to native targets.
+Native TLS sessions, written in Nupp over the native network implementation.
 
-Sessions wrap stream handles from the native network implementation. The native
-runtime owns TLS state and certificate processing; this adapter supplies the
-receiver-based polling protocol in [](io.net.internal.contracts). It preserves
-hostname, certificate, authority, verification, and ALPN options when creating a
-session. The network implementation supplies compatible handles.
+A session wraps a stream handle from [](nupp.runtime.provider.nativenet) and
+runs [](nupp.io.tls.engine) over it, so TLS and its cryptography are Nupp all
+the way down (#3). This adapter supplies the receiver-based polling protocol in
+[](io.net.internal.contracts): handshake, read, write, flush and close-notify
+report pending work, and the public [](io.net) layer drives the network
+reactor and suspension.
 
-Handshake, read, write, flush, and close-notify operations report pending work to
-the caller. The public [](io.net) layer drives networking readiness and
-suspension. Verification and negotiated protocol results describe the established
-session rather than the requested policy.
+A client verifies against the authority it was given, or the process's default
+trust anchors from [](nupp.io.tls.roots), and keeps one resumption ticket per
+configuration: host, port, offered protocols and trust material. A server
+seals its tickets under a key that belongs to its certificate, key and protocol
+order, so a differently configured server falls back to a full handshake.
 
-Session destruction releases TLS state and closes the owned stream. The
-public session controls that lifecycle through `destroy`. Requiring the facade
-imports this implementation; individual TLS operations use the retained session.
+Session destruction closes the owned stream. Requiring the facade imports this
+implementation; individual operations use the retained session.
 ]]
 module nupp.runtime.provider.nativetls
 
 local span = require("bytes.span")
 
-local contract = require("io.net.internal.contracts")
-local ffi = require("ffi")
-local ffiString: function(borrows source: const uint8[?], count: integer): string = ffi.string as any
+const contract = require("io.net.internal.contracts")
+const net = require("nupp.runtime.provider.nativenet") as contract.Provider
+const engine = require("nupp.io.tls.engine")
+const roots = require("nupp.io.tls.roots")
+const x509 = require("nupp.io.tls.crypto.x509")
+const keys = require("nupp.io.tls.crypto.keys")
+const der = require("nupp.io.tls.crypto.der")
+const ecc = require("nupp.io.tls.crypto.ecc")
+const curve25519 = require("nupp.io.tls.crypto.curve25519")
+const bn = require("nupp.io.tls.crypto.bignum")
+const crypto = require("nupp.runtime.provider.nativecrypto")
+const platform = require("nupp.runtime.provider.nativeplatform")
+const streaming = require("nupp.digest.internal.streaming")
+const storage = require("nupp.runtime.storage")
+
 const READ_SIZE = 65536
+const SERVER_CONFIGS_MAX = 32
 
-const native = require("nupp.runtime.native")
-
-cdef struct NuppNativeTlsSlice
-    data: cstring
-    length: uint64
+local function seconds(): number
+    return (tonumber(platform.monotonic()) as number) / 1e9
 end
 
-cdef struct NuppNativeTlsOptions
-    hostname: NuppNativeTlsSlice
-    certificate: NuppNativeTlsSlice
-    private_key: NuppNativeTlsSlice
-    authority: NuppNativeTlsSlice
-    protocols: NuppNativeTlsSlice
-    authority_present: int32
-    server: int32
-    verify: int32
+local function random(count: integer): string
+    return crypto.randombytes(count)
 end
 
-native.ffi.cdef[[
-int32_t nuppNativeTlsCreate(
-    uint64_t, const struct NuppNativeTlsOptions *, uint64_t *);
-int32_t nuppNativeTlsHandshake(uint64_t, uint32_t *);
-int32_t nuppNativeTlsRead(
-    uint64_t, uint8_t *, size_t, uint32_t *, size_t *);
-int32_t nuppNativeTlsWrite(
-    uint64_t, const uint8_t *, size_t, uint32_t *, size_t *);
-int32_t nuppNativeTlsFlushed(uint64_t, int32_t *);
-int32_t nuppNativeTlsCloseNotify(uint64_t, int32_t *);
-int32_t nuppNativeTlsConnected(uint64_t, int32_t *);
-int32_t nuppNativeTlsVerified(uint64_t, int32_t *);
-int32_t nuppNativeTlsResumed(uint64_t, int32_t *);
-int32_t nuppNativeTlsProtocol(
-    uint64_t, uint8_t *, size_t, size_t *, int32_t *);
-int32_t nuppNativeTlsRelease(uint64_t);
-]]
+-- A stream handle presented as the engine's transport.
+local record StreamTransport is engine.Transport
+    @readonly handle: any
 
-local ffi = native.ffi
-const C = native.C
-const TLS_FEATURE = 512
-const TLS_READY = 1
-const TLS_READ_PENDING = 1
-const TLS_READ_EOF = 2
-const TLS_WRITE_PENDING = 1
-const TLS_WRITE_CLOSED = 2
-const PROTOCOL_SIZE = 256
-
-local scratch: any = nil
-
-native.requireFeature(TLS_FEATURE, "tls")
-
-local function slice(text: string): any
-    local value = ffi.new<NuppNativeTlsSlice>()
-    -- The slice points into the Lua string; every caller hands it to C and returns
-    -- while `text` is still a live argument of its own, so the string outlives the
-    -- call.
-    @unsafe do
-        value.data = text
-    end
-    value.length = #text
-
-    return value
-end
-
-local function lastError(prefix: string): string
-    return prefix .. ": " .. (ffi.string(C.nuppNativeLastError()) as string)
-end
-
-local function readBuffer(): any
-    if scratch == nil then
-        scratch = ffi.new("uint8_t[?]", READ_SIZE)
+    function read(self, wanted: integer): (string?, string?)
+        return net:read(self.handle, wanted)
     end
 
-    return scratch
+    function ended(self): boolean
+        return net:ended(self.handle)
+    end
+
+    function write(self, bytes: string): (integer?, string?)
+        return net:write(self.handle, bytes)
+    end
+
+    function pending(self): integer
+        return net:pending(self.handle)
+    end
 end
+
+local record Session
+    @readonly handle: any
+    @readonly state: engine.Session
+    released: boolean
+end
+
+local function digest(parts: {string}): string
+    local hasher = streaming.sha256()
+    for _, part in ipairs(parts) do
+        hasher:update(#part .. ":" .. part)
+    end
+
+    return hasher:digest()
+end
+
+local function unpackProtocols(packed: string): {string}
+    local out: {string} = {}
+    for protocol in packed:gmatch("([^%z]+)%z") do
+        out[#out + 1] = protocol
+    end
+
+    return out
+end
+
+local serverKeys: {[string]: string} = {}
+local serverOrder: {string} = {}
+
+local function ticketKey(identity: string): string
+    local found = serverKeys[identity]
+    if found ~= nil then
+        return found
+    end
+    local key = random(32)
+    serverKeys[identity] = key
+    serverOrder[#serverOrder + 1] = identity
+    if #serverOrder > SERVER_CONFIGS_MAX then
+        serverKeys[table.remove(serverOrder, 1)] = nil
+    end
+
+    return key
+end
+
+-- Whether a private key belongs to a certificate's public key.
+local function keysMatch(private: keys.PrivateKey, public: keys.PublicKey): boolean
+    if private.kind ~= public.kind then
+        return false
+    end
+    if (private.kind as string) == "rsa" then
+        local mine = private.rsa as any
+        local theirs = public.rsa as any
+
+        return bn.compare(mine.n, theirs.n) == 0
+    elseif (private.kind as string) == "ec" then
+        local c = ecc.curve(private.curve as string)
+
+        return c ~= nil and private.curve == public.curve and ecc.publickey(c, private.scalar as string) == public.point
+    end
+
+    return curve25519.edpublic(private.seed as string) == public.point
+end
+
+local function serverConfig(certificate: string, privateKey: string, protocols: {string}): (engine.ServerConfig?, string?)
+    local blocks, why = der.pem(certificate)
+    if blocks == nil then
+        return nil, "the certificate is not valid PEM: " .. tostring(why)
+    end
+    local chain: {string} = {}
+    local leaf: x509.Certificate? = nil
+    for _, block in ipairs(blocks) do
+        if block.label == "CERTIFICATE" then
+            local parsed, parseWhy = x509.parse(block.bytes)
+            if parsed == nil then
+                return nil, "the certificate could not be read: " .. tostring(parseWhy)
+            end
+            leaf = leaf or parsed
+            chain[#chain + 1] = block.bytes
+        end
+    end
+    if leaf == nil then
+        return nil, "no certificate was found"
+    end
+    local key, keyWhy = keys.privatefrompem(privateKey)
+    if key == nil then
+        return nil, "the private key could not be read: " .. tostring(keyWhy)
+    end
+    if not keysMatch(key, leaf.publicKey) then
+        return nil, "the private key does not match the certificate"
+    end
+    local identity = digest({certificate, privateKey, table.concat(protocols, "\0")})
+
+    return engine.ServerConfig(chain = chain, key = key, protocols = protocols, ticketkey = ticketKey(identity)), nil
+end
+
+local function clientConfig(
+    handle: any,
+    hostname: string,
+    authority: string?,
+    protocols: {string},
+    packedProtocols: string,
+    verify: boolean
+): (engine.ClientConfig?, string?)
+    local peer = net:address(handle, true)
+    local port = peer ~= nil and peer.port or 0
+    local name = hostname
+    if name == "" then
+        if peer == nil then
+            return nil, "a TLS client over a path connection needs a hostname"
+        end
+        name = peer.host
+    end
+    local anchors: {x509.Certificate}? = nil
+    if verify then
+        if authority ~= nil then
+            local parsed, why = x509.frompem(authority as string)
+            if parsed == nil then
+                return nil, "the trusted certificate was rejected: " .. tostring(why)
+            end
+            anchors = parsed
+        else
+            local system, why = roots.system()
+            if system == nil then
+                return nil, why
+            end
+            anchors = system
+        end
+    end
+    local cachekey = digest({
+        name,
+        tostring(port),
+        packedProtocols,
+        verify and "1" or "0",
+        authority == nil and "1" or "0",
+        authority or "",
+    })
+
+    return engine.ClientConfig(
+        hostname = name,
+        sni = x509.ipaddress(name) == nil,
+        anchors = anchors,
+        verify = verify,
+        protocols = protocols,
+        cachekey = cachekey
+    ), nil
+end
+
+local function live(session: any): engine.Session?
+    local held = session as Session
+    if held.released then
+        return nil
+    end
+
+    return held.state
+end
+
+const RELEASED = "the TLS session is closed"
 
 local function create(): contract.TlsProvider
-    const scalar = ffi.new("int32_t[1]")
-    const state = ffi.new("uint32_t[1]")
-    const length = ffi.new("size_t[1]")
-    const handleOutput = ffi.new("uint64_t[1]")
-    const protocolBuffer = ffi.new("uint8_t[?]", PROTOCOL_SIZE)
-    const present = ffi.new("int32_t[1]")
-
     return {
         wrap = function(
             self: contract.TlsProvider,
@@ -122,64 +239,66 @@ local function create(): contract.TlsProvider
             protocols: string,
             verify: boolean
         ): (any?, string?)
+            local list = unpackProtocols(protocols)
+            local transport = StreamTransport(handle = handle)
+            local state: engine.Session
+            if server then
+                local config, why = serverConfig(certificate, privateKey, list)
+                if config == nil then
+                    net:closestream(handle)
 
-            local options = ffi.new<NuppNativeTlsOptions>()
-            options.hostname = slice(hostname)
-            options.certificate = slice(certificate)
-            options.private_key = slice(privateKey)
-            options.authority = slice(authority or "")
-            options.protocols = slice(protocols)
-            options.authority_present = authority ~= nil and 1 or 0
-            options.server = server and 1 or 0
-            options.verify = verify and 1 or 0
-            const status = C.nuppNativeTlsCreate(handle, options, handleOutput)
-            if status ~= 0 then
-                return nil, lastError("nupp: could not start the session")
+                    return nil, "nupp: could not start the session: " .. tostring(why)
+                end
+                state = engine.server(transport, config, random)
+            else
+                local config, why = clientConfig(handle, hostname, authority, list, protocols, verify)
+                if config == nil then
+                    net:closestream(handle)
+
+                    return nil, "nupp: could not start the session: " .. tostring(why)
+                end
+                state = engine.client(transport, config, random)
             end
 
-            return handleOutput[0]
+            return Session(handle = handle, state = state, released = false)
         end,
 
         handshake = function(self: contract.TlsProvider, session: any): (boolean?, string?)
-            const status = C.nuppNativeTlsHandshake(session, state)
-            if status ~= 0 then
-                return nil, lastError("nupp: the handshake failed")
+            local state = live(session)
+            if state == nil then
+                return nil, "nupp: the handshake failed: " .. RELEASED
+            end
+            local done, why = engine.handshake(state)
+            if done == nil then
+                return nil, "nupp: the handshake failed: " .. tostring(why)
             end
 
-            return state[0] == TLS_READY
+            return done
         end,
 
         verified = function(self: contract.TlsProvider, session: any): boolean
-            if C.nuppNativeTlsVerified(session, scalar) ~= 0 then
-                return false
-            end
+            local state = live(session)
 
-            return scalar[0] ~= 0
+            return state ~= nil and engine.verified(state)
         end,
 
         resumed = function(self: contract.TlsProvider, session: any): boolean
-            if C.nuppNativeTlsResumed(session, scalar) ~= 0 then
-                return false
-            end
+            local state = live(session)
 
-            return scalar[0] ~= 0
+            return state ~= nil and engine.resumed(state)
         end,
 
         read = function(self: contract.TlsProvider, session: any, wanted: integer): (string?, string?)
-            const taking = wanted < READ_SIZE and wanted or READ_SIZE
-            const into = readBuffer()
-            const status = C.nuppNativeTlsRead(session, into, taking, state, length)
-            if status ~= 0 then
-                return nil, lastError("nupp: could not read")
+            local state = live(session)
+            if state == nil then
+                return nil, "nupp: could not read: " .. RELEASED
             end
-            if state[0] == TLS_READ_PENDING then
-                return nil
-            end
-            if state[0] == TLS_READ_EOF then
-                return ""
+            local bytes, why = engine.read(state, math.min(wanted, READ_SIZE))
+            if why ~= nil then
+                return nil, "nupp: could not read: " .. why
             end
 
-            return ffiString(into, tonumber(length[0]) as integer)
+            return bytes
         end,
 
         readspan = function(
@@ -187,42 +306,35 @@ local function create(): contract.TlsProvider
             session: any,
             exclusive destination: span.ByteWriteSpan
         ): (integer?, string?)
-            const taking = #destination
-            const into = destination:ref()
-            local readInto = C.nuppNativeTlsRead as function(
-                handle: any,
-                borrows pointer: uint8[?],
-                count: integer,
-                state: any,
-                length: any
-            ): integer
-            const status = readInto(session, into, taking, state, length)
-            if status ~= 0 then
-                return nil, lastError("nupp: could not read")
+            local state = live(session)
+            if state == nil then
+                return nil, "nupp: could not read: " .. RELEASED
             end
-            if state[0] == TLS_READ_PENDING then
+            local bytes, why = engine.read(state, math.min(#destination, READ_SIZE))
+            if why ~= nil then
+                return nil, "nupp: could not read: " .. why
+            end
+            if bytes == nil then
                 return nil
             end
-            if state[0] == TLS_READ_EOF then
-                return 0
+            for index = 1, #(bytes as string) do
+                destination[index] = (bytes as string):byte(index)
             end
 
-            return tonumber(length[0]) as integer
+            return #(bytes as string)
         end,
 
         write = function(self: contract.TlsProvider, session: any, bytes: string): (integer?, string?)
-            const status = C.nuppNativeTlsWrite(session, bytes, #bytes, state, length)
-            if status ~= 0 then
-                return nil, lastError("nupp: could not write")
+            local state = live(session)
+            if state == nil then
+                return nil, "nupp: could not write: " .. RELEASED
             end
-            if state[0] == TLS_WRITE_PENDING then
-                return nil
-            end
-            if state[0] == TLS_WRITE_CLOSED then
-                return nil, "nupp: could not write: the connection is closed"
+            local taken, why = engine.write(state, bytes)
+            if why ~= nil then
+                return nil, "nupp: could not write: " .. why
             end
 
-            return tonumber(length[0]) as integer
+            return taken
         end,
 
         writespan = function(
@@ -230,64 +342,63 @@ local function create(): contract.TlsProvider
             session: any,
             borrows source: span.Span<uint8>
         ): (integer?, string?)
-            local writeFrom = C.nuppNativeTlsWrite as function(
-                handle: any,
-                borrows pointer: const uint8[?],
-                count: integer,
-                state: any,
-                length: any
-            ): integer
-            const status = writeFrom(session, source:ref(), #source, state, length)
-            if status ~= 0 then
-                return nil, lastError("nupp: could not write")
+            local state = live(session)
+            if state == nil then
+                return nil, "nupp: could not write: " .. RELEASED
             end
-            if state[0] == TLS_WRITE_PENDING then
-                return nil
-            end
-            if state[0] == TLS_WRITE_CLOSED then
-                return nil, "nupp: could not write: the connection is closed"
+            local pointer, count = source:ref()
+            local taken, why = engine.write(state, storage.string(pointer, count))
+            if why ~= nil then
+                return nil, "nupp: could not write: " .. why
             end
 
-            return tonumber(length[0]) as integer
+            return taken
         end,
 
         flushed = function(self: contract.TlsProvider, session: any): (boolean, string?)
-            const status = C.nuppNativeTlsFlushed(session, scalar)
-            if status ~= 0 then
-                return false, lastError("nupp: could not flush")
+            local state = live(session)
+            if state == nil then
+                return false, "nupp: could not flush: " .. RELEASED
+            end
+            local done, why = engine.flushed(state)
+            if why ~= nil then
+                return false, "nupp: could not flush: " .. why
             end
 
-            return scalar[0] ~= 0
+            return done
         end,
 
         closenotify = function(self: contract.TlsProvider, session: any): (boolean, string?)
-            const status = C.nuppNativeTlsCloseNotify(session, scalar)
-            if status ~= 0 then
-                return false, lastError("nupp: could not send close_notify")
-            end
-
-            return scalar[0] ~= 0
-        end,
-
-        destroy = function(self: contract.TlsProvider, session: any): nil
-            C.nuppNativeTlsRelease(session)
-        end,
-
-        connected = function(self: contract.TlsProvider, session: any): boolean
-            if C.nuppNativeTlsConnected(session, scalar) ~= 0 then
+            local state = live(session)
+            if state == nil then
                 return false
             end
 
-            return scalar[0] ~= 0
+            return engine.closenotify(state, seconds)
+        end,
+
+        destroy = function(self: contract.TlsProvider, session: any): nil
+            local held = session as Session
+            if held.released then
+                return
+            end
+            held.released = true
+            if engine.closing(held.state) then
+                net:shutdownwrite(held.handle)
+            end
+            net:closestream(held.handle)
+        end,
+
+        connected = function(self: contract.TlsProvider, session: any): boolean
+            local state = live(session)
+
+            return state ~= nil and engine.connected(state)
         end,
 
         protocol = function(self: contract.TlsProvider, session: any): string?
-            const status = C.nuppNativeTlsProtocol(session, protocolBuffer, PROTOCOL_SIZE, length, present)
-            if status ~= 0 or present[0] == 0 then
-                return nil
-            end
+            local state = live(session)
 
-            return ffiString(protocolBuffer, tonumber(length[0]) as integer)
+            return state ~= nil and engine.protocol(state) or nil
         end
     }
 end
