@@ -435,4 +435,36 @@ return work(false)
     end
 end
 
+function M.stockMembersKeepTheStockRuntimeUnderCleanup()
+    local source = [[
+local record Guard value: number end
+local function close(takes guard: Guard): nil end
+local function acquire(): affine(Guard, close) return Guard(value=1) end
+local function work(): number
+    do local item = acquire() ;
+        return item.value
+    end
+end
+local co = coroutine.create(function() coroutine.yield(work()) end)
+local step = coroutine.wrap(function() return 2 end)
+local function opens(): boolean
+    local file = io.open("missing-compat-file", "r")
+    if file then
+        file:close()
+        return true
+    end
+    return false
+end
+return coroutine.resume(co), step(), opens(), os.remove("missing-compat-file")
+]]
+    local result, diags = checked(source)
+    assert(errors(diags) == "", errors(diags))
+    local code, generated, _, effects = gen.generate(result, "compat.nupp", nil, nil, nil, nil, "lua51")
+    assert(errors(generated) == "", errors(generated))
+    assert(not effects["runtime.suspension"], "a stock coroutine member selected the suspension runtime")
+    for _, extension in ipairs({"standardcoroutine", "standardio", "standardos"}) do
+        assert(not code:find(extension, 1, true), "compat emission selected " .. extension)
+    end
+end
+
 return M
