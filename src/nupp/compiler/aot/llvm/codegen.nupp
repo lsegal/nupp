@@ -7,7 +7,9 @@ options, checked here from `key=value` form, and what comes out is an object,
 the phase timings, and optionally the assembly and optimized IR; the crate
 behind it knows nothing about Nupp. The numeric-contract checks
 ([](nupp.compiler.aot.llvm.contract)) and the report run here. A host built without
-the pinned LLVM answers `available()` with the reason.
+the pinned LLVM reaches a prebuilt provider instead when one is named
+(`NUPP_CODEGEN_LIBRARY`, or `useLibrary`), and otherwise answers `available()`
+with the reason.
 ]]
 module nupp.compiler.aot.llvm.codegen
 
@@ -53,8 +55,25 @@ int32_t nuppCodegenKitFetch(
 ]]
 end
 
---- Whether this process has the code generator, and if not, why not.
-function codegen.available(): (boolean, string?)
+--- A provider the code generator is reached through: its namespace, and the
+--- status and byte-handle readers that go with that namespace.
+record codegen.Provider
+    C: any
+    succeeded: function(integer, integer): nil
+    bytes: function(any): string
+end
+
+--- The prebuilt code generator named by `codegen.useLibrary`, when this
+--- process's own provider was built without one.
+local fallback: string? = nil
+
+--- Prebuilt providers already opened, by path, and why one could not be.
+local opened: {[string]: codegen.Provider} = {}
+
+local refused: {[string]: string} = {}
+
+--- This process's provider, when it carries the code generator.
+local function own(): (codegen.Provider?, string?)
     local ok, answer = pcall(function(): boolean
         declare()
         local C: any = native.C
@@ -65,10 +84,134 @@ function codegen.available(): (boolean, string?)
         return C.nuppCodegenAvailable() ~= 0
     end)
     if not ok then
-        return false, "the native provider could not be loaded: " .. tostring(answer)
+        return nil, "the native provider could not be loaded: " .. tostring(answer)
     end
     if answer ~= true then
-        return false, "this nupp was built without the LLVM code generator; run scripts/toolchain llvm and rebuild"
+        return nil, "this nupp was built without the LLVM code generator; run scripts/toolchain llvm and rebuild"
+    end
+
+    return codegen.Provider(C = native.C, succeeded = native.succeeded, bytes = native.bytes), nil
+end
+
+--- A prebuilt provider library, opened beside this process's own for its
+--- code generator alone: a checkout that has not built LLVM links native
+--- programs with the one `scripts/toolchain prebuilt-codegen` fetched. Its
+--- byte handles and errors are its own, so they are read through it too.
+local function prebuilt(path: string): (codegen.Provider?, string?)
+    if opened[path] ~= nil then
+        return opened[path], nil
+    end
+    if refused[path] ~= nil then
+        return nil, refused[path]
+    end
+    local ok, answer = pcall(function(): any
+        declare()
+        local ffi: any = native.ffi
+        -- Kept in `opened` for the life of the process, so it is never
+        -- unloaded while a handle it returned is still being read.
+        local library: any = ffi.load(path)
+        if (library.nuppNativeFeatures() as integer) % (CODEGEN_FEATURE * 2) < CODEGEN_FEATURE
+            or library.nuppCodegenAvailable() == 0
+        then
+            return nil
+        end
+
+        return library
+    end)
+    if not ok or answer == nil then
+        refused[path] = not ok and "cannot load the prebuilt code generator " .. path .. ": " .. tostring(answer)
+            or "the prebuilt provider " .. path .. " was built without the LLVM code generator"
+
+        return nil, refused[path]
+    end
+    local ffi: any = native.ffi
+    local library: any = answer
+
+    local function succeeded(status: integer, level: integer): nil
+        if status ~= 0 then
+            error("nupp: " .. ffi.string(library.nuppNativeLastError()), level)
+        end
+    end
+
+    local function bytes(handle: any): string
+        local length = ffi.new("size_t[1]")
+        local status = library.nuppNativeBytesCopy(handle, nil, 0, length)
+        local count = (tonumber(length[0]) or 0) as integer
+        if count == 0 then
+            local released = library.nuppNativeBytesRelease(handle)
+            succeeded(status, 3)
+            succeeded(released, 3)
+
+            return ""
+        end
+        -- Capacity is the expected result of probing a nonempty value.
+        if status ~= 2 then
+            local released = library.nuppNativeBytesRelease(handle)
+            succeeded(status, 3)
+            succeeded(released, 3)
+        end
+        local buffer = ffi.new("uint8_t[?]", count)
+        status = library.nuppNativeBytesCopy(handle, buffer, count, length)
+        local released = library.nuppNativeBytesRelease(handle)
+        succeeded(status, 3)
+        succeeded(released, 3)
+
+        return ffi.string(buffer, count)
+    end
+
+    local provider = codegen.Provider(C = library, succeeded = succeeded, bytes = bytes)
+    opened[path] = provider
+
+    return provider, nil
+end
+
+--- The provider to reach the code generator through, or nil and why there is
+--- none: this process's own, else `NUPP_CODEGEN_LIBRARY`, else the prebuilt
+--- one `codegen.useLibrary` named.
+local function selected(): (codegen.Provider?, string?)
+    local found, why = own()
+    if found ~= nil then
+        return found, nil
+    end
+    local named = os.getenv("NUPP_CODEGEN_LIBRARY")
+    if named ~= nil and named ~= "" then
+        return prebuilt(named as string)
+    end
+    if fallback ~= nil then
+        return prebuilt(fallback as string)
+    end
+
+    return nil, why
+end
+
+--- The provider, for a call that has already been told it is available.
+--- @raises string when there is none
+local function reach(): codegen.Provider
+    local found, why = selected()
+    if found == nil then
+        error(why, 0)
+    end
+
+    return found as codegen.Provider
+end
+
+--- Names a prebuilt provider library to reach the code generator through
+--- when this process's own was built without it.
+--- @return nil, or why that library cannot serve
+function codegen.useLibrary(path: string): string?
+    local _, why = prebuilt(path)
+    if why == nil then
+        fallback = path
+    end
+
+    return why
+end
+
+--- Whether this process has the code generator, and if not, why not.
+function codegen.available(): (boolean, string?)
+    local found, why = selected()
+    if found == nil then
+        return false, why
     end
 
     return true, nil
@@ -79,21 +222,21 @@ end
 function codegen.version(): string
     declare()
     local ffi: any = native.ffi
-    local C: any = native.C
+    local provider = reach()
     local handle = ffi.new("uint64_t[1]")
-    native.succeeded(C.nuppCodegenVersion(handle), 2)
+    provider.succeeded(provider.C.nuppCodegenVersion(handle), 2)
 
-    return native.bytes(handle[0])
+    return provider.bytes(handle[0])
 end
 
 --- The contents of a byte handle, or nil for the zero handle.
-local function take(handle: any): string?
+local function take(provider: codegen.Provider, handle: any): string?
     local ffi: any = native.ffi
     if ffi.cast("uint64_t", handle) == 0 then
         return nil
     end
 
-    return native.bytes(handle)
+    return provider.bytes(handle)
 end
 
 --- A compiled module.
@@ -263,21 +406,25 @@ function codegen.compile(ir: string, name: string, options: {[string]: string}):
     local ok, result = pcall(function(): codegen.Compiled
         declare()
         local ffi: any = native.ffi
-        local C: any = native.C
         local checked, text = nativeOptions(options, true)
+        local provider = reach()
+        local C: any = provider.C
         local object = ffi.new("uint64_t[1]")
         local spent = ffi.new("uint64_t[1]")
         local assembly = ffi.new("uint64_t[1]")
         local optimized = ffi.new("uint64_t[1]")
-        native.succeeded(C.nuppCodegenCompile(ir, #ir, name, #name, text, #text, object, spent, assembly, optimized), 2)
-        local objectBytes = take(object[0]) or ""
-        local listing = take(assembly[0])
-        local optimizedIr = take(optimized[0])
+        provider.succeeded(
+            C.nuppCodegenCompile(ir, #ir, name, #name, text, #text, object, spent, assembly, optimized),
+            2
+        )
+        local objectBytes = take(provider, object[0]) or ""
+        local listing = take(provider, assembly[0])
+        local optimizedIr = take(provider, optimized[0])
         local found: {string} = checked.verify and violations(optimizedIr or "", listing) or {}
 
         return codegen.Compiled(
             object = objectBytes,
-            report = codegen.report(timings(take(spent[0]) or ""), #objectBytes, found),
+            report = codegen.report(timings(take(provider, spent[0]) or ""), #objectBytes, found),
             assembly = listing,
             optimizedIr = checked.optimizedIr and optimizedIr or nil
         )
@@ -337,7 +484,6 @@ function codegen.compileFiles(jobs: {codegen.Job}, width: integer): ({codegen.Ou
     local ok, result = pcall(function(): {codegen.Outcome}
         declare()
         local ffi: any = native.ffi
-        local C: any = native.C
         local records: {string} = {}
         local checked: {codegen.Options} = {}
         for position, job in ipairs(jobs) do
@@ -345,10 +491,12 @@ function codegen.compileFiles(jobs: {codegen.Job}, width: integer): ({codegen.Ou
             checked[position] = options
             records[position] = job.ir .. "\31" .. job.object .. "\31" .. text
         end
+        local provider = reach()
+        local C: any = provider.C
         local joined = table.concat(records, "\0") .. "\0"
         local handle = ffi.new("uint64_t[1]")
-        native.succeeded(C.nuppCodegenCompileFiles(joined, #joined, width, handle), 2)
-        local text = take(handle[0]) or ""
+        provider.succeeded(C.nuppCodegenCompileFiles(joined, #joined, width, handle), 2)
+        local text = take(provider, handle[0]) or ""
         local outcomes: {codegen.Outcome} = {}
         for record in text:gmatch("([^%z]*)%z") do
             local position = #outcomes + 1
@@ -382,7 +530,11 @@ function codegen.endIfUnexitable(code: integer): nil
     if not declared then
         return
     end
-    local C: any = native.C
+    local provider = selected()
+    if provider == nil then
+        return
+    end
+    local C: any = provider.C
     local ok, unexitable = pcall(function(): boolean
         return C.nuppCodegenUnexitable() ~= 0
     end)
@@ -400,12 +552,13 @@ function codegen.link(argv: {string}): (string?, string?)
     local ok, result = pcall(function(): string
         declare()
         local ffi: any = native.ffi
-        local C: any = native.C
+        local provider = reach()
+        local C: any = provider.C
         local joined = table.concat(argv, "\0") .. "\0"
         local messages = ffi.new("uint64_t[1]")
-        native.succeeded(C.nuppCodegenLink(joined, #joined, messages), 2)
+        provider.succeeded(C.nuppCodegenLink(joined, #joined, messages), 2)
 
-        return take(messages[0]) or ""
+        return take(provider, messages[0]) or ""
     end)
     if not ok then
         return nil, tostring(result)
@@ -420,13 +573,14 @@ end
 function codegen.importLibrary(dll: string, path: string, names: {{string}}): string?
     local ok, err = pcall(function(): nil
         declare()
-        local C: any = native.C
+        local provider = reach()
+        local C: any = provider.C
         local entries: {string} = {}
         for position, entry in ipairs(names) do
             entries[position] = entry[2] ~= nil and entry[1] .. "\t" .. entry[2] or entry[1]
         end
         local joined = table.concat(entries, "\0") .. "\0"
-        native.succeeded(C.nuppCodegenImportLibrary(dll, #dll, path, #path, joined, #joined), 2)
+        provider.succeeded(C.nuppCodegenImportLibrary(dll, #dll, path, #path, joined, #joined), 2)
     end)
     if not ok then
         return tostring(err)
@@ -444,9 +598,10 @@ const ARCHIVE: {[string]: integer} = {gnu = 0, bsd = 1, darwin = 2, coff = 3}
 function codegen.archive(path: string, members: {string}, format: string): string?
     local ok, err = pcall(function(): nil
         declare()
-        local C: any = native.C
+        local provider = reach()
+        local C: any = provider.C
         local joined = table.concat(members, "\0") .. "\0"
-        native.succeeded(C.nuppCodegenArchive(path, #path, joined, #joined, ARCHIVE[format] or 0), 2)
+        provider.succeeded(C.nuppCodegenArchive(path, #path, joined, #joined, ARCHIVE[format] or 0), 2)
     end)
     if not ok then
         return tostring(err)
@@ -462,8 +617,9 @@ end
 function codegen.fetchKit(url: string, path: string, size: integer): string?
     local ok, err = pcall(function(): nil
         declare()
-        local C: any = native.C
-        native.succeeded(C.nuppCodegenKitFetch(url, #url, path, #path, size), 2)
+        local provider = reach()
+        local C: any = provider.C
+        provider.succeeded(C.nuppCodegenKitFetch(url, #url, path, #path, size), 2)
     end)
     if not ok then
         return tostring(err)

@@ -87,6 +87,41 @@ function M.declaredStructsKeepTheirIdentityAcrossMentions()
     )
 end
 
+-- `typedef struct { ... } Name;` has no tag, only the typedef, and used to read as
+-- voidptr with no fields (#154).
+local ANON = [[
+local ffi = require('ffi')
+ffi.cdef[==[
+typedef struct { int32_t checked; double ratio; } CstAnon;
+typedef CstAnon CstAnonAlias;
+typedef union { int32_t i; float f; } CstAnonUnion;
+]==]
+]]
+
+function M.aTypedefOfAnAnonymousStructHasItsFields()
+    testAssert.eq(diagsOf(ANON .. "local p = ffi.new('CstAnon')\nlocal n: number = p.checked"), "")
+    testAssert.eq(diagsOf(ANON .. "local p = ffi.new('CstAnon')\nlocal s: string = p.ratio"), "NUPP2001")
+    testAssert.eq(diagsOf(ANON .. "local p = ffi.new('CstAnon')\nlocal n = p.nope"), "NUPP2004")
+    -- a typedef of the typedef, and a union, the same way
+    testAssert.eq(diagsOf(ANON .. "local p = ffi.new('CstAnonAlias')\nlocal n: number = p.checked"), "")
+    testAssert.eq(diagsOf(ANON .. "local u = ffi.new('CstAnonUnion')\nlocal f: number = u.f"), "")
+    testAssert.eq(diagsOf(ANON .. "local u = ffi.new('CstAnonUnion')\nlocal n = u.nope"), "NUPP2004")
+end
+
+function M.aTypedefOfAnAnonymousStructIsOneType()
+    diagsOf(ANON)
+    local cheaderMod = require("nupp.compiler.cinterop.cheader")
+    local types = require("nupp.compiler.types")
+    local t = cheaderMod.typeFromString("CstAnon")
+    assert(t and t.byname and t.byname.checked, "struct decoded")
+    testAssert.eq(types.tostring(t), "CstAnon")
+    -- every mention, a typedef of the typedef, and a pointer name the same struct
+    assert(rawequal(cheaderMod.typeFromString("CstAnon"), t), "one identity across mentions")
+    assert(rawequal(cheaderMod.typeFromString("CstAnonAlias"), t), "the alias is the same struct")
+    testAssert.eq(types.tostring(cheaderMod.typeFromString("CstAnon *")), "CstAnon*?")
+    testAssert.eq(types.tostring(cheaderMod.typeFromString("CstAnonUnion")), "CstAnonUnion")
+end
+
 function M.constIsAModifierOnlyWhenATypeFollows()
     -- `const` is a statement keyword and may also name a type; in type
     -- position it modifies only when a type comes next
@@ -134,6 +169,22 @@ function M.theCNamespaceIsTypedFromDeclarations()
     testAssert.eq(diagsOf(D .. "ffi.C.nsNoSuch()"), "NUPP2004")
     -- ffi.load holds the same declarations
     testAssert.eq(diagsOf(D .. "local lib = ffi.load('m')\nlib.nsA(42)"), "NUPP2006")
+end
+
+-- Checking a file used to declare its blocks into the compiler's own FFI, where a
+-- typedef the checker reached first decided what a runtime module declaring the same
+-- name afterwards got from ffi.new (#117).
+function M.checkingAFileLeavesTheRuntimeItsOwnTypedefs()
+    local D = "local ffi = require('ffi')\nffi.cdef[[ typedef struct CstShadow { int32_t checked; } CstShadow; ]]\n"
+    testAssert.eq(diagsOf(D .. "local p = ffi.new('CstShadow')\nlocal n: number = p.checked"), "")
+    local ffi = require("ffi")
+    ffi.cdef("typedef struct { int64_t pid; int32_t status; } CstShadow;")
+    local child = ffi.new("CstShadow")
+    child.pid = 42
+    testAssert.eq(tonumber(child.pid), 42)
+    -- and the checked file keeps its own shape once the runtime holds the name
+    testAssert.eq(diagsOf(D .. "local p = ffi.new('CstShadow')\nlocal n: number = p.checked"), "")
+    testAssert.eq(diagsOf(D .. "local p = ffi.new('CstShadow')\nlocal n = p.pid"), "NUPP2004")
 end
 
 return M

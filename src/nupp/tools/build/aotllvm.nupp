@@ -20,11 +20,44 @@ local aotllvm = {}
 --- version, and the lowering's.
 const aotllvm.BACKEND = "llvm"
 
+--- Whether the pinned prebuilt code generator has been asked for yet, and
+--- why it could not be had when that is worth saying.
+local askedPrebuilt = false
+
+local prebuiltProblem: string? = nil
+
+--- A source checkout whose provider was built without LLVM links with the
+--- prebuilt code generator `scripts/toolchain.pins` names, fetched and
+--- verified once per machine. Asked once per process, and only by a build
+--- that needs the code generator.
+local function prebuilt(): nil
+    if askedPrebuilt or codegen.available() then
+        return
+    end
+    askedPrebuilt = true
+    local path, problem = require("nupp.tools.build.prebuilt").fetch("codegen")
+    if path == nil then
+        -- Nothing pinned for this platform is the ordinary state of a
+        -- checkout, not a failure to report.
+        if problem ~= nil and not tostring(problem):find("is pinned for", 1, true) then
+            prebuiltProblem = problem
+        end
+
+        return
+    end
+    prebuiltProblem = codegen.useLibrary(path as string)
+end
+
 --- Whether this nupp can compile AOT code: true, or nil and why not (it was
 --- built without the code generator, or NUPP_AOT_FACTS is malformed).
 function aotllvm.selected(): (boolean?, string?)
+    prebuilt()
     local available, why = codegen.available()
     if not available then
+        if prebuiltProblem ~= nil then
+            return nil, tostring(why) .. "; the prebuilt code generator is unavailable: " .. tostring(prebuiltProblem)
+        end
+
         return nil, tostring(why)
     end
     local _, factsErr = aotllvm.facts()
@@ -67,6 +100,7 @@ end
 --- `unavailable` in a nupp built without it: a build that compiles nothing on
 --- the CPU needs none, and one that does says so where it would compile.
 function aotllvm.version(): string
+    prebuilt()
     if not codegen.available() then
         return "unavailable"
     end
@@ -514,9 +548,17 @@ function aotllvm.linkWasm(object: string, output: string, exports: {string}, lib
     return nil
 end
 
+--- What `link` makes: an executable, or with `shared` a shared library, and
+--- the file of `exports`, when there is one, naming all either exports.
+local record LinkMode
+    shared: boolean
+    exports: string?
+end
+
 --- The ELF half of `link`: a position-independent executable from the kit's
 --- startup objects, `runtime` and `archives` whole, the kit's library stubs,
---- and libgcc, bound to the dynamic linker the kit names.
+--- and libgcc, bound to the dynamic linker the kit names. A shared library
+--- leaves out the executable's startup object and the dynamic linker.
 local function linkLinux(
     kit: string,
     manifest: any,
@@ -524,27 +566,28 @@ local function linkLinux(
     output: string,
     runtime: string,
     archives: {string},
-    flags: {string}
+    flags: {string},
+    mode: LinkMode
 ): string?
     local argv: {
         string
-    } = {
-        "ld.lld",
-        "-m",
-        machine,
-        "-pie",
-        "--eh-frame-hdr",
-        "-z",
-        "noexecstack",
-        "--hash-style=gnu",
-        "--build-id",
-        "-dynamic-linker",
-        tostring(manifest.interpreter),
-        "-o",
-        output,
-    }
+    } = {"ld.lld", "-m", machine, "--eh-frame-hdr", "-z", "noexecstack", "--hash-style=gnu", "--build-id",}
+    if mode.shared then
+        argv[#argv + 1] = "-shared"
+        argv[#argv + 1] = "-soname"
+        argv[#argv + 1] = fs.basename(output)
+    else
+        argv[#argv + 1] = "-pie"
+        argv[#argv + 1] = "-dynamic-linker"
+        argv[#argv + 1] = tostring(manifest.interpreter)
+    end
+    argv[#argv + 1] = "-o"
+    argv[#argv + 1] = output
     for _, object in ipairs(manifest.startup) do
-        argv[#argv + 1] = kit .. "/" .. tostring(object)
+        local name = fs.basename(tostring(object))
+        if not mode.shared or name ~= "Scrt1.o" and name ~= "crt1.o" then
+            argv[#argv + 1] = kit .. "/" .. tostring(object)
+        end
     end
     argv[#argv + 1] = "--whole-archive"
     argv[#argv + 1] = runtime
@@ -561,8 +604,14 @@ local function linkLinux(
     for _, object in ipairs(manifest.finish) do
         argv[#argv + 1] = kit .. "/" .. tostring(object)
     end
-    -- The program's native code finds the runtime's entry points by name.
-    argv[#argv + 1] = "--export-dynamic"
+    -- The program's native code finds the runtime's entry points by name; a
+    -- shared library exports its definitions without being asked.
+    if not mode.shared then
+        argv[#argv + 1] = "--export-dynamic"
+    end
+    if mode.exports ~= nil then
+        argv[#argv + 1] = "--version-script=" .. (mode.exports as string)
+    end
     local _, err = codegen.link(argv)
     if err ~= nil then
         os.remove(output)
@@ -575,21 +624,34 @@ end
 
 --- A Windows kit records the link MinGW's driver ran for a probe program;
 --- lld's MinGW driver replays it with this program's archives, loaded whole,
---- where the probe's object was.
+--- where the probe's object was. A DLL starts from the CRT's DLL startup object
+--- in place of the program's, and an export list replaces the probe's export
+--- of everything.
 local function linkWindows(
     kit: string,
     manifest: any,
     output: string,
     runtime: string,
     archives: {string},
-    flags: {string}
+    flags: {string},
+    mode: LinkMode
 ): string?
     if type(manifest.argv) ~= "table" then
         return "the link kit at " .. kit .. " records no link"
     end
     local argv: {string} = {"ld.lld"}
+    if mode.shared then
+        if not fs.exists(kit .. "/lib/dllcrt2.o") then
+            return "the link kit at " .. kit .. " has no DLL startup object; rebuild it with scripts/toolchain kit"
+        end
+        argv[#argv + 1] = "--shared"
+    end
     for _, token in ipairs(manifest.argv as {string}) do
-        if token == "{output}" then
+        if mode.shared and token == "{kit}/lib/crt2.o" then
+            argv[#argv + 1] = kit .. "/lib/dllcrt2.o"
+        elseif mode.exports ~= nil and token == "--export-all-symbols" then
+            -- The list names what is exported instead.
+        elseif token == "{output}" then
             argv[#argv + 1] = output
         elseif token == "{runtime}" then
             argv[#argv + 1] = runtime
@@ -608,6 +670,10 @@ local function linkWindows(
             argv[#argv + 1] = token
         end
     end
+    -- lld's MinGW driver reads a `.def` input as the module definition.
+    if mode.exports ~= nil then
+        argv[#argv + 1] = mode.exports as string
+    end
     local _, err = codegen.link(argv)
     if err ~= nil then
         os.remove(output)
@@ -621,8 +687,17 @@ end
 --- Links `output` from the link kit at `kit`: the archive its manifest names
 --- under `runtime` and `archives` loaded whole (a program reaches native code
 --- by name, which no archive scan sees), against the kit's stubs for the
---- system libraries, with lld in process.
-local function link(kit: string, output: string, runtime: string, archives: {string}, flags: {string}): string?
+--- system libraries, with lld in process. `mode` is what is linked; an
+--- executable exporting whatever the kit's link exports when none is given.
+local function link(
+    kit: string,
+    output: string,
+    runtime: string,
+    archives: {string},
+    flags: {string},
+    mode: LinkMode?
+): string?
+    local how = mode or LinkMode(shared = false)
     local text = fs.readFile(kit .. "/kit.json")
     if text == nil then
         return "the link kit at " .. kit .. " has no kit.json"
@@ -648,9 +723,9 @@ local function link(kit: string, output: string, runtime: string, archives: {str
     local archive = kit .. "/" .. (named as string)
     local machine = (selected as llvmProfile.Profile).machine
     if manifest.platform == "linux" then
-        return linkLinux(kit, manifest, machine, output, archive, archives, flags)
+        return linkLinux(kit, manifest, machine, output, archive, archives, flags, how)
     elseif manifest.platform == "windows" then
-        return linkWindows(kit, manifest, output, archive, archives, flags)
+        return linkWindows(kit, manifest, output, archive, archives, flags, how)
     elseif manifest.platform ~= "macos" then
         return "the link kit at " .. kit .. " is for " .. tostring(manifest.platform) .. ", which this nupp cannot link"
     end
@@ -669,9 +744,14 @@ local function link(kit: string, output: string, runtime: string, archives: {str
         kit .. "/" .. tostring(manifest.syslibroot),
         "-o",
         output,
-        "-force_load",
-        archive,
     }
+    if how.shared then
+        argv[#argv + 1] = "-dylib"
+        argv[#argv + 1] = "-install_name"
+        argv[#argv + 1] = "@rpath/" .. fs.basename(output)
+    end
+    argv[#argv + 1] = "-force_load"
+    argv[#argv + 1] = archive
     for _, linked in ipairs(archives) do
         argv[#argv + 1] = "-force_load"
         argv[#argv + 1] = linked
@@ -690,6 +770,10 @@ local function link(kit: string, output: string, runtime: string, archives: {str
     end
     -- The program's native code finds the runtime's entry points by name.
     argv[#argv + 1] = "-export_dynamic"
+    if how.exports ~= nil then
+        argv[#argv + 1] = "-exported_symbols_list"
+        argv[#argv + 1] = how.exports as string
+    end
     local _, err = codegen.link(argv)
     if err ~= nil then
         os.remove(output)
@@ -715,10 +799,87 @@ function aotllvm.linkProgram(kit: string, output: string, objects: {string}): st
     return link(kit, output, "luajit", objects, {})
 end
 
---- Compiles the LLVM IR `ir` of a native program for `triple` and links it
---- into the executable `output` from the link kit at `kit`.
+--- The members of the static archive at `path`, each written beside `prefix`
+--- under a name of its own, in archive order; its symbol tables are left out.
+--- Reads the GNU and BSD formats, which are what the targets' archivers write.
+--- @return the members' files, or nil and why not
+local function members(path: string, prefix: string): ({string}?, string?)
+    local data = fs.readFile(path)
+    if data == nil then
+        return nil, "cannot read the archive " .. path
+    end
+    local bytes = data as string
+    if bytes:sub(1, 8) ~= "!<arch>\n" then
+        return nil, path .. " is not a static archive"
+    end
+    local files: {string} = {}
+    local longNames = ""
+    local at = 9
+    while at + 60 <= #bytes + 1 do
+        local header = bytes:sub(at, at + 59)
+        local name = (header:sub(1, 16)):gsub("%s+$", "")
+        local size = tonumber((header:sub(49, 58)):match("%d+"))
+        if size == nil or header:sub(59, 60) ~= "`\n" then
+            return nil, path .. " has a damaged member header"
+        end
+        local length = size as integer
+        local start = at + 60
+        local body = bytes:sub(start, start + length - 1)
+        local bsd = name:match("^#1/(%d+)$")
+        if bsd ~= nil then
+            local nameLength = tonumber(bsd) as integer
+            name = (body:sub(1, nameLength)):gsub("%z+$", "")
+            body = body:sub(nameLength + 1)
+        end
+        if name == "//" then
+            longNames = body
+        elseif name ~= "/" and name ~= "/SYM64/" and name:sub(1, 9) ~= "__.SYMDEF" then
+            local offset = name:match("^/(%d+)$")
+            if offset ~= nil then
+                name = longNames:sub((tonumber(offset) as integer) + 1):match("^([^\n]-)/?\n") or name
+            end
+            name = fs.basename((name:gsub("/$", "")))
+            local file = ("%s.%d-%s"):format(prefix, #files + 1, name)
+            local wrote, writeErr = fs.writeFile(file, body)
+            if not wrote then
+                for _, written in ipairs(files) do
+                    os.remove(written)
+                end
+                return nil, tostring(writeErr)
+            end
+            files[#files + 1] = file
+        end
+        at = start + length + length % 2
+    end
+
+    return files, nil
+end
+
+--- How a native program is linked.
+record aotllvm.NativeLink
+    --- "executable", "static" or "shared".
+    linkage: string
+
+    --- Static archives linked in whole, or for a static archive, merged in.
+    archives: {string}
+
+    --- Every symbol the executable or shared library exports, and all it
+    --- exports; nil leaves what the kit's link exports.
+    exports: {string}?
+end
+
+--- Compiles the LLVM IR `ir` of a native program for `triple` into `output`:
+--- an executable or a shared library linked from the link kit at `kit`, or a
+--- static archive, which needs no kit, of the program's object and the
+--- members of `how.archives`.
 --- @return nil, or what went wrong
-function aotllvm.program(ir: string, triple: string, kit: string, output: string): string?
+function aotllvm.nativeProgram(
+    ir: string,
+    triple: string,
+    kit: string?,
+    output: string,
+    how: aotllvm.NativeLink
+): string?
     local selected, profileErr = llvmProfile.of(triple)
     if selected == nil then
         return profileErr
@@ -734,10 +895,77 @@ function aotllvm.program(ir: string, triple: string, kit: string, output: string
     if not wrote then
         return tostring(writeErr)
     end
-    local linkErr = aotllvm.linkProgram(kit, output, {object})
+    if how.linkage == "static" then
+        local inputs: {string} = {object}
+        local extracted: {string} = {}
+        local problem: string? = nil
+        for _, archive in ipairs(how.archives) do
+            if problem == nil then
+                local files, membersErr = members(archive, output)
+                if files == nil then
+                    problem = membersErr
+                else
+                    for _, file in ipairs(files as {string}) do
+                        inputs[#inputs + 1] = file
+                        extracted[#extracted + 1] = file
+                    end
+                end
+            end
+        end
+        if problem == nil then
+            problem = aotllvm.archive(triple, inputs, output)
+        end
+        for _, file in ipairs(extracted) do
+            os.remove(file)
+        end
+        os.remove(object)
+
+        return problem
+    end
+    if kit == nil then
+        os.remove(object)
+
+        return "linking a native program needs a link kit for " .. triple
+    end
+    local listed: string? = nil
+    if how.exports ~= nil then
+        -- lld's MinGW driver knows a module definition by its suffix.
+        listed = output .. ((selected as llvmProfile.Profile).format == "coff" and ".def" or ".exports")
+        local listWrote, listErr = fs.writeFile(
+            listed as string,
+            llvmProfile.exportList(selected as llvmProfile.Profile, how.exports as {string})
+        )
+        if not listWrote then
+            os.remove(object)
+
+            return tostring(listErr)
+        end
+    end
+    local objects: {string} = {object}
+    for _, archive in ipairs(how.archives) do
+        objects[#objects + 1] = archive
+    end
+    local linkErr = link(
+        kit as string,
+        output,
+        "luajit",
+        objects,
+        {},
+        LinkMode(shared = how.linkage == "shared", exports = listed)
+    )
     os.remove(object)
+    if listed ~= nil then
+        os.remove(listed as string)
+    end
 
     return linkErr
+end
+
+--- Compiles the LLVM IR `ir` of a native program for `triple` and links it
+--- into the executable `output` from the link kit at `kit`.
+--- @return nil, or what went wrong
+function aotllvm.program(ir: string, triple: string, kit: string, output: string): string?
+    return aotllvm.nativeProgram(ir, triple, kit, output, aotllvm.NativeLink(linkage = "executable", archives = {}))
 end
 
 export = aotllvm

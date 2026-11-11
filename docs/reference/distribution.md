@@ -252,6 +252,31 @@ NUPP_HOST_OFFLINE=1 \
 
 An offline Rust build without `NUPP_RUST_VENDOR_DIR` fails before Cargo runs.
 
+### Prebuilt code generator and link kit
+
+A source checkout also bootstraps native program linking from a release
+rather than from LLVM. Beside its `nupp-stage0-<tag>.lua.gz`, a stage-zero
+release publishes one pair of assets per platform:
+
+```text
+nupp-codegen-<platform>.tar.gz
+nupp-kit-<platform>.tar.gz
+```
+
+The first holds that release's native provider built with the LLVM code
+generator, and the second its link kit. `scripts/toolchain.pins` pins each by
+`PREBUILT_TAG`, a URL, and a SHA-256 per platform, and the release notes list
+the same digests. `scripts/toolchain prebuilt-codegen` and `prebuilt-kit` fetch
+an asset, verify it before unpacking, refuse one with any other digest, and
+cache it by digest. `NUPP_HOST_SOURCE_DIR`, `NUPP_HOST_SOURCE_BASE_URL` and
+`NUPP_HOST_OFFLINE` work as they do for source archives.
+
+`nupp aot --emit executable` and `kind = "program"` targets use them when this
+tree's own provider was built without the code generator. The prebuilt
+provider is loaded beside this tree's own, for its code generator only.
+`NUPP_CODEGEN_LIBRARY` names such a library directly. A platform with no
+pinned assets still needs `scripts/toolchain llvm`.
+
 ## Cross-target stub acquisition
 
 A binary target with `stub = "nupp"` and `platforms` stamps verified prebuilt

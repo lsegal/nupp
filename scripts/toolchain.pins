@@ -89,6 +89,28 @@ STAGE0_TAG=v0.0.15-nupp-net.1
 STAGE0_SHA256=af3488da1b39198ded189e5efb6b87c31e2fbd3d0f0a286fbb94c631d15f63bf
 STAGE0_URL='https://github.com/lsegal/nupp/releases/download/${STAGE0_TAG}/nupp-stage0-${STAGE0_TAG}.lua.gz'
 
+# The prebuilt code generator and link kit published beside a stage zero, per
+# platform: the release's native provider built with LLVM's code generator, and
+# the kit a native program links against. A checkout that has not built LLVM
+# links native programs (`nupp aot --emit executable`, `kind = "program"`) with
+# these instead of running `scripts/toolchain llvm` and Cargo first. Like stage
+# zero they are fetched, verified and cached by digest, never compiled against,
+# so moving them rebuilds nothing native.
+#
+# The digests are of the archives as published. An empty tag or digest means no
+# release carrying the assets is pinned for that platform yet, and a checkout
+# there keeps needing its own LLVM. `stage0-assets.yml` publishes them into a
+# release and prints the lines to paste here.
+PREBUILT_TAG=''
+PREBUILT_CODEGEN_URL='https://github.com/lsegal/nupp/releases/download/${PREBUILT_TAG}/nupp-codegen-${PREBUILT_TARGET}.tar.gz'
+PREBUILT_KIT_URL='https://github.com/lsegal/nupp/releases/download/${PREBUILT_TAG}/nupp-kit-${PREBUILT_TARGET}.tar.gz'
+PREBUILT_CODEGEN_SHA256_LINUX_X86_64=''
+PREBUILT_CODEGEN_SHA256_MACOS_AARCH64=''
+PREBUILT_CODEGEN_SHA256_WINDOWS_X86_64=''
+PREBUILT_KIT_SHA256_LINUX_X86_64=''
+PREBUILT_KIT_SHA256_MACOS_AARCH64=''
+PREBUILT_KIT_SHA256_WINDOWS_X86_64=''
+
 # Opt-in browser guest inputs. These do not change the native toolchain key.
 # The guest image is built from these sources; no unpublished image is pinned.
 BROWSER_LINUX_VERSION=6.12.110

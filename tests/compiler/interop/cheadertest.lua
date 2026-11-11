@@ -478,4 +478,34 @@ function M.preprocessorFingerprintIncludesCompilerArguments()
     )
 end
 
+-- Pinning a header used to declare it into the compiler's own FFI, where a typedef the
+-- header reached first decided what a runtime module declaring the same name
+-- afterwards got from ffi.new (#153).
+function M.pinningAHeaderLeavesTheRuntimeItsOwnTypedefs()
+    local _, dir = scratchHeader(
+        "shadow.h",
+        "typedef struct { int32_t pinned; } NuppHeaderShadow;\n"
+            .. "int nupp_header_shadow(NuppHeaderShadow *p);\n"
+    )
+    local src = table.concat({
+        "local h = cheader('shadow.h')",
+        "local p = ffi.new('NuppHeaderShadow')",
+        "local n: number = p.pinned",
+        "@unsafe h.nupp_header_shadow(ffi.new('NuppHeaderShadow[1]'))",
+    }, "\n")
+    local diags = diagnosticsAt(dir .. "/probe.nupp", src)
+    testAssert.eq(#diags, 0, diags[1] and diags[1].msg)
+    local ffi = require("ffi")
+    ffi.cdef("typedef struct { int64_t pid; int32_t status; } NuppHeaderShadow;")
+    local child = ffi.new("NuppHeaderShadow")
+    child.pid = 42
+    testAssert.eq(tonumber(child.pid), 42)
+    -- and the checked file keeps the header's shape once the runtime holds the name
+    diags = diagnosticsAt(dir .. "/probe.nupp", src)
+    testAssert.eq(#diags, 0, diags[1] and diags[1].msg)
+    diags = diagnosticsAt(dir .. "/probe.nupp", "local h = cheader('shadow.h')\nlocal p = ffi.new('NuppHeaderShadow')\nlocal n = p.pid")
+    testAssert.eq(diags[1] and diags[1].code, "NUPP2004")
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
 return M

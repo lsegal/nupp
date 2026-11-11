@@ -86,6 +86,10 @@ export interface CType
     --- The ctype id a struct reference keeps, so `structById` can find its members.
     id: integer?
 
+    --- Whether a struct reference's `name` came from a typedef, because the struct has
+    --- no tag of its own.
+    typedefName: boolean?
+
     --- A struct's alignment in bytes, as this ABI lays it out.
     align: integer?
 
@@ -215,9 +219,26 @@ local function alignOf(value): integer
     return bit.lshift(1, bit.band(bit.rshift(value, 16), 15))
 end
 
+-- What a checked program declares goes into the registry under names of its own: the
+-- name it spelled with this suffix. The registry is process-wide and LuaJIT ignores a
+-- typedef, function or extern of a name it already holds, so a checked block that
+-- reached a name first used to decide what the compiler's own runtime got for it when
+-- that runtime declared the name later -- a platform branch the compiler never runs,
+-- or another version of the same source. A double underscore is reserved in C, so no
+-- real declaration ends with it.
+local CHECKED_SUFFIX = "__nuppchecked"
+
+-- Every entry is read back under the name the program spelled, so nothing past this
+-- module sees the suffix. `cname` keeps the registry's own spelling, for the one
+-- lookup that has to ask LuaJIT by name, and marks the entry as a checked one.
 local function info(id)
     local ok, entry = pcall(ffi.typeinfo, id)
     if ok then
+        local name = entry and entry.name
+        if name and #name > #CHECKED_SUFFIX and name:sub(-#CHECKED_SUFFIX) == CHECKED_SUFFIX then
+            entry.cname = name
+            entry.name = name:sub(1, #name - #CHECKED_SUFFIX)
+        end
         return entry
     end
 
@@ -263,6 +284,28 @@ local function resolve(id)
     end
 
     return nil, nil
+end
+
+local typedefNames: {[integer]: string} = {}
+
+-- The typedef an anonymous struct is known by. LuaJIT resolves a typedef name to the
+-- type it stands for, so `ffi.typeof("Name")` and a pointer to `Name` both reach the
+-- struct with no trace of the typedef, and only the registry still links the two. The
+-- first typedef of it is the one that declared it, so a typedef of that typedef names
+-- the same struct the same way. Ids are never reused, so an answer stays good.
+local function typedefOf(id: integer): string?
+    local known = typedefNames[id]
+    if known then
+        return known
+    end
+    for _, entry in ctypes() do
+        if entry.name and kindOf(entry.info) == CT_TYPEDEF and refOf(entry.info) == id then
+            typedefNames[id] = entry.name
+            return entry.name
+        end
+    end
+
+    return nil
 end
 
 local decodeType
@@ -323,10 +366,13 @@ decodeType = function(id)
             size = entry.size,
         }
     elseif kind == CT_STRUCT then
+        -- `typedef struct { ... } Name;` is known by the typedef, as `inspect` names it
+        local typedef = entry.name == nil and typedefOf(rid) or nil
         return {
             kind = bit.band(entry.info, CTF_UNION) ~= 0 and "union" or "struct",
             id = rid,
-            name = entry.name,
+            name = entry.name or typedef,
+            typedefName = typedef ~= nil or nil,
             size = entry.size,
             align = alignOf(entry.info),
         }
@@ -460,7 +506,7 @@ local function decodeEnum(id, entry)
             break
         end
         if kindOf(centry.info) == CT_CONSTVAL and centry.name then
-            local value = enumeratorValue(centry.name, centry)
+            local value = enumeratorValue(centry.cname or centry.name, centry)
             if value then
                 values[#values + 1] = {name = centry.name, value = value}
             end
@@ -469,6 +515,394 @@ local function decodeEnum(id, entry)
     end
 
     return {kind = "enum", id = id, name = entry.name, bits = (entry.size or 4) * 8, values = values,}
+end
+
+-- The names checked blocks have declared, as tags (after `struct`, `union` or `enum`)
+-- and as ordinary identifiers (typedefs, functions, externs, enum constants). C keeps
+-- the two apart, and so does the renaming: `typedef struct Foo Foo;` names the
+-- typedef without defining the tag, so the tag keeps meaning whatever defines it.
+local checkedTags: {[string]: boolean} = {}
+local checkedNames: {[string]: boolean} = {}
+
+local function wordSet(words: {string}): {[string]: boolean}
+    local set: {[string]: boolean} = {}
+    for _, word in ipairs(words) do
+        set[word] = true
+    end
+
+    return set
+end
+
+local AGGREGATES = wordSet({"struct", "union", "enum"})
+
+-- Words that take a parenthesized argument and say nothing about which name a
+-- declaration introduces.
+local DECORATORS = wordSet({"__attribute__", "__attribute", "__declspec", "__asm__", "__asm", "asm", "_Alignas",})
+
+-- Qualifiers and storage classes: neither a type nor a name.
+local QUALIFIERS = wordSet({
+    "typedef",
+    "extern",
+    "static",
+    "register",
+    "auto",
+    "inline",
+    "__inline",
+    "__inline__",
+    "const",
+    "__const",
+    "volatile",
+    "__volatile",
+    "__volatile__",
+    "restrict",
+    "__restrict",
+    "__restrict__",
+    "__extension__",
+    "_Noreturn",
+    "__cdecl",
+    "__stdcall",
+    "__fastcall",
+    "__thiscall",
+    "__ptr32",
+    "__ptr64",
+})
+
+-- Type keywords. Once one is seen, the next identifier is the declarator's name rather
+-- than a typedef name.
+local BASE_TYPES = wordSet({
+    "void",
+    "char",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "signed",
+    "__signed__",
+    "unsigned",
+    "bool",
+    "_Bool",
+    "complex",
+    "_Complex",
+    "__complex",
+    "__complex__",
+    "__int8",
+    "__int16",
+    "__int32",
+    "__int64",
+})
+
+local function isName(word: string?): boolean
+    return word ~= nil
+        and word:match("^[%a_][%w_]*$") ~= nil
+        and not AGGREGATES[word]
+        and not DECORATORS[word]
+        and not QUALIFIERS[word]
+        and not BASE_TYPES[word]
+end
+
+-- The tokens of a block of C declarations, with where each ends in the
+-- text. Comments, preprocessor lines and literals are dropped or stood in for, since
+-- none of them declares anything.
+local function lex(text: string): ({string}, {integer})
+    local words: {string} = {}
+    local ends: {integer} = {}
+    local pos: integer = 1
+    local n = #text
+    while pos <= n do
+        local s, e = text:find("^%s+", pos)
+        if not s then
+            s, e = text:find("^/%*", pos)
+            if s then
+                local _, close = text:find("*/", pos + 2, true)
+                e = close or n
+            end
+        end
+        if not s then
+            s, e = text:find("^//[^\n]*", pos)
+        end
+        if not s then
+            s, e = text:find("^#[^\n]*", pos)
+        end
+        if s then
+            pos = (e as integer) + 1
+        else
+            local quote = text:sub(pos, pos)
+            if quote == '"' or quote == "'" then
+                local p: integer = pos + 1
+                while p <= n do
+                    local c = text:sub(p, p)
+                    if c == "\\" then
+                        p = p + 2
+                    elseif c == quote then
+                        break
+                    else
+                        p = p + 1
+                    end
+                end
+                s, e = pos, p
+                words[#words + 1] = '""'
+            else
+                s, e = text:find("^[%a_][%w_]*", pos)
+                if not s then
+                    s, e = text:find("^%d[%w_%.]*", pos)
+                end
+                if not s then
+                    s, e = text:find("^%.%.%.", pos)
+                end
+                if not s then
+                    s, e = pos, pos
+                end
+                words[#words + 1] = text:sub(s as integer, e as integer)
+            end
+            ends[#words] = e as integer
+            pos = (e as integer) + 1
+        end
+    end
+
+    return words, ends
+end
+
+-- The index past the bracketed group that starts at `i`.
+local function skipGroup(words: {string}, i: integer): integer
+    local depth = 0
+    repeat
+        local word = words[i]
+        if word == "(" or word == "{" or word == "[" then
+            depth = depth + 1
+        elseif word == ")" or word == "}" or word == "]" then
+            depth = depth - 1
+        end
+        i = i + 1
+    until depth <= 0 or i > #words
+
+    return i
+end
+
+-- The index past a decorator at `i` and its argument.
+local function skipDecorator(words: {string}, i: integer): integer
+    i = i + 1
+    if words[i] == "(" then
+        return skipGroup(words, i)
+    end
+
+    return i
+end
+
+local scanAggregate
+
+-- Enumerators: the first identifier of each comma-separated item.
+local function scanEnumBody(words: {string}, i: integer, tags, names): integer
+    i = i + 1
+    local expecting = true
+    local depth = 0
+    while i <= #words do
+        local word = words[i]
+        if depth == 0 and word == "}" then
+            return i + 1
+        end
+        if word == "(" then
+            depth = depth + 1
+        elseif word == ")" then
+            depth = depth - 1
+        elseif depth == 0 and word == "," then
+            expecting = true
+        elseif expecting and isName(word) then
+            names[word] = true
+            expecting = false
+        end
+        i = i + 1
+    end
+
+    return i
+end
+
+-- A struct or union body declares no ordinary names, only the tags of what it defines
+-- inside itself: C gives those file scope.
+local function scanAggregateBody(words: {string}, i: integer, tags, names): integer
+    local depth = 0
+    while i <= #words do
+        local word = words[i]
+        if AGGREGATES[word] then
+            i = scanAggregate(words, i, tags, names)
+        else
+            if word == "{" then
+                depth = depth + 1
+            elseif word == "}" then
+                depth = depth - 1
+                if depth == 0 then
+                    return i + 1
+                end
+            end
+            i = i + 1
+        end
+    end
+
+    return i
+end
+
+-- `struct Tag { ... }` at `i`. Returns the index past it, its tag and whether it had a
+-- body, which is what makes it a definition.
+scanAggregate = function(words: {string}, i: integer, tags, names): (integer, string?, boolean)
+    local kind = words[i]
+    i = i + 1
+    while DECORATORS[words[i]] do
+        i = skipDecorator(words, i)
+    end
+    local tag: string? = nil
+    if isName(words[i]) then
+        tag = words[i]
+        i = i + 1
+    end
+    while DECORATORS[words[i]] do
+        i = skipDecorator(words, i)
+    end
+    if words[i] ~= "{" then
+        return i, tag, false
+    end
+    if tag then
+        tags[tag] = true
+    end
+    if kind == "enum" then
+        return scanEnumBody(words, i, tags, names), tag, true
+    end
+
+    return scanAggregateBody(words, i, tags, names), tag, true
+end
+
+-- One declaration from `i` through its semicolon: its specifiers, then each
+-- declarator's name.
+local function scanDeclaration(words: {string}, i: integer, tags, names): integer
+    local start = i
+    local typed = false
+    while i <= #words do
+        local word = words[i]
+        if word == ";" then
+            return i + 1
+        elseif DECORATORS[word] then
+            i = skipDecorator(words, i)
+        elseif QUALIFIERS[word] then
+            i = i + 1
+        elseif BASE_TYPES[word] then
+            typed = true
+            i = i + 1
+        elseif AGGREGATES[word] then
+            local first = i == start
+            local tag, defined
+            i, tag, defined = scanAggregate(words, i, tags, names)
+            typed = true
+            -- `struct Tag;` on its own declares the tag
+            if first and tag and not defined and words[i] == ";" then
+                tags[tag] = true
+            end
+        elseif isName(word) and not typed then
+            typed = true
+            i = i + 1
+        else
+            break
+        end
+    end
+    local named = false
+    while i <= #words do
+        local word = words[i]
+        if word == ";" then
+            return i + 1
+        elseif word == "," then
+            named = false
+            i = i + 1
+        elseif word == "(" or word == "[" then
+            -- before the name a parenthesis groups, as in `(*callback)`; after it,
+            -- it holds parameters or a count
+            i = named and skipGroup(words, i) or i + 1
+        elseif word == "{" then
+            i = skipGroup(words, i)
+        elseif word == "=" then
+            i = i + 1
+            while i <= #words and words[i] ~= "," and words[i] ~= ";" do
+                local inner = words[i]
+                if inner == "(" or inner == "{" or inner == "[" then
+                    i = skipGroup(words, i)
+                else
+                    i = i + 1
+                end
+            end
+        elseif DECORATORS[word] then
+            i = skipDecorator(words, i)
+        elseif not named and isName(word) then
+            names[word] = true
+            named = true
+            i = i + 1
+        else
+            i = i + 1
+        end
+    end
+
+    return i
+end
+
+-- `text` with every tag in `tags` and every other identifier in `names` given the
+-- checked suffix.
+local function rename(text: string, tags: {[string]: boolean}, names: {[string]: boolean}): string
+    local words, ends = lex(text)
+    local out: {string} = {}
+    local pos: integer = 1
+    local tagNext = false
+    local i: integer = 1
+    while i <= #words do
+        local word = words[i]
+        if AGGREGATES[word] then
+            tagNext = true
+            i = i + 1
+        elseif tagNext and DECORATORS[word] then
+            i = skipDecorator(words, i)
+        else
+            if (tagNext and tags or names)[word] and isName(word) then
+                out[#out + 1] = text:sub(pos, ends[i])
+                out[#out + 1] = CHECKED_SUFFIX
+                pos = ends[i] + 1
+            end
+            tagNext = false
+            i = i + 1
+        end
+    end
+    out[#out + 1] = text:sub(pos)
+
+    return table.concat(out)
+end
+
+-- Adds the tags and ordinary names `text` declares to `tags` and `names`.
+local function scanDeclared(text: string, tags: {[string]: boolean}, names: {[string]: boolean})
+    local words = lex(text)
+    local i: integer = 1
+    while i <= #words do
+        i = scanDeclaration(words, i, tags, names)
+    end
+end
+
+local function keepIn(into: {[string]: boolean}, words: {[string]: boolean})
+    for word in pairs(words) do
+        into[word] = true
+    end
+end
+
+-- Keeps the names a block declared once LuaJIT took it: a name from text LuaJIT refused
+-- would send later lookups after a declaration that is not there.
+local function keepChecked(tags: {[string]: boolean}, names: {[string]: boolean})
+    keepIn(checkedTags, tags)
+    keepIn(checkedNames, names)
+end
+
+-- Tag and name sets for one pass of declarations. Their own keys are what that pass
+-- declares; every name an earlier checked block declared reads through.
+local function scope(): ({[string]: boolean}, {[string]: boolean})
+    return setmetatable({}, {__index = checkedTags}), setmetatable({}, {__index = checkedNames})
+end
+
+--- A type string as a checked program means it: a name some checked block declared
+--- stands for that block's declaration, wherever else the process declared the same
+--- name.
+export function checked(spec: string): string
+    return rename(spec, checkedTags, checkedNames)
 end
 
 -- Content caching also prevents a second consumer from redeclaring the same C text in
@@ -518,8 +952,35 @@ export function inspect(text: string | {string}, prelude: (string | {string})?):
     -- Redeclaring a name LuaJIT already holds fails the same way and is equally
     -- harmless: the registry is global and process-wide, so a second import of an
     -- overlapping header meets its own earlier work.
-    for _, declaration in ipairs(declarations) do
-        pcall(ffi.cdef, declaration)
+    --
+    -- The header and its prelude are a checked program's, as much as a literal
+    -- `ffi.cdef` block is, so what they declare goes in under the checked suffix the
+    -- same way (`declare`). Otherwise a header that reached `struct stat` or a typedef
+    -- first would decide what the compiler's own runtime got when it declared that
+    -- name later. Every entry still reads back under the name the header spelled.
+    local tags, names = scope()
+    local preludeDeclared = {}
+    for index, declaration in ipairs(declarations) do
+        local own: {[string]: boolean} = {}
+        local ownNames: {[string]: boolean} = {}
+        scanDeclared(declaration, own, ownNames)
+        preludeDeclared[index] = {own, ownNames}
+        keepIn(tags, own)
+        keepIn(names, ownNames)
+    end
+    local unitDeclared = {}
+    for index, unit in ipairs(units) do
+        local own: {[string]: boolean} = {}
+        local ownNames: {[string]: boolean} = {}
+        scanDeclared(unit, own, ownNames)
+        unitDeclared[index] = {own, ownNames}
+        keepIn(tags, own)
+        keepIn(names, ownNames)
+    end
+    for index, declaration in ipairs(declarations) do
+        if pcall(ffi.cdef, rename(declaration, tags, names)) then
+            keepChecked(preludeDeclared[index][1], preludeDeclared[index][2])
+        end
     end
 
     local before = {}
@@ -566,16 +1027,18 @@ export function inspect(text: string | {string}, prelude: (string | {string})?):
     local rejected = {}
     local unitOf: {[integer]: integer} = {}
     for index, unit in ipairs(units) do
-        local ok, err = pcall(ffi.cdef, unit)
+        local ok, err = pcall(ffi.cdef, rename(unit, tags, names))
         while info(top + 1) do
             top = top + 1
             unitOf[top] = index
         end
-        if not ok then
+        if ok then
+            keepChecked(unitDeclared[index][1], unitDeclared[index][2])
+        else
             rejected[#rejected + 1] = {
                 text = unit,
                 -- LuaJIT prefixes its own chunk name and line
-                reason = tostring(err):gsub("^.-:%d+:%s*", ""),
+                reason = tostring(err):gsub("^.-:%d+:%s*", ""):gsub(CHECKED_SUFFIX, ""),
                 unit = index,
             }
         end
@@ -587,8 +1050,15 @@ export function inspect(text: string | {string}, prelude: (string | {string})?):
     local structs, functions, enums = {}, {}, {}
     local anonymousStructs = {}
     for id, entry in ctypes() do
-        if before[id] ~= entryFingerprint(entry) or (entry.name ~= nil and spelled[entry.name]) then
-            local kind = kindOf(entry.info)
+        local kind = kindOf(entry.info)
+        -- A name is claimed back as the target meant it. One the renaming above gave
+        -- the checked suffix means the checked entry, so the process's own entry of
+        -- that name is the runtime's and not this header's; any other means the
+        -- process's.
+        local renamed = (kind == CT_STRUCT or kind == CT_ENUM) and tags or names
+        if before[id] ~= entryFingerprint(entry)
+            or (entry.name ~= nil and spelled[entry.name] and (entry.cname ~= nil) == (renamed[entry.name] == true))
+        then
             -- An enum carries its constants whether or not it is named: `typedef enum {
             -- ... } Mode;` names the type and nothing else, and its members are the
             -- point of declaring it.
@@ -627,43 +1097,44 @@ end
 
 --- Declares a block to the FFI and returns which functions *this block* named.
 ---
+--- The block is a checked program's, so what it declares goes in under the checked
+--- suffix, where the compiler's own declarations of the same names cannot meet it.
+--- Only the block's own declarations and those of earlier checked blocks are
+--- renamed; any other name it uses still means what the process holds.
+---
 --- The registry LuaJIT keeps is process-wide, so it cannot say who declared what.
 --- Diffing the ctype ids across the call can: whatever appeared is what this text
 --- introduced. That is the difference between typing `ffi.C` from the program in
 --- front of the checker and typing it from everything the compiler's own process
 --- happens to have loaded.
 ---
---- A block LuaJIT has already seen introduces nothing, so a function this process had
---- already declared for its own use is claimed back by name instead. The compiler runs
---- the code it compiles: the terminal implementation declares `isatty` and calls it,
---- and by the time the checker reaches that file the declaration is already in the
---- registry and the diff finds nothing. Left at that, whether `ffi.C` is typed from the
---- program in front of the checker would depend on whether the compiler happened to
---- reach the same symbol first, which is an ordering accident nobody can see from the
---- source. The cost is that a block spelling the name of an already-declared function
---- it does not itself declare claims that one too; the alternative is losing
---- declarations the program plainly makes.
+--- A block LuaJIT has already seen introduces nothing, as when two files share a
+--- declaration, so a function an earlier checked block declared is claimed back by
+--- name instead. Only a checked one: the compiler's own `isatty` is not the program's.
 export function declare(text: string): boolean, string?, {[string]: boolean}?
+    local tags, names = scope()
+    scanDeclared(text, tags, names)
     local before = {}
     for id in ctypes() do
         before[id] = true
     end
-    local ok, err = pcall(ffi.cdef, text)
+    local ok, err = pcall(ffi.cdef, rename(text, tags, names))
     if not ok then
-        return false, tostring(err)
+        return false, (tostring(err):gsub(CHECKED_SUFFIX, ""))
     end
+    keepChecked(tags, names)
     local spelled: {[string]: boolean} = {}
     for word in text:gmatch("[%a_][%w_]*") do
         spelled[word] = true
     end
-    local names: {[string]: boolean} = {}
+    local declared: {[string]: boolean} = {}
     for id, entry in ctypes() do
-        if entry.name and kindOf(entry.info) == CT_FUNC and (not before[id] or spelled[entry.name]) then
-            names[entry.name] = true
+        if entry.name and entry.cname and kindOf(entry.info) == CT_FUNC and (not before[id] or spelled[entry.name]) then
+            declared[entry.name] = true
         end
     end
 
-    return true, nil, names
+    return true, nil, declared
 end
 
 export function typeFromString(spec: string): CType?, string?
@@ -687,15 +1158,18 @@ local layoutCache: {[string]: Layout} = {}
 --- sequence of C member declarations. This is the other half of a layout check: a
 --- consumer that renders a declaration in its own words asks how those words lay out,
 --- and compares the answer with the declaration's own.
+---
+--- The members are read as a checked program means them (`checked`), since the
+--- declaration they render came from one.
 export function layout(kind: string, body: string): Layout?, string?
     local key = kind .. "\0" .. body
     local hit = layoutCache[key]
     if hit then
         return hit
     end
-    local ok, ct = pcall(ffi.typeof, kind .. " { " .. body .. " }")
+    local ok, ct = pcall(ffi.typeof, kind .. " { " .. checked(body) .. " }")
     if not ok then
-        return nil, (tostring(ct):gsub("^.-:%d+:%s*", ""))
+        return nil, (tostring(ct):gsub("^.-:%d+:%s*", ""):gsub(CHECKED_SUFFIX, ""))
     end
     local rid, entry = resolve(tonumber(ct))
     if not entry or kindOf(entry.info) ~= CT_STRUCT then
@@ -737,12 +1211,20 @@ end
 ---
 --- The walk reads the global registry because that is where the parsed signature
 --- and its ABI live. `only` is what decides membership, and it comes from the
---- program rather than from the process.
+--- program rather than from the process. A name declared both by a checked block and
+--- by the process is the checked block's.
 export function declaredFunctions(only: {[string]: boolean}?): {[string]: Function}
     local out = {}
+    local fromChecked: {[string]: boolean} = {}
     for _, entry in ctypes() do
-        if entry.name and kindOf(entry.info) == CT_FUNC and (only == nil or only[entry.name]) then
-            out[entry.name] = decodeFunction(entry)
+        local name = entry.name
+        if name
+            and kindOf(entry.info) == CT_FUNC
+            and (only == nil or only[name])
+            and (entry.cname or not fromChecked[name])
+        then
+            out[name] = decodeFunction(entry)
+            fromChecked[name] = entry.cname ~= nil
         end
     end
 
