@@ -272,7 +272,8 @@ local record Program
     --- What `export` makes visible to the modules requiring this one.
     exportedCallees: {[string]: Callee}
 
-    exportedGlobals: {[string]: Local}
+    --- The `export const`s, by name, as the literals they bind.
+    exportedConstants: {[string]: any}
 
     --- The name other modules require this one by.
     name: string
@@ -514,15 +515,18 @@ local function memberOf(program: Program, body: Body, node: any): (Program?, str
     return required, (index.name as lexer.Token).text
 end
 
---- The global `m.name` reads in a module this one requires, or a refusal at
---- `node` when that module exports no such state.
-local function importedGlobal(required: Program, member: string, node: any): Local
-    local found = required.exportedGlobals[member]
-    if found == nil then
-        refuse(node, ("module %s exports no state or function %s"):format(required.name, member))
+--- The literal the `export const` `m.name` binds in a module this one
+--- requires, or a refusal at `node` when that module exports no such constant
+--- or function.
+local function importedConstant(required: Program, member: string, node: any): any
+    local found = required.exportedConstants[member]
+    if found == nil and required.exportedCallees[member] == nil then
+        refuse(node, ("module %s exports no function or constant %s"):format(required.name, member))
+    elseif found == nil then
+        refuse(node, ("%s.%s is a function, which is not assigned"):format(required.name, member))
     end
 
-    return found as Local
+    return found
 end
 
 --- The value of the local or global `entry`. A global `cdef struct` is the
@@ -1391,7 +1395,7 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
             if callee ~= nil then
                 return Value(text = "@" .. (callee as Callee).symbol, kind = PTR)
             end
-            return readVariable(body, importedGlobal(required as Program, member as string, node))
+            return expression(program, body, importedConstant(required as Program, member as string, node), want)
         end
         local address, stored, read = place(program, body, node)
         return readPlace(body, address, stored, read, node)
@@ -1471,9 +1475,8 @@ local function assign(program: Program, body: Body, target: any, v: any): nil
     elseif target.kind == "bracketIndex" or target.kind == "dotIndex" then
         local required, member = memberOf(program, body, target)
         if required ~= nil then
-            local entry = importedGlobal(required as Program, member as string, target)
-            store(body, entry, expression(program, body, v, entry.kind), v)
-            return
+            importedConstant(required as Program, member as string, target)
+            refuse(target, "a module's exports are constant; its own functions assign its state")
         end
         local address, stored, read = place(program, body, target)
         writePlace(body, address, stored, read, expression(program, body, v, read), v)
@@ -1637,12 +1640,8 @@ local function statement(program: Program, body: Body, stat: any): nil
         local targetKind = target ~= nil and (target as any).kind or nil
         local required, member = memberOf(program, body, target)
         if required ~= nil then
-            local entry = importedGlobal(required as Program, member as string, target)
-            local current = readVariable(body, entry)
-            local wanted = BITWISE[op] == nil and current.kind or nil
-            local operand = expression(program, body, compound.value, wanted)
-            store(body, entry, binaryValues(program, body, stat, op, current, operand, target, compound.value), stat)
-            return
+            importedConstant(required as Program, member as string, target)
+            refuse(target, "a module's exports are constant; its own functions assign its state")
         end
         if targetKind == "dotIndex" or targetKind == "bracketIndex" then
             local address, stored, read = place(program, body, target)
@@ -1929,8 +1928,9 @@ local function initial(program: Program, node: any, kind: Kind, name: string): s
 end
 
 --- Declares a top-level `local` as module state: a global with a constant
---- initial value, or zero. A `cdef struct` is held in place, zeroed.
-local function state(program: Program, stat: cst.LocalStmt, public: boolean): nil
+--- initial value, or zero, private to the module. A `cdef struct` is held in
+--- place, zeroed.
+local function state(program: Program, stat: cst.LocalStmt): nil
     if stat.pattern ~= nil then
         refuse(stat, "a native program cannot destructure")
     end
@@ -1943,7 +1943,7 @@ local function state(program: Program, stat: cst.LocalStmt, public: boolean): ni
         if program.globals[name] ~= nil or program.callees[name] ~= nil or program.imports[name] ~= nil then
             refuse(stat, name .. " is defined twice")
         end
-        local symbol = public and name or "nupp." .. program.prefix .. name
+        local symbol = "nupp." .. program.prefix .. name
         if program.symbols[symbol] then
             refuse(stat, symbol .. " is defined by more than one module of this program")
         end
@@ -1960,9 +1960,7 @@ local function state(program: Program, stat: cst.LocalStmt, public: boolean): ni
             builder.once(
                 program.module,
                 "global " .. slot,
-                (
-                    "%s = %sglobal [%d x i8] zeroinitializer, align %d"
-                ):format(slot, public and "" or "internal ", layout.size, layout.alignment)
+                ("%s = internal global [%d x i8] zeroinitializer, align %d"):format(slot, layout.size, layout.alignment)
             )
             local storage = Kind(llvm = "struct", signed = false, aggregate = resolved)
             entry = Local(slot = slot, kind = Kind(llvm = "ptr", signed = false, elem = storage), aggregate = storage)
@@ -1997,14 +1995,11 @@ local function state(program: Program, stat: cst.LocalStmt, public: boolean): ni
             builder.once(
                 program.module,
                 "global " .. slot,
-                ("%s = %sglobal %s %s"):format(slot, public and "" or "internal ", held.llvm, text)
+                ("%s = internal global %s %s"):format(slot, held.llvm, text)
             )
             entry = Local(slot = slot, kind = held)
         end
         program.globals[name] = entry
-        if public then
-            program.exportedGlobals[name] = entry
-        end
     end
 end
 
@@ -2182,8 +2177,13 @@ local function declarations(
                 if not import(program, declared, units) then
                     if declared.isConst then
                         constant(program, declared)
+                        if public then
+                            for _, name in ipairs(declared.names) do
+                                program.exportedConstants[name.text] = program.constants[name.text]
+                            end
+                        end
                     else
-                        state(program, declared, public)
+                        state(program, declared)
                     end
                 end
             elseif kind == "cdefStruct" then
@@ -2254,7 +2254,7 @@ function native.program(
             globals = {},
             imports = {},
             exportedCallees = {},
-            exportedGlobals = {},
+            exportedConstants = {},
             name = unit.name,
             prefix = index == 1 and "" or unit.name .. ".",
             constants = {},

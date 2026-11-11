@@ -354,35 +354,71 @@ local function writeListing(listing: Listing): nil
     io.write("\n")
 end
 
---- Links the checked `tree` as a native program whose `main` is the
---- executable's own, writing it to `output`.
-local function executable(
+--- The linkage each native-program `--emit` asks for.
+const NATIVE_LINKAGES: {
+    [string]: string
+} = {executable = "executable", ["static-library"] = "static", ["shared-library"] = "shared",}
+
+--- Links the checked `tree`, with the modules it requires, as a native
+--- program: an executable whose `main` is its own, or a static or shared
+--- library, which needs none, writing it to `--output`. `--archive` links
+--- more static archives in, and `--exports` names what it exports.
+local function native(
     tree: any,
     path: string,
-    output: string?,
+    options: any,
+    environment: any,
     target: Target,
     refuse: function(string, string): integer
 ): integer
+    local emit = options.emit as string
+    local output = options.output as string?
     if output == nil then
-        return usageError("--emit executable needs --output PATH")
+        return usageError("--emit " .. emit .. " needs --output PATH")
     end
-    local ir, problem, at = require("nupp.tools.build.program").lower(tree, target.triple)
-    if ir == nil then
-        if at == nil then
-            return refuse(report.UNKNOWN_NAME, tostring(problem))
+    local linkage = NATIVE_LINKAGES[emit] or "executable"
+    local exports: {string}? = nil
+    if options.exports ~= nil then
+        if linkage == "static" then
+            return usageError("--exports names what an executable or shared library exports")
         end
-        local position = at as {
-            line: integer,
-            column: integer
-        }
+        local text = require("nupp.compiler.fs").readFile(options.exports as string)
+        if text == nil then
+            return refuse(report.UNKNOWN_NAME, "cannot read the export list " .. tostring(options.exports))
+        end
+        local names, listErr = require("nupp.tools.build.program").exportNames(text as string)
+        if names == nil then
+            return refuse(report.UNKNOWN_NAME, tostring(options.exports) .. ": " .. tostring(listErr))
+        end
+        exports = names
+    end
+    for _, archive in ipairs(options.archive as {string}) do
+        if not require("nupp.compiler.fs").exists(archive) then
+            return refuse(report.UNKNOWN_NAME, "cannot read the archive " .. archive)
+        end
+    end
+    local programs = require("nupp.tools.build.program")
+    local ir, refusal = programs.lower(tree, target.triple, {
+        path = path,
+        environment = environment,
+        library = linkage ~= "executable",
+    })
+    if ir == nil then
+        local problem = refusal as {line: integer?}
         return refuse(
-            report.TOOL_FAILED,
-            ("%s:%d:%d: native: %s"):format(path, position.line, position.column, tostring(problem))
+            problem.line == nil and report.UNKNOWN_NAME or report.TOOL_FAILED,
+            programs.describe(refusal as any, path)
         )
     end
+    local aotllvm = require("nupp.tools.build.aotllvm")
     local linked, linkErr = require(
         "nupp.tools.build.native"
-    ).linkProgram(target.triple, output as string, ir as string)
+    ).linkProgram(
+        target.triple,
+        output as string,
+        ir as string,
+        aotllvm.NativeLink(linkage = linkage, archives = options.archive as {string}, exports = exports)
+    )
     if linked == nil then
         return refuse(report.TOOL_FAILED, tostring(linkErr))
     end
@@ -456,8 +492,8 @@ local function run(options: any): integer
     if tree == nil then
         return checked and report.failure(REPORT_SCHEMA, checked, {file = path}) or 1
     end
-    if options.emit == "executable" then
-        return executable(tree, path, options.output, selected as targets.Target, refuse)
+    if NATIVE_LINKAGES[options.emit or ""] ~= nil then
+        return native(tree, path, options, environment, selected as targets.Target, refuse)
     end
 
     local library = options.library or "<object>"
@@ -652,6 +688,9 @@ end
 --- `--emit executable` instead links the file as a native program: its `main` is
 --- the executable's own, and it reaches LuaJIT and other C libraries through
 --- its `cdef function` declarations. The program is written to `--output`.
+--- `--emit static-library` and `--emit shared-library` build it as a library,
+--- which needs no `main`; `--archive` links static archives in and `--exports`
+--- names every symbol the executable or shared library exports.
 ---
 --- Examples:
 ---
@@ -662,16 +701,30 @@ end
 ---     nupp aot --emit wgsl --function transform src/gpu.nupp
 ---     nupp aot --format json src/kernel.nupp
 ---     nupp aot --emit executable --output build/host src/host.nupp
+---     nupp aot --emit shared-library --exports nupp.exports --output build/libhost.so src/host.nupp
 @cli("aot")
 @derive(cliModule.command)
 local record Aot
-    --- Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or executable.
-    @cli(value = "ARTIFACT", choices = {"ir", "llvm", "spirv", "wgsl", "asm", "binding", "executable"})
+    --- Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or a native
+    --- program linked as an executable, static-library or shared-library.
+    @cli(
+        value = "ARTIFACT",
+        choices = {"ir", "llvm", "spirv", "wgsl", "asm", "binding", "executable", "static-library", "shared-library"}
+    )
     emit: string?
 
-    --- Where --emit executable writes the program.
+    --- Where a native program is written.
     @cli(value = "PATH")
     output: string?
+
+    --- A static archive a native program links in whole; repeat for more.
+    @cli(value = "PATH")
+    archive: {string} = {}
+
+    --- A file naming, one per line, every symbol a native executable or
+    --- shared library exports.
+    @cli(value = "PATH")
+    exports: string?
 
     --- Show only this function.
     @cli(name = "function", value = "NAME")

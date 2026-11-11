@@ -75,6 +75,17 @@ export type Target = {
     --- not say. Deliverable kinds default to 2; an explicit `-O` always wins.
     optimize: integer?,
 
+    --- What a program target links: "executable", the default, or a "static"
+    --- archive or "shared" library, which need no `main`.
+    linkage: string?,
+
+    --- Static archives a program target links in whole, project-relative.
+    archives: {string}?,
+
+    --- A file naming, one per line, every symbol a program target's executable
+    --- or shared library exports.
+    exportList: string?,
+
     --- Dotted module functions published by a component target.
     exports: {string}?,
     sources: {string}?,
@@ -412,6 +423,9 @@ local CONFIG_KEYS = {
 -- DOCS_KEYS instead, which spells out these same keys plus the generator's own.
 local TARGET_KEYS = {
     "kind",
+    "linkage",
+    "archives",
+    "exportList",
     "optimize",
     "aot",
     "aotLinkage",
@@ -940,6 +954,37 @@ local function validateTarget(target, label, dependencies)
     -- second entry would be a second `main`.
     if kind == "program" and #target.entries ~= 1 then
         return nil, label .. ".entries names the one module a program target links; it has " .. #target.entries
+    end
+    -- What a native program links into, the archives linked with it, and the
+    -- list of what it exports: the program target's own.
+    if target.linkage ~= nil then
+        if kind ~= "program" then
+            return nil, label .. ".linkage is only valid for a program target"
+        end
+        if target.linkage ~= "executable" and target.linkage ~= "static" and target.linkage ~= "shared" then
+            return nil, label .. ".linkage must be \"executable\", \"static\" or \"shared\""
+        end
+    end
+    if target.archives ~= nil then
+        if kind ~= "program" then
+            return nil, label .. ".archives is only valid for a program target"
+        end
+        valid, err = validateArray(target.archives, label .. ".archives", "string", false)
+        if not valid then
+            return nil, err
+        end
+    end
+    if target.exportList ~= nil then
+        if kind ~= "program" then
+            return nil, label .. ".exportList is only valid for a program target"
+        end
+        valid, err = validateString(target.exportList, label .. ".exportList")
+        if not valid then
+            return nil, err
+        end
+        if target.linkage == "static" then
+            return nil, label .. ".exportList is for an executable or a shared library, not a static archive"
+        end
     end
     if target.output ~= nil then
         valid, err = validateString(target.output, label .. ".output")

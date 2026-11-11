@@ -1,11 +1,14 @@
 --[[
-`kind = "program"` targets: a native program whose `main` is written in Nupp.
+`kind = "program"` targets: a native program written in Nupp.
 
 The same lowering and link `nupp aot --emit executable` does -- the checked
-entry module through `nupp.compiler.aot.llvm.native`, then
-`nupp.tools.build.native`'s `linkProgram` against the static LuaJIT of the
-target triple's link kit -- with the output placed by the target and kept
-across builds that would link the same thing.
+entry module and the modules it requires through
+`nupp.compiler.aot.llvm.native`, then `nupp.tools.build.aotllvm`'s
+`nativeProgram` against the static LuaJIT of the target triple's link kit --
+with the output placed by the target and kept across builds that would link
+the same thing. `linkage` makes it a static archive or a shared library
+instead of an executable, `archives` links more static archives in, and
+`exportList` names what it exports.
 ]]
 module nupp.tools.build.program
 
@@ -19,49 +22,182 @@ local program = {}
 
 --- What a program build did, for the caller to report.
 record program.Outcome
-    --- The executable, or nil when the build only checked.
+    --- The executable or library, or nil when the build only checked.
     output: string?
 
-    --- Whether the executable was linked here rather than kept from the last
+    --- Whether the output was linked here rather than kept from the last
     --- build that linked the same IR with the same code generator and kit.
     linked: boolean
 end
 
---- The LLVM IR of the checked `tree` as a native program for `triple`, or nil
---- and why not: a triple with no link profile, or a source position lowering
---- refused and its message.
-function program.lower(tree: any, triple: string): (string?, string?, {
-    line: integer,
-    column: integer
-}?)
-    local profile = require("nupp.compiler.aot.llvm.profile").of(triple)
-    if profile == nil then
-        return nil, "a native program cannot be built for " .. triple, nil
-    end
-    local ir, problem = require(
-        "nupp.compiler.aot.llvm.native"
-    ).module(tree.root, triple, (profile as {functionAttributes: string}).functionAttributes)
-    if ir == nil then
-        local at = problem as {
-            line: integer,
-            column: integer,
-            message: string
-        }
-
-        return nil, at.message, {line = at.line, column = at.column}
-    end
-
-    return ir as string, nil, nil
+--- Why a native program did not lower: a message, and when lowering refused
+--- something the program wrote, where, and in which of its files.
+record program.Refusal
+    message: string
+    line: integer?
+    column: integer?
+    file: string?
 end
 
---- Where a program target writes its executable: `output` when the target
---- names one, otherwise the target's name under its `outDir`, with the
---- triple's executable suffix. `--out-dir` keeps the file name and moves it.
-local function outputPath(root: string, target: Target, name: string, triple: string, outDir: string?): string
+--- The module `tree` declares itself to be with `module`, if it does.
+local function declaredName(tree: any): string?
+    for _, block in ipairs(tree.root.blocks) do
+        for _, stat in ipairs((block as any).stats or {}) do
+            if (stat as any).kind == "moduleStmt" then
+                local names: {string} = {}
+                for _, token in ipairs((stat as any).names) do
+                    names[#names + 1] = (token as any).text
+                end
+                return table.concat(names, ".")
+            end
+        end
+    end
+
+    return nil
+end
+
+--- The modules of the native program whose checked entry module is `tree`,
+--- read from `path`: the entry first, then every module it requires, directly
+--- or not, each found and checked in `environment`. A module that does not
+--- check has its diagnostics reported, into `diagnostics` when given.
+local function units(tree: any, path: string?, environment: any?, diagnostics: {any}?): ({any}?, program.Refusal?)
+    local native = require("nupp.compiler.aot.llvm.native")
+    local list: {any} = {native.Unit(name = declaredName(tree) or "", tree = tree.root, path = path)}
+    local seen: {[string]: boolean} = {[list[1].name] = true}
+    local index: integer = 1
+    while index <= #list do
+        local unit = list[index]
+        local names, problem = native.requires(unit.tree)
+        if names == nil then
+            local at = problem as native.Problem
+            return nil, program.Refusal(message = at.message, line = at.line, column = at.column, file = unit.path)
+        end
+        for _, name in ipairs(names as {string}) do
+            if not seen[name] then
+                seen[name] = true
+                if environment == nil then
+                    return nil, program.Refusal(message = "a native program here cannot require " .. name)
+                end
+                local found = require("nupp.compiler.project.env").findModulePath(environment, name)
+                if found == nil then
+                    return nil, program.Refusal(
+                        message = ("%s requires %s, which no include root has"):format(unit.path or "the program", name)
+                    )
+                end
+                local checked = require(
+                    "nupp.tools.cli.compile"
+                ).check(found as string, environment as {[string]: any}, {}, diagnostics)
+                if checked == nil then
+                    return nil, program.Refusal(message = "module " .. name .. " does not check", file = found)
+                end
+                list[#list + 1] = native.Unit(name = name, tree = (checked as any).root, path = found)
+            end
+        end
+        index = index + 1
+    end
+
+    return list, nil
+end
+
+--- The LLVM IR of the native program whose checked entry module is `tree`,
+--- for `triple`, or nil and why not: a triple with no link profile, a module
+--- it requires that is missing or does not check, or a source position
+--- lowering refused. `path` is the entry's file, and `environment` the project
+--- the modules it requires are found and checked in. A `library` needs no
+--- `main`.
+function program.lower(tree: any, triple: string, opts: {
+    path: string?,
+    environment: any?,
+    library: boolean?,
+    diagnostics: {any}?
+}?): (string?, program.Refusal?)
+    local options = opts or {}
+    local profile = require("nupp.compiler.aot.llvm.profile").of(triple)
+    if profile == nil then
+        return nil, program.Refusal(message = "a native program cannot be built for " .. triple)
+    end
+    local list, refusal = units(tree, options.path, options.environment, options.diagnostics)
+    if list == nil then
+        return nil, refusal
+    end
+    local native = require("nupp.compiler.aot.llvm.native")
+    local ir, problem = native.program(
+        list as {native.Unit},
+        triple,
+        (profile as {functionAttributes: string}).functionAttributes,
+        native.Options(library = options.library)
+    )
+    if ir == nil then
+        local at = problem as native.Problem
+
+        return nil, program.Refusal(message = at.message, line = at.line, column = at.column, file = at.path)
+    end
+
+    return ir as string, nil
+end
+
+--- `refusal` as one line: the file and position lowering refused, when there
+--- is one, and why.
+function program.describe(refusal: program.Refusal, fallback: string): string
+    if refusal.line == nil then
+        return refusal.message
+    end
+
+    return (
+        "%s:%d:%d: native: %s"
+    ):format(refusal.file or fallback, refusal.line as integer, refusal.column or 1, refusal.message)
+end
+
+--- The symbols the export list in `text` names: one per line, with blank lines
+--- and `#` comments skipped.
+--- @return the names, or nil and the first line that names no symbol
+function program.exportNames(text: string): ({string}?, string?)
+    local names: {string} = {}
+    local number = 0
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        number = number + 1
+        local name = (line:gsub("#.*$", "")):match("^%s*(.-)%s*$") as string
+        if name ~= "" then
+            if not name:match("^[%a_][%w_]*$") then
+                return nil, ("line %d names no symbol: %s"):format(number, name)
+            end
+            names[#names + 1] = name
+        end
+    end
+
+    return names, nil
+end
+
+--- The file name a native program linked as `linkage` takes for `triple`:
+--- the platform's executable, shared-library or static-archive spelling of
+--- `name`.
+function program.fileName(name: string, linkage: string, triple: string): string
+    local windows = triple:find("windows", 1, true) ~= nil
+    if linkage == "static" then
+        return "lib" .. name .. ".a"
+    elseif linkage == "shared" then
+        if windows then
+            return name .. ".dll"
+        end
+        return "lib" .. name .. (triple:find("apple", 1, true) and ".dylib" or ".so")
+    end
     local platform = require("nupp.tools.build.platform")
-    local suffix = platform.has(triple) and platform.executableSuffix(triple)
-        or (triple:find("windows", 1, true) and ".exe" or "")
-    local file = target.output or (name .. suffix)
+
+    return name .. (platform.has(triple) and platform.executableSuffix(triple) or (windows and ".exe" or ""))
+end
+
+--- Where a program target writes its output: `output` when the target names
+--- one, otherwise the target's name under its `outDir`, spelled as the
+--- triple spells its linkage. `--out-dir` keeps the file name and moves it.
+local function outputPath(
+    root: string,
+    target: Target,
+    name: string,
+    triple: string,
+    linkage: string,
+    outDir: string?
+): string
+    local file = target.output or program.fileName(name, linkage, triple)
     if outDir ~= nil then
         return fs.join(root, fs.join(outDir as string, fs.basename(file)))
     end
@@ -87,6 +223,7 @@ function program.build(root: string, config: Config, target: Target, name: strin
     end
     local triple = (selected as {triple: string}).triple
     local entry = (target.entries as {string})[1]
+    local linkage = target.linkage or "executable"
 
     -- The entry is checked the way `nupp aot` checks it, which is how a
     -- native program has always been built: as an inspection of AOT code,
@@ -119,39 +256,74 @@ function program.build(root: string, config: Config, target: Target, name: strin
         return program.Outcome(output = nil, linked = false), nil, nil
     end
 
-    local ir, lowerErr, at = program.lower(tree, triple)
+    local ir, refusal = program.lower(tree, triple, {
+        path = path,
+        environment = environment,
+        library = linkage ~= "executable",
+        diagnostics = opts.diagnostics,
+    })
     if ir == nil then
-        if at == nil then
-            return nil, "NUPP0004", tostring(lowerErr)
+        return nil, "NUPP0004", program.describe(refusal as program.Refusal, path as string)
+    end
+    local archives: {string} = {}
+    local archiveDigests: {string} = {}
+    for _, archive in ipairs(target.archives or {}) do
+        local file = fs.join(root, archive)
+        local bytes = fs.readFile(file)
+        if bytes == nil then
+            return nil, "NUPP0003", "program target " .. name .. " links " .. archive .. ", which does not exist"
         end
-        local position = at as {
-            line: integer,
-            column: integer
-        }
-
-        return nil, "NUPP0004", (
-            "%s:%d:%d: native: %s"
-        ):format(path as string, position.line, position.column, tostring(lowerErr))
+        archives[#archives + 1] = file
+        archiveDigests[#archiveDigests + 1] = hash.digest(bytes as string)
+    end
+    local exports: {string}? = nil
+    if target.exportList ~= nil then
+        local listed = fs.readFile(fs.join(root, target.exportList as string))
+        if listed == nil then
+            return nil, "NUPP0003", (
+                "program target %s exports what %s lists, which does not exist"
+            ):format(name, tostring(target.exportList))
+        end
+        local names, listErr = program.exportNames(listed as string)
+        if names == nil then
+            return nil, "NUPP0004", tostring(target.exportList) .. ": " .. tostring(listErr)
+        end
+        exports = names
     end
     local aotllvm = require("nupp.tools.build.aotllvm")
     local available, availableErr = aotllvm.selected()
     if available ~= true then
         return nil, "NUPP0004", tostring(availableErr)
     end
-    local native = require("nupp.tools.build.native")
-    local kit, kitErr = native.programKit(triple)
-    if kit == nil then
-        return nil, "NUPP0004", tostring(kitErr)
+    -- A static archive is never linked here, so it needs no kit.
+    local kit: string? = nil
+    local kitIdentity = ""
+    if linkage ~= "static" then
+        local found, kitErr = require("nupp.tools.build.native").programKit(triple)
+        if found == nil then
+            return nil, "NUPP0004", tostring(kitErr)
+        end
+        kit = found
+        kitIdentity = require("nupp.tools.build.kits").identity(found as string)
     end
 
     -- Keyed like every other LLVM artifact: the IR, the code generator that
-    -- compiles it and the kit it links against. The executable's own digest
-    -- is recorded beside the key, so one replaced or damaged since is linked
-    -- again.
-    local output = outputPath(root, target, name, triple, opts.outDir)
+    -- compiles it and the kit it links against, with how it is linked: the
+    -- linkage, the archives' contents and the export list. The output's own
+    -- digest is recorded beside the key, so one replaced or damaged since is
+    -- linked again.
+    local output = outputPath(root, target, name, triple, linkage, opts.outDir)
     local key = hash.digest(
         table.concat(
-            {ir as string, aotllvm.version(), triple, require("nupp.tools.build.kits").identity(kit as string)},
+            {
+                ir as string,
+                aotllvm.version(),
+                triple,
+                kitIdentity,
+                linkage,
+                table.concat(archiveDigests, ","),
+                exports ~= nil and table.concat(exports as {string}, ",") or "-",
+            },
             "\0"
         )
     )
@@ -162,7 +334,13 @@ function program.build(root: string, config: Config, target: Target, name: strin
         return program.Outcome(output = output, linked = false), nil, nil
     end
     os.remove(stamp)
-    local linkErr = aotllvm.program(ir as string, triple, kit as string, output)
+    local linkErr = aotllvm.nativeProgram(
+        ir as string,
+        triple,
+        kit,
+        output,
+        aotllvm.NativeLink(linkage = linkage, archives = archives, exports = exports)
+    )
     if linkErr ~= nil then
         return nil, "NUPP0004", tostring(linkErr)
     end
