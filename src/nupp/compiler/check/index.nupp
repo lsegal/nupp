@@ -157,6 +157,16 @@ export function install(c: state.Checker): state.ExprHandlers
                 local resolved = moduleType
                 local definition = nil
                 for memberIndex, memberName in ipairs(suffix) do
+                    -- A member the surface records only as a table, such as
+                    -- `simd.horizontal`, says nothing about its own members. Read
+                    -- through it gradually, as the same path through a required local
+                    -- does, and let the call keep the exported identity it names.
+                    local holder = rawType(resolved)
+                    if memberIndex > 1 and (holder == T.any or holder == T.table_) then
+                        node.gradualIndex = true
+                        resolved, definition = T.any, nil
+                        break
+                    end
                     resolved, definition = c.fieldType(resolved, memberName)
                     if not resolved and memberIndex == 1 and c.env.exportedNominal then
                         local nominal, declared = c.env.exportedNominal(c.env, candidate, memberName)
@@ -198,12 +208,9 @@ export function install(c: state.Checker): state.ExprHandlers
                     (node as any).requiredModule = candidate
                 end
                 (node as any).namespacePath = written
-                if #suffix == 1 then
-                    node.exactCallExport = {
-                        module = candidate,
-                        member = suffix[1],
-                        identity = candidate .. "." .. suffix[1],
-                    }
+                if #suffix > 0 then
+                    local member = table.concat(suffix, ".")
+                    node.exactCallExport = {module = candidate, member = member, identity = candidate .. "." .. member,}
                 end
                 node.immutablePath = true
                 node.resolvedType = resolved
