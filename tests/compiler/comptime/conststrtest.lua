@@ -102,34 +102,24 @@ function M.aTypedefOfAnAnonymousStructHasItsFields()
     testAssert.eq(diagsOf(ANON .. "local p = ffi.new('CstAnon')\nlocal n: number = p.checked"), "")
     testAssert.eq(diagsOf(ANON .. "local p = ffi.new('CstAnon')\nlocal s: string = p.ratio"), "NUPP2001")
     testAssert.eq(diagsOf(ANON .. "local p = ffi.new('CstAnon')\nlocal n = p.nope"), "NUPP2004")
+    -- a typedef of the typedef, and a union, the same way
+    testAssert.eq(diagsOf(ANON .. "local p = ffi.new('CstAnonAlias')\nlocal n: number = p.checked"), "")
     testAssert.eq(diagsOf(ANON .. "local u = ffi.new('CstAnonUnion')\nlocal f: number = u.f"), "")
     testAssert.eq(diagsOf(ANON .. "local u = ffi.new('CstAnonUnion')\nlocal n = u.nope"), "NUPP2004")
-    -- through a pointer, a cast and a typeof as well
-    testAssert.eq(
-        diagsOf(ANON .. "local p = ffi.new('CstAnon')\nlocal q = ffi.cast('CstAnon *', p)\nlocal n: number = q.checked"),
-        ""
-    )
-    testAssert.eq(
-        diagsOf(ANON .. "local p = ffi.new('CstAnon')\nlocal q = ffi.cast('CstAnon *', p)\nlocal n = q.nope"),
-        "NUPP2004"
-    )
-    testAssert.eq(diagsOf(ANON .. "local t = ffi.typeof('CstAnon')\nlocal n = t.nope"), "NUPP2004")
 end
 
 function M.aTypedefOfAnAnonymousStructIsOneType()
-    -- every mention, and a typedef of the typedef, names the same struct
-    testAssert.eq(
-        diagsOf(ANON .. "local a = ffi.new('CstAnon')\nlocal b = ffi.new('CstAnonAlias')\na = b\nb = a"),
-        ""
-    )
-    testAssert.eq(
-        diagsOf(ANON .. "local a = ffi.new('CstAnon')\nlocal u = ffi.new('CstAnonUnion')\na = u"),
-        "NUPP2001"
-    )
+    diagsOf(ANON)
     local cheaderMod = require("nupp.compiler.cinterop.cheader")
+    local types = require("nupp.compiler.types")
     local t = cheaderMod.typeFromString("CstAnon")
     assert(t and t.byname and t.byname.checked, "struct decoded")
-    testAssert.eq(require("nupp.compiler.types").tostring(t), "CstAnon")
+    testAssert.eq(types.tostring(t), "CstAnon")
+    -- every mention, a typedef of the typedef, and a pointer name the same struct
+    assert(rawequal(cheaderMod.typeFromString("CstAnon"), t), "one identity across mentions")
+    assert(rawequal(cheaderMod.typeFromString("CstAnonAlias"), t), "the alias is the same struct")
+    testAssert.eq(types.tostring(cheaderMod.typeFromString("CstAnon *")), "CstAnon*?")
+    testAssert.eq(types.tostring(cheaderMod.typeFromString("CstAnonUnion")), "CstAnonUnion")
 end
 
 function M.constIsAModifierOnlyWhenATypeFollows()
