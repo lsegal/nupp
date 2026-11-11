@@ -2343,7 +2343,8 @@ function M.windowsShellReachesTheResultCache()
     )
     environment._G = environment
     assert(setfenv(assert(loadstring(setup, "@nupp:test-runner")), environment))()
-    local lookup = 'return io.popen("command -v luajit", "r")'
+    -- Not a tail call: that would leave the test, not the chunk, as the caller.
+    local lookup = 'local pipe = io.popen("command -v luajit", "r")\nreturn pipe'
     local pipe = assert(setfenv(assert(loadstring(lookup, "@nupp:test-cache")), environment))()
     test.eq(type(received[1]), "table", "the cache's lookup starts Bash")
     test.eq(received[1][1], "C:/Program Files/Git/bin/bash.exe")
