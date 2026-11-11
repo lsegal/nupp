@@ -334,6 +334,7 @@ if package.config:sub(1, 1) == "\\" then
 
     local function usesTestShell(source)
         return source == "@nupp:test-runner"
+            or source == "@nupp:test-cache"
             or source:find("/tests/", 1, true) ~= nil
             or source:match("^@?tests/") ~= nil
     end

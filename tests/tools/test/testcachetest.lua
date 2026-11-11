@@ -68,7 +68,7 @@ function M.unchangedPassingPackagesHitAndContentChangesMiss()
 end
 
 function M.partialFailedSkippedAndRecentRunsCannotPopulateTheStore()
-    fixture(function(_, options, results, suites)
+    fixture(function(root, options, results, suites)
         local cache = opened(options)
         for _, status in ipairs({"failed", "skipped", "not-executed"}) do
             results[1].status = status
@@ -84,6 +84,9 @@ function M.partialFailedSkippedAndRecentRunsCannotPopulateTheStore()
         os.time = function()
             return clock() - 10
         end
+        -- Each open spawns shells, which is slow enough on Windows that the
+        -- fixture written at the start of the case is no longer recent here.
+        fs.writeFile(root .. "/tests/one/fixture", "first")
         local recent, entry = opened(options)
         test.eq(entry.recent, true)
         recent.save(results, suites)
