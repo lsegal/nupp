@@ -1,0 +1,472 @@
+--- The host's LuaJIT states: opening one the way every Nupp host does, running
+--- a chunk in it, and the globals the worker adapter reads.
+---
+--- Every sequence of Lua API calls that may raise runs inside `lua_cpcall`,
+--- whose function converts its own failure to text while still protected, so
+--- no LuaJIT error escapes to a frame that is not protected. The text is copied
+--- out whole, NUL bytes included, into memory the caller frees.
+module nupphost.state
+
+const build = require("nupphost.build")
+
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function malloc(size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, count: uint64): voidptr
+cdef function strlen(borrows s: cstring): uint64
+cdef function getenv(borrows name: cstring): cstring?
+
+cdef function luaL_newstate(): voidptr?
+cdef function lua_close(borrows L: voidptr)
+cdef function luaL_openlibs(borrows L: voidptr)
+cdef function lua_cpcall(borrows L: voidptr, f: function(L: voidptr): int32, borrows ud: voidptr): int32
+cdef function lua_touserdata(borrows L: voidptr, index: int32): voidptr?
+cdef function lua_gettop(borrows L: voidptr): int32
+cdef function lua_settop(borrows L: voidptr, index: int32)
+cdef function lua_getfield(borrows L: voidptr, index: int32, borrows k: cstring)
+cdef function lua_setfield(borrows L: voidptr, index: int32, borrows k: cstring)
+cdef function lua_pushstring(borrows L: voidptr, borrows s: cstring)
+cdef function lua_pushlstring(borrows L: voidptr, borrows s: voidptr, length: uint64)
+cdef function lua_pushinteger(borrows L: voidptr, n: int64)
+cdef function lua_pushboolean(borrows L: voidptr, b: int32)
+cdef function lua_pushnil(borrows L: voidptr)
+cdef function lua_pushvalue(borrows L: voidptr, index: int32)
+cdef function lua_pushlightuserdata(borrows L: voidptr, borrows p: voidptr)
+cdef function lua_pushcclosure(borrows L: voidptr, f: function(L: voidptr): int32, n: int32)
+cdef function lua_createtable(borrows L: voidptr, narr: int32, nrec: int32)
+cdef function lua_rawget(borrows L: voidptr, index: int32)
+cdef function lua_rawset(borrows L: voidptr, index: int32)
+cdef function lua_rawseti(borrows L: voidptr, index: int32, n: int32)
+cdef function lua_type(borrows L: voidptr, index: int32): int32
+cdef function lua_tolstring(borrows L: voidptr, index: int32, borrows length: voidptr?): voidptr?
+cdef function lua_tointeger(borrows L: voidptr, index: int32): int64
+cdef function lua_pcall(borrows L: voidptr, nargs: int32, nresults: int32, handler: int32): int32
+cdef function luaL_loadbuffer(borrows L: voidptr, borrows buffer: voidptr, size: uint64, borrows name: cstring): int32
+
+const GLOBALS = -10002
+const TNIL = 0
+const TTABLE = 5
+const ERRRUN = 2
+
+--- What a protected function reads and writes. `error` is a failure's text,
+--- allocated, `errorLength` bytes long.
+cdef struct Call
+    status: int32
+    error: voidptr?
+    errorLength: uint64
+    executable: voidptr?
+    workers: voidptr?
+    openWorkers: voidptr?
+    openSharedBytes: voidptr?
+    chunk: voidptr?
+    chunkLength: uint64
+    name: voidptr?
+    arguments: voidptr?
+    argumentLengths: voidptr?
+    argumentCount: int32
+    inbox: voidptr?
+    outbox: voidptr?
+    tasks: voidptr?
+end
+
+--- Copies `length` bytes of failure text into the call, replacing any before.
+local function fail(call: Call*, text: voidptr, length: uint64)
+    @unsafe do
+        call.status = ERRRUN
+        if call.error ~= nil then
+            free(call.error as voidptr)
+        end
+        call.error = nil
+        call.errorLength = 0ULL
+        local copy = malloc(length + 1ULL)
+        if copy == nil then
+            return
+        end
+        if length ~= 0ULL then
+            memcpy(copy as voidptr, text, length)
+        end
+        (copy as uint8*)[length as integer] = 0
+        call.error = copy as voidptr
+        call.errorLength = length
+    end
+end
+
+local function failWith(call: Call*, text: cstring)
+    fail(call, text as voidptr, strlen(text))
+end
+
+--- Records the error value on top of the stack. This runs protected, because
+--- converting a numeric error to text may allocate.
+local function capture(L: voidptr, call: Call*, status: int32)
+    local length = calloc(1ULL, 8ULL) as uint64*
+    if length == nil then
+        failWith(call, "unknown LuaJIT error")
+        return
+    end
+    local text = lua_tolstring(L, -1, length as voidptr)
+    @unsafe do
+        if text == nil then
+            failWith(call, "unknown LuaJIT error")
+        else
+            fail(call, text as voidptr, length[0])
+        end
+        call.status = status
+    end
+    free(length as voidptr)
+end
+
+local function callOf(L: voidptr): Call*
+    return lua_touserdata(L, 1) as Call*
+end
+
+--- LuaJIT's capacity limits, raised before the state traces anything, because
+--- the size of the machine-code area is fixed when the first trace allocates
+--- it. This is nupp.tools.jitlimits.FLAGS, which says why each is raised;
+--- clitest holds the two lists to one account. NUPP_JIT_DEFAULT keeps LuaJIT's
+--- own.
+local function raiseJitLimits(L: voidptr)
+    if getenv("NUPP_JIT_DEFAULT") ~= nil then
+        return
+    end
+    local top = lua_gettop(L)
+    lua_getfield(L, GLOBALS, "jit")
+    if lua_type(L, -1) == TTABLE then
+        lua_getfield(L, -1, "opt")
+        if lua_type(L, -1) == TTABLE then
+            lua_getfield(L, -1, "start")
+            lua_pushstring(L, "maxtrace=20000")
+            lua_pushstring(L, "maxside=1000")
+            lua_pushstring(L, "sizemcode=16384")
+            lua_pushstring(L, "maxmcode=16384")
+            -- A LuaJIT built without the JIT refuses the flags; that is not a
+            -- reason to refuse to run.
+            lua_pcall(L, 4, 0, 0)
+        end
+    end
+    lua_settop(L, top)
+end
+
+--- Installs `source` as `package.preload[module]`, loaded under `name`.
+local function preloadSource(L: voidptr, call: Call*, module: cstring, source: cstring, name: cstring): boolean
+    local status = luaL_loadbuffer(L, source as voidptr, strlen(source), name)
+    if status ~= 0 then
+        capture(L, call, status)
+        return false
+    end
+    lua_getfield(L, GLOBALS, "package")
+    lua_getfield(L, -1, "preload")
+    if lua_type(L, -1) ~= TTABLE then
+        failWith(call, "pinned LuaJIT did not install package.preload")
+        return false
+    end
+    lua_pushvalue(L, -3)
+    lua_setfield(L, -2, module)
+    lua_settop(L, -4)
+
+    return true
+end
+
+local function preloadFunction(L: voidptr, module: cstring, opener: function(L: voidptr): int32)
+    lua_getfield(L, GLOBALS, "package")
+    lua_getfield(L, -1, "preload")
+    lua_pushcclosure(L, opener, 0)
+    lua_setfield(L, -2, module)
+    lua_settop(L, -3)
+end
+
+--- Sets `__nuppHost.hostFeatures[name]`, for the `length` bytes at `name`.
+local function addFeature(L: voidptr, call: Call*, name: voidptr, length: uint64): boolean
+    lua_getfield(L, GLOBALS, "__nuppHost")
+    lua_getfield(L, -1, "hostFeatures")
+    if lua_type(L, -1) ~= TTABLE then
+        failWith(call, "the Nupp host feature table is missing")
+        return false
+    end
+    lua_pushlstring(L, name, length)
+    lua_pushboolean(L, 1)
+    lua_rawset(L, -3)
+    lua_settop(L, -3)
+
+    return true
+end
+
+--- Declares each comma-separated feature of `list`.
+local function addFeatures(L: voidptr, call: Call*, list: cstring): boolean
+    local bytes = list as uint8*
+    local total = strlen(list) as integer
+    local start = 0
+    local at = 0
+    while at <= total do
+        local ends = at == total
+        if not ends then
+            @unsafe do
+                ends = bytes[at] == 44
+            end
+        end
+        if ends then
+            if at > start then
+                local first = ((bytes as int64) + (start as int64)) as voidptr
+                if not addFeature(L, call, first, (at - start) as uint64) then
+                    return false
+                end
+            end
+            start = at + 1
+        end
+        at = at + 1
+    end
+
+    return true
+end
+
+local function installHostRecord(L: voidptr)
+    lua_createtable(L, 0, 3)
+    lua_pushinteger(L, 1LL)
+    lua_setfield(L, -2, "hostAbi")
+    lua_createtable(L, 0, 0)
+    lua_setfield(L, -2, "hostFeatures")
+    lua_createtable(L, 0, 0)
+    lua_setfield(L, -2, "resources")
+    lua_setfield(L, GLOBALS, "__nuppHost")
+end
+
+--- Opens a new state the way every Nupp host does: LuaJIT's libraries with the
+--- raised limits, its `jit.*` support modules, the host record, the compiled
+--- features, and `__NUPP_EXECUTABLE`.
+local function setup(L: voidptr): int32
+    local call = callOf(L)
+    luaL_openlibs(L)
+    raiseJitLimits(L)
+    if not preloadSource(L, call, "jit.vmdef", build.VMDEF, "=jit.vmdef") then
+        return 0
+    end
+    if not preloadSource(L, call, "jit.zone", build.ZONE, "=jit.zone") then
+        return 0
+    end
+    if not preloadSource(L, call, "jit.bc", build.BC, "=jit.bc") then
+        return 0
+    end
+    installHostRecord(L)
+    if not addFeatures(L, call, build.FEATURES) then
+        return 0
+    end
+    if build.LPEG then
+        preloadFunction(L, "lpeg", build.nuppHostBuildOpenLpeg)
+    end
+    @unsafe do
+        if call.executable ~= nil then
+            lua_pushstring(L, call.executable as cstring)
+            lua_setfield(L, GLOBALS, "__NUPP_EXECUTABLE")
+        end
+    end
+
+    return 0
+end
+
+--- Installs the native worker and shared-byte modules, and the worker host
+--- they reach through `__nuppWorkerHost`.
+local function enableWorkers(L: voidptr): int32
+    local call = callOf(L)
+    @unsafe do
+        preloadFunction(L, "nupp.workers.native", call.openWorkers as function(L: voidptr): int32)
+        preloadFunction(L, "nupp.mem.sharedbytes.native", call.openSharedBytes as function(L: voidptr): int32)
+        lua_pushlightuserdata(L, call.workers as voidptr)
+        lua_setfield(L, GLOBALS, "__nuppWorkerHost")
+    end
+    addFeature(L, call, "workers" as voidptr, 7ULL)
+
+    return 0
+end
+
+local function setWorkerContext(L: voidptr): int32
+    local call = callOf(L)
+    @unsafe do
+        lua_pushlightuserdata(L, call.inbox as voidptr)
+        lua_setfield(L, GLOBALS, "__nuppWorkerIn")
+        lua_pushlightuserdata(L, call.outbox as voidptr)
+        lua_setfield(L, GLOBALS, "__nuppWorkerOut")
+        lua_pushlightuserdata(L, call.tasks as voidptr)
+        lua_setfield(L, GLOBALS, "__nuppWorkerTasks")
+    end
+    lua_pushstring(L, "nupp.workers")
+    lua_setfield(L, GLOBALS, "__nuppWorkerEntry")
+
+    return 0
+end
+
+local function rawClear(L: voidptr, name: cstring)
+    lua_pushstring(L, name)
+    lua_pushnil(L)
+    lua_rawset(L, GLOBALS)
+end
+
+--- Raw writes make teardown independent of a hostile globals metatable.
+local function clearWorkerContext(L: voidptr): int32
+    rawClear(L, "__nuppWorkerHost")
+    rawClear(L, "__nuppWorkerIn")
+    rawClear(L, "__nuppWorkerOut")
+    rawClear(L, "__nuppWorkerTasks")
+    rawClear(L, "__nuppWorkerEntry")
+
+    return 0
+end
+
+--- Sets `arg`, then loads and runs the chunk.
+local function run(L: voidptr): int32
+    local call = callOf(L)
+    @unsafe do
+        local count = call.argumentCount
+        lua_createtable(L, count, 0)
+        local texts = call.arguments as voidptr*
+        local lengths = call.argumentLengths as uint64*
+        for index = 0, count - 1 do
+            lua_pushlstring(L, texts[index], lengths[index])
+            lua_rawseti(L, -2, math.i32.wrap(index + 1))
+        end
+        lua_setfield(L, GLOBALS, "arg")
+        local status = luaL_loadbuffer(L, call.chunk as voidptr, call.chunkLength, call.name as cstring)
+        if status ~= 0 then
+            capture(L, call, status)
+            return 0
+        end
+        status = lua_pcall(L, 0, 0, 0)
+        if status ~= 0 then
+            capture(L, call, status)
+        end
+    end
+
+    return 0
+end
+
+--- Runs `f` protected. Nonzero is a failure, whose text is in the call; a
+--- failure that left no text is given one.
+local function protect(L: voidptr, f: function(L: voidptr): int32, call: Call*): int32
+    local top = lua_gettop(L)
+    local status = lua_cpcall(L, f, call as voidptr)
+    lua_settop(L, top)
+    @unsafe do
+        if status ~= 0 and call.status == 0 then
+            call.status = status
+        end
+        if call.status ~= 0 and call.error == nil then
+            failWith(call, "LuaJIT protected operation failed")
+        end
+        return call.status
+    end
+end
+
+--- A new, zeroed call record, or nil.
+export function nuppHostStateCall(): voidptr?
+    return calloc(1ULL, 128ULL)
+end
+
+--- Frees a call record and the failure text it holds.
+export function nuppHostStateCallFree(record: voidptr): nil
+    local call = record as Call*
+    @unsafe do
+        if call.error ~= nil then
+            free(call.error as voidptr)
+        end
+    end
+    free(record)
+end
+
+--- The failure text a call holds, and its length in `length[0]`.
+export function nuppHostStateCallError(record: voidptr, length: uint64*): voidptr?
+    local call = record as Call*
+    @unsafe do
+        length[0] = call.errorLength
+        return call.error
+    end
+end
+
+--- A new state, opened as every host opens one, with `__NUPP_EXECUTABLE` set
+--- to `executable` unless that is nil. Nil when the state could not be made or
+--- set up, with the reason in `record`.
+export function nuppHostStateOpen(record: voidptr, executable: voidptr?): voidptr?
+    local call = record as Call*
+    local L = luaL_newstate()
+    if L == nil then
+        failWith(call, "cannot create a LuaJIT state")
+        return nil
+    end
+    @unsafe do
+        call.executable = executable as voidptr
+    end
+    if protect(L as voidptr, setup, call) ~= 0 then
+        lua_close(L as voidptr)
+        return nil
+    end
+
+    return L
+end
+
+--- Installs the worker adapter for `host`, whose modules `openWorkers` and
+--- `openSharedBytes` open. Nonzero is a failure, with its text in `record`.
+export function nuppHostStateEnableWorkers(
+    L: voidptr,
+    record: voidptr,
+    host: voidptr,
+    openWorkers: function(L: voidptr): int32,
+    openSharedBytes: function(L: voidptr): int32
+): int32
+    local call = record as Call*
+    @unsafe do
+        call.workers = host
+        call.openWorkers = openWorkers as voidptr
+        call.openSharedBytes = openSharedBytes as voidptr
+    end
+
+    return protect(L, enableWorkers, call)
+end
+
+--- Names the queues and task table a worker state's scheduler reads.
+export function nuppHostStateSetWorkerContext(
+    L: voidptr,
+    record: voidptr,
+    inbox: voidptr,
+    outbox: voidptr,
+    tasks: voidptr
+): int32
+    local call = record as Call*
+    @unsafe do
+        call.inbox = inbox
+        call.outbox = outbox
+        call.tasks = tasks
+    end
+
+    return protect(L, setWorkerContext, call)
+end
+
+--- Clears every worker global before the owners behind them go away.
+export function nuppHostStateClearWorkerContext(L: voidptr, record: voidptr): int32
+    return protect(L, clearWorkerContext, record as Call*)
+end
+
+--- Sets `arg` to the `count` arguments and runs `length` bytes of `chunk`
+--- under `name`. Nonzero is a failure, with its text in `record`.
+export function nuppHostStateRun(
+    L: voidptr,
+    record: voidptr,
+    chunk: voidptr,
+    length: uint64,
+    name: cstring,
+    arguments: voidptr,
+    argumentLengths: voidptr,
+    count: int32
+): int32
+    local call = record as Call*
+    @unsafe do
+        call.chunk = chunk
+        call.chunkLength = length
+        call.name = name as voidptr
+        call.arguments = arguments
+        call.argumentLengths = argumentLengths
+        call.argumentCount = count
+    end
+
+    return protect(L, run, call)
+end
+
+export function nuppHostStateClose(L: voidptr): nil
+    lua_close(L)
+end
