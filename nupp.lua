@@ -270,6 +270,10 @@ local RESOURCES = {
         output = "nupp/compiler/nupp/runtime/provider/nativenet.nupp"
     },
     {
+        source = "src/nupp/runtime/provider/nativesocket.nupp",
+        output = "nupp/compiler/nupp/runtime/provider/nativesocket.nupp"
+    },
+    {
         source = "src/nupp/runtime/provider/nativehttp.nupp",
         output = "nupp/compiler/nupp/runtime/provider/nativehttp.nupp"
     },

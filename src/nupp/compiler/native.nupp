@@ -757,13 +757,13 @@ local FEATURES: {[string]: native.Feature} = {
     ["native.net"] = {
         name = "net",
         -- The public surface, and only that: listening, connecting, and the
-        -- connections either produces. Rust owns every platform handle behind
-        -- the native ABI resource boundary.
+        -- connections either produces. The sockets are Nupp over the FFI; all
+        -- it takes from the provider is the wake handle it sleeps on.
         module = "nupp.runtime.provider.nativenet",
         runtimeModule = "nupp.runtime.provider.nativenet",
         provider = "nupp_native",
         providerDriver = "native-rust",
-        providerFeature = "net",
+        providerFeature = "base",
         host = "native-net",
         library = "nupp_native",
         binary = true,
