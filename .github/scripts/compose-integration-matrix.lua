@@ -16,14 +16,12 @@ local platforms = {
     },
     {
         variable = "SELECTED_MACOS",
-        -- The Rust-native gate and broad suite need room for cold checks on
-        -- a three-core runner.
+        -- The broad suite needs room for cold checks on a three-core runner.
         entry = {name = "macOS arm64", os = "macos-15", timeout = 240, artifact = "macos-arm64"},
     },
     {
         variable = "SELECTED_WINDOWS",
-        -- A cold Rust-native artifact gate and broad suite exceeded 180
-        -- minutes; keep the timeout above both stages.
+        -- A cold host build and broad suite once exceeded 180 minutes.
         entry = {name = "Windows x64", os = "windows-2022", timeout = 240, artifact = "windows-x64"},
     },
 }

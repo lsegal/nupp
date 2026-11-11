@@ -61,10 +61,8 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v5
 
-      # Cache pinned source archives and host tools, but not the task-local
-      # Cargo target whose empty first build is one of the measurements. A
-      # deliberate cold build belongs in an empty task-local cache and must
-      # never be served from the caches ordinary correctness runs fill.
+      # Its own key, so a measurement run never churns the entries ordinary
+      # correctness runs fill.
       - name: Restore the provisioned toolchain
         uses: actions/cache@v4
         with:
@@ -86,7 +84,7 @@ jobs:
         shell: bash
         run: ./scripts/toolchain --all
 
-      - name: Measure public native runtime and exact-feature artifacts
+      - name: Measure the public native runtime
         shell: bash
         run: .github/scripts/measure-native-runtime.sh build/ci-native-runtime
 

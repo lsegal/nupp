@@ -476,9 +476,9 @@ function M.nativeRuntimeMeasurementsArePortableAndNonThresholded()
     assert(measure:find("./bin/nupp build", 1, true), "clean measurement runners do not stage root modules")
     assert(measure:find("bench/native-runtime/run.sh", 1, true))
     assert(measure:find("bench/native-runtime/resource.sh", 1, true))
-    assert(measure:find("features=base,filesystem,http,net,uri", 1, true))
+    assert(not measure:find("native-rust", 1, true), "the measurement still times a Rust provider build")
     assert(measure:find('benchmark.exe', 1, true), "Windows benchmark size does not resolve the executable suffix")
-    assert(measure:find("observations, not", 1, true), "hosted-runner timings are not identified as observations")
+    assert(measure:find("pass/fail threshold", 1, true), "hosted-runner timings are not identified as observations")
     assert(peer:find("READY ${httpPort} ${tcpPort}", 1, true), "the peer does not publish one coherent ready event")
     assert(not peer:find("process.argv", 1, true), "Node readiness still crosses the Git Bash path boundary")
     assert(peerDriver:find("kill -0", 1, true), "peer readiness does not track the exact child process")
@@ -801,47 +801,27 @@ function M.pagesCiInstallsThePinnedRustToolchain()
     )
 end
 
--- The broad suite remains the language gate. Native migration regressions need
--- a smaller named boundary before it: the exact resource crates, C ABI, and
--- production host artifacts on each retained runner. Tagged release jobs must
--- repeat it because one GitHub workflow cannot depend on another workflow's
--- result.
-function M.retainedPlatformsGateTheExactRustNativeArtifacts()
+-- Rust is going away (#1), so CI no longer tests it: no Cargo test, Rust ABI
+-- gate, sanitizer run or Rust build cache is left for it to fail on. The
+-- hosts the Nupp suites run on still build through `scripts/toolchain`, which
+-- calls Cargo itself, so the toolchain installs above stay until #8.
+function M.ciRunsNoRustTestsOrRustCaches()
     local compiler = read(ROOT .. "/.github/workflows/compiler.yml")
     local release = read(ROOT .. "/.github/workflows/release.yml")
-    local gate = read(ROOT .. "/.github/scripts/test-rust-native-platform.sh")
-    local marker = ".github/scripts/test-rust-native-platform.sh"
-
-    assert(countOccurrences(compiler, marker) == 1, "the compiler matrix does not run one native artifact gate")
-    assert(countOccurrences(release, marker) == 2, "the Unix and Windows release builders do not both run the gate")
-    assert(
-        gate:find('NUPP_TEST_BASH=${NUPP_TEST_BASH:-$(cygpath -w "$bash_path")}', 1, true),
-        "the Windows native gate does not provide Git Bash to its test harness"
-    )
-    assert(
-        gate:find('NUPP_TEST_SH=${NUPP_TEST_SH:-$(cygpath -w "$sh_path")}', 1, true),
-        "the Windows native gate does not provide sh.exe to its test harness"
-    )
-    assert(gate:find("$channel-x86_64-pc-windows-gnu", 1, true), "the gate does not select Windows GNU Rust")
-    assert(
-        gate:find(
-            "lpeg,native-checksum,native-compression,native-files,native-net,native-process,native-time,native-tls,workers",
-            1,
-            true
-        ),
-        "the gate does not select the production host feature set"
-    )
-    for _, package in ipairs({
-        "nupp-native-net",
-        "nupp-native-tls",
-        "nupp-native-host",
+    for _, path in ipairs({
+        ".github/scripts/test-rust-native-platform.sh",
+        ".github/scripts/sanitize-native.sh",
+        ".github/workflows/sanitizers.yml",
     }) do
-        assert(gate:find("--package " .. package, 1, true), "the gate omits " .. package)
+        assert(not io.open(ROOT .. "/" .. path, "rb"), path .. " came back")
     end
-    for _, artifact in ipairs({"libnupp.a", "libnupp.dll.a", "libnupp.dylib", "libnupp.so", "nupp.dll"}) do
-        assert(gate:find(artifact, 1, true), "the gate does not name " .. artifact)
+    for _, path in ipairs(require("nupp.compiler.fs").listFiles(ROOT .. "/.github")) do
+        local text = read(path)
+        for _, needle in ipairs({"cargo test", "cargo build", '"$cargo"', '"$rustc"', "build/rust", "nupp-rust-"}) do
+            assert(not text:find(needle, 1, true), path .. " still names " .. needle)
+        end
     end
-    assert(gate:find("hostembeddingtest", 1, true), "the gate does not link every host artifact from C")
+    assert(not dofile(ROOT .. "/tests/groups.lua")["rust-native-gate"], "the Rust-native gate group came back")
     assert(compiler:find("./bin/nupp fixpoint", 1, true), "the retained compiler matrix has no fixpoint gate")
     assert(
         countOccurrences(release, "./bin/nupp fixpoint --binary") == 2,

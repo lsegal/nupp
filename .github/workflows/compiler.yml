@@ -305,8 +305,7 @@ jobs:
       && needs.classify.outputs.integration-matrix != '[]'
     runs-on: ${{ matrix.os }}
     # A timeout is here to end a hang, so it has to sit above the work rather
-    # than across it. The Rust-native artifact gate precedes the broad suite;
-    # a cold runner must have time for both. A killed job also skips its post
+    # than across it. A cold runner must have time for the whole broad suite. A killed job also skips its post
     # steps, so it never saves the cache and would miss again next time.
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -364,22 +363,6 @@ jobs:
           restore-keys: |
             nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
 
-      # One identity for the Rust artifacts, shared by every job that builds
-      # them: the lock file, the toolchain file and the native sources. The
-      # feature sets differ between the GPU jobs and the platform gate, and the
-      # store is content-addressed, so a job that asked for a different set
-      # rebuilds what it needs and reuses the rest rather than starting empty.
-      - name: Restore the Rust build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
-          restore-keys: |
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-
-
       - name: Restore the content-validated compiler cache
         uses: actions/cache/restore@v4
         with:
@@ -403,6 +386,8 @@ jobs:
           restore-keys: |
             nupp-test-times-${{ runner.os }}-${{ runner.arch }}-
 
+      # `bin/nupp build` still compiles the host with Cargo until #8 removes
+      # it, so this stays; nothing in this workflow tests Rust code itself.
       - name: Install the ABI-compatible Windows Rust toolchain
         if: runner.os == 'Windows'
         shell: bash
@@ -518,14 +503,6 @@ jobs:
           NUPP_TEST_SH=$(cygpath -w "$sh_path") \
           ./bin/nupp test --fresh --scope=all --jobs=1 --group=windows-preflight
 
-      # Name the Rust-native release boundary before the broad suite. This runs
-      # each resource owner's stress/cancellation tests, the aggregate C ABI
-      # smoke, and C consumers of the executable, static application archive,
-      # and static/dynamic embedding SDKs on the retained platform itself.
-      - name: Gate the Rust-native platform artifacts
-        shell: bash
-        run: .github/scripts/test-rust-native-platform.sh
-
       # Keep the external corpus and the C importer explicit. A configured
       # corpus used to be absent and silently skipped, while an import-c failure
       # could be buried among thousands of unrelated cases. The broad suite
@@ -583,8 +560,8 @@ jobs:
       # The shared lane is excluded on Linux only, where the fast gate this job
       # depends on has already run it against the same revision.
       # hostbinarytest stamps this binary once and reuses it while it is newer
-      # than its sources. Stamped here, its host build -- a cargo build with
-      # LLVM linked in whenever the Rust cache is cold -- does not hold the
+      # than its sources. Stamped here, its host build -- Cargo, with LLVM
+      # linked in -- does not hold the
       # checkout's build lock while every other test's nupp waits on it.
       - name: Stamp the compiler binary
         if: runner.os != 'Linux'
@@ -602,12 +579,12 @@ jobs:
           set -euo pipefail
           ulimit -c unlimited || true
           ./bin/nupp test --fresh --scope=all --lane=isolated \
-            --exclude-group=external-corpus,rust-native-gate,measurement,wasm-conformance
+            --exclude-group=external-corpus,measurement,wasm-conformance
           if [ "$RUNNER_OS" != Linux ]; then
             ./bin/nupp test --fresh --scope=all --lane=shared \
-              --exclude-group=external-corpus,rust-native-gate,measurement,wasm-conformance
+              --exclude-group=external-corpus,measurement,wasm-conformance
             ./bin/nupp test --fresh --scope=all --lane=shell --jobs=2 \
-              --exclude-group=external-corpus,rust-native-gate,measurement,wasm-conformance
+              --exclude-group=external-corpus,measurement,wasm-conformance
           fi
 
       # A worker killed by a signal says which suite it was in, and on Linux it
@@ -683,11 +660,11 @@ jobs:
           NUPP_TEST_SH=$(cygpath -w "$sh_path")
           export NUPP_TEST_BASH NUPP_TEST_SH
           ./bin/nupp test --fresh --scope=all --lane=isolated \
-            --exclude-group=external-corpus,windows-preflight,rust-native-gate,measurement,wasm-conformance
+            --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
           ./bin/nupp test --fresh --scope=all --lane=shared \
-            --exclude-group=external-corpus,windows-preflight,rust-native-gate,measurement,wasm-conformance
+            --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
           ./bin/nupp test --fresh --scope=all --lane=shell --jobs=2 \
-            --exclude-group=external-corpus,windows-preflight,rust-native-gate,measurement,wasm-conformance
+            --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
 
       # What the suite saved, named in the log so a reader knows what the
       # artifact holds before downloading it. `aot-libraries.txt` beside these
@@ -917,22 +894,6 @@ jobs:
           restore-keys: |
             nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
 
-      # One identity for the Rust artifacts, shared by every job that builds
-      # them: the lock file, the toolchain file and the native sources. The
-      # feature sets differ between the GPU jobs and the platform gate, and the
-      # store is content-addressed, so a job that asked for a different set
-      # rebuilds what it needs and reuses the rest rather than starting empty.
-      - name: Restore the Rust build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
-          restore-keys: |
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-
-
       - name: Install the software Vulkan adapter
         run: |
           sudo apt-get update
@@ -955,21 +916,6 @@ jobs:
         id: gpu_conformance
         continue-on-error: true
         run: .github/scripts/test-gpu-conformance.sh
-
-      # A failed conformance step would otherwise skip actions/cache's post
-      # save the toolchain for every diagnostic commit. Preserve the expensive
-      # compiler build before turning the captured outcome back
-      # into the job's verdict.
-      - name: Save a failed conformance build
-        if: steps.gpu_conformance.outcome == 'failure'
-        uses: actions/cache/save@v4
-        continue-on-error: true
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
 
       - name: Report GPU conformance failure
         if: steps.gpu_conformance.outcome == 'failure'
@@ -995,22 +941,8 @@ jobs:
           restore-keys: |
             nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
 
-      # One identity for the Rust artifacts, shared by every job that builds
-      # them: the lock file, the toolchain file and the native sources. The
-      # feature sets differ between the GPU jobs and the platform gate, and the
-      # store is content-addressed, so a job that asked for a different set
-      # rebuilds what it needs and reuses the rest rather than starting empty.
-      - name: Restore the Rust build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
-          restore-keys: |
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-
-
+      # `bin/nupp build` still compiles the host with Cargo until #8 removes
+      # it, so this stays; nothing in this workflow tests Rust code itself.
       - name: Install the ABI-compatible Windows Rust toolchain
         shell: bash
         run: |

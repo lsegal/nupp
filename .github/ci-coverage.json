@@ -90,15 +90,6 @@
           ]
         },
         {
-          "name": "Gate the Rust-native platform artifacts",
-          "groups": ["rust-native-gate"],
-          "guarantees": [
-            "resource owner stress and cancellation",
-            "the aggregate C ABI",
-            "C consumers of the executable and both embedding SDKs"
-          ]
-        },
-        {
           "name": "Run the benchmark runner suite",
           "platforms": ["linux"],
           "groups": ["measurement"],
@@ -114,7 +105,7 @@
         {
           "name": "Run the compiler suite",
           "excludes": {
-            "groups": ["external-corpus", "windows-preflight", "rust-native-gate"],
+            "groups": ["external-corpus", "windows-preflight"],
             "lanes": ["shared"]
           },
           "guarantees": ["every suite an earlier step in this job did not run"]

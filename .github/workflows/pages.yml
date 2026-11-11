@@ -55,17 +55,6 @@ jobs:
           restore-keys: |
             pages-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Restore the Rust build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
-          restore-keys: |
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-
-
       - name: Restore the documentation rocks
         uses: actions/cache@v4
         with:
