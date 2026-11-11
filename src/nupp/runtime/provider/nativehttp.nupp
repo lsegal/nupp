@@ -844,12 +844,11 @@ record http.Client is BodyClient, contracts.Client
             error("nupp: HTTP pump timeoutms must be a non-negative integer", 2)
         end
         if not self._closed then
-            -- Snapshot, drain, and sleep on the shared readiness generation only when
-            -- nothing settled, so an event between the drain and the sleep still wakes
-            -- it.
+            -- Snapshot, drain, and sleep on the network reactor only when nothing
+            -- settled, so an event between the drain and the sleep still wakes it.
             native.snapshot()
             if self._native:poll() == 0 and waitMs > 0 then
-                native.sleep(waitMs)
+                self._native:wait(waitMs)
                 self._native:poll()
             end
         end
@@ -863,14 +862,21 @@ end
 function http.Client._retainSource(self: http.Client, context: suspension.Context): nil
     if self._source == nil then
         local backend = self._native
-        -- The client's events advance the readiness generation every native family
-        -- shares, so its waits sleep on that and drain the events when it moves.
+        -- The client's transfers move on the network reactor's sockets, so its waits
+        -- sleep there and drain the transfers when they move.
         self._source = suspension.source(
             "nupp-http",
             native.READINESS_PRIORITY,
-            native.pump(function(): integer
+            function(): integer
+                native.snapshot()
+
                 return backend:poll()
-            end)
+            end,
+            function(waitMs: integer): integer
+                backend:wait(waitMs)
+
+                return 0
+            end
         )
     end
     self._sourceUsers = self._sourceUsers + 1
