@@ -186,6 +186,7 @@ local function stringAt(L: voidptr, index: int32, borrows length: uint64*): uint
         end
         length[0] = lua_objlen(L, index)
     end
+
     return text as uint64
 end
 
@@ -197,6 +198,7 @@ local function lightAt(L: voidptr, index: int32): uint64
     if pointer == nil then
         return 0ULL
     end
+
     return pointer as uint64
 end
 
@@ -250,6 +252,7 @@ local function handleAt(L: voidptr, index: int32, name: cstring): uint64
     if pointer == nil then
         return 0ULL
     end
+
     return pointer as uint64
 end
 
@@ -260,6 +263,7 @@ local function pushHandle(L: voidptr, value: uint64, name: cstring, gc: function
     write64(handle, value)
     pushMetatable(L, name, gc)
     lua_setmetatable(L, -2)
+
     return handle
 end
 
@@ -274,6 +278,7 @@ local function accountGc(L: voidptr): int32
             write64(slot as uint64, 0ULL)
         end
     end
+
     return 0
 end
 
@@ -284,6 +289,7 @@ local function accountFind(L: voidptr): uint64
     if slot == nil then
         return 0ULL
     end
+
     return read64(slot as uint64)
 end
 
@@ -300,6 +306,7 @@ local function accountGet(L: voidptr): uint64
     lua_setfield(L, -2, "__gc")
     lua_setmetatable(L, -2)
     lua_setfield(L, REGISTRY, ACCOUNT_REGISTRY)
+
     return account
 end
 
@@ -336,6 +343,7 @@ local function regionGc(L: voidptr): int32
             write64(slot as uint64, 0ULL)
         end
     end
+
     return 0
 end
 
@@ -345,6 +353,7 @@ local function pushRegion(L: voidptr, block: uint64): uint64
     if block ~= 0ULL then
         accountCharge(L, block)
     end
+
     return handle
 end
 
@@ -359,6 +368,7 @@ local function regionAt(L: voidptr, index: int32): uint64
     if not same then
         return 0ULL
     end
+
     return read64(handle as uint64)
 end
 
@@ -371,6 +381,7 @@ local function builderGc(L: voidptr): int32
             write64(slot as uint64, 0ULL)
         end
     end
+
     return 0
 end
 
@@ -386,6 +397,7 @@ local function builderAt(L: voidptr, index: int32): uint64
     if not same then
         return 0ULL
     end
+
     return handle as uint64
 end
 
@@ -410,6 +422,7 @@ local function direction(key: uint64): int32
         end
     end
     channel.nuppHostEndpointRelease(endpoint)
+
     return answer
 end
 
@@ -422,6 +435,7 @@ local function endpointGc(L: voidptr): int32
             write64(handle, 0ULL)
         end
     end
+
     return 0
 end
 
@@ -440,6 +454,7 @@ local function messageOwnerGc(L: voidptr): int32
             write64(slot as uint64, 0ULL)
         end
     end
+
     return 0
 end
 
@@ -459,6 +474,7 @@ local function messageOwner(L: voidptr): uint64
     lua_setmetatable(L, -2)
     lua_pushvalue(L, -1)
     lua_setfield(L, REGISTRY, MESSAGE_IDLE)
+
     return owner
 end
 
@@ -544,6 +560,7 @@ local function movedPointer(L: voidptr, index: int32): uint64
             value = (value << 8) | (bytes[at] as uint64)
         end
     end
+
     return value
 end
 
@@ -638,6 +655,7 @@ local function readAttachments(L: voidptr, index: int32, raw: uint64): integer
         write64(slot + 16ULL, first as uint64)
         write64(slot + 24ULL, length as uint64)
     end
+
     return triples
 end
 
@@ -683,6 +701,7 @@ local function validAttachment(raw: uint64, index: integer): boolean
         channel.nuppHostEndpointRelease(endpoint)
         return valid
     end
+
     return false
 end
 
@@ -703,7 +722,9 @@ local function convertAttachments(raw: uint64, count: integer): uint64
         for index = 0, count - 1 do
             if rawKind(raw, index) == channel.ATTACHMENT_ENDPOINT then
                 for other = index + 1, count - 1 do
-                    if rawKind(raw, other) == channel.ATTACHMENT_ENDPOINT and rawBlock(raw, other) == rawBlock(raw, index) then
+                    if rawKind(raw, other) == channel.ATTACHMENT_ENDPOINT
+                        and rawBlock(raw, other) == rawBlock(raw, index)
+                    then
                         valid = false
                     end
                 end
@@ -764,6 +785,7 @@ local function convertAttachments(raw: uint64, count: integer): uint64
             write64(slot + 24ULL, rawLength(raw, index))
         end
     end
+
     return converted
 end
 
@@ -802,6 +824,7 @@ local function controlNew(): uint64
         c.dictionaryLock = lock as uint64
         c.dictionary = dictionary as uint64
     end
+
     return record as uint64
 end
 
@@ -843,6 +866,7 @@ local function controlPush(control: uint64, message: uint64): boolean
         return true
     end
     channel.nuppHostMessageDestroy(message)
+
     return false
 end
 
@@ -856,6 +880,7 @@ local function channelDestroy(L: voidptr): int32
     if control ~= 0ULL then
         controlRelease(control)
     end
+
     return 0
 end
 
@@ -864,6 +889,7 @@ local function channelClose(L: voidptr): int32
     if control ~= 0ULL then
         channel.nuppHostQueueClose(controlQueue(control))
     end
+
     return 0
 end
 
@@ -874,6 +900,7 @@ local function channelCount(L: voidptr): int32
         count = channel.nuppHostQueueCount(controlQueue(control))
     end
     lua_pushinteger(L, count)
+
     return 1
 end
 
@@ -888,6 +915,7 @@ local function channelClosed(L: voidptr): int32
     else
         lua_pushboolean(L, 0)
     end
+
     return 1
 end
 
@@ -897,6 +925,7 @@ local function pushAccepted(L: voidptr, accepted: boolean): int32
     else
         lua_pushboolean(L, 0)
     end
+
     return 1
 end
 
@@ -932,6 +961,7 @@ local function sendControl(
     if message == 0ULL then
         return false
     end
+
     return controlPush(control, message)
 end
 
@@ -944,21 +974,25 @@ local function channelPush(L: voidptr): int32
     local words = lengths as uint64
     local header = stringAt(L, 2, words as uint64*)
     local body = stringAt(L, 3, (words + 8ULL) as uint64*)
-    local accepted = control ~= 0ULL and header ~= 0ULL and body ~= 0ULL and sendControl(
-        control,
-        MESSAGE_BYTES,
-        0LL,
-        0,
-        header,
-        read64(words),
-        body,
-        read64(words + 8ULL),
-        0ULL,
-        0ULL,
-        0ULL,
-        0LL
-    )
+    local accepted = control ~= 0ULL
+        and header ~= 0ULL
+        and body ~= 0ULL
+        and sendControl(
+            control,
+            MESSAGE_BYTES,
+            0LL,
+            0,
+            header,
+            read64(words),
+            body,
+            read64(words + 8ULL),
+            0ULL,
+            0ULL,
+            0ULL,
+            0LL
+        )
     free(lengths as voidptr)
+
     return pushAccepted(L, accepted)
 end
 
@@ -985,7 +1019,9 @@ local function pushScalar(L: voidptr, kind: int32, task: boolean, stringValue: b
     else
         value = lua_tonumber(L, valueIndex)
     end
-    local accepted = control ~= 0ULL and (not task or (module ~= 0ULL and member ~= 0ULL)) and (not stringValue or text ~= 0ULL)
+    local accepted = control ~= 0ULL
+        and (not task or (module ~= 0ULL and member ~= 0ULL))
+        and (not stringValue or text ~= 0ULL)
     if accepted then
         accepted = sendControl(
             control,
@@ -1003,6 +1039,7 @@ local function pushScalar(L: voidptr, kind: int32, task: boolean, stringValue: b
         )
     end
     free(lengths as voidptr)
+
     return pushAccepted(L, accepted)
 end
 
@@ -1045,6 +1082,7 @@ local function attachmentsFor(L: voidptr, index: int32, borrows array: uint64*):
     @unsafe do
         array[0] = converted
     end
+
     return count
 end
 
@@ -1098,6 +1136,7 @@ local function pushBuffer(L: voidptr, kind: int32, task: boolean): int32
     end
     releaseListedEndpoints(L, attachmentsIndex)
     free(lengths as voidptr)
+
     return pushAccepted(L, accepted)
 end
 
@@ -1160,6 +1199,7 @@ local function dictRegister(L: voidptr): int32
     else
         lua_pushinteger(L, answer)
     end
+
     return 1
 end
 
@@ -1175,6 +1215,7 @@ local function dictCount(L: voidptr): int32
         end
     end
     lua_pushinteger(L, count)
+
     return 1
 end
 
@@ -1202,6 +1243,7 @@ local function dictAddress(L: voidptr): int32
     else
         lua_pushlstring(L, address as voidptr, size)
     end
+
     return 1
 end
 
@@ -1250,7 +1292,11 @@ local function channelPop(L: voidptr): int32
         end
         if kind == MESSAGE_NUMBER_TASK or kind == MESSAGE_NUMBER_REPLY then
             lua_pushnumber(L, channel.nuppHostMessageNumber(message))
-        elseif kind == MESSAGE_STRING_TASK or kind == MESSAGE_STRING_REPLY or kind == MESSAGE_BUFFER_TASK or kind == MESSAGE_BUFFER_REPLY then
+        elseif kind == MESSAGE_STRING_TASK
+            or kind == MESSAGE_STRING_REPLY
+            or kind == MESSAGE_BUFFER_TASK
+            or kind == MESSAGE_BUFFER_REPLY
+        then
             pushMessageBytes(L, message, 2)
         else
             lua_pushnil(L)
@@ -1265,6 +1311,7 @@ local function channelPop(L: voidptr): int32
     end
     channel.nuppHostMessageDestroy(message)
     write64(owner, 0ULL)
+
     return 7
 end
 
@@ -1292,6 +1339,7 @@ local function tasksNew(): uint64
         t.lock = lock as uint64
         t.table = table
     end
+
     return record as uint64
 end
 
@@ -1454,7 +1502,16 @@ local function laneMain(argument: uint64): voidptr?
     setPhase(lane, LANE_RUNNING)
     @unsafe do
         local host = l.host as Host*
-        local status = state.nuppHostStateRun(L as voidptr, record, host.payload, host.length, "=nupp-worker" as uint64, 0ULL, 0ULL, 0)
+        local status = state.nuppHostStateRun(
+            L as voidptr,
+            record,
+            host.payload,
+            host.length,
+            "=nupp-worker" as uint64,
+            0ULL,
+            0ULL,
+            0
+        )
         if status ~= 0 then
             laneFailWith(lane, "", record)
         end
@@ -1474,6 +1531,7 @@ local function laneMain(argument: uint64): voidptr?
         state.nuppHostStateClose(L as voidptr)
         state.nuppHostStateCallFree(record)
     end
+
     return nil
 end
 
@@ -1563,6 +1621,7 @@ local function workerSpawn(L: voidptr): int32
         end
     end
     pushLight(L, lane)
+
     return 1
 end
 
@@ -1603,6 +1662,7 @@ local function workerJoin(L: voidptr): int32
         end
     end
     laneFree(lane)
+
     return 2
 end
 
@@ -1617,6 +1677,7 @@ local function pushPair(L: voidptr, first: boolean, second: boolean): int32
     else
         lua_pushboolean(L, 0)
     end
+
     return 2
 end
 
@@ -1655,6 +1716,7 @@ local function taskCreate(L: voidptr): int32
         end
     end
     unlockTasks(tasks)
+
     return pushAccepted(L, created)
 end
 
@@ -1681,6 +1743,7 @@ local function taskCancel(L: voidptr): int32
         unlockTasks(tasks)
     end
     lua_pushinteger(L, answer)
+
     return 1
 end
 
@@ -1711,6 +1774,7 @@ local function taskStart(L: voidptr): int32
         end
         unlockTasks(tasks)
     end
+
     return pushPair(L, run, late)
 end
 
@@ -1736,6 +1800,7 @@ local function taskCheckpoint(L: voidptr): int32
         end
         unlockTasks(tasks)
     end
+
     return pushPair(L, cancelled, late)
 end
 
@@ -1761,6 +1826,7 @@ local function taskFinish(L: voidptr): int32
         end
         unlockTasks(tasks)
     end
+
     return pushPair(L, cancelled, late)
 end
 
@@ -1778,6 +1844,7 @@ local function taskRelease(L: voidptr): int32
         end
         unlockTasks(tasks)
     end
+
     return 0
 end
 
@@ -1797,6 +1864,7 @@ local function taskStatus(L: voidptr): int32
         unlockTasks(tasks)
     end
     lua_pushinteger(L, answer)
+
     return 1
 end
 
@@ -1820,7 +1888,11 @@ end
 local function endpointCreate(L: voidptr): int32
     local messages = lua_tonumber(L, 1)
     local bytes = lua_tonumber(L, 2)
-    if lua_type(L, 1) ~= TNUMBER or lua_type(L, 2) ~= TNUMBER or not wholeNumber(messages, 2147483647) or not wholeNumber(bytes, LARGEST_EXACT) then
+    if lua_type(L, 1) ~= TNUMBER
+        or lua_type(L, 2) ~= TNUMBER
+        or not wholeNumber(messages, 2147483647)
+        or not wholeNumber(bytes, LARGEST_EXACT)
+    then
         return luaL_error(L, "nupp: channel limits must be positive finite integers within host limits")
     end
     -- Both Lua owners exist before either native owner does.
@@ -1845,6 +1917,7 @@ local function endpointCreate(L: voidptr): int32
     end
     write64(sender, sendKey)
     write64(receiver, receiveKey)
+
     return 2
 end
 
@@ -1862,6 +1935,7 @@ local function endpointClose(L: voidptr): int32
             write64(handle, 0ULL)
         end
     end
+
     return 0
 end
 
@@ -1875,6 +1949,7 @@ local function transferKey(key: uint64): uint64
     if successor == 0ULL then
         return 0ULL
     end
+
     return channel.nuppHostEndpointRegister(successor)
 end
 
@@ -1895,6 +1970,7 @@ local function endpointMove(L: voidptr): int32
     write64(moved, successor)
     channel.nuppHostEndpointDiscard(key)
     write64(handle, 0ULL)
+
     return 1
 end
 
@@ -1932,6 +2008,7 @@ local function endpointSend(L: voidptr): int32
         end
     end
     lua_pushinteger(L, status as int64)
+
     return 1
 end
 
@@ -1945,6 +2022,7 @@ local function endpointDirection(L: voidptr): int32
         end
     end
     lua_pushinteger(L, answer as int64)
+
     return 1
 end
 
@@ -1960,8 +2038,19 @@ local function endpointWaitOrReady(L: voidptr, wait: boolean): int32
     if handle ~= 0ULL then
         key = read64(handle)
     end
-    local sized = lua_type(L, 2) == TNUMBER and finite(size) and size >= 0 and math.floor(size) == size and size <= LARGEST_EXACT
-    local timed = not wait or (lua_type(L, 3) == TNUMBER and finite(timeout) and timeout >= -1 and timeout <= 2147483647 and math.floor(timeout) == timeout)
+    local sized = lua_type(L, 2) == TNUMBER
+        and finite(size)
+        and size >= 0
+        and math.floor(size) == size
+        and size <= LARGEST_EXACT
+    local timed = not wait
+        or (
+            lua_type(L, 3) == TNUMBER
+            and finite(timeout)
+            and timeout >= -1
+            and timeout <= 2147483647
+            and math.floor(timeout) == timeout
+        )
     if key ~= 0ULL and sized and timed then
         local endpoint = channel.nuppHostEndpointBorrow(key)
         if endpoint ~= 0ULL then
@@ -1979,6 +2068,7 @@ local function endpointWaitOrReady(L: voidptr, wait: boolean): int32
         end
     end
     lua_pushinteger(L, status as int64)
+
     return 1
 end
 
@@ -2026,6 +2116,7 @@ local function endpointReceive(L: voidptr): int32
         channel.nuppHostMessageDestroy(message)
         write64(owner, 0ULL)
     end
+
     return 3
 end
 
@@ -2047,6 +2138,7 @@ local function anchorClose(L: voidptr): int32
             write64(handle, 0ULL)
         end
     end
+
     return 0
 end
 
@@ -2061,6 +2153,7 @@ local function endpointAnchor(L: voidptr): int32
         return luaL_error(L, "nupp: invalid channel resource")
     end
     write64(handle, key)
+
     return 1
 end
 
@@ -2080,6 +2173,7 @@ local function pendingClose(L: voidptr): int32
             end
         end
     end
+
     return 0
 end
 
@@ -2136,6 +2230,7 @@ local function pendingFill(L: voidptr): int32
     end
     releaseListedEndpoints(L, 3)
     free(slots as voidptr)
+
     return pushAccepted(L, read64(handle) ~= 0ULL)
 end
 
@@ -2150,6 +2245,7 @@ local function pendingOffer(L: voidptr): int32
         write64(message, 0ULL)
     end
     lua_pushinteger(L, status as int64)
+
     return 1
 end
 
@@ -2164,6 +2260,7 @@ local function pendingSize(L: voidptr): int32
     else
         lua_pushnumber(L, size as number)
     end
+
     return 1
 end
 
@@ -2187,6 +2284,7 @@ local function pendingTake(L: voidptr): int32
         channel.nuppHostMessageDestroy(message)
         write64(owner, 0ULL)
     end
+
     return 2
 end
 
@@ -2211,6 +2309,7 @@ local function regionFromString(L: voidptr): int32
     end
     pushRegion(L, block)
     lua_pushinteger(L, size as int64)
+
     return 2
 end
 
@@ -2262,6 +2361,7 @@ local function regionReadFile(L: voidptr): int32
     end
     free(message as voidptr)
     free(slots as voidptr)
+
     return 2
 end
 
@@ -2280,6 +2380,7 @@ local function regionText(L: voidptr): int32
         local start = region.nuppHostRegionData(block) + ((first - 1LL) as uint64)
         lua_pushlstring(L, start as voidptr, (last - first + 1LL) as uint64)
     end
+
     return 1
 end
 
@@ -2290,6 +2391,7 @@ local function regionPointer(L: voidptr): int32
     else
         pushLight(L, region.nuppHostRegionData(block))
     end
+
     return 1
 end
 
@@ -2300,6 +2402,7 @@ local function regionLength(L: voidptr): int32
     else
         lua_pushinteger(L, region.nuppHostRegionLength(block) as int64)
     end
+
     return 1
 end
 
@@ -2314,6 +2417,7 @@ local function builderRelease(L: voidptr): int32
             write64(handle, 0ULL)
         end
     end
+
     return 0
 end
 
@@ -2327,6 +2431,7 @@ local function builderNew(L: voidptr): int32
     end
     pushMetatable(L, BUILDER_METATABLE, builderGc)
     lua_setmetatable(L, -2)
+
     return 1
 end
 
@@ -2358,6 +2463,7 @@ local function builderAppend(L: voidptr): int32
     local accepted = builder ~= 0ULL and data ~= 0ULL and region.nuppHostBuilderAppend(builder, data, size)
     pushAccepted(L, accepted)
     pushOpen(L, builder, accepted)
+
     return 2
 end
 
@@ -2374,13 +2480,17 @@ local function builderReserve(L: voidptr): int32
         pushLight(L, pointer)
     end
     pushOpen(L, builder, pointer ~= 0ULL)
+
     return 2
 end
 
 local function builderCommit(L: voidptr): int32
     local builder = builderOf(builderAt(L, 1))
     local written = lua_tointeger(L, 2)
-    return pushAccepted(L, builder ~= 0ULL and written >= 0LL and region.nuppHostBuilderCommit(builder, written as uint64))
+    return pushAccepted(
+        L,
+        builder ~= 0ULL and written >= 0LL and region.nuppHostBuilderCommit(builder, written as uint64)
+    )
 end
 
 local function builderFreeze(L: voidptr): int32
@@ -2396,6 +2506,7 @@ local function builderFreeze(L: voidptr): int32
     end
     pushRegion(L, block)
     lua_pushinteger(L, region.nuppHostRegionLength(block) as int64)
+
     return 2
 end
 
@@ -2406,6 +2517,7 @@ local function accounted(L: voidptr): int32
         charged = region.nuppHostAccounted(account)
     end
     lua_pushinteger(L, charged as int64)
+
     return 1
 end
 
@@ -2456,6 +2568,7 @@ export function nuppHostWorkersOpen(L: voidptr): int32
     field(L, "workerTaskStatus", taskStatus)
     field(L, "current", current)
     field(L, "workerParallelism", parallelism)
+
     return 1
 end
 
@@ -2473,6 +2586,7 @@ export function nuppHostWorkersOpenSharedBytes(L: voidptr): int32
     field(L, "builderFreeze", builderFreeze)
     field(L, "builderRelease", builderRelease)
     field(L, "accounted", accounted)
+
     return 1
 end
 
@@ -2488,6 +2602,7 @@ export function nuppHostWorkersHost(payload: uint64, length: uint64): uint64
         h.payload = payload
         h.length = length
     end
+
     return record as uint64
 end
 
@@ -2501,7 +2616,8 @@ local function install(L: voidptr): int32
         lua_pushlightuserdata(L, (record as Install*).host as voidptr)
     end
     lua_setfield(L, GLOBALS, "__nuppWorkerHost")
-    state.nuppHostStateAddFeature(L, @unsafe ((record as Install*).call), "workers")
+    state.nuppHostStateAddFeature(L, @unsafe((record as Install*).call), "workers")
+
     return 0
 end
 
@@ -2528,5 +2644,6 @@ export function nuppHostWorkersEnable(borrows L: voidptr, record: uint64, host: 
         lua_settop(L, -2)
         state.nuppHostStateFail(record, "cannot install the Nupp worker adapter")
     end
+
     return status
 end

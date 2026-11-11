@@ -271,7 +271,12 @@ end
 
 --- The bytes of the file at `path`, allocated, with their count written to
 --- `length[0]`; or nil, with the reason written to `message`.
-export function nuppHostSysReadFile(borrows path: cstring, borrows length: int64*, borrows message: voidptr, capacity: uint64): voidptr?
+export function nuppHostSysReadFile(
+    borrows path: cstring,
+    borrows length: int64*,
+    borrows message: voidptr,
+    capacity: uint64
+): voidptr?
     local file = fopen(path, "rb")
     if file == nil then
         nuppHostSysLastError(message, capacity)
@@ -427,7 +432,12 @@ end
 
 --- The process's arguments as byte strings: their addresses in `texts[0]` and
 --- their lengths in `lengths[0]`, both allocated. The count, or -1.
-export function nuppHostSysArguments(argc: int32, borrows argv: cstring*, borrows texts: voidptr*, borrows lengths: voidptr*): int32
+export function nuppHostSysArguments(
+    argc: int32,
+    borrows argv: cstring*,
+    borrows texts: voidptr*,
+    borrows lengths: voidptr*
+): int32
     local count = argc as uint64
     local addresses = calloc(count + 1ULL, 8ULL) as voidptr*
     local sizes = calloc(count + 1ULL, 8ULL) as uint64*

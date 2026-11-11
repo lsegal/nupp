@@ -117,6 +117,7 @@ local function recordOf(borrows L: voidptr): uint64
     if pointer == nil then
         return 0ULL
     end
+
     return pointer as uint64
 end
 
@@ -148,7 +149,13 @@ local function raiseJitLimits(borrows L: voidptr)
 end
 
 --- Installs `source` as `package.preload[module]`, loaded under `name`.
-local function preloadSource(borrows L: voidptr, record: uint64, borrows module: cstring, borrows source: cstring, borrows name: cstring): boolean
+local function preloadSource(
+    borrows L: voidptr,
+    record: uint64,
+    borrows module: cstring,
+    borrows source: cstring,
+    borrows name: cstring
+): boolean
     local status = luaL_loadbuffer(L, source as voidptr, strlen(source), name)
     if status ~= 0 then
         capture(L, record, status)
@@ -163,11 +170,16 @@ local function preloadSource(borrows L: voidptr, record: uint64, borrows module:
     lua_pushvalue(L, -3)
     lua_setfield(L, -2, module)
     lua_settop(L, -4)
+
     return true
 end
 
 --- Installs `opener` as `package.preload[module]`.
-export function nuppHostStatePreload(borrows L: voidptr, borrows module: cstring, opener: function(L: voidptr): int32): nil
+export function nuppHostStatePreload(
+    borrows L: voidptr,
+    borrows module: cstring,
+    opener: function(L: voidptr): int32
+): nil
     lua_getfield(L, GLOBALS, "package")
     lua_getfield(L, -1, "preload")
     lua_pushcclosure(L, opener, 0)
@@ -187,6 +199,7 @@ local function addFeature(borrows L: voidptr, record: uint64, borrows name: void
     lua_pushboolean(L, 1)
     lua_rawset(L, -3)
     lua_settop(L, -3)
+
     return true
 end
 
@@ -210,7 +223,7 @@ local function addFeatures(borrows L: voidptr, record: uint64, borrows list: cst
         end
         if ends then
             if at > start then
-                local first = @unsafe (((list as uint64) + (start as uint64)) as voidptr)
+                local first = @unsafe(((list as uint64) + (start as uint64)) as voidptr)
                 if not addFeature(L, record, first, (at - start) as uint64) then
                     return false
                 end
@@ -219,6 +232,7 @@ local function addFeatures(borrows L: voidptr, record: uint64, borrows list: cst
         end
         at = at + 1
     end
+
     return true
 end
 
@@ -263,6 +277,7 @@ local function setup(L: voidptr): int32
             lua_setfield(L, GLOBALS, "__NUPP_EXECUTABLE")
         end
     end
+
     return 0
 end
 
@@ -278,6 +293,7 @@ local function setWorkerContext(L: voidptr): int32
     end
     lua_pushstring(L, "nupp.workers")
     lua_setfield(L, GLOBALS, "__nuppWorkerEntry")
+
     return 0
 end
 
@@ -294,6 +310,7 @@ local function clearWorkerContext(L: voidptr): int32
     rawClear(L, "__nuppWorkerOut")
     rawClear(L, "__nuppWorkerTasks")
     rawClear(L, "__nuppWorkerEntry")
+
     return 0
 end
 
@@ -321,6 +338,7 @@ local function run(L: voidptr): int32
             capture(L, record, status)
         end
     end
+
     return 0
 end
 
@@ -348,6 +366,7 @@ export function nuppHostStateCall(): uint64
     if record == nil then
         return 0ULL
     end
+
     return record as uint64
 end
 
@@ -388,17 +407,25 @@ export function nuppHostStateOpen(record: uint64, executable: uint64): voidptr?
         lua_close(L as voidptr)
         return nil
     end
+
     return L
 end
 
 --- Names the queues and task table a worker state's scheduler reads.
-export function nuppHostStateSetWorkerContext(borrows L: voidptr, record: uint64, inbox: uint64, outbox: uint64, tasks: uint64): int32
+export function nuppHostStateSetWorkerContext(
+    borrows L: voidptr,
+    record: uint64,
+    inbox: uint64,
+    outbox: uint64,
+    tasks: uint64
+): int32
     local call = record as Call*
     @unsafe do
         call.inbox = inbox
         call.outbox = outbox
         call.tasks = tasks
     end
+
     return nuppHostStateProtect(L, record, setWorkerContext)
 end
 
@@ -430,6 +457,7 @@ export function nuppHostStateRun(
         call.argumentLengths = lengths
         call.argumentCount = count
     end
+
     return nuppHostStateProtect(L, record, run)
 end
 

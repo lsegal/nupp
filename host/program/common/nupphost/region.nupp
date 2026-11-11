@@ -66,6 +66,7 @@ export function nuppHostRegionAdopt(data: uint64, length: uint64): uint64
         r.data = data
         r.length = length
     end
+
     return record as uint64
 end
 
@@ -78,6 +79,7 @@ export function nuppHostRegionNew(data: uint64, length: uint64): uint64
     if length ~= 0ULL then
         memcpy(copy as voidptr, data as voidptr, length)
     end
+
     return nuppHostRegionAdopt(copy as uint64, length)
 end
 
@@ -127,6 +129,7 @@ export function nuppHostBuilderNew(): uint64
     if record == nil then
         return 0ULL
     end
+
     return record as uint64
 end
 
@@ -178,6 +181,7 @@ local function ensure(builder: uint64, wanted: uint64, exact: boolean): boolean
         b.data = grown as uint64
         b.capacity = capacity
     end
+
     return true
 end
 
@@ -198,6 +202,7 @@ export function nuppHostBuilderAppend(builder: uint64, data: uint64, length: uin
         end
         b.length = b.length + length
     end
+
     return true
 end
 
@@ -241,6 +246,7 @@ export function nuppHostBuilderCommit(builder: uint64, written: uint64): boolean
         b.length = b.reservedStart + written
         b.open = 0
     end
+
     return true
 end
 
@@ -278,6 +284,7 @@ export function nuppHostAccountNew(): uint64
     @unsafe do
         a.blocks = blocks
     end
+
     return record as uint64
 end
 

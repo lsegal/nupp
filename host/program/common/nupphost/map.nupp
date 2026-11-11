@@ -48,6 +48,7 @@ export function nuppHostMapNew(): uint64
         m.buckets = buckets as uint64
         m.capacity = 16LL
     end
+
     return record as uint64
 end
 
@@ -83,6 +84,7 @@ local function find(map: uint64, key: uint64): uint64
             node = (node as Node*).next
         end
     end
+
     return 0ULL
 end
 
@@ -126,6 +128,7 @@ local function grow(map: uint64): boolean
         end
         free(old as voidptr)
     end
+
     return true
 end
 
@@ -154,6 +157,7 @@ export function nuppHostMapPut(map: uint64, key: uint64, value: uint64): boolean
         local m = map as Map*
         m.count = m.count + 1LL
     end
+
     return true
 end
 
@@ -181,6 +185,7 @@ export function nuppHostMapRemove(map: uint64, key: uint64): uint64
             node = (node as Node*).next
         end
     end
+
     return 0ULL
 end
 
@@ -197,5 +202,6 @@ export function nuppHostMapTakeAny(map: uint64, borrows key: uint64*): uint64
             end
         end
     end
+
     return 0ULL
 end

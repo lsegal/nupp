@@ -13,7 +13,12 @@ cdef function snprintf(borrows buffer: voidptr, size: uint64, borrows format: cs
 
 cdef function AcquireSRWLockExclusive(borrows lock: voidptr)
 cdef function ReleaseSRWLockExclusive(borrows lock: voidptr)
-cdef function SleepConditionVariableSRW(borrows condition: voidptr, borrows lock: voidptr, milliseconds: uint32, flags: uint32): int32
+cdef function SleepConditionVariableSRW(
+    borrows condition: voidptr,
+    borrows lock: voidptr,
+    milliseconds: uint32,
+    flags: uint32
+): int32
 cdef function WakeConditionVariable(borrows condition: voidptr)
 cdef function WakeAllConditionVariable(borrows condition: voidptr)
 cdef function CreateThread(
@@ -68,9 +73,21 @@ cdef function CreateFileW(
     attributes: uint32,
     borrows template: voidptr?
 ): voidptr
-cdef function ReadFile(borrows file: voidptr, borrows buffer: voidptr, count: uint32, borrows read: uint32*, borrows overlapped: voidptr?): int32
+cdef function ReadFile(
+    borrows file: voidptr,
+    borrows buffer: voidptr,
+    count: uint32,
+    borrows read: uint32*,
+    borrows overlapped: voidptr?
+): int32
 cdef function GetStdHandle(which: uint32): voidptr?
-cdef function WriteFile(borrows file: voidptr, borrows buffer: voidptr, count: uint32, borrows written: uint32*, borrows overlapped: voidptr?): int32
+cdef function WriteFile(
+    borrows file: voidptr,
+    borrows buffer: voidptr,
+    count: uint32,
+    borrows written: uint32*,
+    borrows overlapped: voidptr?
+): int32
 cdef function GetCommandLineW(): voidptr
 cdef function CommandLineToArgvW(borrows line: voidptr, borrows count: int32*): voidptr?
 cdef function LocalFree(borrows memory: voidptr): voidptr?
@@ -132,6 +149,7 @@ export function nuppHostSysWaitMs(borrows condition: voidptr, borrows mutex: voi
     if SleepConditionVariableSRW(condition, mutex, math.u32.wrap(bounded as integer), 0) ~= 0 then
         return false
     end
+
     return (GetLastError() as uint64) == ERROR_TIMEOUT
 end
 
@@ -165,16 +183,17 @@ export function nuppHostSysMonotonicNs(): uint64
     local slot = value as int64*
     if frequency <= 0LL then
         QueryPerformanceFrequency(slot)
-        frequency = @unsafe (slot[0])
+        frequency = @unsafe(slot[0])
         if frequency <= 0LL then
             frequency = 1LL
         end
     end
     QueryPerformanceCounter(slot)
-    local ticks = @unsafe (slot[0] as uint64)
+    local ticks = @unsafe(slot[0] as uint64)
     free(slot as voidptr)
     local rate = frequency as uint64
     -- ticks * 1e9 / rate, without the product overflowing.
+
     return (ticks // rate) * 1000000000ULL + ((ticks % rate) * 1000000000ULL) // rate
 end
 
@@ -195,11 +214,12 @@ export function nuppHostSysParallelism(): int64
         return 1LL
     end
     GetSystemInfo(info as voidptr)
-    local count = @unsafe (((info as uint64 + 32ULL) as uint32*)[0] as int64)
+    local count = @unsafe(((info as uint64 + 32ULL) as uint32*)[0] as int64)
     free(info as voidptr)
     if count < 1LL then
         return 1LL
     end
+
     return count
 end
 
@@ -245,6 +265,7 @@ local function narrow(borrows wide: voidptr, count: int32, borrows length: uint6
             (length as uint64*)[0] = size as uint64
         end
     end
+
     return text
 end
 
@@ -259,6 +280,7 @@ local function widen(borrows text: cstring): voidptr?
         return nil
     end
     MultiByteToWideChar(CP_UTF8, 0, text as voidptr, -1, wide as voidptr, units)
+
     return wide
 end
 
@@ -283,18 +305,32 @@ export function nuppHostSysExecutable(): voidptr?
         free(wide as voidptr)
         capacity = capacity * 2ULL
     end
+
     return nil
 end
 
 --- The bytes of the file at the UTF-8 `path`, allocated, with their count
 --- written to `length[0]`; or nil, with the reason written to `message`.
-export function nuppHostSysReadFile(borrows path: cstring, borrows length: int64*, borrows message: voidptr, capacity: uint64): voidptr?
+export function nuppHostSysReadFile(
+    borrows path: cstring,
+    borrows length: int64*,
+    borrows message: voidptr,
+    capacity: uint64
+): voidptr?
     local wide = widen(path)
     if wide == nil then
         snprintf(message, capacity, "the path is not valid UTF-8")
         return nil
     end
-    local file = CreateFileW(wide as voidptr, GENERIC_READ, FILE_SHARE_ALL, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nil)
+    local file = CreateFileW(
+        wide as voidptr,
+        GENERIC_READ,
+        FILE_SHARE_ALL,
+        nil,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nil
+    )
     free(wide as voidptr)
     if (file as uint64) == INVALID_HANDLE then
         nuppHostSysLastError(message, capacity)
@@ -322,7 +358,7 @@ export function nuppHostSysReadFile(borrows path: cstring, borrows length: int64
             failed = true
             break
         end
-        local step = @unsafe ((read as uint32*)[0] as uint64)
+        local step = @unsafe((read as uint32*)[0] as uint64)
         if step == 0ULL then
             break
         end
@@ -345,6 +381,7 @@ export function nuppHostSysReadFile(borrows path: cstring, borrows length: int64
     @unsafe do
         length[0] = size as int64
     end
+
     return buffer
 end
 
@@ -368,7 +405,7 @@ export function nuppHostSysWriteError(borrows bytes: voidptr, count: uint64): ni
         if WriteFile(handle as voidptr, target, math.u32.wrap(step as integer), written as uint32*, nil) == 0 then
             break
         end
-        local wrote = @unsafe ((written as uint32*)[0] as uint64)
+        local wrote = @unsafe((written as uint32*)[0] as uint64)
         if wrote == 0ULL then
             break
         end
@@ -380,13 +417,18 @@ end
 --- The process's arguments as UTF-8 byte strings, from Windows' own command
 --- line rather than the ANSI `argv`: their addresses in `texts[0]` and their
 --- lengths in `lengths[0]`, both allocated. The count, or -1.
-export function nuppHostSysArguments(argc: int32, borrows argv: cstring*, borrows texts: voidptr*, borrows lengths: voidptr*): int32
+export function nuppHostSysArguments(
+    argc: int32,
+    borrows argv: cstring*,
+    borrows texts: voidptr*,
+    borrows lengths: voidptr*
+): int32
     local found = calloc(1ULL, 8ULL) as int32*?
     if found == nil then
         return -1
     end
     local wide = CommandLineToArgvW(GetCommandLineW(), found as int32*)
-    local count = @unsafe ((found as int32*)[0])
+    local count = @unsafe((found as int32*)[0])
     free(found as voidptr)
     if wide == nil then
         return -1
@@ -417,6 +459,7 @@ export function nuppHostSysArguments(argc: int32, borrows argv: cstring*, borrow
         lengths[0] = sizes as voidptr
     end
     LocalFree(wide as voidptr)
+
     return count
 end
 
