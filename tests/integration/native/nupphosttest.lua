@@ -628,10 +628,35 @@ local function writeHost(bytes)
     -- macOS runs only a signed image; signing puts the signature after the
     -- trailer, which is where a signed host looks for it.
     if jit.os == "OSX" then
-        assert(os.execute("codesign --force --sign - " .. quote(output) .. " 2>/dev/null") == 0)
+        local status, why = run("codesign --force --sign - " .. quote(output))
+        assert(status == 0, why)
     end
 
     return output
+end
+
+--- `stamped`, for an image `writeHost` will sign. The stub is signed already,
+--- and Apple's signer refuses bytes after a signature, so on macOS the stub is
+--- first stamped unsigned the way packaging does it, its __LINKEDIT grown over
+--- the payload, and only the trailer's fields are damaged afterwards.
+local function damagedStamp(image, payload, fields)
+    if jit.os ~= "OSX" then
+        return stamped(image, payload, fields)
+    end
+    local unsigned = temporary() .. "/unsigned"
+    local written, problem = packaging.stampFile(unsigned, image, payload, "aarch64-apple-darwin", 0)
+    assert(written, problem)
+    local text = read(unsigned)
+    local good = text:sub(-48)
+    local trailer = good:sub(1, 8)
+        .. (fields.version or good:sub(9, 12))
+        .. (fields.flags or good:sub(13, 16))
+        .. (fields.offset or good:sub(17, 24))
+        .. (fields.length or good:sub(25, 32))
+        .. (fields.digest or good:sub(33, 40))
+        .. good:sub(41, 48)
+
+    return text:sub(1, -49) .. trailer
 end
 
 function M.anUnstampedHostAsksForAFile()
@@ -703,7 +728,7 @@ function M.aDamagedStampIsRefusedRatherThanRun()
         {{digest = ("\0"):rep(8)}, "does not match the digest"},
     }
     for _, case in ipairs(cases) do
-        local host = writeHost(stamped(image, "print('the payload ran')", case[1]))
+        local host = writeHost(damagedStamp(image, "print('the payload ran')", case[1]))
         local status, output = run(quote(host))
         assert(status == 1, output)
         assert(output:find("^nupp: ") and output:find(case[2], 1, true), output)
