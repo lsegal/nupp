@@ -449,7 +449,17 @@ function M.nativeRuntimeMeasurementsArePortableAndNonThresholded()
     assert(measure:find("./bin/nupp build", 1, true), "clean measurement runners do not stage root modules")
     assert(measure:find("bench/native-runtime/run.sh", 1, true))
     assert(measure:find("bench/native-runtime/resource.sh", 1, true))
-    assert(measure:find("features=base,filesystem,http,net,uri", 1, true))
+    -- Net and HTTP are Nupp since #142; the provider build names only features
+    -- the provider crate still defines.
+    local features = measure:match("\nfeatures=([%w,%-]+)\n")
+    assert(features == "base,uri", "the measured provider build changed its features: " .. tostring(features))
+    local providerFeatures = read(ROOT .. "/native/crates/native/Cargo.toml"):match("\n%[features%]\n(.-)\n%[")
+    for feature in features:gmatch("[^,]+") do
+        assert(
+            providerFeatures:find("\n" .. feature .. " = ", 1, true),
+            "the measured provider build names a feature the provider lacks: " .. feature
+        )
+    end
     assert(measure:find('benchmark.exe', 1, true), "Windows benchmark size does not resolve the executable suffix")
     assert(measure:find("observations, not", 1, true), "hosted-runner timings are not identified as observations")
     assert(peer:find("READY ${httpPort} ${tcpPort}", 1, true), "the peer does not publish one coherent ready event")
