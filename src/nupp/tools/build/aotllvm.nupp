@@ -933,7 +933,7 @@ function aotllvm.nativeProgram(
         listed = output .. ((selected as llvmProfile.Profile).format == "coff" and ".def" or ".exports")
         local listWrote, listErr = fs.writeFile(
             listed as string,
-            llvmProfile.exportList(selected as llvmProfile.Profile, how.exports as {string})
+            llvmProfile.exportList(selected as llvmProfile.Profile, how.exports as {string}, llvmProfile.publicData(ir))
         )
         if not listWrote then
             os.remove(object)
