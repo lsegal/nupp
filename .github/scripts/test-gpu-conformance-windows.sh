@@ -15,9 +15,21 @@ export WGPU_BACKEND=dx12
 export NUPP_REQUIRE_GPU=1
 export NUPP_EXPECT_GPU_BACKEND=dx12
 
+# `tests/run` refuses to start on Windows without Git Bash named, the same way
+# the Windows matrix job names it. Keep a caller's choice when it made one.
+bash_path=$(command -v bash)
+sh_path=$(dirname "$bash_path")/sh.exe
+test -f "$sh_path"
+NUPP_TEST_BASH=${NUPP_TEST_BASH:-$(cygpath -w "$bash_path")}
+NUPP_TEST_SH=${NUPP_TEST_SH:-$(cygpath -w "$sh_path")}
+export NUPP_TEST_BASH NUPP_TEST_SH
+
 # First cross the wgpu-native boundary with a small WGSL compute kernel.
 "$root/bin/nupp" build
-"$root/bin/nupp" test gpudevicetest
+# In this process rather than through a Nupp worker: a shared worker lane
+# started from here never reports on Windows, and the job then runs out its
+# whole timeout with the suite unrun.
+"$root/bin/nupp" test --shard=gpudevicetest
 
 # Then cross the public Nupp API with compiler-emitted SPIR-V and compare the
 # GPU result against the AOT CPU body emitted from the same source.
