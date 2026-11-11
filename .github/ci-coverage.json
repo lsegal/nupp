@@ -186,6 +186,24 @@
         }
       ]
     },
+    "prebuilt-native-program": {
+      "platforms": ["linux"],
+      "selectedBy": "always",
+      "steps": [
+        {
+          "name": "Bootstrap the compiler",
+          "guarantees": ["a checkout without Cargo or LLVM bootstraps the compiler from the pinned prebuilt provider"]
+        },
+        {
+          "name": "Link and run a native program",
+          "guarantees": ["a checkout without Cargo or LLVM links and runs a native program with the pinned prebuilt assets"]
+        },
+        {
+          "name": "Require that Cargo never ran",
+          "guarantees": ["bootstrapping and linking a native program never invoke Cargo or rustc"]
+        }
+      ]
+    },
     "required-ci": {
       "platforms": ["linux"],
       "selectedBy": "always",

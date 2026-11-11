@@ -97,19 +97,24 @@ STAGE0_URL='https://github.com/lsegal/nupp/releases/download/${STAGE0_TAG}/nupp-
 # zero they are fetched, verified and cached by digest, never compiled against,
 # so moving them rebuilds nothing native.
 #
+# The code generator is a whole provider (`base`, `uri` and `codegen`), so a
+# checkout that cannot run Cargo also starts the compiler on it: `native-rust`
+# answers with it when Cargo is missing or NUPP_PREBUILT_PROVIDER=1. A release
+# whose archive predates that carries no `features` file and is refused there.
+#
 # The digests are of the archives as published. An empty tag or digest means no
 # release carrying the assets is pinned for that platform yet, and a checkout
 # there keeps needing its own LLVM. `stage0-assets.yml` publishes them into a
 # release and prints the lines to paste here.
-PREBUILT_TAG=v0.0.15-nupp-prebuilt.1
+PREBUILT_TAG=v0.0.15-nupp-prebuilt.2
 PREBUILT_CODEGEN_URL='https://github.com/lsegal/nupp/releases/download/${PREBUILT_TAG}/nupp-codegen-${PREBUILT_TARGET}.tar.gz'
 PREBUILT_KIT_URL='https://github.com/lsegal/nupp/releases/download/${PREBUILT_TAG}/nupp-kit-${PREBUILT_TARGET}.tar.gz'
-PREBUILT_CODEGEN_SHA256_LINUX_X86_64=3bbae5fc47b35d263923695639304b4c8b8f43c5c808372f46d32b065f640a13
-PREBUILT_CODEGEN_SHA256_MACOS_AARCH64=64d962b2d494ba83fd0201575741c2bfc8347dd6602d7b907535c371ad9ee914
-PREBUILT_CODEGEN_SHA256_WINDOWS_X86_64=633c8b06e26c06d9eefd33774f4c6ecd7eac44e1d21b76dc6983909e13f00e9a
+PREBUILT_CODEGEN_SHA256_LINUX_X86_64=b10b72b201afc796417a892710894e3c2634f2cdd4f38884203713fe4744ffa1
+PREBUILT_CODEGEN_SHA256_MACOS_AARCH64=5da3b29b9332048ab526b9532e140b540896098df82c0089b914add248fc0b20
+PREBUILT_CODEGEN_SHA256_WINDOWS_X86_64=09f6a6d11c213d4f06473f20ea5d6f59bd2579b776ab3824a8497e7ed2fe4952
 PREBUILT_KIT_SHA256_LINUX_X86_64=d2d48e3c9a24a49b141742add5684d399787a9f9602a1837defb1d718ca396ea
-PREBUILT_KIT_SHA256_MACOS_AARCH64=a7985e221c049e5533c7f82f9a9416429bc1b9cde25e03a49d80638f10f2f512
-PREBUILT_KIT_SHA256_WINDOWS_X86_64=9f8773c972916021ce72d88551a679a93694c7371bb0c508fc1f0b53e168a516
+PREBUILT_KIT_SHA256_MACOS_AARCH64=c2b706d96b34ca107b30f407bc40f781428e1ebd83b20aa5e119ff911d0004e0
+PREBUILT_KIT_SHA256_WINDOWS_X86_64=a2656944c6c2b14afd1aa3e2853291295508d8f39f3be9858a6eed5450628fd1
 
 # Opt-in browser guest inputs. These do not change the native toolchain key.
 # The guest image is built from these sources; no unpublished image is pinned.
