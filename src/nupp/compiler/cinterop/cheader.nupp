@@ -604,7 +604,9 @@ end
 
 adoptStruct = function(tag, aggregateKind)
     aggregateKind = aggregateKind or "struct"
-    local key = aggregateKind .. " " .. tag
+    -- Keyed as a checked program means the tag, so a tag adopted from the process
+    -- before a checked block declared it does not stand in for that block's own.
+    local key = cdecl.checked(aggregateKind .. " " .. tag)
     local hit = adopted[key]
     if hit then
         return hit
@@ -640,7 +642,7 @@ adoptStruct = function(tag, aggregateKind)
 end
 
 export function typeFromString(spec: string, resolver: Resolver?): T.Type?, string?
-    local model, err = cdecl.typeFromString(spec)
+    local model, err = cdecl.typeFromString(cdecl.checked(spec))
     if not model then
         return nil, err
     end
