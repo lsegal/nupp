@@ -398,60 +398,20 @@ function M.darwinExactRustToolsCarryTheirSysrootRuntime()
     assert(driver:find('export DYLD_FALLBACK_LIBRARY_PATH', 1, true))
 end
 
-function M.gpuConformanceIsValidPosixShell()
+-- GPU conformance built the host that runs it with Rust, same as the LuaJIT
+-- 2.1 rolling integration jobs did: see issue #139. Both were turned off
+-- rather than reworked, because that host build is not a separable step --
+-- it is how the product under test gets built -- and stay off until #1/#8
+-- remove the Rust build and toolchain requirement. This guards the turn-off
+-- itself: the scripts and the job are gone, and nothing silently rewires them
+-- back in without also rewiring Rust provisioning back in.
+function M.gpuConformanceIsTurnedOffPendingSelfHosting()
     for _, name in ipairs({"test-gpu-conformance.sh", "test-gpu-conformance-windows.sh"}) do
-        local script = ROOT .. "/.github/scripts/" .. name
-        assert(os.execute("sh -n " .. quote(script)) == 0, name .. " is not valid POSIX shell")
+        assert(not io.open(ROOT .. "/.github/scripts/" .. name, "rb"), name .. " still exists")
     end
     local workflow = read(ROOT .. "/.github/workflows/compiler.yml")
-    local linux = read(ROOT .. "/.github/scripts/test-gpu-conformance.sh")
-    local windows = read(ROOT .. "/.github/scripts/test-gpu-conformance-windows.sh")
-    local gemm = read(ROOT .. "/bench/wgpu-spike/gemm-api.lua")
-    local typedGemm = read(ROOT .. "/bench/wgpu-spike/typed/gemm.nupp")
-    assert(workflow:find("GPU conformance / Windows DX12", 1, true), "the compiler matrix has no Windows GPU gate")
-    assert(windows:find("WGPU_BACKEND=dx12", 1, true), "Windows GPU conformance does not force DX12")
-    assert(windows:find('cygpath -m "$root"', 1, true), "Windows GPU conformance passes POSIX paths to LuaJIT")
-    assert(windows:find("$lua_root/build/?.lua", 1, true), "Windows GPU conformance omits compiled Nupp modules")
-    assert(linux:find("$root/build/?.lua", 1, true), "Linux GPU conformance omits compiled Nupp modules")
-    assert(windows:find("NUPP_REQUIRE_GPU=1", 1, true), "Windows GPU conformance allows adapter absence")
-    assert(
-        windows:find("export NUPP_TEST_BASH NUPP_TEST_SH", 1, true)
-            and windows:find('cygpath -w "$bash_path"', 1, true),
-        "Windows GPU conformance leaves tests/run without Git Bash"
-    )
-    assert(windows:find("gemm-api.lua", 1, true), "Windows GPU conformance does not cross the public Nupp API")
-    assert(typedGemm:find('os.monotonic', 1, true), "GPU conformance omits its packaged clock dependency")
-    assert(gemm:find("generated.now()", 1, true), "GPU conformance does not use its packaged benchmark clock")
-    for name, script in pairs({linux = linux, windows = windows}) do
-        assert(
-            script:find('"$root/bin/nupp" test gpudevicetest', 1, true)
-                or script:find('"$root/bin/nupp" test --shard=gpudevicetest', 1, true),
-            name .. " does not cross wgpu-native"
-        )
-        assert(script:find("counted-wgsl.lua", 1, true), name .. " does not execute the emitted WGSL")
-        assert(script:find("NUPP_WGPU_LIBRARY", 1, true), name .. " leaves LuaJIT without wgpu-native")
-        assert(
-            not script:find("cargo test", 1, true) and not script:find("cargo\" test", 1, true),
-            name .. " still tests a Rust GPU crate"
-        )
-    end
-end
-
--- Measurements live in their own workflow. A benchmark harness that does not
--- compile is still a bug, and this is where it is caught; what it must not do
--- is decide the result of an unrelated change, which is why these read
--- `measurements.yml` rather than the gate.
-function M.gpuConformanceStaysInTheMergeGate()
-    -- No Rust provider is built with or without the GPU any more, so there is
-    -- nothing to measure; the conformance gate stays where merging depends on it.
-    local workflow = read(ROOT .. "/.github/workflows/measurements.yml")
-    assert(not workflow:find("gpu-provider", 1, true), "measurements still build a GPU provider")
-    local gate = read(ROOT .. "/.github/workflows/compiler.yml")
-    assert(gate:find(".github/scripts/test-gpu-conformance.sh", 1, true), "Vulkan conformance left the merge gate")
-    assert(
-        gate:find(".github/scripts/test-gpu-conformance-windows.sh", 1, true),
-        "DX12 conformance left the merge gate"
-    )
+    assert(not workflow:find("GPU conformance", 1, true), "the compiler matrix still runs a GPU conformance job")
+    assert(not workflow:find("test-gpu-conformance", 1, true), "the compiler matrix still names a GPU conformance script")
 end
 
 function M.nativeRuntimeMeasurementsArePortableAndNonThresholded()

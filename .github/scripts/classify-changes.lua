@@ -169,13 +169,8 @@ local rules = {
 classifier.jobs = {
     "docs-site",
     "fast-checks",
-    "linux-integration",
-    "macos-integration",
-    "windows-integration",
     "portable-compiler",
     "browser-wasm",
-    "gpu-linux",
-    "gpu-windows",
     "fixpoint",
 }
 
@@ -255,15 +250,6 @@ function classifier.classify(paths)
         or surfaces.evals
     if source then
         select(jobs, "fast-checks", "source changed", reasons)
-        select(jobs, "linux-integration", "source changed", reasons)
-    end
-
-    -- Shared compiler and runtime code, platform code, packaging and test
-    -- changes are the ones whose behaviour differs between operating systems.
-    if surfaces.compiler or surfaces.native or surfaces.packaging or surfaces.tests or surfaces.cli then
-        local why = "shared compiler, runtime, packaging or test code changed"
-        select(jobs, "macos-integration", why, reasons)
-        select(jobs, "windows-integration", why, reasons)
     end
 
     -- SIMD remains an affected surface for the repository-owned local fleet.
@@ -281,11 +267,6 @@ function classifier.classify(paths)
     -- Worker's default settings, and by the nightly backstop.
     if surfaces.browser then
         select(jobs, "browser-wasm", "browser or Wasm delivery changed", reasons)
-    end
-    if surfaces.gpu or surfaces.compiler or surfaces.native then
-        local why = "GPU sources or a stage beneath them changed"
-        select(jobs, "gpu-linux", why, reasons)
-        select(jobs, "gpu-windows", why, reasons)
     end
 
     return {surfaces = surfaces, jobs = jobs, reasons = reasons}

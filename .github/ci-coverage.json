@@ -52,66 +52,6 @@
         }
       ]
     },
-    "integration": {
-      "platforms": ["linux", "macos", "windows"],
-      "selectedBy": "linux-integration, macos-integration, windows-integration",
-      "steps": [
-        {
-          "name": "Run compat-checked output across Lua runtimes",
-          "platforms": ["linux"],
-          "compilerModes": ["compat-lua51", "lua51", "lua52", "lua53", "lua54", "luajit"],
-          "guarantees": ["compatibility-checked output runs on every supported Lua"]
-        },
-        {
-          "name": "Run the Lua 5.1 compatibility corpus",
-          "platforms": ["linux"],
-          "compilerModes": ["luajit", "compat-lua51", "O0", "O1", "O2"],
-          "guarantees": ["ordinary compatibility output runs on stock Lua 5.1 without legacy lowering"]
-        },
-        {
-          "name": "Compare ordinary and compat-checked generation",
-          "platforms": ["linux"],
-          "compilerModes": ["luajit", "compat-lua51"],
-          "guarantees": ["one library builds normally and for the checked Lua 5.1 subset"]
-        },
-        {
-          "name": "Check the compiler",
-          "platforms": ["macos", "windows"],
-          "compilerModes": ["strict"],
-          "guarantees": ["the checker's answer is not platform-dependent"]
-        },
-        {
-          "name": "Run the Windows native and launcher preflight",
-          "platforms": ["windows"],
-          "groups": ["windows-preflight"],
-          "guarantees": [
-            "the Windows Rust host ABI contract",
-            "a Windows loader failure names its last case"
-          ]
-        },
-        {
-          "name": "Run the benchmark runner suite",
-          "platforms": ["linux"],
-          "groups": ["measurement"],
-          "guarantees": [
-            "the benchmark runner's process boundary: listing, selection, replication and the pilot"
-          ]
-        },
-        {
-          "name": "Run the tl.lua oracle and import-c fixtures",
-          "groups": ["external-corpus"],
-          "guarantees": ["the external parser oracle and the C importer"]
-        },
-        {
-          "name": "Run the compiler suite",
-          "excludes": {
-            "groups": ["external-corpus", "windows-preflight"],
-            "lanes": ["shared"]
-          },
-          "guarantees": ["every suite an earlier step in this job did not run"]
-        }
-      ]
-    },
     "fixpoint": {
       "platforms": ["linux"],
       "selectedBy": "fixpoint",
@@ -164,26 +104,6 @@
         "the LuaJIT compiler and application runtime execute in the browser guest",
         "browser applications and templates run in Chromium",
         "the generated Pages artifact builds"
-      ]
-    },
-    "gpu-conformance": {
-      "platforms": ["linux"],
-      "selectedBy": "gpu-linux",
-      "steps": [
-        {
-          "name": "Run exact GPU dispatch and readback",
-          "guarantees": ["exact Vulkan dispatch and readback on a software adapter"]
-        }
-      ]
-    },
-    "gpu-conformance-windows": {
-      "platforms": ["windows"],
-      "selectedBy": "gpu-windows",
-      "steps": [
-        {
-          "name": "Run exact DX12 dispatch and readback",
-          "guarantees": ["exact DX12 dispatch and readback"]
-        }
       ]
     },
     "required-ci": {

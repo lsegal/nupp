@@ -38,16 +38,11 @@ local function everyJob()
     return classifier().jobs
 end
 
-function M.compilerChangeSelectsEveryPlatformAndFixpoint()
+function M.compilerChangeSelectsFixpointAndThePortableCompiler()
     selects("src/nupp/compiler/check/callexpr.nupp", {
         "fast-checks",
-        "linux-integration",
-        "macos-integration",
-        "windows-integration",
         "fixpoint",
         "portable-compiler",
-        "gpu-linux",
-        "gpu-windows",
     })
 end
 
@@ -109,7 +104,7 @@ function M.finalApiRootsPreserveTheirExistingCorrectnessObligations()
 end
 
 function M.aotChangeSelectsAotAndFixpoint()
-    selects("src/nupp/compiler/aot/lower.nupp", {"fast-checks", "linux-integration", "fixpoint"})
+    selects("src/nupp/compiler/aot/lower.nupp", {"fast-checks", "fixpoint"})
 end
 
 function M.localFleetInputsRemainAnExplicitSimdSurface()
@@ -186,12 +181,12 @@ function M.unrelatedSourcesStayOutsideTheSimdSurface()
 end
 
 function M.runtimeChangeSelectsBrowserAndNativeCoverage()
-    selects("src/nupp/runtime/tasks.nupp", {"fast-checks", "linux-integration", "portable-compiler", "fixpoint"})
+    selects("src/nupp/runtime/tasks.nupp", {"fast-checks", "portable-compiler", "fixpoint"})
 end
 
 function M.browserChangeSelectsThePortableCompilerAndTheWasmJob()
     selects("scripts/pages-cache.mjs", {"docs-site", "browser-wasm"})
-    selects("runtime/wasm/loader.js", {"fast-checks", "linux-integration", "portable-compiler", "browser-wasm"})
+    selects("runtime/wasm/loader.js", {"fast-checks", "portable-compiler", "browser-wasm"})
     selects("editors/playground/src/worker.ts", {"browser-wasm"})
     selects("templates/browser/nupp.lua", {"browser-wasm"})
 end
@@ -202,12 +197,7 @@ function M.wasmOnlyFixturesSelectTheJobThatRunsThem()
     selects("tests/integration/browser/wasm-aot/project/src/main.nupp", {"browser-wasm"})
     selects("tests/integration/browser/wasm-aot/simd-project/src/main.nupp", {"browser-wasm"})
     selects("tests/integration/browser/luajit/prepare-packaged.mjs", {"browser-wasm"})
-    selects("tests/integration/simd/primitives.lua", {
-        "browser-wasm",
-        "linux-integration",
-        "macos-integration",
-        "windows-integration"
-    })
+    selects("tests/integration/simd/primitives.lua", {"browser-wasm"})
     selects("src/nupp/compiler/aot/compile.nupp", {"browser-wasm"})
     selects("src/nupp/tools/build/aot.nupp", {"browser-wasm"})
     selects("src/simd.nupp", {"browser-wasm"})
@@ -220,42 +210,33 @@ function M.anOrdinaryCompilerChangeDoesNotPayForEmscripten()
     doesNotSelect("src/nupp/compiler/check/callexpr.nupp", {"browser-wasm"})
 end
 
-function M.gpuChangeSelectsBothAdapters()
-    selects("src/nupp/gpu/kernel.nupp", {"gpu-linux", "gpu-windows", "fast-checks", "linux-integration"})
-    selects("src/io/gpu/kernel.nupp", {"gpu-linux", "gpu-windows", "fast-checks", "linux-integration"})
+-- The GPU and native-integration surfaces no longer map to a GitHub job: the
+-- `LuaJIT 2.1 rolling` integration jobs and the GPU conformance jobs needed
+-- Rust to build the product under test, so they were turned off pending
+-- #1/#8 (see issue #139). The surfaces themselves remain real, and still
+-- select what a change of any kind gets: the fast checker.
+function M.gpuChangeSelectsTheFastChecker()
+    selects("src/nupp/gpu/kernel.nupp", {"fast-checks"})
+    selects("src/io/gpu/kernel.nupp", {"fast-checks"})
 end
 
-function M.nativeChangeSelectsEveryPlatform()
-    selects("native/nupp-native/src/http.rs", {
-        "fast-checks",
-        "linux-integration",
-        "macos-integration",
-        "windows-integration",
-        "gpu-linux",
-        "gpu-windows",
-        "fixpoint",
-    })
+function M.nativeChangeSelectsTheFastCheckerAndFixpoint()
+    selects("native/nupp-native/src/http.rs", {"fast-checks", "fixpoint"})
 end
 
-function M.packagingChangeSelectsEveryPlatform()
-    selects("templates/library/nupp.lua", {"linux-integration", "macos-integration", "windows-integration"})
+function M.packagingChangeSelectsTheFastChecker()
+    selects("templates/library/nupp.lua", {"fast-checks"})
 end
 
-function M.testHarnessChangeSelectsEveryPlatform()
-    selects("tests/tools/lsp/lsptest.lua", {
-        "fast-checks",
-        "linux-integration",
-        "macos-integration",
-        "windows-integration"
-    })
+function M.testHarnessChangeSelectsTheFastChecker()
+    selects("tests/tools/lsp/lsptest.lua", {"fast-checks"})
 end
 
 -- `scripts/toolchain` decides what every job is built with, and general CI
--- orchestration decides what every job is. The four self-contained SIMD
--- workflow inputs above are the deliberate exception.
-function M.compatibilityCorpusSelectsItsStockInterpreterJob()
-    selects("tests/integration/compat/lua51/src/main.nupp", {"linux-integration", "portable-compiler"})
-    selects("scripts/lua51-compat-corpus.sh", {"linux-integration", "portable-compiler"})
+-- orchestration decides what every job is.
+function M.compatibilityCorpusSelectsThePortableCompiler()
+    selects("tests/integration/compat/lua51/src/main.nupp", {"portable-compiler"})
+    selects("scripts/lua51-compat-corpus.sh", {"portable-compiler"})
 end
 
 function M.toolchainAndWorkflowChangesSelectEverything()
@@ -292,11 +273,6 @@ function M.documentationOnlyChangesProvisionNoPlatform()
         selects(path, {"docs-site"})
         doesNotSelect(path, {
             "fast-checks",
-            "linux-integration",
-            "macos-integration",
-            "windows-integration",
-            "gpu-linux",
-            "gpu-windows",
             "fixpoint",
             "portable-compiler",
             "browser-wasm",
@@ -309,7 +285,7 @@ end
 function M.aMixedChangeTakesTheUnionOfItsPaths()
     local jobs = jobsFor("docs/reference/language.md", "src/nupp/gpu/kernel.nupp")
     test(jobs["docs-site"], "the documentation obligation should survive")
-    test(jobs["gpu-linux"], "the GPU obligation should survive")
+    test(jobs["fast-checks"], "the GPU-adjacent source obligation should survive")
 end
 
 function M.everyJobTheClassifierKnowsIsSelectableByEverything()
