@@ -35,10 +35,45 @@ const LIBRARY_KEY = "__nuppNativeLibrary"
 --- @export
 native.BUFFER_TOO_SMALL = 6
 
+-- Keeps a loaded provider mapped until the process exits.
+--
+-- `ffi.load` unloads its library when the namespace is collected, and closing a
+-- Lua state collects everything in no particular order. A finalizer that calls
+-- into the provider -- the wake handle's close, a file or process owner -- can
+-- then run after the library is gone and jump into unmapped code. Taking one more
+-- reference that nothing ever releases keeps the provider's code there for every
+-- finalizer, whatever order the state closes in. Best effort: a platform that
+-- cannot be asked keeps the old behaviour.
+local function pin(loaded: any): any
+    pcall(function(): nil
+        local address = ffi.cast("const void *", loaded.nuppNativeAbiVersion)
+        if ffi.os == "Windows" then
+            ffi.cdef[[
+            int GetModuleHandleExA(uint32_t flags, const void *name, void **module);
+            ]]
+            -- GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN
+            ffi.C.GetModuleHandleExA(5, address, ffi.new("void *[1]"))
+        else
+            ffi.cdef[[
+            typedef struct { const char *fname; void *fbase; const char *sname; void *saddr; } nupp_native_dl_info;
+            int dladdr(const void *address, nupp_native_dl_info *info);
+            void *dlopen(const char *path, int mode);
+            ]]
+            local info = ffi.new("nupp_native_dl_info")
+            if ffi.C.dladdr(address, info) ~= 0 and info.fname ~= nil then
+                -- RTLD_NOW. The handle is never closed, which is the point.
+                ffi.C.dlopen(info.fname, 2)
+            end
+        end
+    end)
+
+    return loaded
+end
+
 local function open(): any
     local wanted = os.getenv("NUPP_NATIVE_LIBRARY")
     if wanted then
-        return ffi.load(wanted)
+        return pin(ffi.load(wanted))
     end
     local source = debug.getinfo(1, "S").source
     local root = source:match("^@(.+)/[^/]+$") or "."
@@ -46,7 +81,7 @@ local function open(): any
     for _, base in ipairs({root, root .. "/..", root .. "/../.."}) do
         local found, value = pcall(ffi.load, base .. library)
         if found then
-            return value
+            return pin(value)
         end
     end
 
@@ -65,7 +100,7 @@ local function open(): any
     -- Repeat the canonical location outside pcall so the loader's diagnostic is
     -- retained when neither a packaged nor a statically linked provider exists.
 
-    return ffi.load(root .. library)
+    return pin(ffi.load(root .. library))
 end
 
 local function library(): any
