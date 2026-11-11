@@ -1578,4 +1578,186 @@ function M.aRunWaitingOnALockSaysWhoHoldsIt()
     os.execute("rm -rf " .. quote(directory))
 end
 
+-- A checkout copy whose prebuilt pins name a code generator and a link kit this
+-- suite made for Linux x86-64, fetched by a `curl` that answers from a table of
+-- hosts and logs each URL it was asked for. What the release host serves is the
+-- case's to say: "codegen" and "kit" are the archives, anything else is served
+-- as is. Each archive's digest is pinned unless `pinned` replaces it.
+local function prebuiltFixture(serves, pinned)
+    local directory = temporary()
+    local root = directory .. "/root"
+    local bin = directory .. "/bin"
+    for _, path in ipairs({
+        root .. "/scripts/patches",
+        bin,
+        directory .. "/codegen",
+        directory .. "/kit",
+        directory .. "/served",
+        directory .. "/supplied",
+    }) do
+        assert(os.execute("mkdir -p " .. quote(path)) == 0)
+    end
+    write(directory .. "/codegen/libnupp_native.so", "a provider with the code generator\n")
+    write(directory .. "/kit/kit.json", '{"target": "x86_64-unknown-linux-gnu"}\n')
+    write(directory .. "/kit/libluajit-5.1.a", "a static LuaJIT\n")
+    local digests = {}
+    for _, kind in ipairs({"codegen", "kit"}) do
+        local tarball = directory .. "/nupp-" .. kind .. "-x86_64-unknown-linux-gnu.tar.gz"
+        assert(os.execute("tar czf " .. quote(tarball) .. " -C " .. quote(directory .. "/" .. kind) .. " .") == 0)
+        local digestCommand = "{ shasum -a 256 2>/dev/null || sha256sum; } < " .. quote(tarball) .. " | cut -c1-64"
+        local pipe = assert(io.popen("sh -c " .. quote(digestCommand)))
+        digests[kind] = pipe:read("*l")
+        pipe:close()
+        assert(digests[kind] and #digests[kind] == 64, "cannot digest the fixture " .. kind)
+    end
+    pinned = pinned or {}
+
+    local pinsText = read(ROOT .. "/scripts/toolchain.pins")
+        :gsub("\nPREBUILT_TAG=[^\n]*", "\nPREBUILT_TAG=v9.9.9")
+        :gsub(
+            "\nPREBUILT_CODEGEN_URL=[^\n]*",
+            "\nPREBUILT_CODEGEN_URL='https://release.invalid/${PREBUILT_TAG}/nupp-codegen-${PREBUILT_TARGET}.tar.gz'"
+        )
+        :gsub(
+            "\nPREBUILT_KIT_URL=[^\n]*",
+            "\nPREBUILT_KIT_URL='https://release.invalid/${PREBUILT_TAG}/nupp-kit-${PREBUILT_TARGET}.tar.gz'"
+        )
+        :gsub("\nPREBUILT_CODEGEN_SHA256_LINUX_X86_64=[^\n]*", "\nPREBUILT_CODEGEN_SHA256_LINUX_X86_64="
+            .. (pinned.codegen or digests.codegen))
+        :gsub("\nPREBUILT_KIT_SHA256_LINUX_X86_64=[^\n]*", "\nPREBUILT_KIT_SHA256_LINUX_X86_64="
+            .. (pinned.kit or digests.kit))
+    local driver = root .. "/scripts/toolchain"
+    write(driver, read(DRIVER))
+    write(root .. "/scripts/toolchain.pins", pinsText)
+    write(root .. "/scripts/patches/luajit.patch", read(ROOT .. "/scripts/patches/luajit.patch"))
+    for host, what in pairs(serves) do
+        local served = what
+        if what == "codegen" or what == "kit" then
+            served = read(directory .. "/nupp-" .. what .. "-x86_64-unknown-linux-gnu.tar.gz")
+        end
+        write(directory .. "/served/" .. host, served)
+    end
+    write(
+        bin .. "/curl",
+        [[#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output) destination=$2; shift ;;
+        -*) ;;
+        *) url=$1 ;;
+    esac
+    shift
+done
+printf '%s\n' "$url" >> "$NUPP_TEST_SERVED/log"
+name=${url##*/}
+[ -f "$NUPP_TEST_SERVED/$name" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+cp "$NUPP_TEST_SERVED/$name" "$destination"
+]]
+    )
+    assert(os.execute("chmod +x " .. quote(driver) .. " " .. quote(bin .. "/curl")) == 0)
+    local compiler = fakeCompiler(directory, "fake-cc", "fixed")
+
+    return {
+        directory = directory,
+        driver = driver,
+        digests = digests,
+        environment = {
+            NUPP_TOOLCHAIN_DIR = forPath(directory .. "/cache"),
+            NUPP_CC = compiler,
+            NUPP_CXX = compiler,
+            NUPP_TEST_SERVED = directory .. "/served",
+            PATH = forPath(bin) .. ":$PATH",
+        },
+    }
+end
+
+local function served(fixture)
+    local log = io.open(fixture.directory .. "/served/log", "rb")
+    local asked = log and log:read("*a") or ""
+    if log then
+        log:close()
+    end
+
+    return asked
+end
+
+-- A clean checkout fetches the pinned code generator from the release that
+-- published it, checks it against the digest beside the stage-zero pin, and
+-- answers with the provider library unpacked under that digest. The second
+-- ask is a cache hit: nothing is fetched again.
+function M.thePrebuiltCodeGeneratorIsFetchedVerifiedAndCached()
+    local fixture = prebuiltFixture({["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"})
+    local status, output = run(fixture.environment, "prebuilt-codegen x86_64-unknown-linux-gnu", fixture.driver)
+    assert(status == 0, "the pinned code generator was not fetched:\n" .. output)
+    local library = assert(output:match("([^\n]+)%s*$"))
+    assert(
+        library:find("/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so", 1, true),
+        "the code generator was not installed under its digest:\n" .. output
+    )
+    assert(read(fixture.directory .. "/cache/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so")
+        == "a provider with the code generator\n", "the unpacked library is not the published one")
+    assert(
+        served(fixture) == "https://release.invalid/v9.9.9/nupp-codegen-x86_64-unknown-linux-gnu.tar.gz\n",
+        "the code generator was not fetched from its pin:\n" .. served(fixture)
+    )
+
+    os.remove(fixture.directory .. "/served/nupp-codegen-x86_64-unknown-linux-gnu.tar.gz")
+    local again, againOutput = run(fixture.environment, "prebuilt-codegen x86_64-unknown-linux-gnu", fixture.driver)
+    assert(again == 0, "a cached code generator was fetched again:\n" .. againOutput)
+    assert(select(2, served(fixture):gsub("\n", "")) == 1, "a cached code generator was fetched again")
+    os.execute("rm -rf " .. quote(fixture.directory))
+end
+
+-- An offline builder supplies the kit under the name the release publishes it
+-- by, and it is held to the same digest as a download.
+function M.thePrebuiltKitComesFromTheSourceDirectoryOffline()
+    local fixture = prebuiltFixture({})
+    assert(os.execute(("cp %s %s"):format(
+        quote(fixture.directory .. "/nupp-kit-x86_64-unknown-linux-gnu.tar.gz"),
+        quote(fixture.directory .. "/supplied/")
+    )) == 0)
+    fixture.environment.NUPP_HOST_SOURCE_DIR = fixture.directory .. "/supplied"
+    fixture.environment.NUPP_HOST_OFFLINE = "1"
+    local status, output = run(fixture.environment, "prebuilt-kit x86_64-unknown-linux-gnu", fixture.driver)
+    assert(status == 0, "the supplied kit was not used:\n" .. output)
+    local kit = assert(output:match("([^\n]+)%s*$"))
+    assert(kit:find("/prebuilt/kit/" .. fixture.digests.kit .. "$"), "the kit directory was not printed:\n" .. output)
+    assert(read(fixture.directory .. "/cache/prebuilt/kit/" .. fixture.digests.kit .. "/kit.json"):find(
+        "x86_64-unknown-linux-gnu", 1, true
+    ), "the kit was not unpacked")
+    assert(served(fixture) == "", "an offline build reached the network:\n" .. served(fixture))
+    os.execute("rm -rf " .. quote(fixture.directory))
+end
+
+-- A release asset whose bytes are not the pinned ones is refused, and nothing
+-- of it is cached for a later command to trust.
+function M.aPrebuiltCodeGeneratorWithAnotherDigestIsRefused()
+    local expected = string.rep("0", 64)
+    local fixture = prebuiltFixture(
+        {["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"},
+        {codegen = expected}
+    )
+    local status, output = run(fixture.environment, "prebuilt-codegen x86_64-unknown-linux-gnu", fixture.driver)
+    assert(status ~= 0, "a code generator with another digest was used:\n" .. output)
+    assert(output:find("expected " .. expected .. "; refusing", 1, true), "the refusal does not say why:\n" .. output)
+    assert(io.open(fixture.directory .. "/cache/prebuilt/codegen/" .. expected, "rb") == nil,
+        "a refused code generator was installed")
+    assert(io.open(fixture.directory .. "/cache/archives/nupp-codegen-x86_64-unknown-linux-gnu.tar.gz", "rb") == nil,
+        "a refused code generator was left in the archive cache")
+    os.execute("rm -rf " .. quote(fixture.directory))
+end
+
+-- A platform nothing is pinned for says so and fetches nothing, so a checkout
+-- there goes on to its own LLVM. Moving the pins rebuilds nothing native: they
+-- are fetched, like stage zero, and kept out of the native key.
+function M.anUnpinnedPrebuiltIsRefusedWithoutAFetch()
+    local fixture = prebuiltFixture({["nupp-kit-aarch64-unknown-linux-gnu.tar.gz"] = "kit"})
+    local status, output = run(fixture.environment, "prebuilt-kit aarch64-unknown-linux-gnu", fixture.driver)
+    assert(status ~= 0, "an unpinned kit was handed out:\n" .. output)
+    assert(output:find("no prebuilt link kit is pinned for aarch64-unknown-linux-gnu", 1, true), output)
+    assert(served(fixture) == "", "an unpinned kit was fetched:\n" .. served(fixture))
+    os.execute("rm -rf " .. quote(fixture.directory))
+    assert(read(DRIVER):find("-e '^PREBUILT_'", 1, true), "a prebuilt pin bump rebuilds the native toolchain")
+end
+
 return M

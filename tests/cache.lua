@@ -38,6 +38,34 @@ function M.flags(arguments)
     return table.concat(flags, "\0")
 end
 
+-- `command -v` answers in the shell's spelling. Under Git Bash on Windows that
+-- is `/c/...` or `/usr/bin/sh`, without the `.exe`, which no native file API
+-- opens: every lookup then read as a missing executable.
+local function locate(name)
+    local function quote(value)
+        return "'" .. value:gsub("'", "'\"'\"'") .. "'"
+    end
+
+    local pipe = io.popen("command -v " .. quote(name) .. " 2>/dev/null", "r")
+    local path = pipe and pipe:read("*l")
+    if pipe then
+        pipe:close()
+    end
+    if path and package.config:sub(1, 1) == "\\" and path:sub(1, 1) == "/" then
+        local native = io.popen("cygpath -m " .. quote(path), "r")
+        local converted = native and native:read("*l")
+        if native then
+            native:close()
+        end
+        path = converted and converted ~= "" and converted or path
+        if not files.stat(path) and files.stat(path .. ".exe") then
+            path = path .. ".exe"
+        end
+    end
+
+    return path
+end
+
 function M.open(options)
     if options.workerHost and not options.runtime and not os.getenv("NUPP_VM_BINARY") then
         return nil
@@ -103,11 +131,7 @@ function M.open(options)
         end
     end
     if jit then
-        local executable = io.popen("command -v luajit", "r")
-        local path = executable and executable:read("*l")
-        if executable then
-            executable:close()
-        end
+        local path = locate("luajit")
         local bytes = path and fs.readFile(path)
         if not bytes then
             return nil
@@ -153,12 +177,7 @@ function M.open(options)
 
     local function program(name)
         if not programs[name] then
-            local quoted = "'" .. name:gsub("'", "'\"'\"'") .. "'"
-            local pipe = io.popen("command -v " .. quoted .. " 2>/dev/null", "r")
-            local path = pipe and pipe:read("*l")
-            if pipe then
-                pipe:close()
-            end
+            local path = locate(name)
             -- `command -v` names shell builtins without a path. Their code is
             -- the shell executable, not a file named `pwd` in the checkout.
             programs[name] = path and (path:find("/", 1, true) or path:find("\\", 1, true)) and fs.absolute(path)

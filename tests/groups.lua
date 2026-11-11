@@ -737,6 +737,9 @@ packages[
     "compiler/interop"
 ] = {cache = false, reason = "C headers, SDKs and system link libraries are external inputs."}
 packages[
+    "compiler/project/contracts/aot/cexport"
+] = {cache = false, reason = "Retiring AOT backend and external LLVM and link toolchain."}
+packages[
     "compiler/project/contracts/aot/component"
 ] = {cache = false, reason = "Retiring AOT backend and external LLVM toolchain."}
 packages[
