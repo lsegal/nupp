@@ -1,0 +1,2534 @@
+--- The native halves of `nupp.workers.native` and
+--- `nupp.mem.sharedbytes.native`: worker lanes that each run the stamped
+--- payload in a LuaJIT state of their own, the control channels between a lane
+--- and its parent, task cancellation, application channel endpoints, and
+--- shared byte regions.
+---
+--- Every function here that a Lua state calls runs on that state's thread,
+--- inside a protected call, and reads only its own arguments. Channels, regions
+--- and task tables are the only values shared across threads; a lane never
+--- enters its parent's state, nor a parent its lane's.
+module nupphost.workers
+
+const sys = require("nupphost.sys")
+const map = require("nupphost.map")
+const region = require("nupphost.region")
+const channel = require("nupphost.channel")
+const state = require("nupphost.state")
+
+cdef function calloc(count: uint64, size: uint64): voidptr?
+cdef function malloc(size: uint64): voidptr?
+cdef function free(borrows p: voidptr)
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, count: uint64): voidptr
+cdef function strlen(borrows s: cstring): uint64
+cdef function snprintf(borrows buffer: voidptr, size: uint64, borrows format: cstring, ...): int32
+cdef function __atomic_fetch_add_8(borrows p: int64*, v: int64, order: int32): int64
+cdef function __atomic_fetch_sub_8(borrows p: int64*, v: int64, order: int32): int64
+cdef function __atomic_load_4(borrows p: int32*, order: int32): int32
+cdef function __atomic_store_4(borrows p: int32*, v: int32, order: int32)
+
+cdef function lua_gettop(borrows L: voidptr): int32
+cdef function lua_settop(borrows L: voidptr, index: int32)
+cdef function lua_type(borrows L: voidptr, index: int32): int32
+cdef function lua_tolstring(borrows L: voidptr, index: int32, borrows length: voidptr?): voidptr?
+cdef function lua_objlen(borrows L: voidptr, index: int32): uint64
+cdef function lua_tointeger(borrows L: voidptr, index: int32): int64
+cdef function lua_tonumber(borrows L: voidptr, index: int32): number
+cdef function lua_touserdata(borrows L: voidptr, index: int32): voidptr?
+cdef function lua_pushnil(borrows L: voidptr)
+cdef function lua_pushboolean(borrows L: voidptr, b: int32)
+cdef function lua_pushinteger(borrows L: voidptr, n: int64)
+cdef function lua_pushnumber(borrows L: voidptr, n: number)
+cdef function lua_pushlstring(borrows L: voidptr, borrows s: voidptr, length: uint64)
+cdef function lua_pushstring(borrows L: voidptr, borrows s: cstring)
+cdef function lua_pushlightuserdata(borrows L: voidptr, borrows p: voidptr)
+cdef function lua_pushcclosure(borrows L: voidptr, f: function(L: voidptr): int32, n: int32)
+cdef function lua_pushvalue(borrows L: voidptr, index: int32)
+cdef function lua_createtable(borrows L: voidptr, narr: int32, nrec: int32)
+cdef function lua_getfield(borrows L: voidptr, index: int32, borrows k: cstring)
+cdef function lua_setfield(borrows L: voidptr, index: int32, borrows k: cstring)
+cdef function lua_rawgeti(borrows L: voidptr, index: int32, n: int32)
+cdef function lua_rawseti(borrows L: voidptr, index: int32, n: int32)
+cdef function lua_rawequal(borrows L: voidptr, a: int32, b: int32): int32
+cdef function lua_newuserdata(borrows L: voidptr, size: uint64): voidptr
+cdef function lua_setmetatable(borrows L: voidptr, index: int32): int32
+cdef function lua_getmetatable(borrows L: voidptr, index: int32): int32
+cdef function lua_gc(borrows L: voidptr, what: int32, data: int32): int32
+cdef function luaL_error(borrows L: voidptr, borrows format: cstring, ...): int32
+cdef function lua_cpcall(borrows L: voidptr, f: function(L: voidptr): int32, borrows ud: voidptr): int32
+
+const GLOBALS = -10002
+const REGISTRY = -10000
+const TNONE = -1
+const TNIL = 0
+const TLIGHTUSERDATA = 2
+const TNUMBER = 3
+const TSTRING = 4
+const TTABLE = 5
+const TUSERDATA = 7
+const GCSTEP = 5
+
+const MESSAGE_BYTES = 0
+const MESSAGE_NUMBER_TASK = 1
+const MESSAGE_NUMBER_REPLY = 2
+const MESSAGE_STRING_TASK = 3
+const MESSAGE_STRING_REPLY = 4
+const MESSAGE_BUFFER_TASK = 7
+const MESSAGE_BUFFER_REPLY = 8
+
+const MAX_ATTACHMENTS = 255
+const MAX_DICTIONARY = 256
+const ERROR_BYTES = 4096ULL
+const SATURATED = 18446744073709551615ULL
+const LARGEST_EXACT = 9007199254740991
+
+const TASK_QUEUED = 1
+const TASK_RUNNING = 2
+const TASK_CANCELLATION_REQUESTED = 3
+const TASK_CANCELLED = 4
+const TASK_DONE = 5
+
+--- What every stamped worker re-runs.
+cdef struct Host
+    payload: uint64
+    length: uint64
+end
+
+--- A control channel between a lane and its parent: a bounded queue, whether
+--- pushes wait for room, and the dictionary of record addresses both sides
+--- share.
+cdef struct Control
+    references: int64
+    queue: uint64
+    waitsForRoom: int32
+    dictionaryLock: uint64
+    dictionary: uint64
+    dictionaryCount: int64
+end
+
+cdef struct Tasks
+    references: int64
+    lock: uint64
+    table: uint64
+    current: int64
+    hasCurrent: int32
+end
+
+cdef struct Task
+    deadline: number
+    hasDeadline: int32
+    status: int32
+end
+
+--- What `install` reads: the call record its failure goes to, and the host.
+cdef struct Install
+    call: uint64
+    host: uint64
+end
+
+--- One worker lane: its thread and the state it shares with its parent.
+cdef struct Lane
+    thread: uint64
+    tasks: uint64
+    inbox: uint64
+    outbox: uint64
+    host: uint64
+    lock: uint64
+    changed: uint64
+    phase: int32
+    stop: int32
+    status: int32
+    error: uint64
+    errorLength: uint64
+end
+
+const LANE_STARTING = 0
+const LANE_RUNNING = 1
+const LANE_FAILED = 2
+const LANE_FINISHED = 3
+
+const ENDPOINT_METATABLE = "nupp.workers.endpoint.rust"
+const ANCHOR_METATABLE = "nupp.workers.channel.resource"
+const PENDING_METATABLE = "nupp.workers.pending.rust"
+const MESSAGE_METATABLE = "nupp.workers.message.rust"
+const MESSAGE_IDLE = "nupp.workers.message.idle"
+const REGION_METATABLE = "nupp.mem.sharedbytes.region.rust"
+const BUILDER_METATABLE = "nupp.mem.sharedbytes.builder.rust"
+const ACCOUNT_REGISTRY = "nupp.mem.sharedbytes.account.rust"
+
+-- Small helpers ----------------------------------------------------------------
+
+local function finite(value: number): boolean
+    return value == value and value - value == 0
+end
+
+local function read64(address: uint64): uint64
+    @unsafe do
+        return (address as uint64*)[0]
+    end
+end
+
+local function write64(address: uint64, value: uint64)
+    local slot = address as uint64*
+    @unsafe do
+        slot[0] = value
+    end
+end
+
+--- The string at `index` and its length in `length[0]`, or 0 when the value
+--- there is neither a string nor a number.
+local function stringAt(L: voidptr, index: int32, borrows length: uint64*): uint64
+    local text = lua_tolstring(L, index, nil)
+    @unsafe do
+        if text == nil then
+            length[0] = 0ULL
+            return 0ULL
+        end
+        length[0] = lua_objlen(L, index)
+    end
+    return text as uint64
+end
+
+local function lightAt(L: voidptr, index: int32): uint64
+    if lua_type(L, index) ~= TLIGHTUSERDATA then
+        return 0ULL
+    end
+    local pointer = lua_touserdata(L, index)
+    if pointer == nil then
+        return 0ULL
+    end
+    return pointer as uint64
+end
+
+local function pushLight(L: voidptr, value: uint64)
+    lua_pushlightuserdata(L, value as voidptr)
+end
+
+local function globalLight(L: voidptr, name: cstring): uint64
+    lua_getfield(L, GLOBALS, name)
+    local answer = lightAt(L, -1)
+    lua_settop(L, -2)
+    return answer
+end
+
+--- Sets `name` on the table on top of the stack to `f`.
+local function field(L: voidptr, name: cstring, f: function(L: voidptr): int32)
+    lua_pushcclosure(L, f, 0)
+    lua_setfield(L, -2, name)
+end
+
+--- Pushes the registry's metatable `name` with `gc` as its finalizer, making it
+--- the first time.
+local function pushMetatable(L: voidptr, name: cstring, gc: function(L: voidptr): int32)
+    lua_getfield(L, REGISTRY, name)
+    if lua_type(L, -1) == TNIL then
+        lua_settop(L, -2)
+        lua_createtable(L, 0, 1)
+        lua_pushcclosure(L, gc, 0)
+        lua_setfield(L, -2, "__gc")
+        lua_pushvalue(L, -1)
+        lua_setfield(L, REGISTRY, name)
+    end
+end
+
+--- The 8-byte userdata at `index` when its metatable is the registry's `name`,
+--- or 0. A forged metatable cannot make a value pass for another kind.
+local function handleAt(L: voidptr, index: int32, name: cstring): uint64
+    if lua_type(L, index) ~= TUSERDATA or lua_objlen(L, index) ~= 8ULL then
+        return 0ULL
+    end
+    if lua_getmetatable(L, index) == 0 then
+        return 0ULL
+    end
+    lua_getfield(L, REGISTRY, name)
+    local same = lua_rawequal(L, -1, -2) ~= 0
+    lua_settop(L, -3)
+    if not same then
+        return 0ULL
+    end
+    local pointer = lua_touserdata(L, index)
+    if pointer == nil then
+        return 0ULL
+    end
+    return pointer as uint64
+end
+
+--- Pushes a new 8-byte userdata holding `value` under the registry's
+--- metatable `name`. Its address.
+local function pushHandle(L: voidptr, value: uint64, name: cstring, gc: function(L: voidptr): int32): uint64
+    local handle = lua_newuserdata(L, 8ULL) as uint64
+    write64(handle, value)
+    pushMetatable(L, name, gc)
+    lua_setmetatable(L, -2)
+    return handle
+end
+
+-- Region handles and per-state accounts ------------------------------------------
+
+local function accountGc(L: voidptr): int32
+    local slot = lua_touserdata(L, 1)
+    if slot ~= nil then
+        local account = read64(slot as uint64)
+        if account ~= 0ULL then
+            region.nuppHostAccountFree(account)
+            write64(slot as uint64, 0ULL)
+        end
+    end
+    return 0
+end
+
+local function accountFind(L: voidptr): uint64
+    lua_getfield(L, REGISTRY, ACCOUNT_REGISTRY)
+    local slot = lua_touserdata(L, -1)
+    lua_settop(L, -2)
+    if slot == nil then
+        return 0ULL
+    end
+    return read64(slot as uint64)
+end
+
+local function accountGet(L: voidptr): uint64
+    local found = accountFind(L)
+    if found ~= 0ULL then
+        return found
+    end
+    local slot = lua_newuserdata(L, 8ULL) as uint64
+    local account = region.nuppHostAccountNew()
+    write64(slot, account)
+    lua_createtable(L, 0, 1)
+    lua_pushcclosure(L, accountGc, 0)
+    lua_setfield(L, -2, "__gc")
+    lua_setmetatable(L, -2)
+    lua_setfield(L, REGISTRY, ACCOUNT_REGISTRY)
+    return account
+end
+
+local function accountCharge(L: voidptr, block: uint64)
+    local account = accountGet(L)
+    if account == 0ULL then
+        return
+    end
+    local step = region.nuppHostAccountCharge(account, block)
+    if step ~= 0ULL then
+        if step > 2147483647ULL then
+            step = 2147483647ULL
+        end
+        lua_gc(L, GCSTEP, math.i32.wrap((step as integer)))
+    end
+end
+
+local function accountDischarge(L: voidptr, block: uint64)
+    local account = accountFind(L)
+    if account ~= 0ULL then
+        region.nuppHostAccountDischarge(account, block)
+    end
+end
+
+--- Finalizers are idempotent: the region owner is released once and the
+--- userdata cleared before another finalizer could observe it.
+local function regionGc(L: voidptr): int32
+    local slot = lua_touserdata(L, 1)
+    if slot ~= nil then
+        local block = read64(slot as uint64)
+        if block ~= 0ULL then
+            accountDischarge(L, block)
+            region.nuppHostRegionRelease(block)
+            write64(slot as uint64, 0ULL)
+        end
+    end
+    return 0
+end
+
+--- Pushes a region handle owning `block`, which may be 0 to be filled later.
+local function pushRegion(L: voidptr, block: uint64): uint64
+    local handle = pushHandle(L, block, REGION_METATABLE, regionGc)
+    if block ~= 0ULL then
+        accountCharge(L, block)
+    end
+    return handle
+end
+
+local function regionAt(L: voidptr, index: int32): uint64
+    local handle = lua_touserdata(L, index)
+    if handle == nil or lua_getmetatable(L, index) == 0 then
+        return 0ULL
+    end
+    lua_getfield(L, REGISTRY, REGION_METATABLE)
+    local same = lua_rawequal(L, -1, -2) ~= 0
+    lua_settop(L, -3)
+    if not same then
+        return 0ULL
+    end
+    return read64(handle as uint64)
+end
+
+local function builderGc(L: voidptr): int32
+    local slot = lua_touserdata(L, 1)
+    if slot ~= nil then
+        local builder = read64(slot as uint64)
+        if builder ~= 0ULL then
+            region.nuppHostBuilderFree(builder)
+            write64(slot as uint64, 0ULL)
+        end
+    end
+    return 0
+end
+
+--- A builder handle's address, when its metatable says it is one, or 0.
+local function builderAt(L: voidptr, index: int32): uint64
+    local handle = lua_touserdata(L, index)
+    if handle == nil or lua_getmetatable(L, index) == 0 then
+        return 0ULL
+    end
+    lua_getfield(L, REGISTRY, BUILDER_METATABLE)
+    local same = lua_rawequal(L, -1, -2) ~= 0
+    lua_settop(L, -3)
+    if not same then
+        return 0ULL
+    end
+    return handle as uint64
+end
+
+-- Endpoint handles -------------------------------------------------------------
+
+--- An endpoint handle's address, or 0. The handle holds a registry key.
+local function endpointAt(L: voidptr, index: int32): uint64
+    return handleAt(L, index, ENDPOINT_METATABLE)
+end
+
+local function direction(key: uint64): int32
+    local endpoint = channel.nuppHostEndpointBorrow(key)
+    if endpoint == 0ULL then
+        return -1
+    end
+    local answer: int32 = -2
+    if channel.nuppHostEndpointIsLive(endpoint) then
+        if channel.nuppHostEndpointIsSender(endpoint) then
+            answer = 1
+        else
+            answer = 0
+        end
+    end
+    channel.nuppHostEndpointRelease(endpoint)
+    return answer
+end
+
+local function endpointGc(L: voidptr): int32
+    local handle = endpointAt(L, 1)
+    if handle ~= 0ULL then
+        local key = read64(handle)
+        if key ~= 0ULL and direction(key) ~= -1 then
+            channel.nuppHostEndpointDiscard(key)
+            write64(handle, 0ULL)
+        end
+    end
+    return 0
+end
+
+local function pushEndpoint(L: voidptr, key: uint64): uint64
+    return pushHandle(L, key, ENDPOINT_METATABLE, endpointGc)
+end
+
+-- Messages handed to Lua -------------------------------------------------------
+
+local function messageOwnerGc(L: voidptr): int32
+    local slot = lua_touserdata(L, 1)
+    if slot ~= nil then
+        local message = read64(slot as uint64)
+        if message ~= 0ULL then
+            channel.nuppHostMessageDestroy(message)
+            write64(slot as uint64, 0ULL)
+        end
+    end
+    return 0
+end
+
+--- The userdata that owns a popped message while its bytes are copied into
+--- Lua, so a Lua allocation failure cannot leak it. One idle owner per state
+--- is reused.
+local function messageOwner(L: voidptr): uint64
+    lua_getfield(L, REGISTRY, MESSAGE_IDLE)
+    local idle = lua_touserdata(L, -1)
+    if idle ~= nil and read64(idle as uint64) == 0ULL then
+        return idle as uint64
+    end
+    lua_settop(L, -2)
+    local owner = lua_newuserdata(L, 8ULL) as uint64
+    write64(owner, 0ULL)
+    pushMetatable(L, MESSAGE_METATABLE, messageOwnerGc)
+    lua_setmetatable(L, -2)
+    lua_pushvalue(L, -1)
+    lua_setfield(L, REGISTRY, MESSAGE_IDLE)
+    return owner
+end
+
+local function pushMessageBytes(L: voidptr, message: uint64, which: int32)
+    local length = calloc(1ULL, 8ULL)
+    if length == nil then
+        lua_pushnil(L)
+        return
+    end
+    local bytes = channel.nuppHostMessageBytes(message, which, length as uint64*)
+    lua_pushlstring(L, bytes as voidptr, read64(length as uint64))
+    free(length as voidptr)
+end
+
+--- Pushes a message's attachments as Lua's triples, taking each, or nil when
+--- it has none.
+local function pushAttachments(L: voidptr, message: uint64)
+    local count = channel.nuppHostMessageAttachmentCount(message) as integer
+    if count == 0 then
+        lua_pushnil(L)
+        return
+    end
+    local out = calloc(4ULL, 8ULL)
+    if out == nil then
+        luaL_error(L, "nupp: out of memory")
+        return
+    end
+    lua_createtable(L, math.i32.wrap(count * 3), 0)
+    for index = 0, count - 1 do
+        local kind = channel.nuppHostMessageAttachmentKind(message, index)
+        local handle: uint64 = 0ULL
+        if kind == channel.ATTACHMENT_ENDPOINT then
+            handle = pushEndpoint(L, 0ULL)
+        elseif kind == channel.ATTACHMENT_REGION then
+            handle = pushRegion(L, 0ULL)
+        end
+        local base = math.i32.wrap(index * 3)
+        if not channel.nuppHostMessageTakeAttachment(message, index, out as uint64*) then
+            if handle ~= 0ULL then
+                lua_settop(L, -2)
+            end
+            lua_pushnil(L)
+            lua_rawseti(L, -2, base + 1)
+        else
+            local words = out as uint64*
+            @unsafe do
+                local block = words[1]
+                if kind == channel.ATTACHMENT_ENDPOINT then
+                    write64(handle, block)
+                elseif kind == channel.ATTACHMENT_REGION then
+                    write64(handle, block)
+                    accountCharge(L, block)
+                else
+                    pushLight(L, block)
+                end
+                lua_rawseti(L, -2, base + 1)
+                lua_pushinteger(L, words[2] as int64)
+                lua_rawseti(L, -2, base + 2)
+                lua_pushinteger(L, words[3] as int64)
+                lua_rawseti(L, -2, base + 3)
+            end
+        end
+    end
+    free(out as voidptr)
+end
+
+-- Attachments from Lua ---------------------------------------------------------
+
+--- A moved entry is a string holding one native pointer; anything else in the
+--- handle position is a region or endpoint handle, or a malformed entry.
+local function movedPointer(L: voidptr, index: int32): uint64
+    if lua_type(L, index) ~= TSTRING or lua_objlen(L, index) ~= 8ULL then
+        return 0ULL
+    end
+    local text = lua_tolstring(L, index, nil)
+    if text == nil then
+        return 0ULL
+    end
+    local value: uint64 = 0ULL
+    @unsafe do
+        local bytes = text as uint8*
+        for at = 7, 0, -1 do
+            value = (value << 8) | (bytes[at] as uint64)
+        end
+    end
+    return value
+end
+
+--- Frees every moved allocation the list at `index` names, which is the
+--- account a refused list gives of the blocks it was handed.
+local function releaseListedMoved(L: voidptr, index: int32, triples: integer)
+    for position = 0, triples - 1 do
+        lua_rawgeti(L, index, math.i32.wrap(position * 3 + 1))
+        local block = movedPointer(L, -1)
+        lua_settop(L, -2)
+        if block ~= 0ULL then
+            free(block as voidptr)
+        end
+    end
+end
+
+--- The temporary handles of a list still own the source generation after it
+--- was claimed. Release those stale owners now, refused or not.
+local function releaseListedEndpoints(L: voidptr, index: int32)
+    if lua_type(L, index) ~= TTABLE then
+        return
+    end
+    local count = (lua_objlen(L, index) as integer) // 3
+    for position = 0, count - 1 do
+        lua_rawgeti(L, index, math.i32.wrap(position * 3 + 1))
+        local handle = endpointAt(L, -1)
+        if handle ~= 0ULL then
+            local key = read64(handle)
+            if key ~= 0ULL and direction(key) ~= -1 then
+                channel.nuppHostEndpointDiscard(key)
+                write64(handle, 0ULL)
+            end
+        end
+        lua_settop(L, -2)
+    end
+end
+
+--- Reads the triples of the list at `index` into `raw`, 32 bytes each. Their
+--- count, 0 for none, or -1 for a malformed list, whose moved blocks are then
+--- freed.
+local function readAttachments(L: voidptr, index: int32, raw: uint64): integer
+    local kind = lua_type(L, index)
+    if kind == TNONE or kind == TNIL then
+        return 0
+    end
+    if kind ~= TTABLE then
+        return -1
+    end
+    local entries = lua_objlen(L, index) as integer
+    local triples = entries // 3
+    if entries % 3 ~= 0 or triples > MAX_ATTACHMENTS then
+        releaseListedMoved(L, index, triples)
+        return -1
+    end
+    for position = 0, triples - 1 do
+        local base = math.i32.wrap(position * 3)
+        lua_rawgeti(L, index, base + 1)
+        local entry = channel.ATTACHMENT_REGION
+        local block: uint64 = 0ULL
+        if lua_type(L, -1) == TSTRING then
+            entry = channel.ATTACHMENT_MOVED
+            block = movedPointer(L, -1)
+        else
+            local endpoint = endpointAt(L, -1)
+            if endpoint ~= 0ULL then
+                entry = channel.ATTACHMENT_ENDPOINT
+                block = read64(endpoint)
+            else
+                block = regionAt(L, -1)
+            end
+        end
+        lua_rawgeti(L, index, base + 2)
+        local first = lua_tointeger(L, -1)
+        lua_rawgeti(L, index, base + 3)
+        local length = lua_tointeger(L, -1)
+        lua_settop(L, -4)
+        local bad = block == 0ULL
+        if entry == channel.ATTACHMENT_MOVED then
+            bad = bad or first < 0LL or length < 1LL
+        elseif entry == channel.ATTACHMENT_ENDPOINT then
+            bad = bad or (first ~= 0LL and first ~= 1LL) or length ~= 0LL
+        else
+            bad = bad or first < 1LL or length < 0LL
+        end
+        if bad then
+            releaseListedMoved(L, index, triples)
+            return -1
+        end
+        local slot = raw + (position as uint64) * 32ULL
+        write64(slot, entry as uint64)
+        write64(slot + 8ULL, block)
+        write64(slot + 16ULL, first as uint64)
+        write64(slot + 24ULL, length as uint64)
+    end
+    return triples
+end
+
+local function rawKind(raw: uint64, index: integer): int32
+    return math.i32.wrap(read64(raw + (index as uint64) * 32ULL) as integer)
+end
+
+local function rawBlock(raw: uint64, index: integer): uint64
+    return read64(raw + (index as uint64) * 32ULL + 8ULL)
+end
+
+local function rawFirst(raw: uint64, index: integer): uint64
+    return read64(raw + (index as uint64) * 32ULL + 16ULL)
+end
+
+local function rawLength(raw: uint64, index: integer): uint64
+    return read64(raw + (index as uint64) * 32ULL + 24ULL)
+end
+
+local function validAttachment(raw: uint64, index: integer): boolean
+    local kind = rawKind(raw, index)
+    local block = rawBlock(raw, index)
+    local first = rawFirst(raw, index)
+    local length = rawLength(raw, index)
+    if kind == channel.ATTACHMENT_REGION then
+        if block == 0ULL or first == 0ULL then
+            return false
+        end
+        local finish = first - 1ULL + length
+        return finish >= length and finish <= region.nuppHostRegionLength(block)
+    elseif kind == channel.ATTACHMENT_MOVED then
+        return block ~= 0ULL and length >= 1ULL
+    elseif kind == channel.ATTACHMENT_ENDPOINT then
+        local endpoint = channel.nuppHostEndpointBorrow(block)
+        if endpoint == 0ULL then
+            return false
+        end
+        local sender: uint64 = 0ULL
+        if channel.nuppHostEndpointIsSender(endpoint) then
+            sender = 1ULL
+        end
+        local valid = channel.nuppHostEndpointIsLive(endpoint) and first == sender and length == 0ULL
+        channel.nuppHostEndpointRelease(endpoint)
+        return valid
+    end
+    return false
+end
+
+--- Converts `count` raw attachments into an owned array a message takes, or 0
+--- for a refused list. Moved blocks belong to this call from here on: a
+--- refused list frees every one of them, including those after the entry that
+--- was refused. Endpoint generations are claimed first, so a refused
+--- capability cannot leave a partly built list behind.
+local function convertAttachments(raw: uint64, count: integer): uint64
+    local valid = true
+    for index = 0, count - 1 do
+        if not validAttachment(raw, index) then
+            valid = false
+            break
+        end
+    end
+    if valid then
+        for index = 0, count - 1 do
+            if rawKind(raw, index) == channel.ATTACHMENT_ENDPOINT then
+                for other = index + 1, count - 1 do
+                    if rawKind(raw, other) == channel.ATTACHMENT_ENDPOINT and rawBlock(raw, other) == rawBlock(raw, index) then
+                        valid = false
+                    end
+                end
+            end
+        end
+    end
+    local converted: uint64 = 0ULL
+    if valid and count > 0 then
+        local array = calloc(count as uint64, 32ULL)
+        if array == nil then
+            valid = false
+        else
+            converted = array as uint64
+        end
+    end
+    if valid then
+        for index = 0, count - 1 do
+            if rawKind(raw, index) == channel.ATTACHMENT_ENDPOINT then
+                local source = channel.nuppHostEndpointBorrow(rawBlock(raw, index))
+                local successor: uint64 = 0ULL
+                if source ~= 0ULL then
+                    successor = channel.nuppHostEndpointTransfer(source)
+                    channel.nuppHostEndpointRelease(source)
+                end
+                if successor == 0ULL then
+                    valid = false
+                    break
+                end
+                local slot = converted + (index as uint64) * 32ULL
+                write64(slot, channel.ATTACHMENT_ENDPOINT as uint64)
+                write64(slot + 8ULL, successor)
+            end
+        end
+    end
+    if not valid then
+        if converted ~= 0ULL then
+            -- The successors claimed so far close with the refusal.
+            channel.nuppHostAttachmentsRelease(converted, count as int64)
+        end
+        for index = 0, count - 1 do
+            if rawKind(raw, index) == channel.ATTACHMENT_MOVED and rawBlock(raw, index) ~= 0ULL then
+                free(rawBlock(raw, index) as voidptr)
+            end
+        end
+        return SATURATED
+    end
+    for index = 0, count - 1 do
+        local kind = rawKind(raw, index)
+        local slot = converted + (index as uint64) * 32ULL
+        if kind ~= channel.ATTACHMENT_ENDPOINT then
+            local block = rawBlock(raw, index)
+            if kind == channel.ATTACHMENT_REGION then
+                block = region.nuppHostRegionRetain(block)
+            end
+            write64(slot, kind as uint64)
+            write64(slot + 8ULL, block)
+            write64(slot + 16ULL, rawFirst(raw, index))
+            write64(slot + 24ULL, rawLength(raw, index))
+        end
+    end
+    return converted
+end
+
+-- Control channels -------------------------------------------------------------
+
+local function controlQueue(control: uint64): uint64
+    @unsafe do
+        return (control as Control*).queue
+    end
+end
+
+local function controlNew(): uint64
+    local record = calloc(1ULL, 48ULL)
+    local queue = channel.nuppHostQueueNew()
+    local lock = sys.nuppHostSysMutexNew()
+    local dictionary = calloc(MAX_DICTIONARY as uint64, 16ULL)
+    if record == nil or queue == 0ULL or lock == nil or dictionary == nil then
+        if record ~= nil then
+            free(record as voidptr)
+        end
+        if queue ~= 0ULL then
+            channel.nuppHostQueueRelease(queue)
+        end
+        if lock ~= nil then
+            sys.nuppHostSysMutexFree(lock as voidptr)
+        end
+        if dictionary ~= nil then
+            free(dictionary as voidptr)
+        end
+        return 0ULL
+    end
+    local c = record as Control*
+    @unsafe do
+        c.references = 1LL
+        c.queue = queue
+        c.dictionaryLock = lock as uint64
+        c.dictionary = dictionary as uint64
+    end
+    return record as uint64
+end
+
+local function controlRetain(control: uint64)
+    @unsafe do
+        __atomic_fetch_add_8(control as int64*, 1LL, 0)
+    end
+end
+
+local function controlRelease(control: uint64)
+    local c = control as Control*
+    @unsafe do
+        if __atomic_fetch_sub_8(control as int64*, 1LL, 4) ~= 1LL then
+            return
+        end
+        channel.nuppHostQueueRelease(c.queue)
+        for index = 0, (c.dictionaryCount as integer) - 1 do
+            free(read64(c.dictionary + (index as uint64) * 16ULL) as voidptr)
+        end
+        free(c.dictionary as voidptr)
+        sys.nuppHostSysMutexFree(c.dictionaryLock as voidptr)
+    end
+    free(control as voidptr)
+end
+
+local function controlWaitsForRoom(control: uint64): boolean
+    @unsafe do
+        return __atomic_load_4((control + 16ULL) as int32*, 0) ~= 0
+    end
+end
+
+local function controlPush(control: uint64, message: uint64): boolean
+    local queue = controlQueue(control)
+    if controlWaitsForRoom(control) then
+        if channel.nuppHostQueuePushWait(queue, message) then
+            return true
+        end
+    elseif channel.nuppHostQueueTryPush(queue, message) == channel.SENT then
+        return true
+    end
+    channel.nuppHostMessageDestroy(message)
+    return false
+end
+
+local function channelCreate(L: voidptr): int32
+    pushLight(L, controlNew())
+    return 1
+end
+
+local function channelDestroy(L: voidptr): int32
+    local control = lightAt(L, 1)
+    if control ~= 0ULL then
+        controlRelease(control)
+    end
+    return 0
+end
+
+local function channelClose(L: voidptr): int32
+    local control = lightAt(L, 1)
+    if control ~= 0ULL then
+        channel.nuppHostQueueClose(controlQueue(control))
+    end
+    return 0
+end
+
+local function channelCount(L: voidptr): int32
+    local control = lightAt(L, 1)
+    local count: int64 = 0LL
+    if control ~= 0ULL then
+        count = channel.nuppHostQueueCount(controlQueue(control))
+    end
+    lua_pushinteger(L, count)
+    return 1
+end
+
+local function channelClosed(L: voidptr): int32
+    local control = lightAt(L, 1)
+    local closed = true
+    if control ~= 0ULL then
+        closed = channel.nuppHostQueueClosed(controlQueue(control))
+    end
+    if closed then
+        lua_pushboolean(L, 1)
+    else
+        lua_pushboolean(L, 0)
+    end
+    return 1
+end
+
+local function pushAccepted(L: voidptr, accepted: boolean): int32
+    if accepted then
+        lua_pushboolean(L, 1)
+    else
+        lua_pushboolean(L, 0)
+    end
+    return 1
+end
+
+--- Pushes one message of `kind` onto the control channel at 1. Returns false
+--- when refused, after destroying it.
+local function sendControl(
+    control: uint64,
+    kind: int32,
+    id: int64,
+    value: number,
+    first: uint64,
+    firstLength: uint64,
+    second: uint64,
+    secondLength: uint64,
+    third: uint64,
+    thirdLength: uint64,
+    attachments: uint64,
+    count: int64
+): boolean
+    local message = channel.nuppHostMessageNew(
+        kind,
+        id,
+        value,
+        first,
+        firstLength,
+        second,
+        secondLength,
+        third,
+        thirdLength,
+        attachments,
+        count
+    )
+    if message == 0ULL then
+        return false
+    end
+    return controlPush(control, message)
+end
+
+local function channelPush(L: voidptr): int32
+    local control = lightAt(L, 1)
+    local lengths = calloc(2ULL, 8ULL)
+    if lengths == nil then
+        return pushAccepted(L, false)
+    end
+    local words = lengths as uint64
+    local header = stringAt(L, 2, words as uint64*)
+    local body = stringAt(L, 3, (words + 8ULL) as uint64*)
+    local accepted = control ~= 0ULL and header ~= 0ULL and body ~= 0ULL and sendControl(
+        control,
+        MESSAGE_BYTES,
+        0LL,
+        0,
+        header,
+        read64(words),
+        body,
+        read64(words + 8ULL),
+        0ULL,
+        0ULL,
+        0ULL,
+        0LL
+    )
+    free(lengths as voidptr)
+    return pushAccepted(L, accepted)
+end
+
+local function pushScalar(L: voidptr, kind: int32, task: boolean, stringValue: boolean): int32
+    local control = lightAt(L, 1)
+    local id = lua_tointeger(L, 2)
+    local lengths = calloc(3ULL, 8ULL)
+    if lengths == nil then
+        return pushAccepted(L, false)
+    end
+    local words = lengths as uint64
+    local module: uint64 = 0ULL
+    local member: uint64 = 0ULL
+    local valueIndex: int32 = 3
+    if task then
+        module = stringAt(L, 3, words as uint64*)
+        member = stringAt(L, 4, (words + 8ULL) as uint64*)
+        valueIndex = 5
+    end
+    local text: uint64 = 0ULL
+    local value: number = 0
+    if stringValue then
+        text = stringAt(L, valueIndex, (words + 16ULL) as uint64*)
+    else
+        value = lua_tonumber(L, valueIndex)
+    end
+    local accepted = control ~= 0ULL and (not task or (module ~= 0ULL and member ~= 0ULL)) and (not stringValue or text ~= 0ULL)
+    if accepted then
+        accepted = sendControl(
+            control,
+            kind,
+            id,
+            value,
+            module,
+            read64(words),
+            member,
+            read64(words + 8ULL),
+            text,
+            read64(words + 16ULL),
+            0ULL,
+            0LL
+        )
+    end
+    free(lengths as voidptr)
+    return pushAccepted(L, accepted)
+end
+
+local function pushNumberTask(L: voidptr): int32
+    return pushScalar(L, MESSAGE_NUMBER_TASK, true, false)
+end
+
+local function pushNumberReply(L: voidptr): int32
+    return pushScalar(L, MESSAGE_NUMBER_REPLY, false, false)
+end
+
+local function pushStringTask(L: voidptr): int32
+    return pushScalar(L, MESSAGE_STRING_TASK, true, true)
+end
+
+local function pushStringReply(L: voidptr): int32
+    return pushScalar(L, MESSAGE_STRING_REPLY, false, true)
+end
+
+--- Converts the list at `index` for a message. -1 refused, else the count, with
+--- the owned array in `array[0]`.
+local function attachmentsFor(L: voidptr, index: int32, borrows array: uint64*): integer
+    local raw = calloc(MAX_ATTACHMENTS as uint64, 32ULL)
+    if raw == nil then
+        if lua_type(L, index) == TTABLE then
+            releaseListedMoved(L, index, (lua_objlen(L, index) as integer) // 3)
+        end
+        return -1
+    end
+    local count = readAttachments(L, index, raw as uint64)
+    if count < 0 then
+        free(raw as voidptr)
+        return -1
+    end
+    local converted = convertAttachments(raw as uint64, count)
+    free(raw as voidptr)
+    if converted == SATURATED then
+        return -1
+    end
+    @unsafe do
+        array[0] = converted
+    end
+    return count
+end
+
+local function pushBuffer(L: voidptr, kind: int32, task: boolean): int32
+    local control = lightAt(L, 1)
+    local id = lua_tointeger(L, 2)
+    local lengths = calloc(4ULL, 8ULL)
+    if lengths == nil then
+        return pushAccepted(L, false)
+    end
+    local words = lengths as uint64
+    local module: uint64 = 0ULL
+    local member: uint64 = 0ULL
+    local countIndex: int32 = 3
+    if task then
+        module = stringAt(L, 3, words as uint64*)
+        member = stringAt(L, 4, (words + 8ULL) as uint64*)
+        countIndex = 5
+    end
+    local valueIndex = countIndex + 1
+    local attachmentsIndex = countIndex + 2
+    local count = lua_tonumber(L, countIndex)
+    local value = stringAt(L, valueIndex, (words + 16ULL) as uint64*)
+    -- The caller hands its moved blocks over with the call, so a push refused
+    -- for its fixed arguments frees them as a refused list would.
+    if control == 0ULL or value == 0ULL or (task and (module == 0ULL or member == 0ULL)) then
+        if lua_type(L, attachmentsIndex) == TTABLE then
+            releaseListedMoved(L, attachmentsIndex, (lua_objlen(L, attachmentsIndex) as integer) // 3)
+        end
+        releaseListedEndpoints(L, attachmentsIndex)
+        free(lengths as voidptr)
+        return pushAccepted(L, false)
+    end
+    local accepted = false
+    local attached = attachmentsFor(L, attachmentsIndex, (words + 24ULL) as uint64*)
+    if attached >= 0 then
+        accepted = sendControl(
+            control,
+            kind,
+            id,
+            count,
+            module,
+            read64(words),
+            member,
+            read64(words + 8ULL),
+            value,
+            read64(words + 16ULL),
+            read64(words + 24ULL),
+            attached as int64
+        )
+    end
+    releaseListedEndpoints(L, attachmentsIndex)
+    free(lengths as voidptr)
+    return pushAccepted(L, accepted)
+end
+
+local function pushBufferTask(L: voidptr): int32
+    return pushBuffer(L, MESSAGE_BUFFER_TASK, true)
+end
+
+local function pushBufferReply(L: voidptr): int32
+    return pushBuffer(L, MESSAGE_BUFFER_REPLY, false)
+end
+
+local function dictRegister(L: voidptr): int32
+    local control = lightAt(L, 1)
+    local length = calloc(1ULL, 8ULL)
+    if length == nil then
+        lua_pushnil(L)
+        return 1
+    end
+    local address = stringAt(L, 2, length as uint64*)
+    local size = read64(length as uint64)
+    free(length as voidptr)
+    local answer: int64 = 0LL
+    if control ~= 0ULL and address ~= 0ULL and size ~= 0ULL then
+        local c = control as Control*
+        @unsafe do
+            sys.nuppHostSysLock(c.dictionaryLock as voidptr)
+            for index = 0, (c.dictionaryCount as integer) - 1 do
+                local entry = c.dictionary + (index as uint64) * 16ULL
+                if answer == 0LL and read64(entry + 8ULL) == size then
+                    local known = read64(entry) as uint8*
+                    local wanted = address as uint8*
+                    local same = true
+                    for at = 0, (size as integer) - 1 do
+                        if known[at] ~= wanted[at] then
+                            same = false
+                            break
+                        end
+                    end
+                    if same then
+                        answer = (index + 1) as int64
+                    end
+                end
+            end
+            if answer == 0LL and c.dictionaryCount < (MAX_DICTIONARY as int64) then
+                local copy = malloc(size)
+                if copy ~= nil then
+                    memcpy(copy as voidptr, address as voidptr, size)
+                    local entry = c.dictionary + (c.dictionaryCount as uint64) * 16ULL
+                    write64(entry, copy as uint64)
+                    write64(entry + 8ULL, size)
+                    c.dictionaryCount = c.dictionaryCount + 1LL
+                    answer = c.dictionaryCount
+                end
+            end
+            sys.nuppHostSysUnlock(c.dictionaryLock as voidptr)
+        end
+    end
+    if answer == 0LL then
+        lua_pushnil(L)
+    else
+        lua_pushinteger(L, answer)
+    end
+    return 1
+end
+
+local function dictCount(L: voidptr): int32
+    local control = lightAt(L, 1)
+    local count: int64 = 0LL
+    if control ~= 0ULL then
+        local c = control as Control*
+        @unsafe do
+            sys.nuppHostSysLock(c.dictionaryLock as voidptr)
+            count = c.dictionaryCount
+            sys.nuppHostSysUnlock(c.dictionaryLock as voidptr)
+        end
+    end
+    lua_pushinteger(L, count)
+    return 1
+end
+
+local function dictAddress(L: voidptr): int32
+    local control = lightAt(L, 1)
+    local index = lua_tointeger(L, 2)
+    local address: uint64 = 0ULL
+    local size: uint64 = 0ULL
+    if control ~= 0ULL then
+        local c = control as Control*
+        @unsafe do
+            sys.nuppHostSysLock(c.dictionaryLock as voidptr)
+            if index >= 1LL and index <= c.dictionaryCount then
+                local entry = c.dictionary + ((index - 1LL) as uint64) * 16ULL
+                address = read64(entry)
+                size = read64(entry + 8ULL)
+            end
+            sys.nuppHostSysUnlock(c.dictionaryLock as voidptr)
+        end
+    end
+    -- Entries are append-only and freed only with the channel, so the bytes
+    -- stay put while they are copied.
+    if address == 0ULL then
+        lua_pushnil(L)
+    else
+        lua_pushlstring(L, address as voidptr, size)
+    end
+    return 1
+end
+
+local function pushNils(L: voidptr, count: integer)
+    for _ = 1, count do
+        lua_pushnil(L)
+    end
+end
+
+local function channelPop(L: voidptr): int32
+    local control = lightAt(L, 1)
+    local timeout = lua_tointeger(L, 2)
+    if timeout < -2147483648LL then
+        timeout = -2147483648LL
+    elseif timeout > 2147483647LL then
+        timeout = 2147483647LL
+    end
+    local owner = messageOwner(L)
+    local message: uint64 = 0ULL
+    if control ~= 0ULL then
+        message = channel.nuppHostQueuePop(controlQueue(control), timeout)
+    end
+    write64(owner, message)
+    if message == 0ULL then
+        pushNils(L, 7)
+        return 7
+    end
+    -- The owner holds the message until every byte has been copied into Lua
+    -- and every attachment taken.
+    local kind = channel.nuppHostMessageKind(message)
+    if kind == MESSAGE_BYTES then
+        pushMessageBytes(L, message, 0)
+        pushMessageBytes(L, message, 1)
+        pushNils(L, 5)
+    else
+        lua_pushnil(L)
+        lua_pushnil(L)
+        lua_pushinteger(L, kind as int64)
+        lua_pushinteger(L, channel.nuppHostMessageId(message))
+        if kind == MESSAGE_NUMBER_TASK or kind == MESSAGE_STRING_TASK or kind == MESSAGE_BUFFER_TASK then
+            pushMessageBytes(L, message, 0)
+            pushMessageBytes(L, message, 1)
+        else
+            lua_pushnil(L)
+            lua_pushnil(L)
+        end
+        if kind == MESSAGE_NUMBER_TASK or kind == MESSAGE_NUMBER_REPLY then
+            lua_pushnumber(L, channel.nuppHostMessageNumber(message))
+        elseif kind == MESSAGE_STRING_TASK or kind == MESSAGE_STRING_REPLY or kind == MESSAGE_BUFFER_TASK or kind == MESSAGE_BUFFER_REPLY then
+            pushMessageBytes(L, message, 2)
+        else
+            lua_pushnil(L)
+        end
+        if kind == MESSAGE_BUFFER_TASK or kind == MESSAGE_BUFFER_REPLY then
+            lua_pushnumber(L, channel.nuppHostMessageNumber(message))
+            pushAttachments(L, message)
+            channel.nuppHostMessageDestroy(message)
+            write64(owner, 0ULL)
+            return 9
+        end
+    end
+    channel.nuppHostMessageDestroy(message)
+    write64(owner, 0ULL)
+    return 7
+end
+
+-- Tasks ------------------------------------------------------------------------
+
+local function tasksNew(): uint64
+    local record = calloc(1ULL, 40ULL)
+    local lock = sys.nuppHostSysMutexNew()
+    local table = map.nuppHostMapNew()
+    if record == nil or lock == nil or table == 0ULL then
+        if record ~= nil then
+            free(record as voidptr)
+        end
+        if lock ~= nil then
+            sys.nuppHostSysMutexFree(lock as voidptr)
+        end
+        if table ~= 0ULL then
+            map.nuppHostMapFree(table)
+        end
+        return 0ULL
+    end
+    local t = record as Tasks*
+    @unsafe do
+        t.references = 1LL
+        t.lock = lock as uint64
+        t.table = table
+    end
+    return record as uint64
+end
+
+local function tasksRetain(tasks: uint64)
+    @unsafe do
+        __atomic_fetch_add_8(tasks as int64*, 1LL, 0)
+    end
+end
+
+local function tasksRelease(tasks: uint64)
+    local t = tasks as Tasks*
+    @unsafe do
+        if __atomic_fetch_sub_8(tasks as int64*, 1LL, 4) ~= 1LL then
+            return
+        end
+        local key = calloc(1ULL, 8ULL)
+        if key ~= nil then
+            local task = map.nuppHostMapTakeAny(t.table, key as uint64*)
+            while task ~= 0ULL do
+                free(task as voidptr)
+                task = map.nuppHostMapTakeAny(t.table, key as uint64*)
+            end
+            free(key as voidptr)
+        end
+        map.nuppHostMapFree(t.table)
+        sys.nuppHostSysMutexFree(t.lock as voidptr)
+    end
+    free(tasks as voidptr)
+end
+
+local function lockTasks(tasks: uint64)
+    @unsafe do
+        sys.nuppHostSysLock((tasks as Tasks*).lock as voidptr)
+    end
+end
+
+local function unlockTasks(tasks: uint64)
+    @unsafe do
+        sys.nuppHostSysUnlock((tasks as Tasks*).lock as voidptr)
+    end
+end
+
+local function monotonicMs(): number
+    return (sys.nuppHostSysMonotonicNs() as number) / 1000000
+end
+
+local function expired(task: uint64): boolean
+    local t = task as Task*
+    @unsafe do
+        return t.hasDeadline ~= 0 and monotonicMs() >= t.deadline
+    end
+end
+
+local function taskOf(tasks: uint64, id: int64): uint64
+    @unsafe do
+        return map.nuppHostMapGet((tasks as Tasks*).table, id as uint64)
+    end
+end
+
+-- Lanes ------------------------------------------------------------------------
+
+local function laneTasks(lane: uint64): uint64
+    @unsafe do
+        return (lane as Lane*).tasks
+    end
+end
+
+local function setPhase(lane: uint64, phase: int32)
+    local l = lane as Lane*
+    @unsafe do
+        sys.nuppHostSysLock(l.lock as voidptr)
+        l.phase = phase
+        sys.nuppHostSysBroadcast(l.changed as voidptr)
+        sys.nuppHostSysUnlock(l.lock as voidptr)
+    end
+end
+
+--- Records a failure's text on the lane, replacing any before.
+local function laneFail(lane: uint64, borrows text: voidptr?, length: uint64)
+    local l = lane as Lane*
+    @unsafe do
+        if l.error ~= 0ULL then
+            free(l.error as voidptr)
+        end
+        l.error = 0ULL
+        l.errorLength = 0ULL
+        l.status = 1
+        local copy = malloc(length + 1ULL)
+        if copy == nil then
+            return
+        end
+        if length ~= 0ULL then
+            memcpy(copy as voidptr, text as voidptr, length)
+        end
+        (copy as uint8*)[length as integer] = 0
+        l.error = copy as uint64
+        l.errorLength = length
+    end
+end
+
+local function laneFailWith(lane: uint64, borrows prefix: cstring, record: uint64)
+    local head = strlen(prefix)
+    local detail: uint64 = 0ULL
+    local detailLength: uint64 = 0ULL
+    if record ~= 0ULL then
+        local length = calloc(1ULL, 8ULL)
+        if length ~= nil then
+            detail = state.nuppHostStateCallError(record, length as uint64*)
+            detailLength = read64(length as uint64)
+            free(length as voidptr)
+        end
+    end
+    local text = malloc(head + detailLength + 1ULL)
+    if text == nil then
+        laneFail(lane, prefix as voidptr, head)
+        return
+    end
+    memcpy(text as voidptr, prefix as voidptr, head)
+    if detail ~= 0ULL and detailLength ~= 0ULL then
+        memcpy(((text as uint64) + head) as voidptr, detail as voidptr, detailLength)
+    end
+    laneFail(lane, text, head + detailLength)
+    free(text as voidptr)
+end
+
+--- A lane's thread: it makes its own state the way every host does, installs
+--- the worker adapter, runs the payload as `=nupp-worker`, and keeps the state
+--- until its parent joins it.
+local function laneMain(argument: uint64): voidptr?
+    local lane = argument as uint64
+    local l = argument as Lane*
+    -- Give the reserved JIT window back on this thread just before the first
+    -- isolated state may be made.
+    sys.nuppHostSysMcodeRelease()
+    local record = state.nuppHostStateCall()
+    if record == 0ULL then
+        laneFailWith(lane, "worker startup failed: out of memory", 0ULL)
+        setPhase(lane, LANE_FAILED)
+        return nil
+    end
+    local L: voidptr? = nil
+    @unsafe do
+        L = state.nuppHostStateOpen(record, 0ULL)
+        if L == nil then
+            laneFailWith(lane, "worker startup failed: ", record)
+        elseif nuppHostWorkersEnable(L as voidptr, record, l.host) ~= 0 then
+            laneFailWith(lane, "worker startup failed: ", record)
+        elseif state.nuppHostStateSetWorkerContext(L as voidptr, record, l.inbox, l.outbox, l.tasks) ~= 0 then
+            laneFailWith(lane, "worker startup failed: ", record)
+        end
+        if l.status ~= 0 then
+            if L ~= nil then
+                state.nuppHostStateClose(L as voidptr)
+            end
+            state.nuppHostStateCallFree(record)
+            channel.nuppHostQueueClose(controlQueue(l.inbox))
+            channel.nuppHostQueueClose(controlQueue(l.outbox))
+            setPhase(lane, LANE_FAILED)
+            return nil
+        end
+    end
+    setPhase(lane, LANE_RUNNING)
+    @unsafe do
+        local host = l.host as Host*
+        local status = state.nuppHostStateRun(L as voidptr, record, host.payload, host.length, "=nupp-worker" as uint64, 0ULL, 0ULL, 0)
+        if status ~= 0 then
+            laneFailWith(lane, "", record)
+        end
+        -- No entry can consume more input after the guest stops. Release queued
+        -- moved owners and endpoint directions now, independently of when the
+        -- parent observes the outcome.
+        channel.nuppHostQueueCloseAndDiscard(controlQueue(l.inbox))
+        channel.nuppHostQueueClose(controlQueue(l.outbox))
+        sys.nuppHostSysLock(l.lock as voidptr)
+        l.phase = LANE_FINISHED
+        sys.nuppHostSysBroadcast(l.changed as voidptr)
+        while l.stop == 0 do
+            sys.nuppHostSysWait(l.changed as voidptr, l.lock as voidptr)
+        end
+        sys.nuppHostSysUnlock(l.lock as voidptr)
+        state.nuppHostStateClearWorkerContext(L as voidptr, record)
+        state.nuppHostStateClose(L as voidptr)
+        state.nuppHostStateCallFree(record)
+    end
+    return nil
+end
+
+local function laneFree(lane: uint64)
+    local l = lane as Lane*
+    @unsafe do
+        tasksRelease(l.tasks)
+        controlRelease(l.inbox)
+        controlRelease(l.outbox)
+        sys.nuppHostSysMutexFree(l.lock as voidptr)
+        sys.nuppHostSysCondFree(l.changed as voidptr)
+        if l.error ~= 0ULL then
+            free(l.error as voidptr)
+        end
+    end
+    free(lane as voidptr)
+end
+
+local function pushLaneError(L: voidptr, lane: uint64, fallback: cstring)
+    local l = lane as Lane*
+    @unsafe do
+        if l.error ~= 0ULL then
+            lua_pushlstring(L, l.error as voidptr, l.errorLength)
+        else
+            lua_pushstring(L, fallback)
+        end
+    end
+end
+
+local function workerSpawn(L: voidptr): int32
+    local host = globalLight(L, "__nuppWorkerHost")
+    local inbox = lightAt(L, 1)
+    local outbox = lightAt(L, 2)
+    if host == 0ULL then
+        lua_pushnil(L)
+        lua_pushstring(L, "workers require a stamped Nupp payload")
+        return 2
+    end
+    if inbox == 0ULL or outbox == 0ULL then
+        lua_pushnil(L)
+        lua_pushstring(L, "worker channels are missing")
+        return 2
+    end
+    local record = calloc(1ULL, 96ULL)
+    local lock = sys.nuppHostSysMutexNew()
+    local changed = sys.nuppHostSysCondNew()
+    local tasks = tasksNew()
+    if record == nil or lock == nil or changed == nil or tasks == 0ULL then
+        lua_pushnil(L)
+        lua_pushstring(L, "cannot start worker: out of memory")
+        return 2
+    end
+    local lane = record as uint64
+    local l = record as Lane*
+    controlRetain(inbox)
+    controlRetain(outbox)
+    @unsafe do
+        __atomic_store_4((outbox + 16ULL) as int32*, 1, 0)
+        l.tasks = tasks
+        l.inbox = inbox
+        l.outbox = outbox
+        l.host = host
+        l.lock = lock as uint64
+        l.changed = changed as uint64
+    end
+    local thread = sys.nuppHostSysThreadStart(laneMain, lane)
+    if thread == nil then
+        laneFree(lane)
+        lua_pushnil(L)
+        lua_pushstring(L, "cannot start worker: the thread could not be created")
+        return 2
+    end
+    @unsafe do
+        l.thread = thread as uint64
+        sys.nuppHostSysLock(l.lock as voidptr)
+        while l.phase == LANE_STARTING do
+            sys.nuppHostSysWait(l.changed as voidptr, l.lock as voidptr)
+        end
+        local failed = l.phase == LANE_FAILED
+        sys.nuppHostSysUnlock(l.lock as voidptr)
+        if failed then
+            sys.nuppHostSysThreadJoin(thread as voidptr)
+            lua_pushnil(L)
+            pushLaneError(L, lane, "cannot start worker")
+            laneFree(lane)
+            return 2
+        end
+    end
+    pushLight(L, lane)
+    return 1
+end
+
+local function workerJoin(L: voidptr): int32
+    local lane = lightAt(L, 1)
+    if lane == 0ULL then
+        lua_pushinteger(L, 1LL)
+        lua_pushstring(L, "worker handle is missing")
+        return 2
+    end
+    local l = lane as Lane*
+    @unsafe do
+        channel.nuppHostQueueClose(controlQueue(l.inbox))
+        -- A lane waiting for room in its outbox would be waiting for a parent
+        -- that is now waiting for it, so replies are drained while the join
+        -- waits; nothing reads a lane's replies past its join.
+        sys.nuppHostSysLock(l.lock as voidptr)
+        while l.phase ~= LANE_FINISHED do
+            sys.nuppHostSysUnlock(l.lock as voidptr)
+            local reply = channel.nuppHostQueuePop(controlQueue(l.outbox), 10LL)
+            while reply ~= 0ULL do
+                channel.nuppHostMessageDestroy(reply)
+                reply = channel.nuppHostQueuePop(controlQueue(l.outbox), 0LL)
+            end
+            sys.nuppHostSysLock(l.lock as voidptr)
+        end
+        l.stop = 1
+        sys.nuppHostSysBroadcast(l.changed as voidptr)
+        sys.nuppHostSysUnlock(l.lock as voidptr)
+        channel.nuppHostQueueClose(controlQueue(l.outbox))
+        sys.nuppHostSysThreadJoin(l.thread as voidptr)
+        local status = l.status
+        lua_pushinteger(L, status as int64)
+        if l.error ~= 0ULL then
+            lua_pushlstring(L, l.error as voidptr, l.errorLength)
+        else
+            lua_pushnil(L)
+        end
+    end
+    laneFree(lane)
+    return 2
+end
+
+local function pushPair(L: voidptr, first: boolean, second: boolean): int32
+    if first then
+        lua_pushboolean(L, 1)
+    else
+        lua_pushboolean(L, 0)
+    end
+    if second then
+        lua_pushboolean(L, 1)
+    else
+        lua_pushboolean(L, 0)
+    end
+    return 2
+end
+
+local function taskCreate(L: voidptr): int32
+    local lane = lightAt(L, 1)
+    local id = lua_tointeger(L, 2)
+    local kind = lua_type(L, 3)
+    local hasDeadline = kind ~= TNONE and kind ~= TNIL
+    local deadline: number = 0
+    if hasDeadline then
+        deadline = lua_tonumber(L, 3)
+        hasDeadline = finite(deadline)
+    end
+    if lane == 0ULL or id < 1LL then
+        return pushAccepted(L, false)
+    end
+    local tasks = laneTasks(lane)
+    lockTasks(tasks)
+    local created = false
+    if taskOf(tasks, id) == 0ULL then
+        local record = calloc(1ULL, 16ULL)
+        if record ~= nil then
+            local t = record as Task*
+            @unsafe do
+                t.status = TASK_QUEUED
+                if hasDeadline then
+                    t.hasDeadline = 1
+                    t.deadline = deadline
+                end
+                if map.nuppHostMapPut((tasks as Tasks*).table, id as uint64, record as uint64) then
+                    created = true
+                else
+                    free(record as voidptr)
+                end
+            end
+        end
+    end
+    unlockTasks(tasks)
+    return pushAccepted(L, created)
+end
+
+local function taskCancel(L: voidptr): int32
+    local lane = lightAt(L, 1)
+    local id = lua_tointeger(L, 2)
+    local answer: int64 = 0LL
+    if lane ~= 0ULL then
+        local tasks = laneTasks(lane)
+        lockTasks(tasks)
+        local task = taskOf(tasks, id)
+        if task ~= 0ULL then
+            local t = task as Task*
+            @unsafe do
+                if t.status == TASK_QUEUED then
+                    t.status = TASK_CANCELLED
+                    answer = 1LL
+                elseif t.status == TASK_RUNNING then
+                    t.status = TASK_CANCELLATION_REQUESTED
+                    answer = 2LL
+                end
+            end
+        end
+        unlockTasks(tasks)
+    end
+    lua_pushinteger(L, answer)
+    return 1
+end
+
+local function taskStart(L: voidptr): int32
+    local tasks = globalLight(L, "__nuppWorkerTasks")
+    local id = lua_tointeger(L, 1)
+    local run = false
+    local late = false
+    if tasks ~= 0ULL then
+        lockTasks(tasks)
+        local task = taskOf(tasks, id)
+        if task ~= 0ULL then
+            local t = task as Task*
+            @unsafe do
+                if t.status == TASK_QUEUED then
+                    if expired(task) then
+                        t.status = TASK_CANCELLED
+                        late = true
+                    else
+                        t.status = TASK_RUNNING
+                        local all = tasks as Tasks*
+                        all.current = id
+                        all.hasCurrent = 1
+                        run = true
+                    end
+                end
+            end
+        end
+        unlockTasks(tasks)
+    end
+    return pushPair(L, run, late)
+end
+
+local function taskCheckpoint(L: voidptr): int32
+    local tasks = globalLight(L, "__nuppWorkerTasks")
+    local cancelled = false
+    local late = false
+    if tasks ~= 0ULL then
+        lockTasks(tasks)
+        local all = tasks as Tasks*
+        @unsafe do
+            if all.hasCurrent ~= 0 then
+                local task = taskOf(tasks, all.current)
+                if task ~= 0ULL then
+                    local t = task as Task*
+                    late = expired(task)
+                    cancelled = late or t.status == TASK_CANCELLATION_REQUESTED or t.status == TASK_CANCELLED
+                    if cancelled and t.status == TASK_RUNNING then
+                        t.status = TASK_CANCELLATION_REQUESTED
+                    end
+                end
+            end
+        end
+        unlockTasks(tasks)
+    end
+    return pushPair(L, cancelled, late)
+end
+
+local function taskFinish(L: voidptr): int32
+    local tasks = globalLight(L, "__nuppWorkerTasks")
+    local id = lua_tointeger(L, 1)
+    local cancelled = false
+    local late = false
+    if tasks ~= 0ULL then
+        lockTasks(tasks)
+        local task = taskOf(tasks, id)
+        if task ~= 0ULL then
+            local t = task as Task*
+            @unsafe do
+                late = expired(task)
+                cancelled = late or t.status == TASK_CANCELLATION_REQUESTED or t.status == TASK_CANCELLED
+                t.status = TASK_DONE
+                local all = tasks as Tasks*
+                if all.hasCurrent ~= 0 and all.current == id then
+                    all.hasCurrent = 0
+                end
+            end
+        end
+        unlockTasks(tasks)
+    end
+    return pushPair(L, cancelled, late)
+end
+
+local function taskRelease(L: voidptr): int32
+    local lane = lightAt(L, 1)
+    local id = lua_tointeger(L, 2)
+    if lane ~= 0ULL then
+        local tasks = laneTasks(lane)
+        lockTasks(tasks)
+        @unsafe do
+            local task = map.nuppHostMapRemove((tasks as Tasks*).table, id as uint64)
+            if task ~= 0ULL then
+                free(task as voidptr)
+            end
+        end
+        unlockTasks(tasks)
+    end
+    return 0
+end
+
+local function taskStatus(L: voidptr): int32
+    local lane = lightAt(L, 1)
+    local id = lua_tointeger(L, 2)
+    local answer: int64 = 0LL
+    if lane ~= 0ULL then
+        local tasks = laneTasks(lane)
+        lockTasks(tasks)
+        local task = taskOf(tasks, id)
+        if task ~= 0ULL then
+            @unsafe do
+                answer = (task as Task*).status as int64
+            end
+        end
+        unlockTasks(tasks)
+    end
+    lua_pushinteger(L, answer)
+    return 1
+end
+
+local function current(L: voidptr): int32
+    lua_getfield(L, GLOBALS, "__nuppWorkerIn")
+    lua_getfield(L, GLOBALS, "__nuppWorkerOut")
+    return 2
+end
+
+local function parallelism(L: voidptr): int32
+    lua_pushinteger(L, sys.nuppHostSysParallelism())
+    return 1
+end
+
+-- Application channel endpoints ------------------------------------------------
+
+local function wholeNumber(value: number, largest: number): boolean
+    return finite(value) and value >= 1 and value == math.floor(value) and value <= largest
+end
+
+local function endpointCreate(L: voidptr): int32
+    local messages = lua_tonumber(L, 1)
+    local bytes = lua_tonumber(L, 2)
+    if lua_type(L, 1) ~= TNUMBER or lua_type(L, 2) ~= TNUMBER or not wholeNumber(messages, 2147483647) or not wholeNumber(bytes, LARGEST_EXACT) then
+        return luaL_error(L, "nupp: channel limits must be positive finite integers within host limits")
+    end
+    -- Both Lua owners exist before either native owner does.
+    local sender = pushEndpoint(L, 0ULL)
+    local receiver = pushEndpoint(L, 0ULL)
+    local slot = calloc(1ULL, 8ULL)
+    if slot == nil then
+        return luaL_error(L, "nupp: cannot create a channel")
+    end
+    local send = channel.nuppHostEndpointPair(messages as int64, bytes as uint64, slot as uint64*)
+    local receive = read64(slot as uint64)
+    free(slot as voidptr)
+    if send == 0ULL then
+        return luaL_error(L, "nupp: cannot create a channel")
+    end
+    local sendKey = channel.nuppHostEndpointRegister(send)
+    local receiveKey = channel.nuppHostEndpointRegister(receive)
+    if sendKey == 0ULL or receiveKey == 0ULL then
+        channel.nuppHostEndpointDiscard(sendKey)
+        channel.nuppHostEndpointDiscard(receiveKey)
+        return luaL_error(L, "nupp: cannot create a channel")
+    end
+    write64(sender, sendKey)
+    write64(receiver, receiveKey)
+    return 2
+end
+
+local function endpointClose(L: voidptr): int32
+    local handle = endpointAt(L, 1)
+    if handle ~= 0ULL then
+        local key = read64(handle)
+        if key ~= 0ULL and direction(key) ~= -1 then
+            local endpoint = channel.nuppHostEndpointBorrow(key)
+            if endpoint ~= 0ULL then
+                channel.nuppHostEndpointClose(endpoint)
+                channel.nuppHostEndpointRelease(endpoint)
+            end
+            channel.nuppHostEndpointDiscard(key)
+            write64(handle, 0ULL)
+        end
+    end
+    return 0
+end
+
+local function transferKey(key: uint64): uint64
+    local endpoint = channel.nuppHostEndpointBorrow(key)
+    if endpoint == 0ULL then
+        return 0ULL
+    end
+    local successor = channel.nuppHostEndpointTransfer(endpoint)
+    channel.nuppHostEndpointRelease(endpoint)
+    if successor == 0ULL then
+        return 0ULL
+    end
+    return channel.nuppHostEndpointRegister(successor)
+end
+
+local function endpointMove(L: voidptr): int32
+    local handle = endpointAt(L, 1)
+    local moved = pushEndpoint(L, 0ULL)
+    local key: uint64 = 0ULL
+    if handle ~= 0ULL then
+        key = read64(handle)
+    end
+    local successor: uint64 = 0ULL
+    if key ~= 0ULL then
+        successor = transferKey(key)
+    end
+    if successor == 0ULL then
+        return luaL_error(L, "nupp: invalid, closed, or moved channel endpoint")
+    end
+    write64(moved, successor)
+    channel.nuppHostEndpointDiscard(key)
+    write64(handle, 0ULL)
+    return 1
+end
+
+local function endpointSend(L: voidptr): int32
+    local handle = endpointAt(L, 1)
+    local length = calloc(1ULL, 8ULL)
+    local status: integer = channel.INVALID
+    if length ~= nil then
+        local bytes = stringAt(L, 2, length as uint64*)
+        local size = read64(length as uint64)
+        free(length as voidptr)
+        local key: uint64 = 0ULL
+        if handle ~= 0ULL then
+            key = read64(handle)
+        end
+        local endpoint: uint64 = 0ULL
+        if key ~= 0ULL and bytes ~= 0ULL then
+            endpoint = channel.nuppHostEndpointBorrow(key)
+        end
+        if endpoint ~= 0ULL then
+            if not channel.nuppHostEndpointIsLive(endpoint) or not channel.nuppHostEndpointIsSender(endpoint) then
+                status = channel.INVALID
+            elseif size > channel.nuppHostEndpointByteLimit(endpoint) then
+                status = channel.OVERSIZED
+            else
+                local message = channel.nuppHostMessageNew(0, 0LL, 0, bytes, size, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0LL)
+                if message ~= 0ULL then
+                    status = channel.nuppHostEndpointTrySend(endpoint, message)
+                    if status ~= channel.SENT then
+                        channel.nuppHostMessageDestroy(message)
+                    end
+                end
+            end
+            channel.nuppHostEndpointRelease(endpoint)
+        end
+    end
+    lua_pushinteger(L, status as int64)
+    return 1
+end
+
+local function endpointDirection(L: voidptr): int32
+    local handle = endpointAt(L, 1)
+    local answer: int32 = -1
+    if handle ~= 0ULL then
+        local key = read64(handle)
+        if key ~= 0ULL then
+            answer = direction(key)
+        end
+    end
+    lua_pushinteger(L, answer as int64)
+    return 1
+end
+
+local function endpointWaitOrReady(L: voidptr, wait: boolean): int32
+    local handle = endpointAt(L, 1)
+    local size = lua_tonumber(L, 2)
+    local timeout: number = 0
+    if wait then
+        timeout = lua_tonumber(L, 3)
+    end
+    local status: integer = channel.INVALID
+    local key: uint64 = 0ULL
+    if handle ~= 0ULL then
+        key = read64(handle)
+    end
+    local sized = lua_type(L, 2) == TNUMBER and finite(size) and size >= 0 and math.floor(size) == size and size <= LARGEST_EXACT
+    local timed = not wait or (lua_type(L, 3) == TNUMBER and finite(timeout) and timeout >= -1 and timeout <= 2147483647 and math.floor(timeout) == timeout)
+    if key ~= 0ULL and sized and timed then
+        local endpoint = channel.nuppHostEndpointBorrow(key)
+        if endpoint ~= 0ULL then
+            if wait then
+                -- Short waits let the guest check cancellation between sleeps.
+                local milliseconds: int64 = 10LL
+                if timeout >= 0 and timeout < 10 then
+                    milliseconds = timeout as int64
+                end
+                status = channel.nuppHostEndpointWaitReady(endpoint, size as uint64, milliseconds)
+            else
+                status = channel.nuppHostEndpointReadiness(endpoint, size as uint64)
+            end
+            channel.nuppHostEndpointRelease(endpoint)
+        end
+    end
+    lua_pushinteger(L, status as int64)
+    return 1
+end
+
+local function endpointReady(L: voidptr): int32
+    return endpointWaitOrReady(L, false)
+end
+
+local function endpointWait(L: voidptr): int32
+    return endpointWaitOrReady(L, true)
+end
+
+local function endpointReceive(L: voidptr): int32
+    local handle = endpointAt(L, 1)
+    local status = calloc(1ULL, 8ULL)
+    if status == nil then
+        return luaL_error(L, "nupp: out of memory")
+    end
+    write64(status as uint64, channel.INVALID as uint64)
+    -- Own the message before allocating its Lua string: a Lua allocation
+    -- failure unwinds straight past this frame, so the owner's finalizer has
+    -- to be what frees it then.
+    local owner = messageOwner(L)
+    local message: uint64 = 0ULL
+    local key: uint64 = 0ULL
+    if handle ~= 0ULL then
+        key = read64(handle)
+    end
+    if key ~= 0ULL then
+        local endpoint = channel.nuppHostEndpointBorrow(key)
+        if endpoint ~= 0ULL then
+            message = channel.nuppHostEndpointTryReceive(endpoint, status as int32*)
+            channel.nuppHostEndpointRelease(endpoint)
+        end
+    end
+    write64(owner, message)
+    local code = (read64(status as uint64) & 4294967295ULL) as int64
+    free(status as voidptr)
+    lua_pushinteger(L, code)
+    if message == 0ULL then
+        lua_pushnil(L)
+        lua_pushnil(L)
+    else
+        pushMessageBytes(L, message, 0)
+        pushAttachments(L, message)
+        channel.nuppHostMessageDestroy(message)
+        write64(owner, 0ULL)
+    end
+    return 3
+end
+
+local function anchorAt(L: voidptr, index: int32): uint64
+    return handleAt(L, index, ANCHOR_METATABLE)
+end
+
+local function anchorClose(L: voidptr): int32
+    local handle = anchorAt(L, 1)
+    if handle ~= 0ULL then
+        local key = read64(handle)
+        if key ~= 0ULL and direction(key) ~= -1 then
+            local endpoint = channel.nuppHostEndpointBorrow(key)
+            if endpoint ~= 0ULL then
+                channel.nuppHostEndpointAbort(endpoint)
+                channel.nuppHostEndpointRelease(endpoint)
+            end
+            channel.nuppHostEndpointDiscard(key)
+            write64(handle, 0ULL)
+        end
+    end
+    return 0
+end
+
+local function endpointAnchor(L: voidptr): int32
+    local source = endpointAt(L, 1)
+    local handle = pushHandle(L, 0ULL, ANCHOR_METATABLE, anchorClose)
+    local key: uint64 = 0ULL
+    if source ~= 0ULL then
+        key = channel.nuppHostEndpointAnchor(read64(source))
+    end
+    if key == 0ULL then
+        return luaL_error(L, "nupp: invalid channel resource")
+    end
+    write64(handle, key)
+    return 1
+end
+
+local function pendingAt(L: voidptr, index: int32): uint64
+    return handleAt(L, index, PENDING_METATABLE)
+end
+
+local function pendingClose(L: voidptr): int32
+    local handle = pendingAt(L, 1)
+    if handle ~= 0ULL then
+        local key = read64(handle)
+        if key ~= 0ULL then
+            local message = channel.nuppHostPendingTake(key)
+            if message ~= 0ULL then
+                channel.nuppHostMessageDestroy(message)
+                write64(handle, 0ULL)
+            end
+        end
+    end
+    return 0
+end
+
+local function pendingCreate(L: voidptr): int32
+    pushHandle(L, 0ULL, PENDING_METATABLE, pendingClose)
+    return 1
+end
+
+local function pendingFill(L: voidptr): int32
+    local handle = pendingAt(L, 1)
+    local slots = calloc(2ULL, 8ULL)
+    if slots == nil then
+        return luaL_error(L, "nupp: out of memory")
+    end
+    local words = slots as uint64
+    local bytes = stringAt(L, 2, words as uint64*)
+    if handle == 0ULL or read64(handle) ~= 0ULL or bytes == 0ULL then
+        if lua_type(L, 3) == TTABLE then
+            releaseListedMoved(L, 3, (lua_objlen(L, 3) as integer) // 3)
+        end
+        releaseListedEndpoints(L, 3)
+        free(slots as voidptr)
+        return pushAccepted(L, false)
+    end
+    local count = attachmentsFor(L, 3, (words + 8ULL) as uint64*)
+    if count >= 0 then
+        local attachments = read64(words + 8ULL)
+        local carriesEndpoint = false
+        for index = 0, count - 1 do
+            if read64(attachments + (index as uint64) * 32ULL) == (channel.ATTACHMENT_ENDPOINT as uint64) then
+                carriesEndpoint = true
+            end
+        end
+        if carriesEndpoint then
+            channel.nuppHostAttachmentsRelease(attachments, count as int64)
+        else
+            local message = channel.nuppHostMessageNew(
+                0,
+                0LL,
+                0,
+                bytes,
+                read64(words),
+                0ULL,
+                0ULL,
+                0ULL,
+                0ULL,
+                attachments,
+                count as int64
+            )
+            if message ~= 0ULL then
+                write64(handle, channel.nuppHostPendingPut(message))
+            end
+        end
+    end
+    releaseListedEndpoints(L, 3)
+    free(slots as voidptr)
+    return pushAccepted(L, read64(handle) ~= 0ULL)
+end
+
+local function pendingOffer(L: voidptr): int32
+    local endpoint = endpointAt(L, 1)
+    local message = pendingAt(L, 2)
+    local status: integer = channel.INVALID
+    if endpoint ~= 0ULL and message ~= 0ULL and read64(message) ~= 0ULL then
+        status = channel.nuppHostPendingOffer(read64(endpoint), read64(message))
+    end
+    if status == channel.SENT then
+        write64(message, 0ULL)
+    end
+    lua_pushinteger(L, status as int64)
+    return 1
+end
+
+local function pendingSize(L: voidptr): int32
+    local message = pendingAt(L, 1)
+    local size = SATURATED
+    if message ~= 0ULL and read64(message) ~= 0ULL then
+        size = channel.nuppHostPendingSize(read64(message))
+    end
+    if size > (LARGEST_EXACT as uint64) then
+        lua_pushnil(L)
+    else
+        lua_pushnumber(L, size as number)
+    end
+    return 1
+end
+
+local function pendingTake(L: voidptr): int32
+    local handle = pendingAt(L, 1)
+    local owner = messageOwner(L)
+    local message: uint64 = 0ULL
+    if handle ~= 0ULL and read64(handle) ~= 0ULL then
+        message = channel.nuppHostPendingTake(read64(handle))
+    end
+    write64(owner, message)
+    if handle ~= 0ULL and message ~= 0ULL then
+        write64(handle, 0ULL)
+    end
+    if message == 0ULL then
+        lua_pushnil(L)
+        lua_pushnil(L)
+    else
+        pushMessageBytes(L, message, 0)
+        pushAttachments(L, message)
+        channel.nuppHostMessageDestroy(message)
+        write64(owner, 0ULL)
+    end
+    return 2
+end
+
+-- Shared bytes -----------------------------------------------------------------
+
+local function regionFromString(L: voidptr): int32
+    local length = calloc(1ULL, 8ULL)
+    if length == nil then
+        return luaL_error(L, "nupp: out of memory")
+    end
+    local text = stringAt(L, 1, length as uint64*)
+    local size = read64(length as uint64)
+    free(length as voidptr)
+    local block: uint64 = 0ULL
+    if text ~= 0ULL then
+        block = region.nuppHostRegionNew(text, size)
+    end
+    if block == 0ULL then
+        lua_pushnil(L)
+        lua_pushnil(L)
+        return 2
+    end
+    pushRegion(L, block)
+    lua_pushinteger(L, size as int64)
+    return 2
+end
+
+local function regionReadFile(L: voidptr): int32
+    local slots = calloc(2ULL, 8ULL)
+    local message = malloc(1024ULL)
+    if slots == nil or message == nil then
+        return luaL_error(L, "nupp: out of memory")
+    end
+    local words = slots as uint64
+    local text = stringAt(L, 1, words as uint64*)
+    local size = read64(words)
+    local path = malloc(size + 1ULL)
+    local block: uint64 = 0ULL
+    if text ~= 0ULL and path ~= nil then
+        memcpy(path as voidptr, text as voidptr, size)
+        @unsafe do
+            (path as uint8*)[size as integer] = 0
+        end
+        local data = sys.nuppHostSysReadFile(path as cstring, (words + 8ULL) as int64*, message as voidptr, 1024ULL)
+        if data ~= nil then
+            block = region.nuppHostRegionAdopt(data as uint64, read64(words + 8ULL))
+        end
+    end
+    if block == 0ULL then
+        lua_pushnil(L)
+        if text == 0ULL then
+            lua_pushstring(L, "a file path is required")
+        else
+            -- `cannot read PATH: REASON`, as the Rust host worded it.
+            local length = 16ULL + size + strlen(message as cstring)
+            local full = malloc(length)
+            if full ~= nil and path ~= nil then
+                snprintf(full as voidptr, length, "cannot read %s: %s", path as cstring, message as cstring)
+                lua_pushstring(L, full as cstring)
+            else
+                lua_pushstring(L, message as cstring)
+            end
+            if full ~= nil then
+                free(full as voidptr)
+            end
+        end
+    else
+        pushRegion(L, block)
+        lua_pushnil(L)
+    end
+    if path ~= nil then
+        free(path as voidptr)
+    end
+    free(message as voidptr)
+    free(slots as voidptr)
+    return 2
+end
+
+local function regionText(L: voidptr): int32
+    local block = regionAt(L, 1)
+    local first = lua_tointeger(L, 2)
+    local last = lua_tointeger(L, 3)
+    if block == 0ULL then
+        lua_pushnil(L)
+        return 1
+    end
+    local length = region.nuppHostRegionLength(block) as int64
+    if first < 1LL or last > length or first > last + 1LL then
+        lua_pushnil(L)
+    else
+        local start = region.nuppHostRegionData(block) + ((first - 1LL) as uint64)
+        lua_pushlstring(L, start as voidptr, (last - first + 1LL) as uint64)
+    end
+    return 1
+end
+
+local function regionPointer(L: voidptr): int32
+    local block = regionAt(L, 1)
+    if block == 0ULL then
+        lua_pushnil(L)
+    else
+        pushLight(L, region.nuppHostRegionData(block))
+    end
+    return 1
+end
+
+local function regionLength(L: voidptr): int32
+    local block = regionAt(L, 1)
+    if block == 0ULL then
+        lua_pushnil(L)
+    else
+        lua_pushinteger(L, region.nuppHostRegionLength(block) as int64)
+    end
+    return 1
+end
+
+--- Gives a builder's storage back now, for a builder dropped unfrozen. The
+--- finalizer then finds nothing left to release.
+local function builderRelease(L: voidptr): int32
+    local handle = builderAt(L, 1)
+    if handle ~= 0ULL then
+        local builder = read64(handle)
+        if builder ~= 0ULL then
+            region.nuppHostBuilderFree(builder)
+            write64(handle, 0ULL)
+        end
+    end
+    return 0
+end
+
+local function builderNew(L: voidptr): int32
+    local handle = lua_newuserdata(L, 8ULL) as uint64
+    local builder = region.nuppHostBuilderNew()
+    write64(handle, builder)
+    if builder == 0ULL then
+        lua_pushnil(L)
+        return 1
+    end
+    pushMetatable(L, BUILDER_METATABLE, builderGc)
+    lua_setmetatable(L, -2)
+    return 1
+end
+
+--- The builder a handle holds, or 0.
+local function builderOf(handle: uint64): uint64
+    if handle == 0ULL then
+        return 0ULL
+    end
+    return read64(handle)
+end
+
+local function pushOpen(L: voidptr, builder: uint64, succeeded: boolean)
+    if succeeded or builder == 0ULL or not region.nuppHostBuilderOpen(builder) then
+        lua_pushnil(L)
+    else
+        lua_pushstring(L, "open")
+    end
+end
+
+local function builderAppend(L: voidptr): int32
+    local builder = builderOf(builderAt(L, 1))
+    local length = calloc(1ULL, 8ULL)
+    if length == nil then
+        return luaL_error(L, "nupp: out of memory")
+    end
+    local data = stringAt(L, 2, length as uint64*)
+    local size = read64(length as uint64)
+    free(length as voidptr)
+    local accepted = builder ~= 0ULL and data ~= 0ULL and region.nuppHostBuilderAppend(builder, data, size)
+    pushAccepted(L, accepted)
+    pushOpen(L, builder, accepted)
+    return 2
+end
+
+local function builderReserve(L: voidptr): int32
+    local builder = builderOf(builderAt(L, 1))
+    local count = lua_tointeger(L, 2)
+    local pointer: uint64 = 0ULL
+    if builder ~= 0ULL and count >= 0LL then
+        pointer = region.nuppHostBuilderReserve(builder, count as uint64)
+    end
+    if pointer == 0ULL then
+        lua_pushnil(L)
+    else
+        pushLight(L, pointer)
+    end
+    pushOpen(L, builder, pointer ~= 0ULL)
+    return 2
+end
+
+local function builderCommit(L: voidptr): int32
+    local builder = builderOf(builderAt(L, 1))
+    local written = lua_tointeger(L, 2)
+    return pushAccepted(L, builder ~= 0ULL and written >= 0LL and region.nuppHostBuilderCommit(builder, written as uint64))
+end
+
+local function builderFreeze(L: voidptr): int32
+    local builder = builderOf(builderAt(L, 1))
+    local block: uint64 = 0ULL
+    if builder ~= 0ULL then
+        block = region.nuppHostBuilderFreeze(builder)
+    end
+    if block == 0ULL then
+        lua_pushnil(L)
+        pushOpen(L, builder, false)
+        return 2
+    end
+    pushRegion(L, block)
+    lua_pushinteger(L, region.nuppHostRegionLength(block) as int64)
+    return 2
+end
+
+local function accounted(L: voidptr): int32
+    local account = accountFind(L)
+    local charged: uint64 = 0ULL
+    if account ~= 0ULL then
+        charged = region.nuppHostAccounted(account)
+    end
+    lua_pushinteger(L, charged as int64)
+    return 1
+end
+
+-- Openers ----------------------------------------------------------------------
+
+export function nuppHostWorkersOpen(L: voidptr): int32
+    lua_createtable(L, 0, 44)
+    field(L, "endpointCreate", endpointCreate)
+    field(L, "endpointClose", endpointClose)
+    field(L, "endpointMove", endpointMove)
+    field(L, "endpointSend", endpointSend)
+    field(L, "endpointReceive", endpointReceive)
+    field(L, "endpointAnchor", endpointAnchor)
+    field(L, "channelRelease", anchorClose)
+    field(L, "messageCreate", pendingCreate)
+    field(L, "messageFill", pendingFill)
+    field(L, "messageOffer", pendingOffer)
+    field(L, "messageSize", pendingSize)
+    field(L, "messageTake", pendingTake)
+    field(L, "messageClose", pendingClose)
+    field(L, "endpointReady", endpointReady)
+    field(L, "endpointWait", endpointWait)
+    field(L, "endpointDirection", endpointDirection)
+    field(L, "channelCreate", channelCreate)
+    field(L, "channelDestroy", channelDestroy)
+    field(L, "channelClose", channelClose)
+    field(L, "channelPush", channelPush)
+    field(L, "channelPushNumberTask", pushNumberTask)
+    field(L, "channelPushNumberReply", pushNumberReply)
+    field(L, "channelPushStringTask", pushStringTask)
+    field(L, "channelPushStringReply", pushStringReply)
+    field(L, "channelDictRegister", dictRegister)
+    field(L, "channelDictCount", dictCount)
+    field(L, "channelDictAddress", dictAddress)
+    field(L, "channelPushBufferTask", pushBufferTask)
+    field(L, "channelPushBufferReply", pushBufferReply)
+    field(L, "channelPop", channelPop)
+    field(L, "channelCount", channelCount)
+    field(L, "channelClosed", channelClosed)
+    field(L, "workerSpawn", workerSpawn)
+    field(L, "workerJoin", workerJoin)
+    field(L, "workerTaskCreate", taskCreate)
+    field(L, "workerTaskCancel", taskCancel)
+    field(L, "workerTaskStart", taskStart)
+    field(L, "workerTaskCheckpoint", taskCheckpoint)
+    field(L, "workerTaskFinish", taskFinish)
+    field(L, "workerTaskRelease", taskRelease)
+    field(L, "workerTaskStatus", taskStatus)
+    field(L, "current", current)
+    field(L, "workerParallelism", parallelism)
+    return 1
+end
+
+export function nuppHostWorkersOpenSharedBytes(L: voidptr): int32
+    lua_createtable(L, 0, 12)
+    field(L, "fromString", regionFromString)
+    field(L, "readFile", regionReadFile)
+    field(L, "text", regionText)
+    field(L, "pointer", regionPointer)
+    field(L, "length", regionLength)
+    field(L, "builderNew", builderNew)
+    field(L, "builderAppend", builderAppend)
+    field(L, "builderReserve", builderReserve)
+    field(L, "builderCommit", builderCommit)
+    field(L, "builderFreeze", builderFreeze)
+    field(L, "builderRelease", builderRelease)
+    field(L, "accounted", accounted)
+    return 1
+end
+
+--- A worker host for `length` bytes of stamped payload at `payload`, which
+--- must outlive every lane, or 0.
+export function nuppHostWorkersHost(payload: uint64, length: uint64): uint64
+    local record = calloc(1ULL, 16ULL)
+    if record == nil then
+        return 0ULL
+    end
+    local h = record as Host*
+    @unsafe do
+        h.payload = payload
+        h.length = length
+    end
+    return record as uint64
+end
+
+--- Installs the worker and shared-byte modules in `L` for `host`, and declares
+--- the `workers` feature. Nonzero is a failure, with its text in `record`.
+local function install(L: voidptr): int32
+    local record = lua_touserdata(L, 1) as uint64
+    state.nuppHostStatePreload(L, "nupp.workers.native", nuppHostWorkersOpen)
+    state.nuppHostStatePreload(L, "nupp.mem.sharedbytes.native", nuppHostWorkersOpenSharedBytes)
+    @unsafe do
+        lua_pushlightuserdata(L, (record as Install*).host as voidptr)
+    end
+    lua_setfield(L, GLOBALS, "__nuppWorkerHost")
+    state.nuppHostStateAddFeature(L, @unsafe ((record as Install*).call), "workers")
+    return 0
+end
+
+--- Installs the worker and shared-byte modules in `L` for `host`, and declares
+--- the `workers` feature. Nonzero is a failure, with its text in `record`.
+export function nuppHostWorkersEnable(borrows L: voidptr, record: uint64, host: uint64): int32
+    if not channel.nuppHostChannelInitialize() then
+        state.nuppHostStateFail(record, "cannot prepare the worker registries")
+        return 1
+    end
+    local context = calloc(1ULL, 16ULL)
+    if context == nil then
+        state.nuppHostStateFail(record, "out of memory")
+        return 1
+    end
+    local c = context as Install*
+    @unsafe do
+        c.call = record
+        c.host = host
+    end
+    local status = lua_cpcall(L, install, context as voidptr)
+    free(context as voidptr)
+    if status ~= 0 then
+        lua_settop(L, -2)
+        state.nuppHostStateFail(record, "cannot install the Nupp worker adapter")
+    end
+    return status
+end

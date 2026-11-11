@@ -31,8 +31,8 @@ cdef function pthread_cond_broadcast(borrows condition: voidptr): int32
 cdef function pthread_create(
     borrows thread: voidptr,
     borrows attributes: voidptr?,
-    start: function(arg: voidptr): voidptr?,
-    borrows arg: voidptr
+    start: function(arg: uint64): voidptr?,
+    arg: uint64
 ): int32
 cdef function pthread_join(thread: uint64, borrows result: voidptr?): int32
 cdef function clock_gettime(clock: int32, borrows time: voidptr): int32
@@ -152,7 +152,7 @@ export function nuppHostSysBroadcast(borrows condition: voidptr): nil
 end
 
 --- Starts a thread running `entry(argument)`, or nil when it cannot.
-export function nuppHostSysThreadStart(entry: function(arg: voidptr): voidptr?, borrows argument: voidptr): voidptr?
+export function nuppHostSysThreadStart(entry: function(arg: uint64): voidptr?, argument: uint64): voidptr?
     local thread = calloc(1ULL, 8ULL)
     if thread == nil then
         return nil

@@ -44,13 +44,13 @@ local function joined(borrows prefix: cstring, borrows text: voidptr, count: uin
 end
 
 --- Reports a state's failure and frees its record.
-local function failed(borrows record: voidptr, borrows prefix: cstring): int32
+local function failed(record: uint64, borrows prefix: cstring): int32
     local length = malloc(8ULL) as uint64*
     if length ~= nil then
         local text = state.nuppHostStateCallError(record, length)
         say(prefix)
         @unsafe do
-            if text ~= nil then
+            if text ~= 0ULL then
                 sayLine(text as voidptr, length[0])
             else
                 say("\n")
@@ -163,19 +163,20 @@ export function nuppHostCliMain(argc: int32, borrows argv: cstring*): int32
 
     sys.nuppHostSysMcodeReserve()
     local record = state.nuppHostStateCall()
-    if record == nil then
+    if record == 0ULL then
         say("nupp: out of memory\n")
         return EXIT_FAILURE
     end
-    local L = state.nuppHostStateOpen(record as voidptr, executable)
+    local L = state.nuppHostStateOpen(record, executable as uint64)
     if L == nil then
-        return failed(record as voidptr, "nupp: ")
+        return failed(record, "nupp: ")
     end
     local lua = L as voidptr
     local enabled = false
     if build.WORKERS and stamped then
-        if workers.nuppHostWorkersEnable(lua, record as voidptr, chunk, chunkLength, nil) ~= 0 then
-            return failed(record as voidptr, "nupp: ")
+        local host = workers.nuppHostWorkersHost(chunk as uint64, chunkLength)
+        if host == 0ULL or workers.nuppHostWorkersEnable(lua, record, host) ~= 0 then
+            return failed(record, "nupp: ")
         end
         enabled = true
     end
@@ -183,25 +184,25 @@ export function nuppHostCliMain(argc: int32, borrows argv: cstring*): int32
     if forwarded < 0 then
         forwarded = 0
     end
-    local argumentTexts = ((texts as uint64) + (first as uint64) * 8ULL) as voidptr
-    local argumentLengths = ((lengths as uint64) + (first as uint64) * 8ULL) as voidptr
+    local argumentTexts = (texts as uint64) + (first as uint64) * 8ULL
+    local argumentLengths = (lengths as uint64) + (first as uint64) * 8ULL
     if state.nuppHostStateRun(
         lua,
-        record as voidptr,
-        chunk,
+        record,
+        chunk as uint64,
         chunkLength,
-        name as cstring,
+        name as uint64,
         argumentTexts,
         argumentLengths,
         forwarded
     ) ~= 0 then
-        return failed(record as voidptr, "")
+        return failed(record, "")
     end
-    if enabled and state.nuppHostStateClearWorkerContext(lua, record as voidptr) ~= 0 then
-        return failed(record as voidptr, "nupp: ")
+    if enabled and state.nuppHostStateClearWorkerContext(lua, record) ~= 0 then
+        return failed(record, "nupp: ")
     end
     state.nuppHostStateClose(lua)
-    state.nuppHostStateCallFree(record as voidptr)
+    state.nuppHostStateCallFree(record)
 
     return 0
 end
