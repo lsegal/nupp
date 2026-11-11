@@ -31,7 +31,7 @@ const T3: {integer} = {}
 do
     local exp: {integer} = {}
     local log: {integer} = {}
-    local value = 1
+    local value: integer = 1
     for index = 0, 254 do
         exp[index] = value
         log[value] = index
@@ -103,7 +103,7 @@ export function expand(key: string): Key
     for index = 0, nk - 1 do
         words[index] = word(key, index * 4 + 1)
     end
-    local rcon = 1
+    local rcon: integer = 1
     for index = nk, 4 * (rounds + 1) - 1 do
         local temp = words[index - 1]
         if index % nk == 0 then
@@ -140,7 +140,7 @@ export function encryptWords(key: Key, s0: integer, s1: integer, s2: integer, s3
     s1 = bxor(s1, w[1])
     s2 = bxor(s2, w[2])
     s3 = bxor(s3, w[3])
-    local at = 4
+    local at: integer = 4
     for _ = 1, key.rounds - 1 do
         local t0 = bxor(
             T0[band(rshift(s0, 24), 0xff)],
@@ -236,7 +236,7 @@ export function gcm(keyBytes: string): Gcm
     local m2: {integer} = {[0] = 0}
     local m3: {integer} = {[0] = 0}
     m0[8], m1[8], m2[8], m3[8] = v0, v1, v2, v3
-    local index = 4
+    local index: integer = 4
     while index > 0 do
         local carry = band(v3, 1)
         v3 = bor(rshift(v3, 1), lshift(v2, 31))
@@ -272,7 +272,7 @@ local function multiply(
     x3: integer
 ): (integer, integer, integer, integer)
     local m0, m1, m2, m3 = context.m0, context.m1, context.m2, context.m3
-    local z0, z1, z2, z3 = 0, 0, 0, 0
+    local z0: integer, z1: integer, z2: integer, z3: integer = 0, 0, 0, 0
     local first = true
     for position = 15, 0, -1 do
         local source = position >= 12 and x3 or position >= 8 and x2 or position >= 4 and x1 or x0
@@ -311,7 +311,7 @@ local function absorb(
     x3: integer
 ): (integer, integer, integer, integer)
     local length = #text
-    local at = 1
+    local at: integer = 1
     while at <= length do
         local block = text:sub(at, at + 15)
         if #block < 16 then
@@ -333,7 +333,7 @@ local function ctr(context: Gcm, n0: integer, n1: integer, n2: integer, counter:
     local key = context.key
     local parts: {string} = {}
     local length = #text
-    local at = 1
+    local at: integer = 1
     local chars = string.char
     while at <= length do
         local k0, k1, k2, k3 = encryptWords(key, n0, n1, n2, tobit(counter))
@@ -413,7 +413,7 @@ export function open(context: Gcm, nonce: string, aad: string, sealed: string): 
     local ciphertext = sealed:sub(1, #sealed - 16)
     local expected = tag(context, n0, n1, n2, aad, ciphertext)
     local received = sealed:sub(#sealed - 15)
-    local difference = 0
+    local difference: integer = 0
     for index = 1, 16 do
         difference = bor(difference, bxor(expected:byte(index), received:byte(index)))
     end

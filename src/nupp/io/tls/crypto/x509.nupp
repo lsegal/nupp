@@ -1,0 +1,598 @@
+@!internal
+--[[X.509 certificates (RFC 5280): parsing and server-certificate path validation.
+
+Validation follows the rules of webpki, which the Rust stack this replaces
+used (#3): a path is built from the end-entity certificate through the peer's
+intermediates to a trust anchor whose subject matches the last issuer byte for
+byte and whose key verifies its signature. Every certificate in the path must
+be within its validity period; issuers must be CAs permitted to sign
+certificates within their path-length limits; an extended key usage, wherever
+one is present, must allow server authentication; DNS and IP name constraints
+are enforced; and an unknown critical extension fails the certificate. The
+reference identity is matched against subject alternative names only -- never
+the subject common name -- with a wildcard allowed only as a whole leftmost
+label.
+]]
+module nupp.io.tls.crypto.x509
+
+const der = require("nupp.io.tls.crypto.der")
+const keys = require("nupp.io.tls.crypto.keys")
+const bit = require("nupp.runtime.bitops")
+
+--- A name constraint subtree.
+export record Subtree
+    @readonly kind: "dns" | "ip"
+    @readonly value: string
+end
+
+--- A parsed certificate.
+export record Certificate
+    @readonly encoded: string
+    @readonly tbs: string
+    @readonly algorithm: der.Node
+    @readonly signature: string
+    @readonly issuer: string
+    @readonly subject: string
+    @readonly notBefore: integer
+    @readonly notAfter: integer
+    @readonly publicKey: keys.PublicKey
+    @readonly dnsNames: {string}
+    @readonly ipAddresses: {string}
+    @readonly ca: boolean
+    @readonly pathLength: integer?
+    @readonly keyUsage: integer?
+    @readonly serverAuth: boolean
+    @readonly permitted: {Subtree}?
+    @readonly excluded: {Subtree}?
+end
+
+local function daysFromCivil(year: integer, month: integer, day: integer): integer
+    if month <= 2 then
+        year = year - 1
+    end
+    local era = (year >= 0 and year or year - 399) // 400
+    local yearOfEra = year - era * 400
+    local shifted = month > 2 and month - 3 or month + 9
+    local dayOfYear = (153 * shifted + 2) // 5 + day - 1
+    local dayOfEra = yearOfEra * 365 + yearOfEra // 4 - yearOfEra // 100 + dayOfYear
+
+    return era * 146097 + dayOfEra - 719468
+end
+
+local function parseTime(node: der.Node): integer?
+    local text = der.contents(node)
+    local year: integer
+    local rest: string
+    if node.tag == der.UTCTIME and #text == 13 then
+        local yy = tonumber(text:sub(1, 2))
+        if yy == nil then
+            return nil
+        end
+        year = (yy as integer) < 50 and 2000 + (yy as integer) or 1900 + (yy as integer)
+        rest = text:sub(3)
+    elseif node.tag == der.GENERALIZEDTIME and #text == 15 then
+        local yyyy = tonumber(text:sub(1, 4))
+        if yyyy == nil then
+            return nil
+        end
+        year = yyyy as integer
+        rest = text:sub(5)
+    else
+        return nil
+    end
+    if rest:sub(11, 11) ~= "Z" or rest:sub(1, 10):find("^%d+$") == nil then
+        return nil
+    end
+    local month = tonumber(rest:sub(1, 2)) as integer
+    local day = tonumber(rest:sub(3, 4)) as integer
+    local hour = tonumber(rest:sub(5, 6)) as integer
+    local minute = tonumber(rest:sub(7, 8)) as integer
+    local second = tonumber(rest:sub(9, 10)) as integer
+    if month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60 then
+        return nil
+    end
+
+    return daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
+end
+
+const KNOWN_CRITICAL: {[string]: boolean} = {
+    ["2.5.29.15"] = true,
+    ["2.5.29.17"] = true,
+    ["2.5.29.19"] = true,
+    ["2.5.29.30"] = true,
+    ["2.5.29.32"] = true,
+    ["2.5.29.37"] = true,
+    ["2.5.29.36"] = true,
+    ["2.5.29.54"] = true,
+}
+
+local function generalNames(node: der.Node, dns: {string}, ips: {string}): boolean
+    local names = der.children(node)
+    if names == nil then
+        return false
+    end
+    for _, name in ipairs(names) do
+        if name.tag == 0x82 then
+            dns[#dns + 1] = der.contents(name):lower()
+        elseif name.tag == 0x87 then
+            ips[#ips + 1] = der.contents(name)
+        end
+    end
+
+    return true
+end
+
+local function subtrees(node: der.Node): {Subtree}?
+    local list = der.children(node)
+    if list == nil then
+        return nil
+    end
+    local out: {Subtree} = {}
+    for _, subtree in ipairs(list) do
+        local inner = der.children(subtree)
+        if inner == nil or #inner < 1 then
+            return nil
+        end
+        local base = inner[1]
+        if base.tag == 0x82 then
+            out[#out + 1] = Subtree(kind = "dns", value = der.contents(base):lower())
+        elseif base.tag == 0x87 then
+            out[#out + 1] = Subtree(kind = "ip", value = der.contents(base))
+        end
+    end
+
+    return out
+end
+
+--- Parses a DER certificate, or answers nil and why.
+export function parse(encoded: string): (Certificate?, string?)
+    local root, why = der.parse(encoded)
+    if root == nil then
+        return nil, why
+    end
+    local parts = der.children(root)
+    if root.tag ~= der.SEQUENCE or parts == nil or #parts ~= 3 then
+        return nil, "malformed certificate"
+    end
+    local signature = der.bitstring(parts[3])
+    local tbsFields = der.children(parts[1])
+    if signature == nil or tbsFields == nil then
+        return nil, "malformed certificate"
+    end
+    local at: integer = 1
+    if tbsFields[1] ~= nil and tbsFields[1].tag == 0xa0 then
+        at = 2
+    end
+    local validity = tbsFields[at + 3]
+    local spki = tbsFields[at + 5]
+    if spki == nil or validity == nil then
+        return nil, "malformed certificate"
+    end
+    local times = der.children(validity)
+    if times == nil or #times ~= 2 then
+        return nil, "malformed validity"
+    end
+    local notBefore = parseTime(times[1])
+    local notAfter = parseTime(times[2])
+    if notBefore == nil or notAfter == nil then
+        return nil, "malformed validity"
+    end
+    local publicKey, keyWhy = keys.publicfromspki(spki)
+    if publicKey == nil then
+        return nil, keyWhy
+    end
+    local dns: {string} = {}
+    local ips: {string} = {}
+    local ca = false
+    local pathLength: integer? = nil
+    local keyUsage: integer? = nil
+    local serverAuth = true
+    local permitted: {Subtree}? = nil
+    local excluded: {Subtree}? = nil
+    for index = at + 6, #tbsFields do
+        local field = tbsFields[index]
+        if field.tag == 0xa3 then
+            local wrapper = der.children(field)
+            local list = wrapper ~= nil and wrapper[1] ~= nil and der.children(wrapper[1]) or nil
+            if list == nil then
+                return nil, "malformed extensions"
+            end
+            for _, extension in ipairs(list) do
+                local items = der.children(extension)
+                if items == nil or #items < 2 then
+                    return nil, "malformed extension"
+                end
+                local oid = der.oid(items[1]) or ""
+                local critical = #items == 3 and items[2].tag == der.BOOLEAN and der.contents(items[2]) ~= "\0"
+                local value = der.parse(der.contents(items[#items]))
+                if value == nil then
+                    return nil, "malformed extension value"
+                end
+                if critical and not KNOWN_CRITICAL[oid] then
+                    return nil, "unsupported critical extension " .. oid
+                end
+                if oid == "2.5.29.17" then
+                    if not generalNames(value, dns, ips) then
+                        return nil, "malformed subject alternative names"
+                    end
+                elseif oid == "2.5.29.19" then
+                    local fields = der.children(value) or {}
+                    for _, item in ipairs(fields) do
+                        if item.tag == der.BOOLEAN then
+                            ca = der.contents(item) ~= "\0"
+                        elseif item.tag == der.INTEGER then
+                            pathLength = der.smallint(item)
+                        end
+                    end
+                elseif oid == "2.5.29.15" then
+                    local bytes = der.contents(value)
+                    local usage: integer = 0
+                    if #bytes >= 2 then
+                        usage = bytes:byte(2) * 256 + (bytes:byte(3) or 0)
+                    end
+                    keyUsage = usage
+                elseif oid == "2.5.29.37" then
+                    serverAuth = false
+                    for _, purpose in ipairs(der.children(value) or {}) do
+                        local name = der.oid(purpose)
+                        if name == "1.3.6.1.5.5.7.3.1" or name == "2.5.29.37.0" then
+                            serverAuth = true
+                        end
+                    end
+                elseif oid == "2.5.29.30" then
+                    for _, item in ipairs(der.children(value) or {}) do
+                        if item.tag == 0xa0 then
+                            permitted = subtrees(item)
+                        elseif item.tag == 0xa1 then
+                            excluded = subtrees(item)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return Certificate(
+        encoded = encoded,
+        tbs = der.encoding(parts[1]),
+        algorithm = parts[2],
+        signature = signature,
+        issuer = der.encoding(tbsFields[at + 2]),
+        subject = der.encoding(tbsFields[at + 4]),
+        notBefore = notBefore,
+        notAfter = notAfter,
+        publicKey = publicKey,
+        dnsNames = dns,
+        ipAddresses = ips,
+        ca = ca,
+        pathLength = pathLength,
+        keyUsage = keyUsage,
+        serverAuth = serverAuth,
+        permitted = permitted,
+        excluded = excluded
+    ), nil
+end
+
+--- Every certificate in PEM text, skipping blocks that are not certificates.
+--- Answers nil and why when a certificate block is malformed.
+export function frompem(text: string): ({Certificate}?, string?)
+    local blocks, why = der.pem(text)
+    if blocks == nil then
+        return nil, why
+    end
+    local out: {Certificate} = {}
+    for _, block in ipairs(blocks) do
+        if block.label == "CERTIFICATE" or block.label == "TRUSTED CERTIFICATE" then
+            local certificate, certificateWhy = parse(block.bytes)
+            if certificate == nil then
+                return nil, certificateWhy
+            end
+            out[#out + 1] = certificate
+        end
+    end
+
+    return out, nil
+end
+
+-- Parses dotted IPv4 or RFC 4291 IPv6 text into 4 or 16 bytes.
+local function ipBytes(text: string): string?
+    if text:find("^%d+%.%d+%.%d+%.%d+$") ~= nil then
+        local out: {string} = {}
+        for part in text:gmatch("%d+") do
+            local value = tonumber(part) as integer
+            if value > 255 or (#part > 1 and part:sub(1, 1) == "0") then
+                return nil
+            end
+            out[#out + 1] = string.char(value)
+        end
+
+        return table.concat(out)
+    end
+    if text:find(":", 1, true) == nil or text:find("[^%x:%.]") ~= nil then
+        return nil
+    end
+    local head, tail = text, ""
+    local double = text:find("::", 1, true)
+    if double ~= nil then
+        head = text:sub(1, double - 1)
+        tail = text:sub(double + 2)
+        if tail:find("::", 1, true) ~= nil then
+            return nil
+        end
+    end
+    local function groups(part: string): {integer}?
+        local out: {integer} = {}
+        if part == "" then
+            return out
+        end
+        for group in (part .. ":"):gmatch("([^:]*):") do
+            if group:find("%.") ~= nil then
+                local v4 = ipBytes(group)
+                if v4 == nil or #v4 ~= 4 then
+                    return nil
+                end
+                out[#out + 1] = v4:byte(1) * 256 + v4:byte(2)
+                out[#out + 1] = v4:byte(3) * 256 + v4:byte(4)
+            else
+                if #group < 1 or #group > 4 then
+                    return nil
+                end
+                out[#out + 1] = tonumber(group, 16) as integer
+            end
+        end
+
+        return out
+    end
+    local first = groups(head)
+    local last = groups(tail)
+    if first == nil or last == nil then
+        return nil
+    end
+    local count = #first + #last
+    if (double == nil and count ~= 8) or (double ~= nil and count > 7) then
+        return nil
+    end
+    local all: {integer} = {}
+    for _, value in ipairs(first) do
+        all[#all + 1] = value
+    end
+    for _ = 1, 8 - count do
+        all[#all + 1] = 0
+    end
+    for _, value in ipairs(last) do
+        all[#all + 1] = value
+    end
+    local out: {string} = {}
+    for _, value in ipairs(all) do
+        out[#out + 1] = string.char(value // 256, value % 256)
+    end
+
+    return table.concat(out)
+end
+
+--- The packed address for IP text, or nil when it is a DNS name.
+export function ipaddress(text: string): string?
+    local bare = text
+    if bare:sub(1, 1) == "[" and bare:sub(-1) == "]" then
+        bare = bare:sub(2, -2)
+    end
+    local zone = bare:find("%", 1, true)
+    if zone ~= nil then
+        bare = bare:sub(1, zone - 1)
+    end
+
+    return ipBytes(bare)
+end
+
+local function dnsMatches(pattern: string, name: string): boolean
+    if pattern == name then
+        return true
+    end
+    if pattern:sub(1, 2) ~= "*." then
+        return false
+    end
+    local suffix = pattern:sub(2)
+    local dot = name:find(".", 1, true)
+    if dot == nil or dot == 1 then
+        return false
+    end
+    -- A wildcard matches one whole label, never a public suffix's worth of them.
+    return name:sub(dot) == suffix and suffix:find(".", 2, true) ~= nil
+end
+
+local function withinDns(name: string, base: string): boolean
+    if base == "" then
+        return true
+    end
+    if base:sub(1, 1) == "." then
+        return name:sub(-#base) == base
+    end
+    if name == base then
+        return true
+    end
+
+    return #name > #base and name:sub(-#base - 1) == "." .. base
+end
+
+local function withinIp(address: string, subtree: string): boolean
+    if #subtree ~= 2 * #address then
+        return false
+    end
+    for index = 1, #address do
+        local mask = subtree:byte(#address + index)
+        if bit.band(address:byte(index), mask) ~= bit.band(subtree:byte(index), mask) then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function permittedName(issuer: Certificate, kind: "dns" | "ip", name: string): boolean
+    local permitted, excluded = issuer.permitted, issuer.excluded
+    if excluded ~= nil then
+        for _, subtree in ipairs(excluded) do
+            if subtree.kind == kind then
+                local inside = kind == "dns" and withinDns(name, subtree.value) or withinIp(name, subtree.value)
+                if inside then
+                    return false
+                end
+            end
+        end
+    end
+    if permitted ~= nil then
+        local any = false
+        for _, subtree in ipairs(permitted) do
+            if subtree.kind == kind then
+                any = true
+                local inside = kind == "dns" and withinDns(name, subtree.value) or withinIp(name, subtree.value)
+                if inside then
+                    return true
+                end
+            end
+        end
+        if any then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function namesPermitted(issuer: Certificate, leaf: Certificate): boolean
+    if issuer.permitted == nil and issuer.excluded == nil then
+        return true
+    end
+    for _, name in ipairs(leaf.dnsNames) do
+        local bare = name:sub(1, 2) == "*." and name:sub(3) or name
+        if not permittedName(issuer, "dns", bare) then
+            return false
+        end
+    end
+    for _, address in ipairs(leaf.ipAddresses) do
+        if not permittedName(issuer, "ip", address) then
+            return false
+        end
+    end
+
+    return true
+end
+
+--- Reports whether the certificate is valid for `name`, a DNS name or an IP
+--- literal.
+export function matchesname(certificate: Certificate, name: string): boolean
+    local address = ipaddress(name)
+    if address ~= nil then
+        for _, candidate in ipairs(certificate.ipAddresses) do
+            if candidate == address then
+                return true
+            end
+        end
+
+        return false
+    end
+    local lowered = name:lower()
+    if lowered:sub(-1) == "." then
+        lowered = lowered:sub(1, -2)
+    end
+    for _, pattern in ipairs(certificate.dnsNames) do
+        if dnsMatches(pattern, lowered) then
+            return true
+        end
+    end
+
+    return false
+end
+
+const KEY_CERT_SIGN = 0x0400
+const MAX_DEPTH = 8
+
+local function signedBy(subject: Certificate, issuer: Certificate): boolean
+    return subject.issuer == issuer.subject
+        and keys.verifyalgorithm(issuer.publicKey, subject.algorithm, subject.tbs, subject.signature)
+end
+
+local function usableIssuer(issuer: Certificate, depth: integer, now: integer): boolean
+    if not issuer.ca or now < issuer.notBefore or now > issuer.notAfter or not issuer.serverAuth then
+        return false
+    end
+    local usage = issuer.keyUsage
+    if usage ~= nil and bit.band(usage, KEY_CERT_SIGN) == 0 then
+        return false
+    end
+    local limit = issuer.pathLength
+
+    return limit == nil or depth - 1 <= limit
+end
+
+local function build(
+    current: Certificate,
+    leaf: Certificate,
+    intermediates: {Certificate},
+    anchors: {Certificate},
+    used: {[Certificate]: boolean},
+    depth: integer,
+    now: integer
+): boolean
+    for _, anchor in ipairs(anchors) do
+        if signedBy(current, anchor) and namesPermitted(anchor, leaf) then
+            return true
+        end
+    end
+    if depth >= MAX_DEPTH then
+        return false
+    end
+    for _, candidate in ipairs(intermediates) do
+        if not used[candidate] and usableIssuer(candidate, depth, now) and namesPermitted(candidate, leaf) then
+            if signedBy(current, candidate) then
+                used[candidate] = true
+                if build(candidate, leaf, intermediates, anchors, used, depth + 1, now) then
+                    return true
+                end
+                used[candidate] = nil
+            end
+        end
+    end
+
+    return false
+end
+
+--- Validates a server's chain (leaf first, DER encoded) against trust anchors
+--- for `name` at time `now` (seconds since the epoch). Returns true, or false
+--- and why.
+export function verifyserver(chain: {string}, anchors: {Certificate}, name: string, now: integer): (boolean, string?)
+    if #chain == 0 then
+        return false, "the peer sent no certificate"
+    end
+    local leaf, why = parse(chain[1])
+    if leaf == nil then
+        return false, "the peer's certificate is malformed: " .. (why as string)
+    end
+    if leaf.ca then
+        return false, "the peer's certificate is a CA certificate"
+    end
+    if now < leaf.notBefore then
+        return false, "the peer's certificate is not valid yet"
+    end
+    if now > leaf.notAfter then
+        return false, "the peer's certificate has expired"
+    end
+    if not leaf.serverAuth then
+        return false, "the peer's certificate is not for server authentication"
+    end
+    if not matchesname(leaf, name) then
+        return false, "the peer's certificate is not valid for " .. name
+    end
+    local intermediates: {Certificate} = {}
+    for index = 2, #chain do
+        local certificate = parse(chain[index])
+        if certificate ~= nil then
+            intermediates[#intermediates + 1] = certificate
+        end
+    end
+    if not build(leaf, leaf, intermediates, anchors, {}, 1, now) then
+        return false, "the peer's certificate is not signed by a trusted authority"
+    end
+
+    return true, nil
+end

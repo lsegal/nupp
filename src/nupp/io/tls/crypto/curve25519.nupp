@@ -1,0 +1,398 @@
+@!internal
+--[[X25519 key agreement (RFC 7748) and Ed25519 signatures (RFC 8032).
+
+A port of TweetNaCl's field arithmetic: an element is sixteen limbs of sixteen
+bits in ordinary numbers, products are reduced with the 38 = 2 * 19 fold, and
+carries are propagated with floor division, so nothing needs a 64-bit type.
+]]
+module nupp.io.tls.crypto.curve25519
+
+const words = require("nupp.digest.internal.words")
+
+local type Field = {integer}
+
+local function gf(init: {integer}?): Field
+    local out: Field = {}
+    for index = 1, 16 do
+        out[index] = init ~= nil and (init[index] or 0) or 0
+    end
+
+    return out
+end
+
+local function carry(o: Field): nil
+    for index = 1, 16 do
+        o[index] = o[index] + 65536
+        local c = o[index] // 65536
+        if index < 16 then
+            o[index + 1] = o[index + 1] + c - 1
+        else
+            o[1] = o[1] + 38 * (c - 1)
+        end
+        o[index] = o[index] - c * 65536
+    end
+end
+
+local function select(p: Field, q: Field, b: integer): nil
+    if b ~= 0 then
+        for index = 1, 16 do
+            p[index], q[index] = q[index], p[index]
+        end
+    end
+end
+
+local function pack(n: Field): string
+    local t = gf(n)
+    local m = gf()
+    carry(t)
+    carry(t)
+    carry(t)
+    for _ = 1, 2 do
+        m[1] = t[1] - 0xffed
+        for index = 2, 15 do
+            m[index] = t[index] - 0xffff - ((m[index - 1] // 65536) % 2)
+            m[index - 1] = m[index - 1] % 65536
+        end
+        m[16] = t[16] - 0x7fff - ((m[15] // 65536) % 2)
+        local b = (m[16] // 65536) % 2
+        m[15] = m[15] % 65536
+        select(t, m, 1 - b)
+    end
+    local out: {string} = {}
+    for index = 1, 16 do
+        out[index] = string.char(t[index] % 256, t[index] // 256)
+    end
+
+    return table.concat(out)
+end
+
+local function unpack25519(bytes: string): Field
+    local o = gf()
+    for index = 1, 16 do
+        o[index] = bytes:byte(2 * index - 1) + bytes:byte(2 * index) * 256
+    end
+    o[16] = o[16] % 32768
+
+    return o
+end
+
+local function add(a: Field, b: Field): Field
+    local o: Field = {}
+    for index = 1, 16 do
+        o[index] = a[index] + b[index]
+    end
+
+    return o
+end
+
+local function sub(a: Field, b: Field): Field
+    local o: Field = {}
+    for index = 1, 16 do
+        o[index] = a[index] - b[index]
+    end
+
+    return o
+end
+
+local function mul(a: Field, b: Field): Field
+    local t: {integer} = {}
+    for index = 1, 31 do
+        t[index] = 0
+    end
+    for i = 1, 16 do
+        local ai = a[i]
+        for j = 1, 16 do
+            t[i + j - 1] = t[i + j - 1] + ai * b[j]
+        end
+    end
+    for index = 1, 15 do
+        t[index] = t[index] + 38 * t[index + 16]
+    end
+    local o: Field = {}
+    for index = 1, 16 do
+        o[index] = t[index]
+    end
+    carry(o)
+    carry(o)
+
+    return o
+end
+
+local function inverse(i: Field): Field
+    local c = gf(i)
+    for a = 253, 0, -1 do
+        c = mul(c, c)
+        if a ~= 2 and a ~= 4 then
+            c = mul(c, i)
+        end
+    end
+
+    return c
+end
+
+local function pow2523(i: Field): Field
+    local c = gf(i)
+    for a = 250, 0, -1 do
+        c = mul(c, c)
+        if a ~= 1 then
+            c = mul(c, i)
+        end
+    end
+
+    return c
+end
+
+const A24 = gf({0xdb41, 1})
+
+--- Computes X25519(scalar, u) for 32-byte strings.
+export function x25519(scalar: string, u: string): string
+    local z: {integer} = {scalar:byte(1, 32)}
+    z[32] = z[32] % 128
+    if z[32] < 64 then
+        z[32] = z[32] + 64
+    end
+    z[1] = z[1] - z[1] % 8
+    local x = unpack25519(u)
+    local a = gf({1})
+    local b = gf(x)
+    local c = gf()
+    local d = gf({1})
+    for index = 254, 0, -1 do
+        local r = (z[(index // 8) + 1] // (2 ^ (index % 8)) as integer) % 2
+        select(a, b, r)
+        select(c, d, r)
+        local e = add(a, c)
+        a = sub(a, c)
+        c = add(b, d)
+        b = sub(b, d)
+        d = mul(e, e)
+        local f = mul(a, a)
+        a = mul(c, a)
+        c = mul(b, e)
+        e = add(a, c)
+        a = sub(a, c)
+        b = mul(a, a)
+        c = sub(d, f)
+        a = mul(c, A24)
+        a = add(a, d)
+        c = mul(c, a)
+        a = mul(d, f)
+        d = mul(b, x)
+        b = mul(e, e)
+        select(a, b, r)
+        select(c, d, r)
+    end
+
+    return pack(mul(a, inverse(c)))
+end
+
+const BASEPOINT = "\9" .. string.rep("\0", 31)
+
+--- The public key for a 32-byte X25519 private key.
+export function x25519public(scalar: string): string
+    return x25519(scalar, BASEPOINT)
+end
+
+-- Ed25519 ----------------------------------------------------------------
+
+const D = gf({0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070, 0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203})
+const D2 = gf({0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0, 0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406})
+const X = gf({0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c, 0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169})
+const Y = gf({0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666})
+const I = gf({0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43, 0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83})
+
+local type Ext = {Field}
+
+local function edadd(p: Ext, q: Ext): nil
+    local a = mul(sub(p[2], p[1]), sub(q[2], q[1]))
+    local b = mul(add(p[1], p[2]), add(q[1], q[2]))
+    local c = mul(mul(p[4], q[4]), D2)
+    local d = mul(p[3], q[3])
+    d = add(d, d)
+    local e = sub(b, a)
+    local f = sub(d, c)
+    local g = add(d, c)
+    local h = add(b, a)
+    p[1] = mul(e, f)
+    p[2] = mul(h, g)
+    p[3] = mul(g, f)
+    p[4] = mul(e, h)
+end
+
+local function cswap(p: Ext, q: Ext, b: integer): nil
+    for index = 1, 4 do
+        select(p[index], q[index], b)
+    end
+end
+
+local function parity(a: Field): integer
+    return pack(a):byte(1) % 2
+end
+
+local function edpack(p: Ext): string
+    local zi = inverse(p[3])
+    local tx = mul(p[1], zi)
+    local ty = mul(p[2], zi)
+    local packed = pack(ty)
+    local last = packed:byte(32) + parity(tx) * 128
+
+    return packed:sub(1, 31) .. string.char(last % 256)
+end
+
+local function scalarmult(q: Ext, s: string): Ext
+    local p: Ext = {gf(), gf({1}), gf({1}), gf()}
+    for index = 255, 0, -1 do
+        local b = (s:byte((index // 8) + 1) // (2 ^ (index % 8)) as integer) % 2
+        cswap(p, q, b)
+        edadd(q, p)
+        edadd(p, p)
+        cswap(p, q, b)
+    end
+
+    return p
+end
+
+local function scalarbase(s: string): Ext
+    return scalarmult({gf(X), gf(Y), gf({1}), mul(X, Y)}, s)
+end
+
+const L: {integer} = {
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+}
+
+-- Reduces a 64-limb little-endian value modulo the group order.
+local function modL(x: {integer}): string
+    for i = 64, 33, -1 do
+        local c: integer = 0
+        local j: integer = i - 32
+        while j < i - 12 do
+            x[j] = x[j] + c - 16 * x[i] * L[j - (i - 32) + 1]
+            c = (x[j] + 128) // 256
+            x[j] = x[j] - c * 256
+            j = j + 1
+        end
+        x[j] = x[j] + c
+        x[i] = 0
+    end
+    local c: integer = 0
+    for j = 1, 32 do
+        x[j] = x[j] + c - (x[32] // 16) * L[j]
+        c = x[j] // 256
+        x[j] = x[j] % 256
+    end
+    for j = 1, 32 do
+        x[j] = x[j] - c * L[j]
+    end
+    local out: {string} = {}
+    for i = 1, 32 do
+        x[i + 1] = (x[i + 1] or 0) + x[i] // 256
+        out[i] = string.char(x[i] % 256)
+    end
+
+    return table.concat(out)
+end
+
+local function reduce(bytes: string): string
+    local x: {integer} = {}
+    for index = 1, 64 do
+        x[index] = bytes:byte(index)
+    end
+
+    return modL(x)
+end
+
+local function sha512(message: string): string
+    return words.create("sha512"):update(message):digest()
+end
+
+local function clamped(seed: string): (string, string)
+    local h = sha512(seed)
+    local first = h:byte(1) - h:byte(1) % 8
+    local last = h:byte(32) % 128
+    if last < 64 then
+        last = last + 64
+    end
+
+    return string.char(first) .. h:sub(2, 31) .. string.char(last), h:sub(33, 64)
+end
+
+--- The Ed25519 public key for a 32-byte seed.
+export function edpublic(seed: string): string
+    local scalar = clamped(seed)
+
+    return edpack(scalarbase(scalar))
+end
+
+--- Signs `message` with a 32-byte seed, returning the 64-byte signature.
+export function edsign(seed: string, message: string): string
+    local scalar, prefix = clamped(seed)
+    local public = edpack(scalarbase(scalar))
+    local r = reduce(sha512(prefix .. message))
+    local rpoint = edpack(scalarbase(r))
+    local k = reduce(sha512(rpoint .. public .. message))
+    local x: {integer} = {}
+    for index = 1, 64 do
+        x[index] = index <= 32 and r:byte(index) or 0
+    end
+    for i = 1, 32 do
+        for j = 1, 32 do
+            x[i + j - 1] = x[i + j - 1] + k:byte(i) * scalar:byte(j)
+        end
+    end
+
+    return rpoint .. modL(x)
+end
+
+local function equal(a: Field, b: Field): boolean
+    return pack(a) == pack(b)
+end
+
+-- Decodes a point and negates it, as TweetNaCl's verification wants.
+local function unpackneg(bytes: string): Ext?
+    local r: Ext = {gf(), gf(), gf({1}), gf()}
+    r[2] = unpack25519(bytes)
+    local num = mul(r[2], r[2])
+    local den = mul(num, D)
+    num = sub(num, r[3])
+    den = add(r[3], den)
+    local den2 = mul(den, den)
+    local den4 = mul(den2, den2)
+    local den6 = mul(den4, den2)
+    local t = mul(mul(den6, num), den)
+    t = pow2523(t)
+    t = mul(mul(t, num), den)
+    t = mul(t, den)
+    r[1] = mul(t, den)
+    local check = mul(mul(r[1], r[1]), den)
+    if not equal(check, num) then
+        r[1] = mul(r[1], I)
+    end
+    check = mul(mul(r[1], r[1]), den)
+    if not equal(check, num) then
+        return nil
+    end
+    if parity(r[1]) == bytes:byte(32) // 128 then
+        r[1] = sub(gf(), r[1])
+    end
+    r[4] = mul(r[1], r[2])
+
+    return r
+end
+
+--- Verifies a 64-byte Ed25519 signature.
+export function edverify(public: string, message: string, signature: string): boolean
+    if #public ~= 32 or #signature ~= 64 or signature:byte(64) >= 32 then
+        return false
+    end
+    local q = unpackneg(public)
+    if q == nil then
+        return false
+    end
+    local h = reduce(sha512(signature:sub(1, 32) .. public .. message))
+    local p = scalarmult(q, h)
+    local base = scalarbase(signature:sub(33, 64))
+    edadd(p, base)
+
+    return edpack(p) == signature:sub(1, 32)
+end

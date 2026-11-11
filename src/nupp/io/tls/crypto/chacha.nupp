@@ -141,7 +141,7 @@ local function xorStream(key: {integer}, nonce: {integer}, counter: integer, tex
     local parts: {string} = {}
     local bytes: {integer} = {}
     local length = #text
-    local at = 1
+    local at: integer = 1
     while at <= length do
         block(key, counter, nonce, stream)
         counter = counter + 1
@@ -168,7 +168,7 @@ end
 
 -- TweetNaCl's limb addition.
 local function add1305(h: {integer}, c: {integer}): nil
-    local carry = 0
+    local carry: integer = 0
     for index = 1, 17 do
         carry = carry + h[index] + c[index]
         h[index] = carry % 256
@@ -196,7 +196,7 @@ export function poly1305(key: string, message: string): string
     r[13] = r[13] - r[13] % 4
     r[16] = r[16] % 16
     local length = #message
-    local at = 1
+    local at: integer = 1
     while at <= length do
         local count = math.min(16, length - at + 1)
         for index = 1, 17 do
@@ -209,7 +209,7 @@ export function poly1305(key: string, message: string): string
         at = at + count
         add1305(h, c)
         for i = 1, 17 do
-            local sum = 0
+            local sum: integer = 0
             for j = 1, 17 do
                 if j <= i then
                     sum = sum + h[j] * r[i - j + 1]
@@ -219,7 +219,7 @@ export function poly1305(key: string, message: string): string
             end
             x[i] = sum
         end
-        local u = 0
+        local u: integer = 0
         for index = 1, 16 do
             u = u + x[index]
             h[index] = u % 256
@@ -323,7 +323,7 @@ export function open(context: Aead, nonce: string, aad: string, sealed: string):
     local ciphertext = sealed:sub(1, #sealed - 16)
     local expected = poly1305(oneTimeKey(context.words, words), macInput(aad, ciphertext))
     local received = sealed:sub(#sealed - 15)
-    local difference = 0
+    local difference: integer = 0
     for index = 1, 16 do
         difference = bor(difference, bxor(expected:byte(index), received:byte(index)))
     end

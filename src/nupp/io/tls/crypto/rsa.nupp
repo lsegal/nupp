@@ -1,0 +1,231 @@
+@!internal
+--[[RSA signatures: PKCS #1 v1.5 and PSS (RFC 8017), verification and signing.
+
+Verification is the public operation with a small exponent. Signing uses the
+private key's CRT components. Only SHA-256, SHA-384 and SHA-512 are accepted;
+older digests have no place in a modern certificate path or handshake.
+]]
+module nupp.io.tls.crypto.rsa
+
+const bn = require("nupp.io.tls.crypto.bignum")
+const hash = require("nupp.io.tls.crypto.hash")
+const bit = require("nupp.runtime.bitops")
+
+local type Int = bn.Int
+
+--- A public key.
+export record PublicKey
+    @readonly n: Int
+    @readonly e: Int
+end
+
+--- A private key with its CRT components.
+export record PrivateKey
+    @readonly n: Int
+    @readonly e: Int
+    @readonly d: Int
+    @readonly p: Int
+    @readonly q: Int
+    @readonly dp: Int
+    @readonly dq: Int
+    @readonly qinv: Int
+end
+
+const DIGEST_INFO: {[string]: string} = {
+    sha256 = "\48\49\48\13\6\9\96\134\72\1\101\3\4\2\1\5\0\4\32",
+    sha384 = "\48\65\48\13\6\9\96\134\72\1\101\3\4\2\2\5\0\4\48",
+    sha512 = "\48\81\48\13\6\9\96\134\72\1\101\3\4\2\3\5\0\4\64",
+}
+
+local montgomeryCache: {[string]: bn.Montgomery} = setmetatable({}, {__mode = "v"}) as any
+
+local function context(modulus: Int): bn.Montgomery
+    local key = bn.tobytes(modulus)
+    local found = montgomeryCache[key]
+    if found == nil then
+        found = bn.montgomery(modulus)
+        montgomeryCache[key] = found
+    end
+
+    return found
+end
+
+--- The modulus length in bytes.
+export function size(key: PublicKey): integer
+    return (bn.bitlength(key.n) + 7) // 8
+end
+
+-- s^e mod n as k bytes, or nil when s is out of range.
+local function publicOperation(key: PublicKey, signature: string): string?
+    local k = size(key)
+    if #signature ~= k then
+        return nil
+    end
+    local s = bn.frombytes(signature)
+    if bn.compare(s, key.n) >= 0 then
+        return nil
+    end
+
+    return bn.tobytes(bn.modexp(context(key.n), s, key.e), k)
+end
+
+local function privateOperation(key: PrivateKey, message: string): string
+    local m = bn.frombytes(message)
+    local pc = context(key.p)
+    local qc = context(key.q)
+    local m1 = bn.modexp(pc, bn.mod(m, key.p), key.dp)
+    local m2 = bn.modexp(qc, bn.mod(m, key.q), key.dq)
+    local difference = bn.modsub(key.p, m1, bn.mod(m2, key.p))
+    local h = bn.mod(bn.mul(key.qinv, difference), key.p)
+    local result = bn.add(m2, bn.mul(h, key.q))
+    local k = (bn.bitlength(key.n) + 7) // 8
+
+    return bn.tobytes(result, k)
+end
+
+local function pkcs1Encoding(hashName: hash.Name, digest: string, k: integer): string?
+    local info = DIGEST_INFO[hashName]
+    local t = info .. digest
+    if k < #t + 11 then
+        return nil
+    end
+
+    return "\0\1" .. string.rep("\255", k - #t - 3) .. "\0" .. t
+end
+
+--- Verifies a PKCS #1 v1.5 signature over a message digest.
+export function verifypkcs1(key: PublicKey, hashName: hash.Name, digest: string, signature: string): boolean
+    local recovered = publicOperation(key, signature)
+    if recovered == nil then
+        return false
+    end
+    local expected = pkcs1Encoding(hashName, digest, #recovered)
+
+    return expected ~= nil and expected == recovered
+end
+
+--- Signs a message digest with PKCS #1 v1.5.
+--- @raises string when the key is too small for the digest
+export function signpkcs1(key: PrivateKey, hashName: hash.Name, digest: string): string
+    local k = (bn.bitlength(key.n) + 7) // 8
+    local encoded = pkcs1Encoding(hashName, digest, k)
+    if encoded == nil then
+        error("nupp: the RSA key is too small to sign this digest", 2)
+    end
+
+    return privateOperation(key, encoded)
+end
+
+local function mgf1(hashName: hash.Name, seed: string, length: integer): string
+    local out: {string} = {}
+    local total: integer = 0
+    local counter: integer = 0
+    while total < length do
+        local c = string.char(
+            (counter // 16777216) % 256,
+            (counter // 65536) % 256,
+            (counter // 256) % 256,
+            counter % 256
+        )
+        local block = hash.digest(hashName, seed .. c)
+        out[#out + 1] = block
+        total = total + #block
+        counter = counter + 1
+    end
+
+    return table.concat(out):sub(1, length)
+end
+
+local function xorStrings(a: string, b: string): string
+    local out: {string} = {}
+    for index = 1, #a do
+        out[index] = string.char(bit.bxor(a:byte(index), b:byte(index)))
+    end
+
+    return table.concat(out)
+end
+
+--- Verifies an RSASSA-PSS signature with MGF1 over the same hash. A negative
+--- `saltLength` accepts whatever salt length the encoding carries.
+export function verifypss(
+    key: PublicKey,
+    hashName: hash.Name,
+    digest: string,
+    signature: string,
+    saltLength: integer
+): boolean
+    local recovered = publicOperation(key, signature)
+    if recovered == nil then
+        return false
+    end
+    local modBits = bn.bitlength(key.n)
+    local emBits = modBits - 1
+    local emLength = (emBits + 7) // 8
+    local em = recovered
+    if #em > emLength then
+        if em:byte(1) ~= 0 then
+            return false
+        end
+        em = em:sub(2)
+    end
+    local hLength = hash.size(hashName)
+    if emLength < hLength + 2 or em:byte(emLength) ~= 0xbc then
+        return false
+    end
+    local maskedDb = em:sub(1, emLength - hLength - 1)
+    local h = em:sub(emLength - hLength, emLength - 1)
+    local unused = 8 * emLength - emBits
+    local topMask = 0xff // (2 ^ unused) as integer
+    if bit.band(maskedDb:byte(1), bit.bnot(topMask)) ~= 0 then
+        return false
+    end
+    local db = xorStrings(maskedDb, mgf1(hashName, h, #maskedDb))
+    db = string.char(bit.band(db:byte(1), topMask)) .. db:sub(2)
+    local separator: integer? = nil
+    for index = 1, #db do
+        local byte = db:byte(index)
+        if byte == 1 then
+            separator = index
+
+            break
+        elseif byte ~= 0 then
+            return false
+        end
+    end
+    if separator == nil then
+        return false
+    end
+    local salt = db:sub(separator + 1)
+    if saltLength >= 0 and #salt ~= saltLength then
+        return false
+    end
+
+    return hash.digest(hashName, string.rep("\0", 8) .. digest .. salt) == h
+end
+
+--- Signs a message digest with RSASSA-PSS, a salt as long as the digest, and
+--- MGF1 over the same hash.
+--- @raises string when the key is too small
+export function signpss(
+    key: PrivateKey,
+    hashName: hash.Name,
+    digest: string,
+    random: function(count: integer): string
+): string
+    local modBits = bn.bitlength(key.n)
+    local emBits = modBits - 1
+    local emLength = (emBits + 7) // 8
+    local hLength = hash.size(hashName)
+    if emLength < 2 * hLength + 2 then
+        error("nupp: the RSA key is too small for PSS with this hash", 2)
+    end
+    local salt = random(hLength)
+    local h = hash.digest(hashName, string.rep("\0", 8) .. digest .. salt)
+    local db = string.rep("\0", emLength - 2 * hLength - 2) .. "\1" .. salt
+    local masked = xorStrings(db, mgf1(hashName, h, #db))
+    local unused = 8 * emLength - emBits
+    local topMask = 0xff // (2 ^ unused) as integer
+    masked = string.char(bit.band(masked:byte(1), topMask)) .. masked:sub(2)
+
+    return privateOperation(key, masked .. h .. "\188")
+end

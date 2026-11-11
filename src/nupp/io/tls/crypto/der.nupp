@@ -1,0 +1,320 @@
+@!internal
+--[[ASN.1 DER reading and writing (X.690) and PEM armour (RFC 7468).
+
+Reading is strict about framing -- definite lengths only, minimal length
+encodings, no element running past its parent -- because a certificate parser
+that tolerates a malformed length is one an attacker can steer. It is not a
+general ASN.1 decoder: callers walk the tree they expect with `children` and
+check tags as they go.
+]]
+module nupp.io.tls.crypto.der
+
+const bit = require("nupp.runtime.bitops")
+
+--- One element: its tag byte, the offset of its first content byte, and the
+--- offset just past its last, within `source`. `start` is where its header began.
+export record Node
+    @readonly source: string
+    @readonly tag: integer
+    @readonly start: integer
+    @readonly first: integer
+    @readonly last: integer
+end
+
+--- Common tags.
+export const SEQUENCE = 0x30
+export const SET = 0x31
+export const INTEGER = 0x02
+export const BITSTRING = 0x03
+export const OCTETSTRING = 0x04
+export const NULL = 0x05
+export const OID = 0x06
+export const BOOLEAN = 0x01
+export const UTF8STRING = 0x0c
+export const PRINTABLESTRING = 0x13
+export const IA5STRING = 0x16
+export const UTCTIME = 0x17
+export const GENERALIZEDTIME = 0x18
+
+--- Reads the element starting at `at`, which must end at or before `limit`.
+--- Returns the node, or nil and why it is malformed.
+export function read(source: string, at: integer, limit: integer): (Node?, string?)
+    if at > limit then
+        return nil, "truncated element"
+    end
+    local tag = source:byte(at)
+    if bit.band(tag, 0x1f) == 0x1f then
+        return nil, "multi-byte tags are not supported"
+    end
+    if at + 1 > limit then
+        return nil, "truncated length"
+    end
+    local first = source:byte(at + 1)
+    local length: integer
+    local contents: integer
+    if first < 0x80 then
+        length = first
+        contents = at + 2
+    else
+        local count = first - 0x80
+        if count == 0 then
+            return nil, "indefinite length"
+        end
+        if count > 4 or at + 1 + count > limit then
+            return nil, "bad length"
+        end
+        length = 0
+        for index = 1, count do
+            length = length * 256 + source:byte(at + 1 + index)
+        end
+        if length < 0x80 or source:byte(at + 2) == 0 then
+            return nil, "non-minimal length"
+        end
+        contents = at + 2 + count
+    end
+    local last = contents + length
+    if last - 1 > limit then
+        return nil, "element runs past its parent"
+    end
+
+    return Node(source = source, tag = tag, start = at, first = contents, last = last), nil
+end
+
+--- Parses a whole DER value that must fill `text` exactly.
+export function parse(text: string): (Node?, string?)
+    local node, why = read(text, 1, #text)
+    if node == nil then
+        return nil, why
+    end
+    if node.last ~= #text + 1 then
+        return nil, "trailing data"
+    end
+
+    return node, nil
+end
+
+--- The children of a constructed node.
+export function children(node: Node): ({Node}?, string?)
+    local out: {Node} = {}
+    local at = node.first
+    while at < node.last do
+        local child, why = read(node.source, at, node.last - 1)
+        if child == nil then
+            return nil, why
+        end
+        out[#out + 1] = child
+        at = child.last
+    end
+
+    return out, nil
+end
+
+--- The content bytes.
+export function contents(node: Node): string
+    return node.source:sub(node.first, node.last - 1)
+end
+
+--- The whole encoding, header included.
+export function encoding(node: Node): string
+    return node.source:sub(node.start, node.last - 1)
+end
+
+--- The bytes of a BIT STRING with no unused bits, or nil.
+export function bitstring(node: Node): string?
+    if node.tag ~= BITSTRING or node.first >= node.last or node.source:byte(node.first) ~= 0 then
+        return nil
+    end
+
+    return node.source:sub(node.first + 1, node.last - 1)
+end
+
+--- An INTEGER's magnitude as unsigned big-endian bytes, or nil when it is
+--- negative or not an integer.
+export function unsigned(node: Node): string?
+    if node.tag ~= INTEGER or node.first >= node.last then
+        return nil
+    end
+    local bytes = contents(node)
+    if bytes:byte(1) >= 0x80 then
+        return nil
+    end
+    local at: integer = 1
+    while at < #bytes and bytes:byte(at) == 0 do
+        at = at + 1
+    end
+
+    return bytes:sub(at)
+end
+
+--- A small INTEGER's value, or nil.
+export function smallint(node: Node): integer?
+    local bytes = unsigned(node)
+    if bytes == nil or #bytes > 6 then
+        return nil
+    end
+    local value: integer = 0
+    for index = 1, #bytes do
+        value = value * 256 + bytes:byte(index)
+    end
+
+    return value
+end
+
+--- An OBJECT IDENTIFIER in dotted form, or nil.
+export function oid(node: Node): string?
+    if node.tag ~= OID or node.first >= node.last then
+        return nil
+    end
+    local parts: {string} = {}
+    local value: integer = 0
+    local firstArc = true
+    for at = node.first, node.last - 1 do
+        local byte = node.source:byte(at)
+        value = value * 128 + bit.band(byte, 0x7f)
+        if byte < 0x80 then
+            if firstArc then
+                local top = value < 80 and value // 40 or 2
+                parts[1] = tostring(top)
+                parts[2] = tostring(value - top * 40)
+                firstArc = false
+            else
+                parts[#parts + 1] = tostring(value)
+            end
+            value = 0
+        end
+    end
+
+    return table.concat(parts, ".")
+end
+
+local function lengthBytes(length: integer): string
+    if length < 0x80 then
+        return string.char(length)
+    end
+    local bytes: {string} = {}
+    while length > 0 do
+        table.insert(bytes, 1, string.char(length % 256))
+        length = length // 256
+    end
+
+    return string.char(0x80 + #bytes) .. table.concat(bytes)
+end
+
+--- Encodes one element from its tag and content bytes.
+export function encode(tag: integer, body: string): string
+    return string.char(tag) .. lengthBytes(#body) .. body
+end
+
+--- Encodes an unsigned big-endian magnitude as an INTEGER.
+export function encodeunsigned(bytes: string): string
+    local at: integer = 1
+    while at < #bytes and bytes:byte(at) == 0 do
+        at = at + 1
+    end
+    bytes = bytes:sub(at)
+    if bytes == "" then
+        bytes = "\0"
+    end
+    if bytes:byte(1) >= 0x80 then
+        bytes = "\0" .. bytes
+    end
+
+    return encode(INTEGER, bytes)
+end
+
+--- Encodes a dotted OBJECT IDENTIFIER.
+export function encodeoid(dotted: string): string
+    local arcs: {integer} = {}
+    for part in dotted:gmatch("%d+") do
+        arcs[#arcs + 1] = tonumber(part) as integer
+    end
+    local out: {string} = {}
+    local function arc(value: integer): nil
+        local chunk: {integer} = {value % 128}
+        value = value // 128
+        while value > 0 do
+            table.insert(chunk, 1, value % 128 + 128)
+            value = value // 128
+        end
+        out[#out + 1] = string.char(unpack(chunk))
+    end
+    arc(arcs[1] * 40 + arcs[2])
+    for index = 3, #arcs do
+        arc(arcs[index])
+    end
+
+    return encode(OID, table.concat(out))
+end
+
+const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+const DECODE: {[integer]: integer} = {}
+for index = 1, 64 do
+    DECODE[BASE64:byte(index)] = index - 1
+end
+
+--- Decodes base64, ignoring whitespace; nil when malformed.
+export function base64(text: string): string?
+    local out: {string} = {}
+    local buffer: integer = 0
+    local bits: integer = 0
+    local ended = false
+    for at = 1, #text do
+        local byte = text:byte(at)
+        if byte == 61 then
+            ended = true
+        elseif byte == 32 or byte == 9 or byte == 10 or byte == 13 then
+            -- whitespace
+        else
+            local value = DECODE[byte]
+            if value == nil or ended then
+                return nil
+            end
+            buffer = buffer * 64 + value
+            bits = bits + 6
+            if bits >= 8 then
+                bits = bits - 8
+                local shift = (2 ^ bits) as integer
+                out[#out + 1] = string.char(buffer // shift)
+                buffer = buffer % shift
+            end
+        end
+    end
+
+    return table.concat(out)
+end
+
+--- One PEM block: its label and decoded bytes.
+export record Block
+    @readonly label: string
+    @readonly bytes: string
+end
+
+--- Every PEM block in `text`, in order. Text between blocks is ignored, as
+--- RFC 7468 allows. Returns nil and why when a block is malformed.
+export function pem(text: string): ({Block}?, string?)
+    local blocks: {Block} = {}
+    local at: integer = 1
+    while true do
+        local first, headerEnd, label = text:find("%-%-%-%-%-BEGIN ([^%-\r\n]+)%-%-%-%-%-", at)
+        if first == nil then
+            break
+        end
+        local footer = "-----END " .. (label as string) .. "-----"
+        local footerFirst, footerLast = text:find(footer, (headerEnd as integer) + 1, true)
+        if footerFirst == nil then
+            return nil, "a PEM block has no end line"
+        end
+        local body = text:sub((headerEnd as integer) + 1, (footerFirst as integer) - 1)
+        if body:find(":", 1, true) ~= nil then
+            return nil, "encrypted or annotated PEM is not supported"
+        end
+        local bytes = base64(body)
+        if bytes == nil then
+            return nil, "a PEM block is not valid base64"
+        end
+        blocks[#blocks + 1] = Block(label = label as string, bytes = bytes)
+        at = (footerLast as integer) + 1
+    end
+
+    return blocks, nil
+end
