@@ -68,12 +68,19 @@ end
 --- A C value as LLVM holds it: its type, whether integer conversions extend it
 --- as signed, and, for a pointer that can be indexed, what it points at. A
 --- `cdef struct` a pointer points at is a kind too, with `aggregate` its checked
---- type, but only as a place whose fields are read: it is never a value.
+--- type, but only as a place whose fields are read: it is never a value. So is
+--- a C array, `llvm` "array", of `count` `elem`s: as a value it is the address of
+--- its first element, as C's arrays decay.
 local record Kind
     llvm: string
     signed: boolean
     elem: Kind?
     aggregate: any?
+    count: integer?
+
+    --- What an element `elem` is read as, where that is not `elem` itself: a
+    --- `boolean` is held as a byte, and an `integer` as an `int32_t`.
+    read: Kind?
 
     --- For a function pointer, the checked function type it is called through.
     signature: any?
@@ -239,18 +246,23 @@ local record Callee
     --- which other modules call and C finds by name.
     public: boolean?
 
+    --- The ELF and Mach-O visibility `@visibility` gives an export, when it
+    --- gives one other than the default.
+    visibility: string?
+
     --- Its checked function type, which its address carries as a function
     --- pointer's signature.
     signature: any?
 end
 
 --- A name a body can read: a local's stack slot, or a module's global. A
---- global `cdef struct` is `aggregate`: its slot is the struct's storage,
---- which the name evaluates to the address of.
+--- global `cdef struct` or C array is `aggregate`: its slot is its storage,
+--- which the name evaluates to the address of. A `const` array is `readonly`.
 local record Local
     slot: string
     kind: Kind
     aggregate: Kind?
+    readonly: boolean?
 end
 
 --- The lexical scopes of one body, innermost last.
@@ -293,6 +305,17 @@ local record Program
 
     --- The `export const`s, by name, as the literals they bind.
     exportedConstants: {[string]: any}
+
+    --- The module data `export` makes a C symbol: state and arrays, by name.
+    exportedGlobals: {[string]: Local}
+
+    --- The names `require("ffi")` is bound to, whose layout queries are
+    --- answered for the target.
+    ffi: {[string]: boolean}
+
+    --- What writes the module's data, once every module's declarations are
+    --- known: an initial value may name a function or `const` declared later.
+    data: {function(): nil}
 
     --- The name other modules require this one by.
     name: string
@@ -545,7 +568,9 @@ end
 --- or function.
 local function importedConstant(required: Program, member: string, node: any): any
     local found = required.exportedConstants[member]
-    if found == nil and required.exportedCallees[member] == nil then
+    if found == nil and required.exportedGlobals[member] ~= nil then
+        refuse(node, ("%s.%s is module data, which only its own module assigns"):format(required.name, member))
+    elseif found == nil and required.exportedCallees[member] == nil then
         refuse(node, ("module %s exports no function or constant %s"):format(required.name, member))
     elseif found == nil then
         refuse(node, ("%s.%s is a function, which is not assigned"):format(required.name, member))
@@ -554,8 +579,9 @@ local function importedConstant(required: Program, member: string, node: any): a
     return found
 end
 
---- The value of the local or global `entry`. A global `cdef struct` is the
---- address of its storage, which `.` reaches through and C takes as a pointer.
+--- The value of the local or global `entry`. A global `cdef struct` or array
+--- is the address of its storage, which `.` and `[]` reach through and C takes
+--- as a pointer.
 local function readVariable(body: Body, entry: Local): Value
     if entry.aggregate ~= nil then
         return Value(text = entry.slot, kind = entry.kind)
@@ -1034,7 +1060,16 @@ const INTRINSICS: {
     ["math.f32.narrow"] = "f32",
 }
 
+--- The answer to `ffi.sizeof(T)`, `ffi.alignof(T)` or `ffi.offsetof(T, "field")`
+--- on the program's target, or nil when `node` asks none of them.
+local layoutQuery: function(Program, any): integer?
+
 intrinsic = function(program: Program, body: Body, node: cst.Call): Value?
+    local measured = layoutQuery(program, node)
+    if measured ~= nil then
+        -- A number, as LuaJIT's answer is.
+        return Value(text = llvmText.double(measured as integer), kind = F64)
+    end
     local identity = lower.callIdentity(node.obj)
     local operation: string? = nil
     for name, selected in pairs(INTRINSICS) do
@@ -1453,39 +1488,124 @@ local function layoutOf(program: Program, t: any, node: any): any
     return layout
 end
 
---- The address of `p[i]`, and what is stored there.
-local function element(program: Program, body: Body, node: cst.BracketIndex): (string, Kind)
-    local base = expression(program, body, node.obj, nil)
-    if base.kind.llvm ~= "ptr" or base.kind.elem == nil then
-        refuse(node, "a native program indexes only pointers to C scalars, pointers and cdef structs")
+--- The checked type `node` names, where it is written as a value: the type
+--- argument of a layout query.
+local function namedType(node: any): any?
+    local t = node ~= nil and ((node as any).inferredType or (node as any).resolvedType) or nil
+    if t == nil then
+        return nil
     end
-    local elem = base.kind.elem as Kind
-    -- A struct strides by its size on the target, padding included.
-    local stride = elem.aggregate ~= nil and ("[%d x i8]"):format(layoutOf(program, elem.aggregate, node).size)
-        or elem.llvm
-    local index = expression(program, body, node.expr, I64)
-    if not isInteger(index.kind) and not isFloat(index.kind) then
-        refuse(node.expr, "a pointer index must be a number")
+    local raw = bare(t)
+    if raw.tag == "typeobject" and raw.of ~= nil then
+        raw = bare(raw.of)
     end
-    local wide = convert(body, index, I64, node.expr)
-    local address = value(body, ("getelementptr %s, ptr %s, i64 %s"):format(stride, base.text, wide.text))
 
-    return address, elem
+    return raw
 end
 
---- How a field of type `t` is held: as it is stored, and as the program reads
---- it. They differ where C's storage is not the value's kind: a `boolean` is a
---- byte, and an `integer`, binary64 when read, is an `int32_t`.
-local function fieldKinds(t: any, field: string, owner: string, node: any): (Kind, Kind)
+--- Whether `node` calls `ffi.<member>`, through `require("ffi")` or the
+--- language's own `ffi`.
+local function ffiCall(node: any, member: string): boolean
+    if node == nil or node.kind ~= "call" then
+        return false
+    end
+    local callee = (node as cst.Call).obj as any
+    local identity = lower.callIdentity(callee)
+    if identity ~= nil then
+        return identity == apiidentity.canonical("ffi." .. member)
+    end
+
+    return callee ~= nil
+        and callee.kind == "dotIndex"
+        and callee.name ~= nil
+        and (callee.name as lexer.Token).text == member
+        and callee.obj ~= nil
+        and callee.obj.kind == "name"
+        and ((callee.obj as cst.NameExpr).token as lexer.Token).text == "ffi"
+end
+
+layoutQuery = function(program: Program, node: any): integer?
+    if node == nil or node.kind ~= "call" then
+        return nil
+    end
+    local call = node as cst.Call
+    local query: string? = nil
+    for _, name in ipairs({"sizeof", "alignof", "offsetof"}) do
+        if ffiCall(node, name) then
+            query = name
+        end
+    end
+    if query == nil then
+        return nil
+    end
+    local written = call.args ~= nil and ((call.args as cst.Args).exprs or {}) or {}
+    local expected = query == "offsetof" and 2 or 1
+    if #written ~= expected then
+        refuse(node, ("ffi.%s takes %d argument%s here"):format(query, expected, expected == 1 and "" or "s"))
+    end
+    local t = namedType(written[1])
+    if t == nil or (written[1] as any).kind == "string" then
+        refuse(written[1], "a native program asks ffi." .. tostring(query) .. " of a declared type, not a C string")
+    end
+    local subject = t as any
+    if query == "offsetof" then
+        if not isAggregate(subject) then
+            refuse(written[1], "ffi.offsetof takes a cdef struct")
+        end
+        local field = written[2] as any
+        local name = field.kind == "string" and lexer.stringValue((field.token as lexer.Token).text) or nil
+        if name == nil then
+            refuse(field, "ffi.offsetof takes the field's name as a string literal")
+        end
+        local offset = layoutOf(program, subject, node).offsets[name as string]
+        if offset == nil then
+            refuse(field, ("cdef struct %s has no field %s"):format(tostring(subject.cdefName), name as string))
+        end
+        return offset as integer
+    end
+    local layout: any
+    if isAggregate(subject) then
+        layout = layoutOf(program, subject, node)
+    else
+        local measured, why = targetLayout.of(subject, program.triple)
+        if measured == nil then
+            refuse(
+                written[1],
+                ("%s has no layout on %s: %s"):format(T.tostring(subject), program.triple, tostring(why))
+            )
+        end
+        layout = measured
+    end
+
+    return query == "sizeof" and layout.size as integer or layout.alignment as integer
+end
+
+--- How a field or element of type `t` is held: as it is stored, and as the
+--- program reads it, or nil when it has no C representation. They differ where
+--- C's storage is not the value's kind: a `boolean` is a byte, and an
+--- `integer`, binary64 when read, is an `int32_t`. A C array is stored and read
+--- as itself, its elements held the same way.
+local function held(t: any): (Kind?, Kind?)
     local raw = bare(t)
     if isAggregate(raw) then
         local nested = Kind(llvm = "struct", signed = false, aggregate = raw)
         return nested, nested
     elseif raw.tag == "carray" then
-        refuse(
-            node,
-            ("field %s of cdef struct %s is a C array, which a native program does not index"):format(field, owner)
+        if raw.count == nil or (raw.count as integer) < 0 then
+            return nil, nil
+        end
+        local stored, read = held(raw.elem)
+        if stored == nil then
+            return nil, nil
+        end
+        local array = Kind(
+            llvm = "array",
+            signed = false,
+            elem = stored,
+            count = raw.count as integer,
+            read = (read as Kind) ~= stored and read or nil
         )
+        return array, array
     elseif raw.tag == "boolean" then
         return INTEGERS.uint8 as Kind, BOOL
     elseif raw.tag == "integer" then
@@ -1493,6 +1613,53 @@ local function fieldKinds(t: any, field: string, owner: string, node: any): (Kin
     end
     local kind = kindOf(t)
     if kind == nil or (kind as Kind).llvm == "void" then
+        return nil, nil
+    end
+
+    return kind, kind
+end
+
+--- The LLVM type `kind` is stored as: a struct as the bytes of its size on the
+--- target, padding included, and an array as its elements.
+local function storageType(program: Program, kind: Kind, node: any): string
+    if kind.aggregate ~= nil then
+        return ("[%d x i8]"):format(layoutOf(program, kind.aggregate, node).size)
+    elseif kind.llvm == "array" then
+        return ("[%d x %s]"):format(kind.count as integer, storageType(program, kind.elem as Kind, node))
+    end
+
+    return kind.llvm
+end
+
+--- The C array `array` held at `address`, as the value it decays to: a pointer
+--- to its first element.
+local function decay(address: string, array: Kind): Value
+    return Value(text = address, kind = Kind(llvm = "ptr", signed = false, elem = array.elem, read = array.read))
+end
+
+--- The address of `p[i]`, what is stored there, and what it is read as.
+local function element(program: Program, body: Body, node: cst.BracketIndex): (string, Kind, Kind)
+    local base = expression(program, body, node.obj, nil)
+    if base.kind.llvm ~= "ptr" or base.kind.elem == nil then
+        refuse(node, "a native program indexes only C arrays and pointers to C scalars, pointers and cdef structs")
+    end
+    local elem = base.kind.elem as Kind
+    -- An element strides by its size on the target, a struct's padding included.
+    local stride = storageType(program, elem, node)
+    local index = expression(program, body, node.expr, I64)
+    if not isInteger(index.kind) and not isFloat(index.kind) then
+        refuse(node.expr, "a pointer index must be a number")
+    end
+    local wide = convert(body, index, I64, node.expr)
+    local address = value(body, ("getelementptr %s, ptr %s, i64 %s"):format(stride, base.text, wide.text))
+
+    return address, elem, base.kind.read or elem
+end
+
+--- How the field `field` of type `t` of the cdef struct `owner` is held.
+local function fieldKinds(t: any, field: string, owner: string, node: any): (Kind, Kind)
+    local stored, read = held(t)
+    if stored == nil then
         refuse(
             node,
             (
@@ -1501,7 +1668,7 @@ local function fieldKinds(t: any, field: string, owner: string, node: any): (Kin
         )
     end
 
-    return kind as Kind, kind as Kind
+    return stored as Kind, read as Kind
 end
 
 --- Where the field or element `node` names lives: its address, the kind
@@ -1533,8 +1700,7 @@ end
 
 place = function(program: Program, body: Body, node: any): (string, Kind, Kind)
     if node.kind == "bracketIndex" then
-        local address, elem = element(program, body, node as cst.BracketIndex)
-        return address, elem, elem
+        return element(program, body, node as cst.BracketIndex)
     end
     local index = node as cst.DotIndex
     local base, owner = aggregatePlace(program, body, index.obj)
@@ -1552,10 +1718,13 @@ place = function(program: Program, body: Body, node: any): (string, Kind, Kind)
     return address, stored, read
 end
 
---- What is stored at `address`, read as `read`.
+--- What is stored at `address`, read as `read`. A C array is read as the
+--- address of its first element.
 local function readPlace(body: Body, address: string, stored: Kind, read: Kind, node: any): Value
     if read.aggregate ~= nil then
         refuse(node, "a native program reads a cdef struct's fields, not the whole struct")
+    elseif stored.llvm == "array" then
+        return decay(address, stored)
     end
     local loaded = Value(text = value(body, ("load %s, ptr %s"):format(stored.llvm, address)), kind = stored)
     if read.llvm == "i1" and stored.llvm ~= "i1" then
@@ -1569,9 +1738,45 @@ end
 local function writePlace(body: Body, address: string, stored: Kind, read: Kind, v: Value, node: any): nil
     if read.aggregate ~= nil then
         refuse(node, "a native program assigns a cdef struct's fields, not the whole struct")
+    elseif stored.llvm == "array" then
+        refuse(node, "a native program assigns a C array's elements, not the whole array")
     end
     local converted = convert(body, convert(body, v, read, node), stored, node)
     builder.emit(body.f, ("store %s %s, ptr %s"):format(stored.llvm, converted.text, address))
+end
+
+--- Refuses a write through `target` that reaches a `const` array, which lives
+--- in read-only memory.
+local function writable(program: Program, body: Body, target: any): nil
+    local current = target
+    while current ~= nil
+        and (current.kind == "bracketIndex" or current.kind == "dotIndex" or current.kind == "paren") do
+        local required, member = memberOf(program, body, current)
+        if required ~= nil then
+            local entry = (required as Program).exportedGlobals[member as string]
+            if entry ~= nil and (entry as Local).readonly then
+                refuse(
+                    target,
+                    (
+                        "%s.%s is read-only data, which is never written"
+                    ):format((required as Program).name, member as string)
+                )
+            end
+            return
+        end
+        current = current.kind == "paren" and (current as cst.Paren).expr or (current as any).obj
+    end
+    if current ~= nil and current.kind == "name" then
+        local name = ((current as cst.NameExpr).token as lexer.Token).text
+        local entry = variable(program, body, name)
+        if entry == nil and program.aliases[name] ~= nil then
+            local alias = program.aliases[name] as Alias
+            entry = alias.unit.exportedGlobals[alias.member]
+        end
+        if entry ~= nil and (entry as Local).readonly then
+            refuse(target, name .. " is read-only data, which is never written")
+        end
+    end
 end
 
 --- `node` as a value. `want` is the kind its context takes, which a literal
@@ -1615,6 +1820,10 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
             if exported ~= nil then
                 return address(exported as Callee)
             end
+            local data = selected.unit.exportedGlobals[selected.member]
+            if data ~= nil then
+                return readVariable(body, data as Local)
+            end
             return expression(program, body, importedConstant(selected.unit, selected.member, node), want)
         end
         refuse(node, name .. " is not a local, a parameter or a function of this native program")
@@ -1647,6 +1856,10 @@ expression = function(program: Program, body: Body, node: any, want: Kind?): Val
             if callee ~= nil then
                 return address(callee as Callee)
             end
+            local data = (required as Program).exportedGlobals[member as string]
+            if data ~= nil then
+                return readVariable(body, data as Local)
+            end
             return expression(program, body, importedConstant(required as Program, member as string, node), want)
         end
         local address, stored, read = place(program, body, node)
@@ -1662,7 +1875,9 @@ local function condition(program: Program, body: Body, node: any): string
 end
 
 local function store(body: Body, entry: Local, v: Value, node: any): nil
-    if entry.aggregate ~= nil then
+    if entry.aggregate ~= nil and (entry.aggregate as Kind).llvm == "array" then
+        refuse(node, "a native program assigns a C array's elements, not the whole array")
+    elseif entry.aggregate ~= nil then
         refuse(node, "a native program assigns a cdef struct's fields, not the whole struct")
     end
     local converted = convert(body, v, entry.kind, node)
@@ -1730,6 +1945,7 @@ local function assign(program: Program, body: Body, target: any, v: any): nil
             importedConstant(required as Program, member as string, target)
             refuse(target, "a module's exports are constant; its own functions assign its state")
         end
+        writable(program, body, target)
         local address, stored, read = place(program, body, target)
         writePlace(body, address, stored, read, expression(program, body, v, read), v)
         return
@@ -1906,6 +2122,7 @@ local function statement(program: Program, body: Body, stat: any): nil
             refuse(target, "a module's exports are constant; its own functions assign its state")
         end
         if targetKind == "dotIndex" or targetKind == "bracketIndex" then
+            writable(program, body, target)
             local address, stored, read = place(program, body, target)
             local current = readPlace(body, address, stored, read, target)
             local operand = expression(program, body, compound.value, current.kind)
@@ -2115,7 +2332,8 @@ local function foreign(stat: cst.CdefFunc): Callee
     )
 end
 
---- Whether `node` is a literal, or a negated number, which a `const` may name.
+--- Whether `node` is a literal, a negated number, or an `ffi` layout query,
+--- which a `const` may name.
 local function literal(node: any): boolean
     local kind = node ~= nil and node.kind or nil
     if kind == "paren" then
@@ -2123,20 +2341,11 @@ local function literal(node: any): boolean
     elseif kind == "unop" then
         return ((node as cst.Unop).op as lexer.Token).text == "-"
             and ((node as cst.Unop).operand as any).kind == "number"
+    elseif kind == "call" then
+        return ffiCall(node, "sizeof") or ffiCall(node, "alignof") or ffiCall(node, "offsetof")
     end
 
     return kind == "number" or kind == "string" or kind == "trueExpr" or kind == "falseExpr"
-end
-
---- Records a top-level `const` of literals, read wherever its name is.
-local function constant(program: Program, stat: cst.LocalStmt): nil
-    local exprs = stat.exprs or {}
-    for index, name in ipairs(stat.names) do
-        if not literal(exprs[index]) then
-            refuse(exprs[index] or stat, "a native program's top-level const binds a literal")
-        end
-        program.constants[name.text] = exprs[index]
-    end
 end
 
 --- The values a top-level `local` or `const` binds: its initializers, or the
@@ -2169,16 +2378,99 @@ local function required(node: any): string?
     return lexer.stringValue(token.text)
 end
 
---- The constant text of the initial value `node` gives a global of `kind`.
-local function initial(program: Program, node: any, kind: Kind, name: string): string
+--- `node` with any parentheses around it taken off.
+local function stripped(node: any): any
     local current = node
-    while current.kind == "paren" do
+    while current ~= nil and current.kind == "paren" do
         current = (current as cst.Paren).expr
     end
-    if current.kind == "name" then
-        local named = program.constants[((current as cst.NameExpr).token as lexer.Token).text]
+
+    return current
+end
+
+--- What the constant `name` or `m.name` names: a `const` of the module, of a
+--- module it requires, or a function, whose address it is.
+local function namedConstant(program: Program, node: any): (any?, Callee?)
+    if node.kind == "dotIndex" then
+        local index = node as cst.DotIndex
+        local obj = index.obj as any
+        local bound = obj ~= nil and obj.kind == "name" and ((obj as cst.NameExpr).token as lexer.Token).text or nil
+        local unit = bound ~= nil and program.imports[bound as string] or nil
+        if unit == nil or index.name == nil then
+            return nil, nil
+        end
+        local member = (index.name as lexer.Token).text
+        return (unit as Program).exportedConstants[member], (unit as Program).exportedCallees[member]
+    end
+    if node.kind ~= "name" then
+        return nil, nil
+    end
+    local name = ((node as cst.NameExpr).token as lexer.Token).text
+    if program.globals[name] ~= nil then
+        return nil, nil
+    end
+    local alias = program.aliases[name]
+    if alias ~= nil then
+        local selected = alias as Alias
+        return selected.unit.exportedConstants[selected.member], selected.unit.exportedCallees[selected.member]
+    end
+
+    return program.constants[name], program.callees[name]
+end
+
+--- The number the constant expression `node` comes to: a plain numeric
+--- literal, negated or not, a `const` naming one, or a layout query. Nil when
+--- it is none of those.
+local function folded(program: Program, node: any): number?
+    local current = stripped(node)
+    if current == nil then
+        return nil
+    elseif current.kind == "number" then
+        local spelling = ((current as cst.NumberLit).token as lexer.Token).text
+        if spelling:match("[lL][lL]$") ~= nil then
+            return nil
+        end
+        return tonumber(spelling)
+    elseif current.kind == "unop" and ((current as cst.Unop).op as lexer.Token).text == "-" then
+        local operand = folded(program, (current as cst.Unop).operand)
+        return operand ~= nil and -(operand as number) or nil
+    elseif current.kind == "call" then
+        local measured = layoutQuery(program, current)
+        return measured ~= nil and measured as number or nil
+    elseif current.kind == "name" or current.kind == "dotIndex" then
+        local named = namedConstant(program, current)
+        return named ~= nil and folded(program, named) or nil
+    end
+
+    return nil
+end
+
+--- The constant text of the number `amount` as `kind`, refused at `node` when
+--- `kind` cannot hold it exactly.
+local function numeric(amount: number, kind: Kind, node: any): string
+    if isInteger(kind) then
+        if amount ~= math.floor(amount) or math.abs(amount) >= 2 ^ 63 then
+            refuse(node, tostring(amount) .. " is not an integer")
+        end
+        return llvmText.integer(amount)
+    elseif kind.llvm == "float" then
+        return llvmText.float(llvmText.roundToFloat(amount))
+    elseif kind.llvm == "double" then
+        return llvmText.double(amount)
+    end
+    refuse(node, "a number is not a " .. kind.llvm)
+end
+
+--- The constant text of the initial value `node` gives a global of `kind`.
+local function initial(program: Program, node: any, kind: Kind, what: string): string
+    local current = stripped(node)
+    if current.kind == "name" or current.kind == "dotIndex" then
+        local named, callee = namedConstant(program, current)
         if named ~= nil then
-            return initial(program, named, kind, name)
+            return initial(program, named, kind, what)
+        elseif callee ~= nil and (callee as Callee).atomic == nil and kind.llvm == "ptr" then
+            -- A function's address, which C calls through.
+            return "@" .. (callee as Callee).symbol
         end
     end
     local v: Value? = nil
@@ -2195,21 +2487,250 @@ local function initial(program: Program, node: any, kind: Kind, name: string): s
         v = stringConstant(program, current)
     elseif current.kind == "nilExpr" then
         v = Value(text = "null", kind = PTR)
+    elseif current.kind == "call" and layoutQuery(program, current) ~= nil then
+        v = Value(text = numeric(layoutQuery(program, current) as number, kind, current), kind = kind)
+    elseif current.kind == "castExpr" then
+        local cast = current as cst.CastExpr
+        local to = annotated(cast.type, "a cast", (current as any).inferredType)
+        local amount = folded(program, cast.expr)
+        if to.llvm == "ptr" and amount ~= nil then
+            -- An integer as an address, as `ffi.cast` makes one.
+            local whole = numeric(amount as number, I64, cast.expr)
+            v = Value(text = whole == "0" and "null" or ("inttoptr (i64 %s to ptr)"):format(whole), kind = to)
+        elseif to.llvm == "ptr" then
+            v = Value(text = initial(program, cast.expr, PTR, what), kind = to)
+        elseif amount ~= nil and (isInteger(to) or isFloat(to)) then
+            v = Value(text = numeric(amount as number, to, cast.expr), kind = to)
+        end
     end
     if v == nil then
-        refuse(node, "module state " .. name .. " starts as a literal, nil or a const")
+        refuse(node, what .. " starts as a literal, nil, a const, a function or a layout query")
     end
     local got = v as Value
     if got.kind.llvm ~= kind.llvm or isInteger(kind) and got.kind.llvm == "i64" and got.kind.signed ~= kind.signed then
-        refuse(node, "the initial value of module state " .. name .. " is not of its type")
+        refuse(node, "the initial value of " .. what .. " is not of its type")
     end
 
     return got.text
 end
 
---- Declares a top-level `local` as module state: a global with a constant
---- initial value, or zero, private to the module. A `cdef struct` is held in
---- place, zeroed.
+--- The constant text of a zeroed `kind`.
+local function zero(kind: Kind): string
+    if kind.aggregate ~= nil or kind.llvm == "array" then
+        return "zeroinitializer"
+    elseif kind.llvm == "ptr" then
+        return "null"
+    elseif isFloat(kind) then
+        return "0.0"
+    elseif kind.llvm == "i1" then
+        return "false"
+    end
+
+    return "0"
+end
+
+--- The constant text of the array `array` filled from the table `node`, its
+--- elements in order and the rest zero, or all zero when there is none.
+local function arrayConstant(program: Program, node: any, array: Kind, what: string): string
+    local current = stripped(node)
+    if current == nil then
+        return "zeroinitializer"
+    end
+    if current.kind ~= "tableExpr" then
+        refuse(node, what .. " takes each nested array's elements as a table")
+    end
+    local fields = (current as cst.TableExpr).fields
+    local count = array.count as integer
+    if #fields > count then
+        refuse(node, ("%s holds %d elements, not %d"):format(what, count, #fields))
+    end
+    local elem = array.elem as Kind
+    local read = array.read or elem
+    local stride = storageType(program, elem, node)
+    local texts: {string} = {}
+    for index = 1, count do
+        local field = fields[index] as any
+        local text: string
+        if field == nil then
+            text = zero(elem)
+        elseif field.kind ~= "fieldItem" or field.value == nil then
+            refuse(field, what .. " takes its elements in order, without keys")
+        elseif elem.llvm == "array" then
+            text = arrayConstant(program, field.value, elem, what)
+        elseif elem.aggregate ~= nil then
+            refuse(field, what .. " holds cdef structs, which start zeroed")
+        elseif read.llvm == "i1" and elem.llvm ~= "i1" then
+            text = initial(program, field.value, BOOL, what) == "true" and "1" or "0"
+        else
+            text = initial(program, field.value, elem, what)
+        end
+        texts[index] = stride .. " " .. text
+    end
+
+    return "[" .. table.concat(texts, ", ") .. "]"
+end
+
+--- Whether the C type `t` is read-only: `const` itself, or an array of
+--- read-only elements.
+local function readonlyType(t: any): boolean
+    local raw = T.unwrapOwnership(t)
+    while raw.tag == "genericAlias" and #(raw.paramKinds or {}) == 0 do
+        raw = T.unwrapOwnership(raw.body)
+    end
+    if raw.tag == "const" then
+        return true
+    elseif raw.tag == "carray" then
+        return readonlyType(raw.elem)
+    end
+
+    return false
+end
+
+--- The C array or `cdef struct` the top-level binding `stat` holds at `index`
+--- as data, written as its annotation or made by its `ffi.new` initializer
+--- `start`, and whether that type is read-only; nil when it holds neither.
+local function dataType(stat: cst.LocalStmt, index: integer, start: any): (any?, boolean)
+    local written = stat.types[index]
+    local annotation = written ~= nil and (written as any).resolvedType or nil
+    if annotation ~= nil and bare(annotation).tag == "carray" then
+        return bare(annotation), readonlyType(annotation)
+    end
+    local made = stripped(start)
+    local t = made ~= nil and ffiCall(made, "new") and (made as any).inferredType or nil
+    if t ~= nil and (bare(t).tag == "carray" or isAggregate(bare(t))) then
+        return bare(t), readonlyType(t)
+    end
+
+    return nil, false
+end
+
+--- The table the data a top-level binding holds starts from: what its
+--- `ffi.new<T[N]>({...})` initializer `start` is given, nil for none.
+local function elementsOf(start: any, what: string): any?
+    local made = stripped(start)
+    if made == nil then
+        return nil
+    end
+    if not ffiCall(made, "new") then
+        refuse(start, what .. " starts as ffi.new<T[N]>({...}), or zeroed")
+    end
+    local call = made as cst.Call
+    local written = call.args ~= nil and ((call.args as cst.Args).exprs or {}) or {}
+    if call.args ~= nil and (call.args as cst.Args).table ~= nil then
+        return (call.args as cst.Args).table
+    elseif #written == 0 then
+        return nil
+    elseif #written == 1 and stripped(written[1]).kind == "tableExpr" then
+        return written[1]
+    end
+    refuse(start, what .. " takes its elements as one table")
+end
+
+--- The symbol of module data or a function named `name`: its own name when
+--- `public`, private to the program otherwise.
+local function symbolOf(program: Program, name: string, public: boolean, node: any): string
+    local symbol = public and name or "nupp." .. program.prefix .. name
+    if program.symbols[symbol] then
+        refuse(node, symbol .. " is defined by more than one module of this program")
+    end
+    program.symbols[symbol] = true
+
+    return symbol
+end
+
+--- The linkage and visibility a definition is written with.
+local function linkage(public: boolean, visibility: string?): string
+    if not public then
+        return "internal "
+    end
+
+    return visibility ~= nil and visibility ~= "default" and visibility .. " " or ""
+end
+
+--- Declares the C array or `cdef struct` a top-level binding holds at `index`
+--- as module data, made by `ffi.new`: read-only when its type is `const`, a C
+--- symbol under its own name when `public`. Its contents are written once every
+--- module's declarations are known, so they may name a function defined later.
+local function data(program: Program, stat: cst.LocalStmt, index: integer, public: boolean, visibility: string?): nil
+    local name = stat.names[index].text
+    local start = (stat.exprs or {})[index]
+    local t, readonly = dataType(stat, index, start)
+    local what = (readonly and "constant " or "module data ") .. name
+    if program.globals[name] ~= nil or program.callees[name] ~= nil or program.imports[name] ~= nil then
+        refuse(stat, name .. " is defined twice")
+    end
+    local stored = held(t)
+    if stored == nil then
+        refuse(stat, what .. " is not a C array of a fixed size a native program can hold")
+    end
+    local inner = t
+    while inner.tag == "carray" do
+        inner = bare(inner.elem)
+    end
+    if isAggregate(inner) then
+        layoutOf(program, inner, stat)
+    end
+    local measured, why = targetLayout.of(t, program.triple)
+    if measured == nil then
+        refuse(stat, ("%s has no layout on %s: %s"):format(what, program.triple, tostring(why)))
+    end
+    local symbol = symbolOf(program, name, public, stat)
+    local slot = llvmText.name("@", symbol)
+    local storage = stored as Kind
+    local kind = storage.llvm == "array" and decay(slot, storage).kind
+        or Kind(llvm = "ptr", signed = false, elem = storage)
+    local entry = Local(slot = slot, kind = kind, aggregate = storage, readonly = readonly)
+    program.globals[name] = entry
+    if public then
+        program.exportedGlobals[name] = entry
+    end
+    local elements = elementsOf(start, what)
+    if elements ~= nil and storage.aggregate ~= nil then
+        refuse(start, what .. " holds a cdef struct, which starts zeroed")
+    end
+    program.data[#program.data + 1] = function(): nil
+        builder.once(
+            program.module,
+            "global " .. slot,
+            (
+                "%s = %s%s %s %s, align %d"
+            ):format(
+                slot,
+                linkage(public, visibility),
+                readonly and "constant" or "global",
+                storageType(program, storage, stat),
+                storage.aggregate ~= nil and "zeroinitializer" or arrayConstant(program, elements, storage, what),
+                measured.alignment
+            )
+        )
+    end
+end
+
+--- Records a top-level `const`: a literal or layout query, read wherever its
+--- name is, or module data `ffi.new` makes.
+local function constant(program: Program, stat: cst.LocalStmt, public: boolean, visibility: string?): nil
+    local exprs = stat.exprs or {}
+    for index, name in ipairs(stat.names) do
+        if dataType(stat, index, exprs[index]) ~= nil then
+            data(program, stat, index, public, visibility)
+        else
+            if visibility ~= nil then
+                refuse(stat, "@visibility applies to a C symbol, and const " .. name.text .. " is a literal")
+            end
+            if not literal(exprs[index]) then
+                refuse(
+                    exprs[index] or stat,
+                    "a native program's top-level const binds a literal, a layout query or ffi.new data"
+                )
+            end
+            program.constants[name.text] = exprs[index]
+        end
+    end
+end
+
+--- Declares a top-level `local` as module state, private to the module: a
+--- global with a constant initial value, or zero. A `cdef struct` is held in
+--- place, zeroed, and so is a C array unless `ffi.new` gives its elements.
 local function state(program: Program, stat: cst.LocalStmt): nil
     if stat.pattern ~= nil then
         refuse(stat, "a native program cannot destructure")
@@ -2220,66 +2741,63 @@ local function state(program: Program, stat: cst.LocalStmt): nil
     end
     for index, token in ipairs(stat.names) do
         local name = token.text
-        if program.globals[name] ~= nil or program.callees[name] ~= nil or program.imports[name] ~= nil then
-            refuse(stat, name .. " is defined twice")
-        end
-        local symbol = "nupp." .. program.prefix .. name
-        if program.symbols[symbol] then
-            refuse(stat, symbol .. " is defined by more than one module of this program")
-        end
-        program.symbols[symbol] = true
-        local slot = llvmText.name("@", symbol)
+        local what = "module state " .. name
         local written = stat.types[index]
         local resolved = written ~= nil and bare((written as any).resolvedType) or nil
-        local entry: Local
-        if isAggregate(resolved) then
-            if exprs[index] ~= nil then
-                refuse(exprs[index], "module state " .. name .. " holds a cdef struct, which starts zeroed")
-            end
-            local layout = layoutOf(program, resolved, written)
-            builder.once(
-                program.module,
-                "global " .. slot,
-                ("%s = internal global [%d x i8] zeroinitializer, align %d"):format(slot, layout.size, layout.alignment)
-            )
-            local storage = Kind(llvm = "struct", signed = false, aggregate = resolved)
-            entry = Local(slot = slot, kind = Kind(llvm = "ptr", signed = false, elem = storage), aggregate = storage)
+        if dataType(stat, index, exprs[index]) ~= nil and not isAggregate(resolved) then
+            data(program, stat, index, false, nil)
         else
-            local kind: Kind? = written ~= nil and annotated(written, "module state " .. name) or nil
-            local start = exprs[index]
-            if kind == nil then
-                if start == nil or (start as any).kind == "nilExpr" then
-                    refuse(stat, "module state " .. name .. " needs a written C type")
-                end
-                kind = kindOf((start as any).inferredType)
-                if kind == nil then
-                    refuse(stat, "module state " .. name .. " needs a written C type")
-                end
+            if program.globals[name] ~= nil or program.callees[name] ~= nil or program.imports[name] ~= nil then
+                refuse(stat, name .. " is defined twice")
             end
-            local held = kind as Kind
-            if held.llvm == "void" then
-                refuse(stat, "module state " .. name .. " cannot be nil")
-            end
-            local text: string
-            if start ~= nil then
-                text = initial(program, start, held, name)
-            elseif held.llvm == "ptr" then
-                text = "null"
-            elseif isFloat(held) then
-                text = "0.0"
-            elseif held.llvm == "i1" then
-                text = "false"
+            local slot = llvmText.name("@", symbolOf(program, name, false, stat))
+            local entry: Local
+            if isAggregate(resolved) then
+                if exprs[index] ~= nil then
+                    refuse(exprs[index], what .. " holds a cdef struct, which starts zeroed")
+                end
+                local layout = layoutOf(program, resolved, written)
+                builder.once(
+                    program.module,
+                    "global " .. slot,
+                    (
+                        "%s = internal global [%d x i8] zeroinitializer, align %d"
+                    ):format(slot, layout.size, layout.alignment)
+                )
+                local storage = Kind(llvm = "struct", signed = false, aggregate = resolved)
+                entry = Local(
+                    slot = slot,
+                    kind = Kind(llvm = "ptr", signed = false, elem = storage),
+                    aggregate = storage
+                )
             else
-                text = "0"
+                local kind: Kind? = written ~= nil and annotated(written, what) or nil
+                local start = exprs[index]
+                if kind == nil then
+                    if start == nil or (start as any).kind == "nilExpr" then
+                        refuse(stat, what .. " needs a written C type")
+                    end
+                    kind = kindOf((start as any).inferredType)
+                    if kind == nil then
+                        refuse(stat, what .. " needs a written C type")
+                    end
+                end
+                local scalar = kind as Kind
+                if scalar.llvm == "void" then
+                    refuse(stat, what .. " cannot be nil")
+                end
+                program.data[#program.data + 1] = function(): nil
+                    local text = start ~= nil and initial(program, start, scalar, what) or zero(scalar)
+                    builder.once(
+                        program.module,
+                        "global " .. slot,
+                        ("%s = internal global %s %s"):format(slot, scalar.llvm, text)
+                    )
+                end
+                entry = Local(slot = slot, kind = scalar)
             end
-            builder.once(
-                program.module,
-                "global " .. slot,
-                ("%s = internal global %s %s"):format(slot, held.llvm, text)
-            )
-            entry = Local(slot = slot, kind = held)
+            program.globals[name] = entry
         end
-        program.globals[name] = entry
     end
 end
 
@@ -2292,11 +2810,10 @@ local function lowerDefinition(program: Program, attributes: string, item: Defin
     if callee.symbol == "main" and #params == 0 then
         params = {"i32 %arg1", "ptr %arg2"}
     end
-    local linkage = callee.public and "" or "internal "
     local header = (
         "define %s%s @%s(%s) %s {"
     ):format(
-        linkage,
+        linkage(callee.public == true, callee.visibility),
         callee.symbol == "main" and "i32" or callee.result.llvm,
         llvmText.name("", callee.symbol),
         table.concat(params, ", "),
@@ -2329,18 +2846,34 @@ record native.Options
     library: boolean?
 end
 
---- The top-level statement `stat` with any `export` taken off, and whether it
---- had one.
-local function unexported(stat: any): (any, boolean)
-    if stat.kind ~= "exportStmt" then
-        return stat, false
+--- The top-level statement `stat` with its annotations and any `export` taken
+--- off, whether it had an `export`, and the visibility `@visibility` gave it.
+local function unexported(stat: any): (any, boolean, string?)
+    local current = stat
+    local visibility: string? = nil
+    while current.kind == "pragmaStmt" do
+        local pragma = current as cst.PragmaStmt
+        local name = pragma.name ~= nil and (pragma.name as lexer.Token).text or nil
+        local argument = (pragma.annotationArgs or {})[1]
+        local written = argument ~= nil and stripped((argument as cst.AnnotationArg).expr) or nil
+        if name ~= "visibility" or written == nil or written.kind ~= "string" then
+            refuse(current, "a native program cannot apply this annotation")
+        end
+        visibility = lexer.stringValue(((written as any).token as lexer.Token).text)
+        current = pragma.stat
     end
-    local exported = stat as cst.ExportStmt
+    if current.kind ~= "exportStmt" then
+        if visibility ~= nil then
+            refuse(stat, "@visibility applies to what a native program exports")
+        end
+        return current, false, nil
+    end
+    local exported = current as cst.ExportStmt
     if exported.stat == nil then
         refuse(stat, "a native program exports declarations, not a module value")
     end
 
-    return exported.stat, true
+    return exported.stat, true, visibility
 end
 
 --- The modules the top level of `tree` requires, in order, as the names a
@@ -2356,7 +2889,8 @@ function native.requires(tree: cst.Chunk): ({string}?, native.Problem?)
                 if (stat as any).kind == "localStmt" then
                     for _, expr in ipairs(valuesOf(stat as cst.LocalStmt)) do
                         local name = required(expr)
-                        if name ~= nil then
+                        -- LuaJIT's FFI, whose layout queries are answered here.
+                        if name ~= nil and name ~= "ffi" then
                             names[#names + 1] = name as string
                         end
                     end
@@ -2390,6 +2924,15 @@ local function import(program: Program, stat: cst.LocalStmt, units: {[string]: P
         refuse(stat, "a native program binds each module it requires to one name")
     end
     local name = required(sources[1]) as string
+    if name == "ffi" then
+        -- LuaJIT's FFI is no module of the program: only its layout queries,
+        -- answered for the target, and `ffi.new` initializers are lowered.
+        if stat.pattern ~= nil then
+            refuse(stat, "a native program binds require(\"ffi\") to one name")
+        end
+        program.ffi[stat.names[1].text] = true
+        return true
+    end
     local unit = units[name]
     if unit == nil then
         refuse(sources[1], "module " .. name .. " is not a module of this native program")
@@ -2443,8 +2986,11 @@ local function declarations(
     local hasMain = false
     for _, top in ipairs(unit.tree.blocks) do
         for _, written in ipairs(top.stats or {}) do
-            local stat, public = unexported(written)
+            local stat, public, visibility = unexported(written)
             local kind = (stat as any).kind
+            if visibility ~= nil and kind ~= "localStmt" and kind ~= "localFuncStmt" and kind ~= "funcStmt" then
+                refuse(written, "@visibility applies to an exported function or module data")
+            end
             if kind == "cdefFunc" then
                 local declared = foreign(stat as cst.CdefFunc)
                 if program.callees[declared.symbol] ~= nil then
@@ -2463,10 +3009,8 @@ local function declarations(
                     refuse(stat, (name as string) .. " is defined twice")
                 end
                 local item = signature(program, name as string, stat, funcbody as cst.Funcbody, public, entry)
-                if program.symbols[item.callee.symbol] then
-                    refuse(stat, item.callee.symbol .. " is defined by more than one module of this program")
-                end
-                program.symbols[item.callee.symbol] = true
+                symbolOf(program, item.callee.symbol, true, stat)
+                item.callee.visibility = visibility
                 pending[#pending + 1] = Pending(program = program, unit = unit, item = item)
                 program.callees[name as string] = item.callee
                 if public then
@@ -2477,7 +3021,7 @@ local function declarations(
                 local declared = stat as cst.LocalStmt
                 if not import(program, declared, units) then
                     if declared.isConst then
-                        constant(program, declared)
+                        constant(program, declared, public, visibility)
                         if public then
                             for _, name in ipairs(declared.names) do
                                 program.exportedConstants[name.text] = program.constants[name.text]
@@ -2557,6 +3101,9 @@ function native.program(
             aliases = {},
             exportedCallees = {},
             exportedConstants = {},
+            exportedGlobals = {},
+            ffi = {},
+            data = {},
             name = unit.name,
             prefix = index == 1 and "" or unit.name .. ".",
             constants = {},
@@ -2573,6 +3120,20 @@ function native.program(
     local pending: {Pending} = {}
     local ok, err = pcall(function(): nil
         local hasMain = false
+        -- Every struct first, so a layout any declaration asks for is known
+        -- whichever module declares the struct.
+        for _, unit in ipairs(units) do
+            current = unit
+            for _, top in ipairs(unit.tree.blocks) do
+                for _, written in ipairs(top.stats or {}) do
+                    local stat = unexported(written)
+                    local identity = (stat as any).kind == "cdefStruct" and (stat as cst.CdefStruct).cdefIdentity or nil
+                    if identity ~= nil then
+                        aggregates[identity as string] = stat as cst.CdefStruct
+                    end
+                end
+            end
+        end
         -- Every module's declarations before any body, so a function may call
         -- one, or read state, of a module declared after its own.
         for index, unit in ipairs(units) do
@@ -2583,6 +3144,13 @@ function native.program(
         if not hasMain and not library then
             refuse(units[1].tree, "a native program defines main")
         end
+        for index, program in ipairs(programs) do
+            current = units[index]
+            for _, write in ipairs(program.data) do
+                write()
+            end
+        end
+        current = units[1]
         declareForeign(module, programs)
         -- Unwind tables, because a C function a Nupp callback calls may raise a
         -- Lua error that unwinds through it to the VM's protected call.

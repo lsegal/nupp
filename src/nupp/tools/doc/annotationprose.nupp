@@ -141,6 +141,24 @@ understand them. See [editors.md](docs/learn/tooling/editors.md#visual-studio-co
 what the extension provides.
 ]====],
     [
+        "visibility"
+    ] = [====[
+`@visibility("hidden")` keeps a native program's `export function` or exported
+data symbol to the library or executable it is linked into, as C's
+`__attribute__((visibility("hidden")))` does. `"default"`, what an export has
+without the annotation, publishes it from a shared library:
+
+```nupp:fragment
+module runtime
+
+@visibility("hidden")
+export const runtime_table = ffi.new<uint64[2]>({1ULL, 2ULL})
+```
+
+Other objects linked into the same library still find a hidden symbol by name.
+See [exported data](docs/learn/performance/ahead-of-time/native-programs.md#exported-data).
+]====],
+    [
         "jit"
     ] = [====[
 `@jit` is an absence-of-known-blockers contract for the selected LuaJIT trace

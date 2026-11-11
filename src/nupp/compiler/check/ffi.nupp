@@ -103,6 +103,27 @@ export function install(c: state.Checker): Intrinsic
             c.lookupEntry(baseName)
         end
 
+        -- `ffi.offsetof(S, "field")` of a field a `cdef struct` declares always has
+        -- an offset; only a field the struct lacks gives nil.
+        if not typeArg and baseName == "ffi" and memberName == "offsetof" and #argExprs == 2 then
+            local subject = argExprs[1] as any
+            local field = argExprs[2] as any
+            local declared = subject.kind == "name" and c.lookupType(subject.token.text) or nil
+            local fieldName = field.kind == "string" and cdefBody(field.token.text) or nil
+            if declared ~= nil
+                and declared.tag == "nominal"
+                and declared.cdefName ~= nil
+                and fieldName ~= nil
+                and declared.byname ~= nil
+                and declared.byname[fieldName] ~= nil
+            then
+                c.infer(argExprs[1])
+                c.infer(argExprs[2])
+                capabilities.require(c, "cinterop", node)
+                return T.integer
+            end
+        end
+
         if not typeArg and baseName == "ffi" and operators.ffiTypeFirst[memberName] then
             local name = memberName
             local args = argExprs

@@ -147,10 +147,13 @@ export function requiresTrust(t: T.Type?, seen: {[string]: boolean}?): boolean
     return false
 end
 
---- The value produced by loading one physical scalar slot.
+--- The value produced by loading one physical scalar slot. A `const` slot
+--- loads as its value, as C's lvalue conversion drops the qualifier.
 export function loaded(t: T.Type): T.Type
     local raw = T.unwrapOwnership(t)
-    if raw.tag == "int8" or raw.tag == "int16" then
+    if raw.tag == "const" then
+        return loaded((raw as any).inner)
+    elseif raw.tag == "int8" or raw.tag == "int16" then
         return T.int32
     elseif raw.tag == "uint8" or raw.tag == "uint16" then
         return T.uint32
