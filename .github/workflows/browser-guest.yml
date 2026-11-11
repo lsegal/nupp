@@ -63,6 +63,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   guest:
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    if: false
     runs-on: ubuntu-24.04
     # A slow runner reached the archive check 23 minutes in; see below.
     timeout-minutes: 55

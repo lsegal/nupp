@@ -214,7 +214,10 @@ jobs:
   fast-checks:
     name: Fast checks
     needs: classify
-    if: needs.classify.outputs.fast-checks == 'true'
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    # Restore this condition when #1/#8 make it Rust-free:
+    # if: needs.classify.outputs.fast-checks == 'true'
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -299,10 +302,13 @@ jobs:
   integration:
     name: ${{ matrix.name }} / LuaJIT 2.1 rolling
     needs: [classify, fast-checks]
-    if: >-
-      !cancelled() && needs.classify.result == 'success'
-      && needs.fast-checks.result == 'success'
-      && needs.classify.outputs.integration-matrix != '[]'
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    # Restore this condition when #1/#8 make it Rust-free:
+    # if: >-
+    #   !cancelled() && needs.classify.result == 'success'
+    #   && needs.fast-checks.result == 'success'
+    #   && needs.classify.outputs.integration-matrix != '[]'
+    if: false
     runs-on: ${{ matrix.os }}
     # A timeout is here to end a hang, so it has to sit above the work rather
     # than across it. A cold runner builds the native provider before the
@@ -737,10 +743,13 @@ jobs:
   fixpoint:
     name: Self-hosting fixpoint
     needs: [classify, fast-checks]
-    if: >-
-      !cancelled() && needs.classify.result == 'success'
-      && needs.fast-checks.result == 'success'
-      && needs.classify.outputs.fixpoint == 'true'
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    # Restore this condition when #1/#8 make it Rust-free:
+    # if: >-
+    #   !cancelled() && needs.classify.result == 'success'
+    #   && needs.fast-checks.result == 'success'
+    #   && needs.classify.outputs.fixpoint == 'true'
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -776,10 +785,13 @@ jobs:
   portable-compiler:
     name: LuaJIT browser compiler
     needs: [classify, fast-checks]
-    if: >-
-      !cancelled() && needs.classify.result == 'success'
-      && needs.fast-checks.result == 'success'
-      && needs.classify.outputs.portable-compiler == 'true'
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    # Restore this condition when #1/#8 make it Rust-free:
+    # if: >-
+    #   !cancelled() && needs.classify.result == 'success'
+    #   && needs.fast-checks.result == 'success'
+    #   && needs.classify.outputs.portable-compiler == 'true'
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -834,7 +846,10 @@ jobs:
   docs-site:
     name: Documentation and site
     needs: classify
-    if: needs.classify.outputs.docs-site == 'true'
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    # Restore this condition when #1/#8 make it Rust-free:
+    # if: needs.classify.outputs.docs-site == 'true'
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -883,16 +898,22 @@ jobs:
   browser-wasm:
     name: Browser and Wasm
     needs: [classify, fast-checks]
-    if: >-
-      !cancelled() && needs.classify.result == 'success'
-      && needs.fast-checks.result == 'success'
-      && needs.classify.outputs.browser-wasm == 'true'
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    # Restore this condition when #1/#8 make it Rust-free:
+    # if: >-
+    #   !cancelled() && needs.classify.result == 'success'
+    #   && needs.fast-checks.result == 'success'
+    #   && needs.classify.outputs.browser-wasm == 'true'
+    if: false
     uses: ./.github/workflows/wasm-playground.yml
 
   gpu-conformance:
     name: GPU conformance / CI Lavapipe Vulkan
     needs: classify
-    if: needs.classify.outputs.gpu-linux == 'true'
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    # Restore this condition when #1/#8 make it Rust-free:
+    # if: needs.classify.outputs.gpu-linux == 'true'
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -970,7 +991,10 @@ jobs:
   gpu-conformance-windows:
     name: GPU conformance / Windows DX12
     needs: classify
-    if: needs.classify.outputs.gpu-windows == 'true'
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    # Restore this condition when #1/#8 make it Rust-free:
+    # if: needs.classify.outputs.gpu-windows == 'true'
+    if: false
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -1055,11 +1079,17 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v5
 
+      # Every job the classifier can select is turned off until #1/#8 make it
+      # Rust-free (#139), so none is required: a turned-off job is skipped, and
+      # a skipped selected job would otherwise fail this. Drop the override
+      # with the `if: false` lines above.
       - name: Require every selected job to have succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
-          SELECTION: ${{ needs.classify.outputs.selection }}
-        run: .github/scripts/require-selected-jobs.py
+          CLASSIFIED: ${{ needs.classify.outputs.selection }}
+        run: |
+          SELECTION=$(jq -c 'with_entries(if (.value | type) == "boolean" then .value = false else . end)' <<< "$CLASSIFIED") \
+            .github/scripts/require-selected-jobs.py
 
       # One row per required run, so queue delay, execution time and the failed
       # step are answerable from retained data rather than from whichever run
