@@ -1,0 +1,35 @@
+#!/bin/sh
+# Regenerates src/nupp/io/uri/idnatables.nupp, the Unicode data behind the
+# native URI provider's UTS #46 processing, from the Unicode Character Database.
+#
+#   scripts/idna-tables [VERSION]
+#
+# VERSION defaults to the one the table already names. Move it with the Unicode
+# version of the `url` crate's IDNA data the provider is held to (ICU4X's), so
+# the two keep agreeing; uritest pins rows that move between versions.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+OUTPUT="$ROOT/src/nupp/io/uri/idnatables.nupp"
+VERSION=${1:-$(sed -n 's/^export const VERSION = "\(.*\)"$/\1/p' "$OUTPUT")}
+[ -n "$VERSION" ] || { echo "usage: scripts/idna-tables VERSION" >&2; exit 2; }
+
+native_path() {
+    if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s\n' "$1"; fi
+}
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/nupp-idna.XXXXXX")
+trap 'rm -rf "$work"' EXIT INT TERM
+for file in \
+    "idna/IdnaMappingTable.txt" \
+    "ucd/UnicodeData.txt" \
+    "ucd/DerivedNormalizationProps.txt" \
+    "ucd/extracted/DerivedBidiClass.txt" \
+    "ucd/extracted/DerivedJoiningType.txt"; do
+    curl -fsSL -o "$work/$(basename "$file")" "https://www.unicode.org/Public/$VERSION/$file"
+done
+
+LUAJIT="$("$ROOT/scripts/toolchain" luajit)/bin/luajit"
+"$LUAJIT" "$(native_path "$ROOT/scripts/idna-tables.lua")" "$VERSION" "$(native_path "$work")" \
+    "$(native_path "$OUTPUT")"
+"$ROOT/bin/nupp" fmt --write "$(native_path "$OUTPUT")" >/dev/null

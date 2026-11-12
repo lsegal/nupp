@@ -580,6 +580,8 @@ for _, resource in ipairs({
     "src/nupp/runtime/browser/webgpu/internal.nupp",
     "src/nupp/runtime/browser/uri.nupp",
     "src/nupp/io/uri/whatwg.nupp",
+    "src/nupp/io/uri/idna.nupp",
+    "src/nupp/io/uri/idnatables.nupp",
     "src/nupp/io/uri/provider.nupp",
     "src/nupp/runtime/browser/init.nupp",
     "src/nupp/compiler/init.nupp",

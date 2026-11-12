@@ -289,6 +289,9 @@ build_native() {
     # These are optional stdlib facilities a program run by this launcher may
     # select; unlike a packaged build, `nupp run` loads this one development
     # provider rather than staging a target-specific union beside the program.
+    # No program selects `uri` since URI parsing became Nupp (#200); it stays
+    # because the pinned stage-zero compiler loads this provider and still
+    # parses URIs through it, until the pin moves past that.
     #
     # A machine without Cargo gets the pinned prebuilt provider from the same
     # request, without Cargo or rustc being asked anything (`scripts/toolchain`,

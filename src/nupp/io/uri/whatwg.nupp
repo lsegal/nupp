@@ -3,23 +3,24 @@
 The WHATWG URL Standard's basic URL parser, for hosts without a URL parser of
 their own.
 
-Every provider behind [](io) returns the result the URL Standard
-defines, because that is what both transports send: the native HTTP client is
-built on the `url` crate and the browser on Fetch. This module is the reading
-used where neither a native library nor a host `URL` is available, and the one
-the public `resolve` uses on every host to find the text a reference names
+Every provider behind [](io) returns the result the URL Standard defines,
+because that is what both transports send. This module is the native
+provider's parser, the reading used where a page host offers no `URL`, and the
+one the public `resolve` uses on every host to find the text a reference names
 before the provider normalizes it.
 
 It follows the standard's state machine byte by byte. Bytes above 127 are only
 ever percent-encoded, which is UTF-8 percent-encoding for the valid UTF-8 the
-entry insists on. The one thing it does not carry is UTS #46: a special-scheme
-host that is not plain ASCII, or that holds an `xn--` label, is refused with a
-reason rather than mapped, because mapping it needs the IDNA tables a host URL
-parser has. `trustHosts` lifts that refusal for text whose host a real parser
-will read afterwards: the host is then kept as written.
+entry insists on. UTS #46 is the caller's to supply: the native provider passes
+[](nupp.io.uri.idna), whose tables the portable runtime does not carry. Without
+it a special-scheme host that is not plain ASCII, or that holds an `xn--`
+label, is refused with a reason rather than mapped. `trustHosts` lifts that
+refusal for text whose host a real parser will read afterwards: the host is
+then kept as written.
 
-The percent-encode sets are the ones the `url` crate the native provider uses
-implements, so that the two agree byte for byte.
+The percent-encode sets are the ones the `url` crate implements, which the
+native provider was built on before this parser replaced it, so that the two
+agree byte for byte.
 ]]
 module nupp.io.uri.whatwg
 

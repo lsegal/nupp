@@ -15,8 +15,8 @@ The boundary is deliberately narrow:
 
 | Layer | Owner | Responsibilities |
 | --- | --- | --- |
-| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, driving LLVM and lld as the AOT code generator, the filesystem, process, network, TLS and HTTP services, which call the operating system through FFI, and the readiness generation and its wake handle |
-| native provider | Rust | clocks and URI |
+| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, driving LLVM and lld as the AOT code generator, the filesystem, process, network, TLS and HTTP services, which call the operating system through FFI, URI parsing with its UTS #46 host mapping, and the readiness generation and its wake handle |
+| native provider | Rust | clocks |
 | GPU provider | Nupp | GPU contexts, resources, validation, dispatch, readback, and cost records, over the pinned wgpu-native library |
 | host | Rust | payload discovery, LuaJIT state lifetime, native preload registration, workers, components, embedding handles, and shutdown |
 | VM and compatibility modules | C | LuaJIT and the retained LPeg module |
@@ -31,16 +31,15 @@ LuaJIT.
 Authors select APIs, not Cargo features. The compiler records effects from the
 reachable program and closes their dependencies. The build then asks
 `scripts/toolchain` for an exact-feature provider and host. Default Cargo
-features are disabled, so a URI-free program does not acquire the `url` crate,
-and a GPU-free program stages no wgpu-native library.
+features are disabled, and a GPU-free program stages no wgpu-native library.
 
 | Nupp facility | Rust provider feature | Host feature when linked into a stub |
 | --- | --- | --- |
 | clocks and timer suspension | `base` | base host |
 | paths and files | none: Nupp calls the operating system through FFI | none |
 | UUID | `uuid` | provider archive |
-| URI | `uri` | provider archive |
-| HTTP client | `uri`, for the URI handling it parses with: HTTP/1.1 in Nupp over the network and TLS services | none |
+| URI | none: the URL Standard's parser and UTS #46 in Nupp | none |
+| HTTP client | none: HTTP/1.1 in Nupp over the network and TLS services | none |
 | TCP, UDP, DNS, and Unix path sockets | none: Nupp sockets through FFI | none |
 | TLS over a network stream | none: TLS 1.2/1.3 and its cryptography in Nupp | none |
 | child processes and pipes | none: Nupp spawns, reaps and waits through FFI | none |
@@ -50,8 +49,8 @@ and a GPU-free program stages no wgpu-native library.
 
 TLS includes the network service, and the compiler's HTTP effect closure also
 selects TLS, the network service and URI handling. Sockets, TLS and processes
-wait on the runtime's wake handle, which is Nupp too, so none of them stages
-the provider. The `native-net`, `native-process` and `native-tls` host
+wait on the runtime's wake handle, which is Nupp too, and URI handling is Nupp,
+so none of them, HTTP included, stages the provider. The `native-net`, `native-process` and `native-tls` host
 features remain as names that select nothing, so manifests and release feature
 lists naming them keep working. A standalone link may combine the Rust
 application-host archive with one or more exact-feature provider or AOT
@@ -250,6 +249,11 @@ artifact:
   standalone binary cannot carry it.
 - Curl and ada were removed. URI behavior follows Rust's WHATWG `url` contract,
   and HTTP follows the documented Reqwest contract rather than curl parity.
+- URI parsing later moved off the provider's `url` crate to Nupp: the URL
+  Standard's parser, with UTS #46 tables generated from the Unicode Character
+  Database by `scripts/idna-tables`, giving the crate's results and refusal
+  reasons. No program selects the provider's `uri` feature any more; its
+  `nuppNativeUri*` exports stay only until the stage-zero pin moves past them.
 - Libuv and mbedTLS were removed, and later the Rust `net`, `http` and `tls`
   crates, with Tokio's network lanes, Reqwest and Rustls. Sockets, TLS and HTTP
   are Nupp over FFI; their `nuppNativeNet*`, `nuppNativeTls*` and
