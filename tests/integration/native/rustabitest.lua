@@ -82,13 +82,10 @@ function M.theGeneratedHeaderDescribesTheProvider()
     local features = native.nuppNativeFeatures()
     local wanted = defines.NUPP_NATIVE_FEATURE_BASE + defines.NUPP_NATIVE_FEATURE_URI
     test.eq(tonumber(require("bit").band(features, wanted)), wanted, "the requested feature bits")
-    assert(
-        require("bit").band(features, defines.NUPP_NATIVE_FEATURE_READINESS) ~= 0,
-        "the readiness feature bit is absent"
-    )
+    assert(defines.NUPP_NATIVE_FEATURE_READINESS == nil, "readiness is Nupp's, not the provider's")
 
-    -- The readiness pair rejects a NULL output, and a wait that nothing wakes
-    -- answers at its timeout with the generation it was given.
+    -- The readiness pair kept for the pinned stage zero rejects a NULL output,
+    -- and a wait answers at its timeout with the generation it was given.
     test.eq(native.nuppNativePoll(nil), defines.NUPP_NATIVE_INVALID_ARGUMENT, "a NULL poll output")
     test.eq(native.nuppNativeWait(0, 0, nil), defines.NUPP_NATIVE_INVALID_ARGUMENT, "a NULL wait output")
     local generation = ffi.new("uint64_t[1]")

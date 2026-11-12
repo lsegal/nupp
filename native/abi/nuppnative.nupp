@@ -45,16 +45,14 @@ export const NUPP_NATIVE_UNAVAILABLE = 8
 export const NUPP_NATIVE_FEATURE_BASE = 1
 -- Bit 1 was UUIDs, bit 2 the GPU provider, bit 4 HTTP, bits 5 to 7 processes,
 -- files and the file-transfer lane, bits 8 and 9 the network and TLS families
--- and bit 13 their endpoint calls. Nupp provides all of them now, and bit 11,
--- the code generator, is a library of its own (native/codegen/symbols).
+-- bit 13 their endpoint calls and bit 14 the readiness generation. Nupp
+-- provides all of them now, and bit 11, the code generator, is a library of its
+-- own (native/codegen/symbols).
 export const NUPP_NATIVE_FEATURE_URI = 8
 
 --- The AOT runtime, `nuppAotRuntime`: a provider built before its checkout had
 --- a compiler to build the runtime with has none.
 export const NUPP_NATIVE_FEATURE_AOT_RUNTIME = 4096
-
---- The process-wide readiness generation, nuppNativePoll and nuppNativeWait.
-export const NUPP_NATIVE_FEATURE_READINESS = 16384
 
 cdef function nuppNativeAbiVersion(): uint32
 cdef function nuppNativeFeatures(): uint64
@@ -78,30 +76,14 @@ cdef function nuppNativeAvailableParallelism(): uint64
 --- returns NUPP_NATIVE_INTERNAL with the panic as the last error.
 cdef function nuppNativePanicProbe(): int32
 
---- Present when NUPP_NATIVE_FEATURE_READINESS is set. One process-wide
---- generation that every family advances when something a caller could be
---- waiting for changes. A caller waiting on any mix of them sleeps here once;
---- the families Nupp provides through the FFI sleep on their own handles and
---- the wake handle below instead.
----
---- Poll the generation first, then check the resources you are waiting for
---- with their non-blocking calls, and wait from the generation you polled:
---- any change after the poll returns the wait at once, so no edge is lost. A
---- wake says only that something changed; check again after every wait.
+--- Deprecated: readiness is Nupp's own (`nupp.runtime.native`), and nothing
+--- advances this generation any more. Poll answers 0, and Wait sleeps its
+--- timeout and answers the generation it was given. They stay only because the
+--- pinned stage-zero compiler's runtime still calls them, and go once the pin
+--- moves past it.
 cdef function nuppNativePoll(generation: uint64*?): int32
 
 cdef function nuppNativeWait(generation: uint64, timeoutMs: uint64, outputGeneration: uint64*?): int32
-
---- Present when NUPP_NATIVE_FEATURE_READINESS is set, for a caller that has to
---- sleep on handles of its own as well as the generation. Open answers a
---- waitable handle every advance of the generation signals: a manual-reset
---- event HANDLE on Windows, and on POSIX the nonblocking read end of a pipe
---- that receives a byte. Reset it (ResetEvent, or read the pipe dry), poll the
---- generation, check, and then wait on it with the other handles. Close stops
---- signalling the handle and closes it.
-cdef function nuppNativeWakeOpen(handle: uint64*?): int32
-
-cdef function nuppNativeWakeClose(handle: uint64): int32
 
 --- Present when NUPP_NATIVE_FEATURE_URI is set. URI values are immutable
 --- generational handles. Text and components are copied into caller-owned
