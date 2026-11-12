@@ -26,7 +26,7 @@ local askedPrebuilt = false
 
 local prebuiltProblem: string? = nil
 
---- A source checkout whose provider was built without LLVM links with the
+--- A source checkout that has not linked a code generator from LLVM uses the
 --- prebuilt code generator `scripts/toolchain.pins` names, fetched and
 --- verified once per machine. Asked once per process, and only by a build
 --- that needs the code generator.
@@ -48,8 +48,8 @@ local function prebuilt(): nil
     prebuiltProblem = codegen.useLibrary(path as string)
 end
 
---- Whether this nupp can compile AOT code: true, or nil and why not (it was
---- built without the code generator, or NUPP_AOT_FACTS is malformed).
+--- Whether this nupp can compile AOT code: true, or nil and why not (it has
+--- no code generator, or NUPP_AOT_FACTS is malformed).
 function aotllvm.selected(): (boolean?, string?)
     prebuilt()
     local available, why = codegen.available()
