@@ -122,6 +122,17 @@ function M.aGuardIsAlwaysACIdentifier()
     )
 end
 
+-- An exported integer constant is a `#define`, and one past int32_t is
+-- unsigned in C as it is in the source.
+function M.aConstantIsADefine()
+    local header = assert(cabi.header({}, {}, "abi.h", {
+        {name = "ABI_VERSION", value = 2},
+        {name = "FEATURE_HIGH", value = 4294967296},
+    }))
+    assert(header:find("#define ABI_VERSION 2\n", 1, true), header)
+    assert(header:find("#define FEATURE_HIGH 4294967296ULL\n", 1, true), header)
+end
+
 function M.functionRecordsRejectUnmodelledCallingConventions()
     local signature = cabi.functionRecord("callback", {}, nil, false, "stdcall")
     local prototype, why = cabi.prototype(signature)

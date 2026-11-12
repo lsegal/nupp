@@ -236,6 +236,13 @@ llvm_is_available() {
     "$ROOT/scripts/toolchain" llvm --available >/dev/null 2>&1
 }
 
+# Whether a provider built now carries the AOT runtime: once there is a compiler
+# to build it with, and not inside the runtime's own build, which runs this
+# launcher on a provider without it (`scripts/toolchain`, "the AOT runtime").
+aot_runtime_expected() {
+    [ -f "$BUILT" ] && [ "${NUPP_AOT_RUNTIME_ARCHIVE+set}" != set ]
+}
+
 build_native() {
     # These are optional stdlib facilities a program run by this launcher may
     # select; unlike a packaged build, `nupp run` loads this one development
@@ -259,6 +266,14 @@ build_native() {
         : > "$NUPP_NATIVE_LIBRARY.codegen"
     else
         rm -f "$NUPP_NATIVE_LIBRARY.codegen"
+    fi
+    # The AOT runtime is a Nupp program, so a provider built before there was a
+    # compiler to build it has none; `native_is_current` asks for another once
+    # there is one.
+    if aot_runtime_expected; then
+        : > "$NUPP_NATIVE_LIBRARY.aotruntime"
+    else
+        rm -f "$NUPP_NATIVE_LIBRARY.aotruntime"
     fi
     # Copied beside the destination and renamed onto it, never written in place.
     # A rename within one directory is atomic, so a command loading the library
@@ -551,14 +566,16 @@ native_is_current() {
     # union invalidates its staged copy.
     [ ! "$ROOT/bin/nupp" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
     [ -z "$(find "$ROOT/runtime" "$ROOT/native" "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" -type f \
-        \( -name '*.rs' -o -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.toml' -o -name 'Cargo.lock' \) \
+        \( -name '*.rs' -o -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.toml' -o -name 'Cargo.lock' \
+            -o -name '*.nupp' \) \
         -newer "$NUPP_NATIVE_LIBRARY" 2>/dev/null | head -n 1)" ] || return 1
     [ ! "$ROOT/scripts/toolchain" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
     [ ! "$ROOT/scripts/toolchain.pins" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
     [ ! "$ROOT/rust-toolchain.toml" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
     [ ! "$ROOT/.cargo/config.toml" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
     # A provider built before the pinned LLVM existed lacks the code generator.
-    [ -f "$NUPP_NATIVE_LIBRARY.codegen" ] || ! llvm_is_available
+    [ -f "$NUPP_NATIVE_LIBRARY.codegen" ] || ! llvm_is_available || return 1
+    [ -f "$NUPP_NATIVE_LIBRARY.aotruntime" ] || ! aot_runtime_expected
 }
 
 if [ "$needs_native" = yes ] && ! native_is_current; then
@@ -602,6 +619,12 @@ if [ "$rebuild" = yes ] && ! built_is_current; then
         # did build still runs; it is just running behind, and says so.
         echo "nupp: the compiler did not build; running the last one that did" >&2
     fi
+fi
+
+# The first compiler a checkout builds is what the AOT runtime is built with,
+# and the provider built before it went without.
+if [ "$needs_native" = yes ] && ! native_is_current; then
+    build_native || exit 1
 fi
 
 # This tree's own build is one writer of this tree, however it was asked for.

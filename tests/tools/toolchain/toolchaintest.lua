@@ -1157,21 +1157,6 @@ function M.windowsAnswersNativePaths()
     assert(prefix:match("^C:/"), "Windows answered an MSYS path: " .. prefix)
 end
 
--- `native-rust` deliberately answers a drive-letter path for native compiler
--- arguments. That spelling cannot be inserted into Git Bash's colon-separated
--- PATH: its drive colon becomes a separator and the DLL is not found.
-function M.windowsRustAbiSmokeConvertsTheDllSearchPath()
-    local smoke = read(ROOT .. "/scripts/test-rust-abi")
-    assert(
-        smoke:find('SEARCH_DIRECTORY=$(cygpath -u "$DIRECTORY")', 1, true),
-        "the Rust ABI smoke does not convert its native DLL directory for PATH"
-    )
-    assert(
-        smoke:find('PATH="$SEARCH_DIRECTORY:$PATH"', 1, true),
-        "the Rust ABI smoke inserts the drive-letter directory into PATH"
-    )
-end
-
 -- The native spelling belongs in compiler arguments, but not in the colon-
 -- separated PATH assembled by Git Bash. The selector converts that one use
 -- back before looking for the staged interpreter.

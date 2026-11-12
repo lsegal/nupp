@@ -72,6 +72,11 @@ jobs:
       - name: Fetch or build the pinned LLVM
         uses: ./.github/actions/pinned-llvm
 
+      # The AOT runtime the provider links is a Nupp program, so the provider
+      # carries it only once the checkout has a compiler to build it with.
+      - name: Build the compiler
+        run: ./bin/nupp --version
+
       - name: Build the code generator and the link kit
         run: |
           set -euo pipefail

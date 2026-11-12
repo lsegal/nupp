@@ -63,7 +63,7 @@ record context.Lua
     --- The `lua_State *`.
     state: string
 
-    --- The runtime's table (`ks_rt.c`), loaded once at entry.
+    --- The runtime's table (`native/aotruntime`), loaded once at entry.
     runtime: string
 
     --- The target's `size_t`.

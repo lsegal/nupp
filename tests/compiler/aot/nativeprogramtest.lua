@@ -1381,6 +1381,36 @@ function M.aStaticLibraryTakesNoExportList()
     assert(output:find("--exports names what an executable or shared library exports", 1, true), output)
 end
 
+-- A type alias a required module exports chooses a C type for every module
+-- requiring it, as a module a build writes per target does for `size_t`, and
+-- `--emit llvm-library` prints the library's IR for the triple it names
+-- without linking anything.
+function M.aTypeAliasChoosesACTypeAcrossModules()
+    local dir = project([[
+module host
+
+const {type Size} = require("app.build")
+
+export function measured(length: Size): Size
+    return length
+end
+]], {["app/build.nupp"] = "module app.build\n\nexport type Size = uint32\n"})
+    local status, output = run(
+        ("cd %s && NO_COLOR= %s aot --emit llvm-library --triple i686-unknown-linux-gnu host.nupp"):format(
+            quote(dir),
+            quote(NUPP)
+        )
+    )
+    test.eq(status, 0, output)
+    assert(output:find("define i32 @measured(i32 ", 1, true), output)
+
+    status, output = run(
+        ("cd %s && NO_COLOR= %s aot --emit llvm-library --archive x.a host.nupp"):format(quote(dir), quote(NUPP))
+    )
+    assert(status ~= 0, output)
+    assert(output:find("--emit llvm-library links nothing", 1, true), output)
+end
+
 function M.moduleStateStartsAsALiteral()
     local executable, output = link([[
 local start: int32 = math.i32.wrap(3)

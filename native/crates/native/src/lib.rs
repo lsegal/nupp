@@ -96,9 +96,10 @@ unsafe extern "C" {
     fn ks_rt_bind() -> std::ffi::c_int;
 }
 
-/// The AOT runtime's table (`c/ks_rt.c`): what an LLVM-compiled Lua-builder
-/// module's registrar is handed, and calls the runtime through. Null when the
-/// runtime cannot find the Lua API in this process (Windows binds it here).
+/// The AOT runtime's table (`native/aotruntime`, which `build.rs` links): what
+/// an LLVM-compiled Lua-builder module's registrar is handed, and calls the
+/// runtime through. Null when the runtime cannot find the Lua API in this
+/// process (Windows binds it here).
 #[cfg(nupp_aot_runtime)]
 #[unsafe(no_mangle)]
 pub extern "C" fn nuppAotRuntime() -> *const std::ffi::c_void {
@@ -316,9 +317,10 @@ mod tests {
     }
 
     #[test]
-    fn the_header_declares_every_export_and_feature_bit() {
+    fn the_definition_declares_every_export_and_feature_bit() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let header = std::fs::read_to_string(root.join("../../include/nupp_native.h")).unwrap();
+        // The ABI is defined in Nupp; the C header is generated from it.
+        let definition = std::fs::read_to_string(root.join("../../abi/nuppnative.nupp")).unwrap();
         for (name, value) in [
             ("BASE", FEATURE_BASE),
             ("URI", FEATURE_URI),
@@ -326,14 +328,11 @@ mod tests {
             ("AOT_RUNTIME", FEATURE_AOT_RUNTIME),
             ("READINESS", FEATURE_READINESS),
         ] {
-            let define = format!(
-                "#define NUPP_NATIVE_FEATURE_{name} (UINT64_C(1) << {})",
-                value.trailing_zeros()
-            );
-            assert!(header.contains(&define), "the header lacks {define}");
+            let define = format!("\nexport const NUPP_NATIVE_FEATURE_{name} = {value}\n");
+            assert!(definition.contains(&define), "the definition lacks {}", define.trim());
         }
         // The code generator's exports belong to the compiler, which declares
-        // them itself; everything else this crate exports is the header's.
+        // them itself; everything else this crate exports is the definition's.
         let mut exported = std::collections::BTreeSet::new();
         for entry in std::fs::read_dir(root.join("src")).unwrap() {
             let source = std::fs::read_to_string(entry.unwrap().path()).unwrap();
@@ -343,7 +342,7 @@ mod tests {
                     .filter(|name| name.starts_with("nupp") && !name.starts_with("nuppCodegen")),
             );
         }
-        let mut declarations = declared(&header, "NUPP_NATIVE_EXPORT");
+        let mut declarations = declared(&definition, "\ncdef function ");
         declarations.retain(|name| name.starts_with("nupp"));
         assert_eq!(exported, declarations);
     }

@@ -1,0 +1,456 @@
+--[[
+The Lua C API the AOT runtime calls, bound from the process the first time the
+provider is asked for the runtime's table.
+
+The provider is loaded by processes that carry the Lua API and by ones that do
+not export it (an embedding host that links LuaJIT privately), and on Windows
+every import names its module, which the VM's differs by process. So the
+runtime imports none of the API: `ks_rt_bind` finds each function in the
+process and keeps a pointer to it, and the rest of the runtime calls the API
+through the functions below, which call through those pointers.
+
+The browser guest links the runtime beside the VM that exports the API, so its
+`ksrt.api` (under `direct/`) calls it directly and binds nothing.
+]]
+module ksrt.api
+
+const {type Size} = require("ksrt.build")
+
+cdef function GetModuleHandleA(name: cstring?): voidptr?
+cdef function GetProcAddress(borrows module: voidptr, borrows name: cstring): voidptr?
+cdef function dlsym(borrows handle: voidptr?, borrows name: cstring): voidptr?
+
+local luaL_addlstring: function(B: voidptr, s: voidptr, l: Size): nil
+local luaL_addvalue: function(B: voidptr): nil
+local luaL_buffinit: function(L: voidptr, B: voidptr): nil
+local luaL_error: function(L: voidptr, format: cstring, ...): int32
+local luaL_pushresult: function(B: voidptr): nil
+local lua_call: function(L: voidptr, nargs: int32, nresults: int32): nil
+local lua_checkstack: function(L: voidptr, extra: int32): int32
+local lua_createtable: function(L: voidptr, narr: int32, nrec: int32): nil
+local lua_equal: function(L: voidptr, index1: int32, index2: int32): int32
+local lua_getfield: function(L: voidptr, index: int32, k: cstring): nil
+local lua_gettop: function(L: voidptr): int32
+local lua_insert: function(L: voidptr, index: int32): nil
+local lua_newuserdata: function(L: voidptr, size: Size): voidptr
+local lua_next: function(L: voidptr, index: int32): int32
+local lua_objlen: function(L: voidptr, index: int32): Size
+local lua_pushboolean: function(L: voidptr, b: int32): nil
+local lua_pushlightuserdata: function(L: voidptr, p: voidptr): nil
+local lua_pushlstring: function(L: voidptr, s: voidptr, l: Size): nil
+local lua_pushnil: function(L: voidptr): nil
+local lua_pushnumber: function(L: voidptr, n: number): nil
+local lua_pushvalue: function(L: voidptr, index: int32): nil
+local lua_rawget: function(L: voidptr, index: int32): nil
+local lua_rawgeti: function(L: voidptr, index: int32, n: int32): nil
+local lua_rawset: function(L: voidptr, index: int32): nil
+local lua_rawseti: function(L: voidptr, index: int32, n: int32): nil
+local lua_remove: function(L: voidptr, index: int32): nil
+local lua_setmetatable: function(L: voidptr, index: int32): int32
+local lua_settop: function(L: voidptr, index: int32): nil
+local lua_toboolean: function(L: voidptr, index: int32): int32
+local lua_tolstring: function(L: voidptr, index: int32, len: voidptr?): voidptr?
+local lua_tonumber: function(L: voidptr, index: int32): number
+local lua_topointer: function(L: voidptr, index: int32): voidptr?
+local lua_touserdata: function(L: voidptr, index: int32): voidptr?
+local lua_type: function(L: voidptr, index: int32): int32
+
+local bound: boolean = false
+
+--- Where the API is looked for: the program's own exports first, because
+--- LuaJIT linked into it exports its API, and then `lua51.dll`. Nil when
+--- no loaded module exports it. Everywhere else every loaded object is
+--- searched, the program first.
+local function luaModule(): voidptr?
+    if jit.os == "Windows" then
+        local program = GetModuleHandleA(nil)
+        if program ~= nil and GetProcAddress(program as voidptr, "lua_gettop") ~= nil then
+            return program
+        end
+        return GetModuleHandleA("lua51.dll")
+    elseif jit.os == "OSX" then
+        -- RTLD_DEFAULT is ((void *)-2) on Darwin.
+        return (0ULL - 2ULL) as voidptr
+    end
+    -- And null on glibc and musl, so a null handle is no failure here.
+
+    return nil
+end
+
+local function lookup(module: voidptr?, borrows name: cstring): voidptr?
+    if jit.os == "Windows" then
+        return GetProcAddress(module as voidptr, name)
+    end
+    return dlsym(module, name)
+end
+
+--- Fills every pointer from the process: 1 once each is filled, and 0 when
+--- the process exports no Lua API.
+@visibility("hidden")
+export function ks_rt_bind(): int32
+    if bound then
+        return 1
+    end
+    local module = luaModule()
+    if jit.os == "Windows" and module == nil then
+        return 0
+    end
+    local found: voidptr? = nil
+    found = lookup(module, "luaL_addlstring")
+    if found == nil then
+        return 0
+    end
+    luaL_addlstring = found as function(B: voidptr, s: voidptr, l: Size): nil
+    found = lookup(module, "luaL_addvalue")
+    if found == nil then
+        return 0
+    end
+    luaL_addvalue = found as function(B: voidptr): nil
+    found = lookup(module, "luaL_buffinit")
+    if found == nil then
+        return 0
+    end
+    luaL_buffinit = found as function(L: voidptr, B: voidptr): nil
+    found = lookup(module, "luaL_error")
+    if found == nil then
+        return 0
+    end
+    luaL_error = found as function(L: voidptr, format: cstring, ...): int32
+    found = lookup(module, "luaL_pushresult")
+    if found == nil then
+        return 0
+    end
+    luaL_pushresult = found as function(B: voidptr): nil
+    found = lookup(module, "lua_call")
+    if found == nil then
+        return 0
+    end
+    lua_call = found as function(L: voidptr, nargs: int32, nresults: int32): nil
+    found = lookup(module, "lua_checkstack")
+    if found == nil then
+        return 0
+    end
+    lua_checkstack = found as function(L: voidptr, extra: int32): int32
+    found = lookup(module, "lua_createtable")
+    if found == nil then
+        return 0
+    end
+    lua_createtable = found as function(L: voidptr, narr: int32, nrec: int32): nil
+    found = lookup(module, "lua_equal")
+    if found == nil then
+        return 0
+    end
+    lua_equal = found as function(L: voidptr, index1: int32, index2: int32): int32
+    found = lookup(module, "lua_getfield")
+    if found == nil then
+        return 0
+    end
+    lua_getfield = found as function(L: voidptr, index: int32, k: cstring): nil
+    found = lookup(module, "lua_gettop")
+    if found == nil then
+        return 0
+    end
+    lua_gettop = found as function(L: voidptr): int32
+    found = lookup(module, "lua_insert")
+    if found == nil then
+        return 0
+    end
+    lua_insert = found as function(L: voidptr, index: int32): nil
+    found = lookup(module, "lua_newuserdata")
+    if found == nil then
+        return 0
+    end
+    lua_newuserdata = found as function(L: voidptr, size: Size): voidptr
+    found = lookup(module, "lua_next")
+    if found == nil then
+        return 0
+    end
+    lua_next = found as function(L: voidptr, index: int32): int32
+    found = lookup(module, "lua_objlen")
+    if found == nil then
+        return 0
+    end
+    lua_objlen = found as function(L: voidptr, index: int32): Size
+    found = lookup(module, "lua_pushboolean")
+    if found == nil then
+        return 0
+    end
+    lua_pushboolean = found as function(L: voidptr, b: int32): nil
+    found = lookup(module, "lua_pushlightuserdata")
+    if found == nil then
+        return 0
+    end
+    lua_pushlightuserdata = found as function(L: voidptr, p: voidptr): nil
+    found = lookup(module, "lua_pushlstring")
+    if found == nil then
+        return 0
+    end
+    lua_pushlstring = found as function(L: voidptr, s: voidptr, l: Size): nil
+    found = lookup(module, "lua_pushnil")
+    if found == nil then
+        return 0
+    end
+    lua_pushnil = found as function(L: voidptr): nil
+    found = lookup(module, "lua_pushnumber")
+    if found == nil then
+        return 0
+    end
+    lua_pushnumber = found as function(L: voidptr, n: number): nil
+    found = lookup(module, "lua_pushvalue")
+    if found == nil then
+        return 0
+    end
+    lua_pushvalue = found as function(L: voidptr, index: int32): nil
+    found = lookup(module, "lua_rawget")
+    if found == nil then
+        return 0
+    end
+    lua_rawget = found as function(L: voidptr, index: int32): nil
+    found = lookup(module, "lua_rawgeti")
+    if found == nil then
+        return 0
+    end
+    lua_rawgeti = found as function(L: voidptr, index: int32, n: int32): nil
+    found = lookup(module, "lua_rawset")
+    if found == nil then
+        return 0
+    end
+    lua_rawset = found as function(L: voidptr, index: int32): nil
+    found = lookup(module, "lua_rawseti")
+    if found == nil then
+        return 0
+    end
+    lua_rawseti = found as function(L: voidptr, index: int32, n: int32): nil
+    found = lookup(module, "lua_remove")
+    if found == nil then
+        return 0
+    end
+    lua_remove = found as function(L: voidptr, index: int32): nil
+    found = lookup(module, "lua_setmetatable")
+    if found == nil then
+        return 0
+    end
+    lua_setmetatable = found as function(L: voidptr, index: int32): int32
+    found = lookup(module, "lua_settop")
+    if found == nil then
+        return 0
+    end
+    lua_settop = found as function(L: voidptr, index: int32): nil
+    found = lookup(module, "lua_toboolean")
+    if found == nil then
+        return 0
+    end
+    lua_toboolean = found as function(L: voidptr, index: int32): int32
+    found = lookup(module, "lua_tolstring")
+    if found == nil then
+        return 0
+    end
+    lua_tolstring = found as function(L: voidptr, index: int32, len: voidptr?): voidptr?
+    found = lookup(module, "lua_tonumber")
+    if found == nil then
+        return 0
+    end
+    lua_tonumber = found as function(L: voidptr, index: int32): number
+    found = lookup(module, "lua_topointer")
+    if found == nil then
+        return 0
+    end
+    lua_topointer = found as function(L: voidptr, index: int32): voidptr?
+    found = lookup(module, "lua_touserdata")
+    if found == nil then
+        return 0
+    end
+    lua_touserdata = found as function(L: voidptr, index: int32): voidptr?
+    found = lookup(module, "lua_type")
+    if found == nil then
+        return 0
+    end
+    lua_type = found as function(L: voidptr, index: int32): int32
+    bound = true
+
+    return 1
+end
+
+@visibility("hidden")
+export function ksAddlstring(B: voidptr, s: voidptr, l: Size): nil
+    luaL_addlstring(B, s, l)
+end
+
+@visibility("hidden")
+export function ksAddvalue(B: voidptr): nil
+    luaL_addvalue(B)
+end
+
+@visibility("hidden")
+export function ksBuffinit(L: voidptr, B: voidptr): nil
+    luaL_buffinit(L, B)
+end
+
+--- Raises `message` as it stands: it is passed as a `%s` argument, never as
+--- the format.
+@visibility("hidden")
+export function ksError(L: voidptr, message: cstring): nil
+    luaL_error(L, "%s", message)
+end
+
+--- Raises `format` with its one `%s` filled from `text`.
+@visibility("hidden")
+export function ksErrorText(L: voidptr, format: cstring, text: cstring): nil
+    luaL_error(L, format, text)
+end
+
+--- Raises `format` with its one `%d` filled from `value`.
+@visibility("hidden")
+export function ksErrorNumber(L: voidptr, format: cstring, value: int32): nil
+    luaL_error(L, format, value)
+end
+
+@visibility("hidden")
+export function ksPushresult(B: voidptr): nil
+    luaL_pushresult(B)
+end
+
+@visibility("hidden")
+export function ksCall(L: voidptr, nargs: int32, nresults: int32): nil
+    lua_call(L, nargs, nresults)
+end
+
+@visibility("hidden")
+export function ksCheckstack(L: voidptr, extra: int32): int32
+    return math.i32.wrap(lua_checkstack(L, extra))
+end
+
+@visibility("hidden")
+export function ksCreatetable(L: voidptr, narr: int32, nrec: int32): nil
+    lua_createtable(L, narr, nrec)
+end
+
+@visibility("hidden")
+export function ksEqual(L: voidptr, index1: int32, index2: int32): int32
+    return math.i32.wrap(lua_equal(L, index1, index2))
+end
+
+@visibility("hidden")
+export function ksGetfield(L: voidptr, index: int32, k: cstring): nil
+    lua_getfield(L, index, k)
+end
+
+@visibility("hidden")
+export function ksGettop(L: voidptr): int32
+    return math.i32.wrap(lua_gettop(L))
+end
+
+@visibility("hidden")
+export function ksInsert(L: voidptr, index: int32): nil
+    lua_insert(L, index)
+end
+
+@visibility("hidden")
+export function ksNewuserdata(L: voidptr, size: Size): voidptr
+    return lua_newuserdata(L, size)
+end
+
+@visibility("hidden")
+export function ksNext(L: voidptr, index: int32): int32
+    return math.i32.wrap(lua_next(L, index))
+end
+
+@visibility("hidden")
+export function ksObjlen(L: voidptr, index: int32): Size
+    return lua_objlen(L, index)
+end
+
+@visibility("hidden")
+export function ksPushboolean(L: voidptr, b: int32): nil
+    lua_pushboolean(L, b)
+end
+
+@visibility("hidden")
+export function ksPushlightuserdata(L: voidptr, p: voidptr): nil
+    lua_pushlightuserdata(L, p)
+end
+
+@visibility("hidden")
+export function ksPushlstring(L: voidptr, s: voidptr, l: Size): nil
+    lua_pushlstring(L, s, l)
+end
+
+@visibility("hidden")
+export function ksPushnil(L: voidptr): nil
+    lua_pushnil(L)
+end
+
+@visibility("hidden")
+export function ksPushnumber(L: voidptr, n: number): nil
+    lua_pushnumber(L, n)
+end
+
+@visibility("hidden")
+export function ksPushvalue(L: voidptr, index: int32): nil
+    lua_pushvalue(L, index)
+end
+
+@visibility("hidden")
+export function ksRawget(L: voidptr, index: int32): nil
+    lua_rawget(L, index)
+end
+
+@visibility("hidden")
+export function ksRawgeti(L: voidptr, index: int32, n: int32): nil
+    lua_rawgeti(L, index, n)
+end
+
+@visibility("hidden")
+export function ksRawset(L: voidptr, index: int32): nil
+    lua_rawset(L, index)
+end
+
+@visibility("hidden")
+export function ksRawseti(L: voidptr, index: int32, n: int32): nil
+    lua_rawseti(L, index, n)
+end
+
+@visibility("hidden")
+export function ksRemove(L: voidptr, index: int32): nil
+    lua_remove(L, index)
+end
+
+@visibility("hidden")
+export function ksSetmetatable(L: voidptr, index: int32): int32
+    return math.i32.wrap(lua_setmetatable(L, index))
+end
+
+@visibility("hidden")
+export function ksSettop(L: voidptr, index: int32): nil
+    lua_settop(L, index)
+end
+
+@visibility("hidden")
+export function ksToboolean(L: voidptr, index: int32): int32
+    return math.i32.wrap(lua_toboolean(L, index))
+end
+
+@visibility("hidden")
+export function ksTolstring(L: voidptr, index: int32, len: voidptr?): voidptr?
+    return lua_tolstring(L, index, len)
+end
+
+@visibility("hidden")
+export function ksTonumber(L: voidptr, index: int32): number
+    return lua_tonumber(L, index)
+end
+
+@visibility("hidden")
+export function ksTopointer(L: voidptr, index: int32): voidptr?
+    return lua_topointer(L, index)
+end
+
+@visibility("hidden")
+export function ksTouserdata(L: voidptr, index: int32): voidptr?
+    return lua_touserdata(L, index)
+end
+
+@visibility("hidden")
+export function ksType(L: voidptr, index: int32): int32
+    return math.i32.wrap(lua_type(L, index))
+end

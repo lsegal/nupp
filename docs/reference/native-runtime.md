@@ -81,9 +81,11 @@ as the provider. So the version stays at 2, and the ABI grows by addition:
   so the struct can grow at its tail.
 - A symbol can be deleted once no provider module uses it and the pinned
   stage-zero bundle does not name it. `rustabitest` checks that every
-  `nuppNative*` name in the pinned bundle is still declared in
-  `native/include/nupp_native.h`, and that the header's version is the one the
-  bundle requires.
+  `nuppNative*` name in the pinned bundle is still declared in the ABI's
+  definition, `native/abi/nuppnative.nupp`, and that its version is the one
+  the bundle requires. The C header is generated from that definition by
+  `scripts/native-abi-header`, and `rustabitest` compiles it and calls the
+  provider through it.
 - Status codes and their meanings are part of the ABI. `nuppNativeBytesCopy`
   still returns `CAPACITY` for a short output, where every other call returns
   `BUFFER_TOO_SMALL`, because the pinned bundle reads that code as the answer
@@ -163,8 +165,11 @@ claim that every executable byte is Rust. Native builds still retain:
   channels and shared bytes are a native Nupp program, `host/program`;
 - `ring`'s bounded C and assembly implementation under its Rust API, which the
   code generator's link-kit download still uses;
-- compiled AOT code, and the AOT runtime (`native/crates/native/c/ks_rt.c`) a
-  builder entry calls through a table the provider hands it;
+- compiled AOT code. The AOT runtime a builder entry calls, through a table the
+  provider hands it, is a native Nupp program (`native/aotruntime`) that
+  `scripts/toolchain` compiles with the checkout's own compiler and links into
+  the provider, so the first provider a checkout builds, before it has a
+  compiler, has none;
 - LLVM and lld, linked into `nupp` as the AOT code generator and never into the
   programs it builds;
 - the pinned, prebuilt wgpu-native library, which a GPU program loads beside

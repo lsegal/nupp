@@ -1,0 +1,2734 @@
+--[[
+The value-stream builder: what assembles Lua tables from a compiled body's
+stream of containers, keys and scalars, against the selection shape or serde
+schema the entry was compiled with.
+]]
+module ksrt.builder
+
+const {type Size, ksSize as toSize} = require("ksrt.build")
+const {
+    ksError as raise,
+    ksErrorText as raiseText,
+    ksErrorNumber as raiseNumber,
+    ksCall as lua_call,
+    ksCheckstack as lua_checkstack,
+    ksCreatetable as lua_createtable,
+    ksEqual as lua_equal,
+    ksGettop as lua_gettop,
+    ksInsert as lua_insert,
+    ksNewuserdata as lua_newuserdata,
+    ksNext as lua_next,
+    ksObjlen as lua_objlen,
+    ksPushboolean as lua_pushboolean,
+    ksPushlstring as lua_pushlstring,
+    ksPushnil as lua_pushnil,
+    ksPushnumber as lua_pushnumber,
+    ksPushvalue as lua_pushvalue,
+    ksRawget as lua_rawget,
+    ksRawgeti as lua_rawgeti,
+    ksRawset as lua_rawset,
+    ksRawseti as lua_rawseti,
+    ksRemove as lua_remove,
+    ksSetmetatable as lua_setmetatable,
+    ksSettop as lua_settop,
+    ksToboolean as lua_toboolean,
+    ksTolstring as lua_tolstring,
+    ksTonumber as lua_tonumber,
+    ksTopointer as lua_topointer,
+    ksType as lua_type
+} = require("ksrt.api")
+const {
+    ksOffset as offset,
+    ksByteAt as byteAt,
+    ksIsDigit as isDigit,
+    ksIsFinite as isFinite,
+    ksSignbit as signbit,
+    ksPop as pop,
+    ksNumberSlice as numberSlice,
+    ksIntegerSlice as integerSlice,
+    ksDecimal64Value as decimal64Value,
+    ksHex4 as hex4,
+    ksUtf8 as utf8,
+    ksTrailingZeros as trailingZeros,
+    ksScratchU8Push as scratchU8Push,
+    ksScratchWord as scratchWord,
+    ksScratchCapacity as scratchCapacity,
+    ksScratchEscapeLength as scratchEscapeLength,
+    TNIL,
+    TBOOLEAN,
+    TNUMBER,
+    TSTRING,
+    TTABLE,
+    TFUNCTION,
+    INT_MAX,
+    UINT32_MAX,
+    BACKSLASH,
+    QUOTE,
+    SLASH,
+    MINUS,
+    PLUS,
+    DOT,
+    DIGIT_0,
+    LETTER_E,
+    LETTER_LOWER_E
+} = require("ksrt.values")
+
+cdef function memchr(borrows s: voidptr, c: int32, n: Size): voidptr?
+cdef function memcmp(borrows a: voidptr, borrows b: voidptr, n: Size): int32
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, n: Size): voidptr
+
+--- One name of an object shape a plan indexes. Up to seven bytes are also
+--- packed into one word, closing quote included, which is how an unescaped
+--- key of that length is compared.
+cdef struct ShapeKey
+    bytes: voidptr
+    length: Size
+    packed: uint64
+    hash: uint32
+    scalar: int32
+end
+
+--- An object shape's names, either listed from the shape's table or read
+--- from the compiled blob the shape carries.
+cdef struct ShapePlan
+    identity: voidptr?
+    compiled: voidptr?
+    compiledLength: Size
+    first: uint32
+    count: uint32
+    required: uint64
+    aliases: int32
+    defaults: int32
+    factory: int32
+end
+
+--- One open container. `serial` names an object frame for the duplicate-member
+--- sets.
+cdef struct Frame
+    tableIndex: int32
+    shapeIndex: int32
+    kind: uint32
+    next: uint32
+    count: uint32
+    mode: uint32
+    plan: uint32
+    expected: uint32
+    seen: uint64
+    expectsKey: int32
+    aliases: int32
+    tuple: int32
+    serial: uint32
+end
+
+--- A value stream's state, in the block generated code sets aside for it. The
+--- fields up to the inline frames are read by generated code too, in this
+--- order (`runtime.BUILDER`).
+cdef struct Builder
+    nullIndex: int32
+    arrayMarkerIndex: int32
+    objectMarkerIndex: int32
+    rootIndex: int32
+    frameRootIndex: int32
+    byteRootIndex: int32
+    selectionShapeIndex: int32
+    arrayShapeMarkerIndex: int32
+    serdeMarkersIndex: int32
+    pendingShapeIndex: int32
+    depth: uint32
+    frameCapacity: uint32
+    pendingMode: uint32
+    pendingShapeOwned: int32
+    pendingScalar: int32
+    rootDone: int32
+    frames: voidptr?
+    inlineFrames: Frame[16]
+    bytes: voidptr?
+    byteCapacity: uint32
+    byteAllocated: uint32
+    planCount: uint32
+    keyCount: uint32
+    plans: ShapePlan[16]
+    keys: ShapeKey[64]
+    dupIndex: int32
+    dupSerial: uint32
+
+    --- Where `strtod` says a number ended, and the plan key a lookup reads.
+    --- Only the runtime reads them, and generated code sets their bytes aside
+    --- with the rest (`runtime.BUILDER_BYTES`).
+    ending: voidptr?
+
+    probe: ShapeKey
+end
+
+--- How a frame or a pending value is built: skipped, built whole, built as an
+--- object against its shape, or built as an array against its item shape.
+const BUILD_SKIP = 0
+
+const BUILD_ALL = 1
+
+const BUILD_OBJECT = 2
+
+const BUILD_ARRAY = 3
+
+const BUILD_PENDING = 4294967295
+
+const KIND_ARRAY = 5
+
+const KIND_OBJECT = 6
+
+--- The frame at `index`: the inline frames until the stream spills them.
+local function frameAt(builder: Builder*, index: integer): Frame*
+    @unsafe do
+        local base = builder.inlineFrames as voidptr
+        local spilled = builder.frames
+        if spilled ~= nil then
+            base = spilled as voidptr
+        end
+        return offset(base, index * ffi.sizeof(Frame)) as Frame*
+    end
+end
+
+local function currentFrame(builder: Builder*): Frame*
+    @unsafe do
+        return frameAt(builder, (builder.depth as integer) - 1)
+    end
+end
+
+local function planAt(builder: Builder*, index: integer): ShapePlan*
+    @unsafe do
+        return offset(builder.plans as voidptr, index * ffi.sizeof(ShapePlan)) as ShapePlan*
+    end
+end
+
+local function keyAt(builder: Builder*, index: integer): ShapeKey*
+    @unsafe do
+        return offset(builder.keys as voidptr, index * ffi.sizeof(ShapeKey)) as ShapeKey*
+    end
+end
+
+--- Where `strtod` writes the end of the number it read.
+local function endingOf(builder: Builder*): voidptr
+    return offset(builder as voidptr, ffi.offsetof(Builder, "ending"))
+end
+
+local function probeOf(builder: Builder*): ShapeKey*
+    return offset(builder as voidptr, ffi.offsetof(Builder, "probe")) as ShapeKey*
+end
+
+--- In place, in the block generated code set aside for the state, so only
+--- the live fields are written rather than a whole struct copied back.
+local function builderInit(
+    L: voidptr,
+    builder: Builder*,
+    nullIndex: int32,
+    arrayMarkerIndex: int32,
+    objectMarkerIndex: int32,
+    maxDepth: integer,
+    byteCapacity: integer,
+    selectionShapeIndex: int32,
+    arrayShapeMarkerIndex: int32,
+    serdeMarkersIndex: int32
+): nil
+    local selection = selectionShapeIndex
+    if selection ~= 0 and lua_type(L, selection) <= 0 then
+        selection = 0
+    end
+    local pendingMode = BUILD_OBJECT
+    if selection == 0 then
+        pendingMode = BUILD_ALL
+    end
+    @unsafe do
+        builder.nullIndex = nullIndex
+        builder.arrayMarkerIndex = arrayMarkerIndex
+        builder.objectMarkerIndex = objectMarkerIndex
+        builder.rootIndex = 0
+        builder.frameRootIndex = lua_gettop(L)
+        builder.byteRootIndex = 0
+        builder.selectionShapeIndex = selection
+        builder.arrayShapeMarkerIndex = arrayShapeMarkerIndex
+        builder.serdeMarkersIndex = serdeMarkersIndex
+        builder.pendingShapeIndex = selection
+        builder.depth = 0
+        builder.frameCapacity = maxDepth as uint32
+        builder.pendingMode = pendingMode as uint32
+        builder.pendingShapeOwned = 0
+        builder.pendingScalar = 0
+        builder.rootDone = 0
+        builder.frames = nil
+        builder.bytes = nil
+        builder.byteCapacity = byteCapacity as uint32
+        builder.byteAllocated = 0
+        builder.planCount = 0
+        builder.keyCount = 0
+        builder.dupIndex = 0
+        builder.dupSerial = 0
+    end
+end
+
+--- Every stack index the stream holds at or above `destination` moves up one,
+--- because a value was inserted there.
+local function shiftIndices(builder: Builder*, destination: integer): nil
+    @unsafe do
+        if builder.byteRootIndex >= destination then
+            builder.byteRootIndex = math.i32.wrap(builder.byteRootIndex + 1)
+        end
+        if builder.arrayMarkerIndex >= destination then
+            builder.arrayMarkerIndex = math.i32.wrap(builder.arrayMarkerIndex + 1)
+        end
+        if builder.objectMarkerIndex >= destination then
+            builder.objectMarkerIndex = math.i32.wrap(builder.objectMarkerIndex + 1)
+        end
+        if builder.selectionShapeIndex >= destination then
+            builder.selectionShapeIndex = math.i32.wrap(builder.selectionShapeIndex + 1)
+        end
+        if builder.arrayShapeMarkerIndex >= destination then
+            builder.arrayShapeMarkerIndex = math.i32.wrap(builder.arrayShapeMarkerIndex + 1)
+        end
+        if builder.serdeMarkersIndex >= destination then
+            builder.serdeMarkersIndex = math.i32.wrap(builder.serdeMarkersIndex + 1)
+        end
+        if builder.pendingShapeIndex >= destination then
+            builder.pendingShapeIndex = math.i32.wrap(builder.pendingShapeIndex + 1)
+        end
+        if builder.dupIndex >= destination then
+            builder.dupIndex = math.i32.wrap(builder.dupIndex + 1)
+        end
+        local depth = builder.depth as integer
+        local at: integer = 0
+        while at < depth do
+            local frame = frameAt(builder, at)
+            if frame.tableIndex >= destination then
+                frame.tableIndex = math.i32.wrap(frame.tableIndex + 1)
+            end
+            if frame.shapeIndex >= destination then
+                frame.shapeIndex = math.i32.wrap(frame.shapeIndex + 1)
+            end
+            at += 1
+        end
+        if builder.rootIndex >= destination then
+            builder.rootIndex = math.i32.wrap(builder.rootIndex + 1)
+        end
+    end
+end
+
+--- Roots the value on top of the stack just above the stream's frame root,
+--- answering where it went.
+local function rootBelow(L: voidptr, builder: Builder*): integer
+    @unsafe do
+        local destination = (builder.frameRootIndex as integer) + 1
+        lua_insert(L, math.i32.wrap(destination))
+        shiftIndices(builder, destination)
+        return destination
+    end
+end
+
+local function ensureFrames(L: voidptr, builder: Builder*): nil
+    @unsafe do
+        if builder.frames ~= nil or builder.frameCapacity <= 16 then
+            return
+        end
+        local bytes = (builder.frameCapacity as integer) * ffi.sizeof(Frame)
+        local frames = lua_newuserdata(L, toSize(bytes))
+        memcpy(frames, builder.inlineFrames as voidptr, toSize(16 * ffi.sizeof(Frame)))
+        builder.frames = frames
+        local destination = (builder.frameRootIndex as integer) + 1
+        lua_insert(L, math.i32.wrap(destination))
+        builder.frameRootIndex = math.i32.wrap(destination)
+        shiftIndices(builder, destination)
+    end
+end
+
+--- At least `needed` bytes of decoding storage, grown by doubling up to the
+--- authored capacity and rooted with the stream.
+local function builderBytes(L: voidptr, builder: Builder*, needed: integer): voidptr
+    @unsafe do
+        local byteCapacity = builder.byteCapacity as integer
+        if needed > byteCapacity then
+            raise(L, "AOT value stream string exceeds its authored capacity")
+            return builder as voidptr
+        end
+        local existing = builder.bytes
+        if existing ~= nil and needed <= builder.byteAllocated then
+            return existing as voidptr
+        end
+        local capacity = builder.byteAllocated as integer
+        if capacity == 0 then
+            capacity = 64
+            if byteCapacity < 64 then
+                capacity = byteCapacity
+            end
+        end
+        while capacity < needed do
+            if capacity > byteCapacity // 2 then
+                capacity = byteCapacity
+                break
+            end
+            capacity = capacity * 2
+        end
+        local size = capacity
+        if size == 0 then
+            size = 1
+        end
+        local bytes = lua_newuserdata(L, toSize(size))
+        if builder.byteRootIndex == 0 then
+            builder.byteRootIndex = math.i32.wrap(rootBelow(L, builder))
+        else
+            lua_insert(L, builder.byteRootIndex)
+            lua_remove(L, math.i32.wrap(builder.byteRootIndex + 1))
+        end
+        builder.bytes = bytes
+        builder.byteAllocated = capacity as uint32
+        return bytes
+    end
+end
+
+local function duplicate(L: voidptr, start: integer): nil
+    raiseNumber(L, "invalid JSON at byte %d: duplicate member name", math.i32.wrap(start))
+end
+
+--- Names an object has had that it holds no entry for: a dropped null, a skipped
+--- member, or a member stored under another name. One set per depth, rooted
+--- with the builder, maps a name to the serial of the last object that had it,
+--- so a set is reused by the next object at its depth without being cleared.
+--- The name is on top of the stack and stays there. With `check`, a name the
+--- current object already had is refused at `start`, the one-based position of
+--- its opening quote.
+local function noteKey(L: voidptr, builder: Builder*, frame: Frame*, start: integer, check: boolean): nil
+    if lua_checkstack(L, 4) == 0 then
+        raise(L, "AOT builder Lua stack exhausted")
+        return
+    end
+    @unsafe do
+        if builder.dupIndex == 0 then
+            lua_createtable(L, 4, 0)
+            builder.dupIndex = math.i32.wrap(rootBelow(L, builder))
+        end
+        local depth = math.i32.wrap(builder.depth)
+        lua_rawgeti(L, builder.dupIndex, depth)
+        if lua_type(L, -1) ~= TTABLE then
+            pop(L, 1)
+            lua_createtable(L, 0, 8)
+            lua_pushvalue(L, -1)
+            lua_rawseti(L, builder.dupIndex, depth)
+        end
+        if check then
+            lua_pushvalue(L, -2)
+            lua_rawget(L, -2)
+            if lua_type(L, -1) == TNUMBER and lua_tonumber(L, -1) == frame.serial then
+                duplicate(L, start)
+                return
+            end
+            pop(L, 1)
+        end
+        lua_pushvalue(L, -2)
+        lua_pushnumber(L, frame.serial as number)
+        lua_rawset(L, -3)
+        pop(L, 1)
+    end
+end
+
+--- The value the serde markers table holds under `marker` in the shape at
+--- `shapeIndex`, pushed, and its index. Nil without serde markers.
+local function shapeMarker(L: voidptr, builder: Builder*, shapeIndex: integer, marker: int32): integer
+    @unsafe do
+        local markers = builder.serdeMarkersIndex
+        if markers == 0 or lua_type(L, markers) ~= TTABLE then
+            lua_pushnil(L)
+            return lua_gettop(L)
+        end
+        if shapeIndex == 0 or lua_type(L, math.i32.wrap(shapeIndex)) ~= TTABLE then
+            raise(L, "AOT value stream shape marker needs a table")
+            return 0
+        end
+        lua_rawgeti(L, markers, marker)
+        lua_rawget(L, math.i32.wrap(shapeIndex))
+    end
+
+    return lua_gettop(L)
+end
+
+local function complete(L: voidptr, builder: Builder*, pushed: boolean, eager: boolean): nil
+    @unsafe do
+        local pendingShape = builder.pendingShapeIndex
+        if not eager
+            and pushed
+            and builder.pendingMode == BUILD_OBJECT
+            and pendingShape ~= 0
+            and lua_type(L, pendingShape) == TTABLE
+        then
+            local value = lua_gettop(L)
+            local matched = false
+            local literal = shapeMarker(L, builder, pendingShape, 11)
+            if lua_type(L, math.i32.wrap(literal)) ~= TNIL then
+                matched = lua_equal(L, value, math.i32.wrap(literal)) ~= 0
+            else
+                local choices = shapeMarker(L, builder, pendingShape, 14)
+                if lua_type(L, math.i32.wrap(choices)) == TTABLE then
+                    local count = lua_objlen(L, math.i32.wrap(choices)) as integer
+                    local at: integer = 1
+                    while at <= count and not matched do
+                        lua_rawgeti(L, math.i32.wrap(choices), math.i32.wrap(at))
+                        matched = lua_equal(L, value, -1) ~= 0
+                        pop(L, 1)
+                        at += 1
+                    end
+                end
+            end
+            if not matched then
+                raise(L, "nupp: value does not match literal schema or union")
+                return
+            end
+            lua_settop(L, value)
+            if builder.pendingShapeOwned ~= 0 then
+                lua_remove(L, builder.pendingShapeIndex)
+            end
+            builder.pendingShapeIndex = 0
+            builder.pendingShapeOwned = 0
+            builder.pendingMode = BUILD_PENDING
+        end
+        if builder.depth == 0 then
+            if builder.rootDone ~= 0 then
+                raise(L, "AOT value stream has more than one root")
+                return
+            end
+            builder.rootDone = 1
+            if not pushed then
+                lua_pushnil(L)
+            end
+            builder.rootIndex = lua_gettop(L)
+            return
+        end
+        local frame = currentFrame(builder)
+        if frame.kind == KIND_ARRAY then
+            if frame.count == UINT32_MAX then
+                raise(L, "AOT value stream array is too large")
+                return
+            end
+            frame.count = math.u32.wrap(frame.count + 1)
+            if not pushed then
+                return
+            end
+            if frame.tableIndex == 0 or not eager and lua_gettop(L) ~= frame.tableIndex + 1 then
+                raise(L, "AOT value stream value is not above its array")
+                return
+            end
+            if lua_type(L, -1) == TNIL then
+                lua_settop(L, frame.tableIndex)
+                return
+            end
+            if frame.next > INT_MAX then
+                raise(L, "AOT value stream array exceeds C API range")
+                return
+            end
+            local next = frame.next
+            frame.next = math.u32.wrap(next + 1)
+            lua_rawseti(L, frame.tableIndex, math.i32.wrap(next))
+            return
+        end
+        if frame.expectsKey ~= 0 then
+            raise(L, "AOT value stream object needs a key")
+            return
+        end
+        if frame.count == UINT32_MAX then
+            raise(L, "AOT value stream object is too large")
+            return
+        end
+        frame.count = math.u32.wrap(frame.count + 1)
+        frame.expectsKey = 1
+        if not pushed then
+            return
+        end
+        if frame.tableIndex == 0 or not eager and lua_gettop(L) ~= frame.tableIndex + 2 then
+            raise(L, "AOT value stream key and value are not above their object")
+            return
+        end
+        if lua_type(L, -1) == TNIL then
+            if frame.mode == BUILD_ALL then
+                pop(L, 1)
+                noteKey(L, builder, frame, 0, false)
+                frame.seen = 1ULL
+            end
+            lua_settop(L, frame.tableIndex)
+            return
+        end
+        lua_rawset(L, frame.tableIndex)
+    end
+end
+
+local function prepare(L: voidptr, builder: Builder*): nil
+    @unsafe do
+        if builder.pendingMode ~= BUILD_PENDING then
+            return
+        end
+        if builder.depth == 0 then
+            raise(L, "AOT value stream has more than one root")
+            return
+        end
+        local frame = currentFrame(builder)
+        if frame.kind ~= KIND_ARRAY then
+            raise(L, "AOT value stream object needs a key")
+            return
+        end
+        if frame.mode == BUILD_SKIP then
+            builder.pendingMode = BUILD_SKIP
+        elseif frame.mode == BUILD_ALL then
+            builder.pendingMode = BUILD_ALL
+        else
+            if frame.tuple ~= 0 then
+                if frame.next > INT_MAX then
+                    raise(L, "AOT tuple index exceeds C API range")
+                    return
+                end
+                lua_rawgeti(L, frame.shapeIndex, math.i32.wrap(frame.next))
+                if lua_type(L, -1) == TNIL then
+                    raise(L, "nupp: tuple has too many values")
+                    return
+                end
+            else
+                lua_pushvalue(L, frame.shapeIndex)
+            end
+            builder.pendingShapeIndex = lua_gettop(L)
+            builder.pendingShapeOwned = 1
+            builder.pendingMode = BUILD_OBJECT
+        end
+    end
+end
+
+local function clearPending(L: voidptr, builder: Builder*): nil
+    @unsafe do
+        if builder.pendingShapeOwned ~= 0 then
+            lua_remove(L, builder.pendingShapeIndex)
+        end
+        builder.pendingShapeIndex = 0
+        builder.pendingShapeOwned = 0
+        builder.pendingScalar = 0
+        builder.pendingMode = BUILD_PENDING
+    end
+end
+
+--- Whether the pending value is kept, a scalar being next.
+local function scalarWanted(L: voidptr, builder: Builder*, eager: boolean): boolean
+    if eager then
+        return true
+    end
+    prepare(L, builder)
+    @unsafe do
+        local mode = builder.pendingMode
+        if mode == BUILD_SKIP then
+            clearPending(L, builder)
+            return false
+        end
+        if mode == BUILD_ALL then
+            clearPending(L, builder)
+            return true
+        end
+        if builder.pendingScalar ~= 0 then
+            return true
+        end
+        local shape = builder.pendingShapeIndex
+        local kind = lua_type(L, shape)
+        if kind == TBOOLEAN then
+            local wanted = lua_toboolean(L, shape) ~= 0
+            clearPending(L, builder)
+            return wanted
+        end
+        if kind == TNUMBER and builder.serdeMarkersIndex ~= 0 and lua_type(L, builder.serdeMarkersIndex) == TTABLE then
+            return true
+        end
+        if kind == TTABLE then
+            local top = lua_gettop(L)
+            local scalar = shapeMarker(L, builder, shape, 10)
+            local wanted = lua_type(L, math.i32.wrap(scalar)) == TNUMBER
+            lua_settop(L, top)
+            if not wanted then
+                local choices = shapeMarker(L, builder, shape, 14)
+                wanted = lua_type(L, math.i32.wrap(choices)) == TTABLE
+                lua_settop(L, top)
+            end
+            if wanted then
+                return true
+            end
+            raise(L, "pull container shape matched a scalar value")
+            return false
+        end
+    end
+    raise(L, "pull shape entries must be true, false, object shapes, or array shapes")
+
+    return false
+end
+
+--- Checks a kept scalar against the schema the pending shape names: `actual`
+--- is its Lua type, `integerToken` whether its token was an integer (-1
+--- for a value that had none), and `negative` its sign.
+local function scalarValidate(
+    L: voidptr,
+    builder: Builder*,
+    eager: boolean,
+    actual: integer,
+    value: number,
+    integerToken: integer,
+    negative: boolean
+): nil
+    if eager then
+        return
+    end
+    @unsafe do
+        if builder.pendingMode ~= BUILD_OBJECT or builder.pendingShapeIndex == 0 and builder.pendingScalar == 0 then
+            return
+        end
+        local shape = builder.pendingShapeIndex
+        local expected = builder.pendingScalar as integer
+        local literal = false
+        if expected == 0 then
+            if lua_type(L, shape) == TTABLE then
+                local top = lua_gettop(L)
+                local scalar = shapeMarker(L, builder, shape, 10)
+                if lua_type(L, math.i32.wrap(scalar)) == TNUMBER then
+                    expected = math.floor(lua_tonumber(L, math.i32.wrap(scalar)))
+                else
+                    lua_settop(L, top)
+                    local choices = shapeMarker(L, builder, shape, 14)
+                    if lua_type(L, math.i32.wrap(choices)) ~= TTABLE then
+                        raise(L, "pull container shape matched a scalar value")
+                        return
+                    end
+                end
+                lua_settop(L, top)
+                literal = true
+                if expected == 0 then
+                    return
+                end
+            else
+                if lua_type(L, shape) ~= TNUMBER then
+                    raise(L, "pull container shape matched a scalar value")
+                    return
+                end
+                expected = math.floor(lua_tonumber(L, shape))
+            end
+        end
+        if expected < 0 then
+            expected = -expected
+        end
+        if expected >= 32 then
+            expected -= 32
+            if actual == TNUMBER and integerToken ~= 1 then
+                raise(L, "nupp: expected integer token")
+                return
+            end
+            if actual == TNUMBER and expected >= 5 and expected <= 8 and negative then
+                raise(L, "nupp: expected unsigned integer token")
+                return
+            end
+        end
+        if actual ~= expected and not (actual == TNUMBER and expected >= 3) then
+            if expected == 1 then
+                raise(L, "nupp: expected boolean")
+            elseif expected == 2 then
+                raise(L, "nupp: expected string")
+            else
+                raise(L, "nupp: expected number")
+            end
+            return
+        end
+        if expected >= 3 then
+            if not isFinite(value) then
+                raise(L, "nupp: expected finite number")
+                return
+            end
+            if expected >= 4 and math.floor(value) ~= value then
+                raise(L, "nupp: expected integer")
+                return
+            end
+            if expected >= 5 and expected <= 8 and value < 0 then
+                raise(L, "nupp: expected unsigned integer")
+                return
+            end
+            if expected == 6 and value > 255
+                or expected == 7 and value > 65535
+                or expected == 8 and value > 4294967295
+                or expected == 9 and (value < -128 or value > 127)
+                or expected == 10 and (value < -32768 or value > 32767)
+                or expected == 11 and (value < -2147483648 or value > 2147483647)
+            then
+                raise(L, "nupp: number is outside schema range")
+                return
+            end
+        end
+        if not literal then
+            clearPending(L, builder)
+        end
+    end
+end
+
+--- Whether the pending value is kept, a null being next.
+local function nullWanted(L: voidptr, builder: Builder*, eager: boolean): boolean
+    if eager then
+        return true
+    end
+    prepare(L, builder)
+    @unsafe do
+        local mode = builder.pendingMode
+        if mode == BUILD_SKIP then
+            clearPending(L, builder)
+            return false
+        end
+        if mode == BUILD_ALL then
+            clearPending(L, builder)
+            return true
+        end
+        if mode ~= BUILD_OBJECT or builder.pendingShapeIndex == 0 and builder.pendingScalar == 0 then
+            raise(L, "pull shape cannot accept null")
+            return false
+        end
+        if builder.pendingScalar ~= 0 then
+            if builder.pendingScalar >= 0 then
+                raise(L, "nupp: null is not allowed")
+                return false
+            end
+            clearPending(L, builder)
+            return true
+        end
+        local shape = builder.pendingShapeIndex
+        if lua_type(L, shape) == TBOOLEAN then
+            local wanted = lua_toboolean(L, shape) ~= 0
+            clearPending(L, builder)
+            return wanted
+        end
+        if lua_type(L, shape) == TNUMBER
+            and builder.serdeMarkersIndex ~= 0
+            and lua_type(L, builder.serdeMarkersIndex) == TTABLE
+        then
+            if not (lua_tonumber(L, shape) < 0) then
+                raise(L, "nupp: null is not allowed")
+                return false
+            end
+            clearPending(L, builder)
+            return true
+        end
+        if lua_type(L, shape) ~= TTABLE then
+            raise(L, "pull shape cannot accept null")
+            return false
+        end
+        local top = lua_gettop(L)
+        local nullable = shapeMarker(L, builder, shape, 9)
+        local accepted = lua_toboolean(L, math.i32.wrap(nullable)) ~= 0
+        lua_settop(L, top)
+        if not accepted then
+            raise(L, "nupp: null is not allowed")
+            return false
+        end
+    end
+    clearPending(L, builder)
+
+    return true
+end
+
+--- FNV-1a over `length` bytes.
+local function keyHash(bytes: voidptr, length: integer): uint64
+    local hash: uint64 = 2166136261ULL
+    for at = 0, length - 1 do
+        hash = ((hash ~ (byteAt(bytes, at) as uint64)) * 16777619ULL) & 0xffffffffULL
+    end
+
+    return hash
+end
+
+--- Up to eight bytes at `bytes` as one little-endian word, as `memcpy` of
+--- them into a zeroed word reads on this machine.
+local function packed(bytes: voidptr, length: integer): uint64
+    local word: uint64 = 0ULL
+    for at = 0, length - 1 do
+        word = word | ((byteAt(bytes, at) as uint64) << (8 * at))
+    end
+
+    return word
+end
+
+local function addShapeKey(L: voidptr, builder: Builder*, index: int32): nil
+    @unsafe do
+        local key = keyAt(builder, builder.keyCount as integer)
+        builder.keyCount = math.u32.wrap(builder.keyCount + 1)
+        local lengthOf = offset(key as voidptr, ffi.offsetof(ShapeKey, "length"))
+        key.bytes = lua_tolstring(L, index, lengthOf) as voidptr
+        local length = key.length as integer
+        key.hash = keyHash(key.bytes, length) as uint32
+        key.packed = 0ULL
+        key.scalar = 0
+        if length <= 7 then
+            key.packed = packed(key.bytes, length) | ((QUOTE as uint64) << (length * 8))
+        end
+    end
+end
+
+--- The little-endian word of a compiled plan at `at`.
+local function blobU32(bytes: voidptr, at: integer): uint64
+    return packed(offset(bytes, at), 4)
+end
+
+--- Reads the plan's key at `index` into `key`: false when there is none, or
+--- when the compiled blob holding it is malformed.
+local function planKey(builder: Builder*, plan: ShapePlan*, index: integer, key: ShapeKey*): boolean
+    @unsafe do
+        local count = plan.count as integer
+        if index >= count then
+            return false
+        end
+        local compiled = plan.compiled
+        if compiled == nil then
+            local listed = keyAt(builder, (plan.first as integer) + index)
+            key.bytes = listed.bytes
+            key.length = listed.length
+            key.packed = listed.packed
+            key.hash = listed.hash
+            key.scalar = listed.scalar
+            return true
+        end
+        local blob = compiled as voidptr
+        local header = 12 + index * 24
+        local at = blobU32(blob, header + 16) as integer
+        local length = blobU32(blob, header) as integer
+        key.length = toSize(length)
+        key.hash = blobU32(blob, header + 4) as uint32
+        key.packed = packed(offset(blob, header + 8), 8)
+        local scalar = blobU32(blob, header + 20) as integer
+        if scalar >= 2147483648 then
+            scalar -= 4294967296
+        end
+        key.scalar = math.i32.wrap(scalar)
+        local names = 12 + count * 24
+        local compiledLength = plan.compiledLength as integer
+        if names > compiledLength or at > compiledLength - names or length > compiledLength - names - at then
+            return false
+        end
+        key.bytes = offset(blob, names + at)
+        return true
+    end
+end
+
+--- The plan for the object shape at `shapeIndex`, made the first time the
+--- stream meets it, and UINT32_MAX when it has no room for one.
+local function shapePlan(L: voidptr, builder: Builder*, shapeIndex: integer): integer
+    local shape = math.i32.wrap(shapeIndex)
+    local identity = lua_topointer(L, shape)
+    @unsafe do
+        local planCount = builder.planCount as integer
+        for index = 0, planCount - 1 do
+            if planAt(builder, index).identity == identity then
+                return index
+            end
+        end
+        if planCount >= 16 then
+            return UINT32_MAX
+        end
+        local first = builder.keyCount as integer
+        local top = lua_gettop(L)
+        if builder.serdeMarkersIndex ~= 0 then
+            lua_rawgeti(L, shape, 0)
+        else
+            shapeMarker(L, builder, shapeIndex, 6)
+        end
+        local compiledIndex = lua_gettop(L)
+        local compiled = lua_tolstring(L, compiledIndex, nil)
+        local compiledLength: integer = 0
+        if compiled ~= nil then
+            compiledLength = lua_objlen(L, compiledIndex) as integer
+        end
+        if compiled ~= nil and compiledLength >= 12 then
+            local blob = compiled as voidptr
+            local descriptor = blobU32(blob, 0)
+            local count = (descriptor & 0xffffULL) as integer
+            local headers = 12 + count * 24
+            if count <= 64 and headers <= compiledLength and planCount < 16 then
+                local plan = planAt(builder, planCount)
+                builder.planCount = (planCount + 1) as uint32
+                plan.identity = identity
+                plan.compiled = blob
+                plan.compiledLength = toSize(compiledLength)
+                plan.first = first as uint32
+                plan.count = count as uint32
+                plan.required = blobU32(blob, 4) | (blobU32(blob, 8) << 32)
+                plan.aliases = 0
+                if (descriptor & 0x80000000ULL) ~= 0ULL then
+                    plan.aliases = 1
+                end
+                plan.defaults = 0
+                if (descriptor & 0x40000000ULL) ~= 0ULL then
+                    plan.defaults = 1
+                end
+                plan.factory = 0
+                if (descriptor & 0x20000000ULL) ~= 0ULL then
+                    plan.factory = 1
+                end
+                lua_settop(L, top)
+                return planCount
+            end
+        end
+        lua_settop(L, top)
+        local order = math.i32.wrap(shapeMarker(L, builder, shapeIndex, 5))
+        if lua_type(L, order) == TTABLE then
+            local count = lua_objlen(L, order) as integer
+            if count > 64 - (builder.keyCount as integer) then
+                lua_settop(L, top)
+                return UINT32_MAX
+            end
+            for at = 1, count do
+                lua_rawgeti(L, order, math.i32.wrap(at))
+                if lua_type(L, -1) ~= TSTRING then
+                    lua_settop(L, top)
+                    builder.keyCount = first as uint32
+                    return UINT32_MAX
+                end
+                addShapeKey(L, builder, -1)
+                pop(L, 1)
+            end
+        else
+            lua_settop(L, top)
+            lua_pushnil(L)
+            while lua_next(L, shape) ~= 0 do
+                if lua_type(L, -2) == TSTRING and not (lua_type(L, -1) == TBOOLEAN and lua_toboolean(L, -1) == 0) then
+                    if builder.keyCount >= 64 then
+                        lua_settop(L, top)
+                        builder.keyCount = first as uint32
+                        return UINT32_MAX
+                    end
+                    addShapeKey(L, builder, -2)
+                end
+                pop(L, 1)
+            end
+        end
+        lua_settop(L, top)
+        local plan = planAt(builder, planCount)
+        builder.planCount = (planCount + 1) as uint32
+        plan.identity = identity
+        plan.compiled = nil
+        plan.compiledLength = toSize(0)
+        plan.first = first as uint32
+        plan.count = math.u32.wrap((builder.keyCount as integer) - first)
+        plan.required = 0ULL
+        local aliases = shapeMarker(L, builder, shapeIndex, 1)
+        plan.aliases = 0
+        if lua_type(L, math.i32.wrap(aliases)) == TTABLE then
+            plan.aliases = 1
+        end
+        lua_settop(L, top)
+        local defaults = shapeMarker(L, builder, shapeIndex, 8)
+        plan.defaults = 0
+        if lua_type(L, math.i32.wrap(defaults)) == TTABLE then
+            plan.defaults = 1
+        end
+        lua_settop(L, top)
+        local factory = shapeMarker(L, builder, shapeIndex, 12)
+        plan.factory = 0
+        if lua_type(L, math.i32.wrap(factory)) == TFUNCTION then
+            plan.factory = 1
+        end
+        lua_settop(L, top)
+        return planCount
+    end
+end
+
+local function builderOpen(L: voidptr, builder: Builder*, kind: integer, capacity: integer, eager: boolean): nil
+    if not eager then
+        prepare(L, builder)
+    end
+    @unsafe do
+        if builder.depth >= builder.frameCapacity then
+            raise(L, "AOT value stream nesting exceeds its authored capacity")
+            return
+        end
+        if builder.depth == 16 and builder.frames == nil then
+            ensureFrames(L, builder)
+        end
+        if capacity > INT_MAX then
+            raise(L, "AOT value stream capacity exceeds C API range")
+            return
+        end
+        if lua_checkstack(L, 4) == 0 then
+            raise(L, "AOT builder Lua stack exhausted")
+            return
+        end
+        local mode = BUILD_ALL
+        if not eager then
+            mode = builder.pendingMode as integer
+        end
+        local shapeIndex: integer = 0
+        if not eager and mode == BUILD_OBJECT then
+            if builder.pendingScalar ~= 0 then
+                raiseNumber(L, "pull scalar shape %d matched a container value", builder.pendingScalar)
+                return
+            end
+            local shape = builder.pendingShapeIndex
+            local shapeType = lua_type(L, shape)
+            if shapeType == TBOOLEAN then
+                if lua_toboolean(L, shape) ~= 0 then
+                    mode = BUILD_ALL
+                else
+                    mode = BUILD_SKIP
+                end
+            elseif shapeType == TNUMBER then
+                raise(L, "pull scalar shape matched a container value")
+                return
+            elseif shapeType ~= TTABLE then
+                raise(L, "pull shape entries must be true, false, object shapes, or array shapes")
+                return
+            else
+                lua_pushvalue(L, builder.arrayShapeMarkerIndex)
+                lua_rawget(L, shape)
+                local item = lua_gettop(L)
+                if kind == KIND_ARRAY then
+                    if lua_type(L, item) == TNIL then
+                        raise(L, "pull object shape matched an array value")
+                        return
+                    end
+                    mode = BUILD_ARRAY
+                    shapeIndex = item
+                else
+                    if lua_type(L, item) ~= TNIL then
+                        raise(L, "pull array shape matched an object value")
+                        return
+                    end
+                    lua_settop(L, math.i32.wrap(item - 1))
+                    mode = BUILD_OBJECT
+                    shapeIndex = shape
+                end
+            end
+        end
+        if not eager and (mode == BUILD_ALL or mode == BUILD_SKIP) then
+            clearPending(L, builder)
+        elseif not eager then
+            if mode == BUILD_OBJECT and builder.pendingShapeOwned == 0 then
+                lua_pushvalue(L, math.i32.wrap(shapeIndex))
+                shapeIndex = lua_gettop(L)
+            end
+            if mode == BUILD_ARRAY and builder.pendingShapeOwned ~= 0 then
+                local wrapper = builder.pendingShapeIndex as integer
+                lua_remove(L, math.i32.wrap(wrapper))
+                if shapeIndex > wrapper then
+                    shapeIndex -= 1
+                end
+            end
+            builder.pendingShapeOwned = 0
+            builder.pendingShapeIndex = 0
+            builder.pendingMode = BUILD_PENDING
+        end
+        local plan: integer = UINT32_MAX
+        if not eager and mode == BUILD_OBJECT then
+            plan = shapePlan(L, builder, shapeIndex)
+        end
+        local objectCapacity = capacity
+        if plan ~= UINT32_MAX then
+            objectCapacity = planAt(builder, plan).count as integer
+        end
+        if mode ~= BUILD_SKIP then
+            local narr: integer = 0
+            local nrec: integer = 0
+            if kind == KIND_ARRAY then
+                narr = capacity
+            elseif kind == KIND_OBJECT then
+                nrec = objectCapacity
+            end
+            lua_createtable(L, math.i32.wrap(narr), math.i32.wrap(nrec))
+        end
+        local depth = builder.depth as integer
+        local frame = frameAt(builder, depth)
+        builder.depth = (depth + 1) as uint32
+        frame.tableIndex = 0
+        if mode ~= BUILD_SKIP then
+            frame.tableIndex = lua_gettop(L)
+        end
+        frame.shapeIndex = math.i32.wrap(shapeIndex)
+        frame.kind = kind as uint32
+        frame.next = 1
+        frame.count = 0
+        frame.mode = mode as uint32
+        frame.plan = plan as uint32
+        frame.expected = 0
+        frame.seen = 0ULL
+        frame.expectsKey = 0
+        frame.serial = 0
+        if kind == KIND_OBJECT then
+            frame.expectsKey = 1
+            builder.dupSerial = math.u32.wrap(builder.dupSerial + 1)
+            frame.serial = builder.dupSerial
+        end
+        frame.aliases = 0
+        if plan ~= UINT32_MAX then
+            frame.aliases = planAt(builder, plan).aliases
+        end
+        frame.tuple = 0
+        if kind == KIND_ARRAY and mode == BUILD_ARRAY and lua_type(L, math.i32.wrap(shapeIndex)) == TTABLE then
+            local top = lua_gettop(L)
+            local tuple = shapeMarker(L, builder, shapeIndex, 13)
+            frame.tuple = lua_toboolean(L, math.i32.wrap(tuple))
+            lua_settop(L, top)
+        end
+        if kind == KIND_OBJECT and mode == BUILD_OBJECT and plan == UINT32_MAX then
+            local aliases = shapeMarker(L, builder, shapeIndex, 1)
+            if lua_type(L, math.i32.wrap(aliases)) == TTABLE then
+                frame.aliases = 1
+            end
+            lua_settop(L, frame.tableIndex)
+        end
+    end
+end
+
+local function builderQuery(L: voidptr, builder: Builder*, query: integer): integer
+    @unsafe do
+        local depth = builder.depth as integer
+        if query == 0 then
+            return depth
+        end
+        if depth == 0 then
+            if query == 3 then
+                return 0
+            end
+            raise(L, "AOT value stream has no current container")
+            return 0
+        end
+        local frame = currentFrame(builder)
+        local kind = frame.kind as integer
+        if query == 1 then
+            return kind
+        elseif query == 3 then
+            if frame.count > 0 then
+                return kind + 256
+            end
+            return kind
+        end
+        return frame.count as integer
+    end
+end
+
+local function builderKey(L: voidptr, builder: Builder*): nil
+    @unsafe do
+        if builder.depth == 0 then
+            raise(L, "AOT value stream key is outside an object")
+            return
+        end
+        local frame = currentFrame(builder)
+        if frame.kind ~= KIND_OBJECT or frame.expectsKey == 0 then
+            raise(L, "AOT value stream object is not expecting a key")
+            return
+        end
+        frame.expectsKey = 0
+        if frame.mode == BUILD_SKIP then
+            pop(L, 1)
+            builder.pendingMode = BUILD_SKIP
+            return
+        end
+        if lua_gettop(L) ~= frame.tableIndex + 1 then
+            raise(L, "AOT value stream key is not above its object")
+            return
+        end
+        if frame.mode == BUILD_ALL then
+            builder.pendingMode = BUILD_ALL
+            return
+        end
+        lua_pushvalue(L, -1)
+        lua_rawget(L, frame.shapeIndex)
+        if lua_type(L, -1) == TNIL or lua_type(L, -1) == TBOOLEAN and lua_toboolean(L, -1) == 0 then
+            lua_settop(L, frame.tableIndex)
+            builder.pendingMode = BUILD_SKIP
+            return
+        end
+        local aliases = math.i32.wrap(shapeMarker(L, builder, frame.shapeIndex, 1))
+        if lua_type(L, aliases) == TTABLE then
+            lua_pushvalue(L, math.i32.wrap(frame.tableIndex + 1))
+            lua_rawget(L, aliases)
+            lua_remove(L, aliases)
+            if lua_type(L, -1) == TNIL then
+                pop(L, 1)
+            else
+                lua_insert(L, math.i32.wrap(frame.tableIndex + 1))
+                lua_remove(L, math.i32.wrap(frame.tableIndex + 2))
+            end
+        else
+            lua_settop(L, math.i32.wrap(aliases - 1))
+        end
+        builder.pendingShapeIndex = lua_gettop(L)
+        builder.pendingShapeOwned = 1
+        builder.pendingMode = BUILD_OBJECT
+    end
+end
+
+--- The code point the `\u` escape whose digits start at `at` spells, a
+--- surrogate pair's whole: raised when it spells none.
+local function unicodeEscape(L: voidptr, input: voidptr, count: integer, at: integer): integer
+    local codepoint = hex4(input, count, at)
+    if codepoint < 0 then
+        raise(L, "AOT value stream has an invalid Unicode escape")
+        return 0
+    end
+    if codepoint >= 0xd800 and codepoint <= 0xdbff then
+        local next = at + 4
+        if next > count or count - next < 2 or byteAt(input, next) ~= BACKSLASH or byteAt(input, next + 1) ~= 117 then
+            raise(L, "AOT value stream has an unmatched high surrogate")
+            return 0
+        end
+        local low = hex4(input, count, next + 2)
+        if low < 0xdc00 or low > 0xdfff then
+            raise(L, "AOT value stream has an invalid low surrogate")
+            return 0
+        end
+        return 0x10000 + (codepoint - 0xd800) * 0x400 + low - 0xdc00
+    elseif codepoint >= 0xdc00 and codepoint <= 0xdfff then
+        raise(L, "AOT value stream has an unmatched low surrogate")
+        return 0
+    end
+
+    return codepoint
+end
+
+--- The byte a one-character escape stands for, or -1 for none.
+local function simpleEscape(escaped: integer): integer
+    if escaped == QUOTE or escaped == BACKSLASH or escaped == SLASH then
+        return escaped
+    elseif escaped == 98 then
+        return 8
+    elseif escaped == 102 then
+        return 12
+    elseif escaped == 110 then
+        return 10
+    elseif escaped == 114 then
+        return 13
+    elseif escaped == 116 then
+        return 9
+    end
+
+    return -1
+end
+
+local function checkRange(L: voidptr, sourceLength: integer, start: integer, length: integer): boolean
+    if start > sourceLength or length > sourceLength - start then
+        raise(L, "AOT value stream string range is out of bounds")
+        return false
+    end
+
+    return true
+end
+
+local function validateEscapedString(
+    L: voidptr,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    count: integer
+): nil
+    if not checkRange(L, sourceLength, start, count) then
+        return
+    end
+    local input = offset(source, start)
+    local at: integer = 0
+    while at < count do
+        local slash = memchr(offset(input, at), BACKSLASH, toSize(count - at))
+        if slash == nil then
+            return
+        end
+        at = ((slash as uint64) - (input as uint64)) as integer + 1
+        if at >= count then
+            raise(L, "AOT value stream has an incomplete escape")
+            return
+        end
+        local escaped = byteAt(input, at)
+        at += 1
+        if simpleEscape(escaped) < 0 then
+            if escaped ~= 117 then
+                raise(L, "AOT value stream has an unknown escape")
+                return
+            end
+            if unicodeEscape(L, input, count, at) >= 0x10000 then
+                at += 10
+            else
+                at += 4
+            end
+        end
+    end
+end
+
+--- Decodes the escaped string at `start` into the stream's byte storage,
+--- answering its decoded length.
+local function unescape(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    count: integer
+): integer
+    if not checkRange(L, sourceLength, start, count) then
+        return 0
+    end
+    @unsafe do
+        if count > builder.byteCapacity then
+            raise(L, "AOT value stream string exceeds its authored capacity")
+            return 0
+        end
+    end
+    local input = offset(source, start)
+    local out = builderBytes(L, builder, count)
+    local at: integer = 0
+    local written: integer = 0
+    while at < count do
+        local slash = memchr(offset(input, at), BACKSLASH, toSize(count - at))
+        if slash == nil then
+            memcpy(offset(out, written), offset(input, at), toSize(count - at))
+            written += count - at
+            break
+        end
+        local slashAt = ((slash as uint64) - (input as uint64)) as integer
+        local literal = slashAt - at
+        if literal ~= 0 then
+            memcpy(offset(out, written), offset(input, at), toSize(literal))
+        end
+        written += literal
+        at = slashAt + 1
+        if at >= count then
+            raise(L, "AOT value stream has an incomplete escape")
+            return 0
+        end
+        local escaped = byteAt(input, at)
+        at += 1
+        local simple = simpleEscape(escaped)
+        if simple >= 0 then
+            @unsafe do
+                (out as uint8*)[written] = math.u32.wrap(simple)
+            end
+            written += 1
+        elseif escaped == 117 then
+            local codepoint = unicodeEscape(L, input, count, at)
+            if codepoint >= 0x10000 then
+                at += 10
+            else
+                at += 4
+            end
+            written += utf8(offset(out, written), codepoint)
+        else
+            raise(L, "AOT value stream has an unknown escape")
+            return 0
+        end
+    end
+
+    return written
+end
+
+--- As `unescape`, with every backslash's position already known: the
+--- scratch holds them from its end down, from `escapeIndex` on.
+local function unescapeIndexed(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    count: integer,
+    escapes: voidptr,
+    escapeIndex: integer,
+    escapeCount: integer
+): integer
+    if not checkRange(L, sourceLength, start, count) then
+        return 0
+    end
+    @unsafe do
+        local escapeLength = scratchEscapeLength(escapes)
+        if escapeIndex > escapeLength or escapeCount > escapeLength - escapeIndex then
+            raise(L, "AOT value stream escape range is out of bounds")
+            return 0
+        end
+        if count > builder.byteCapacity then
+            raise(L, "AOT value stream string exceeds its authored capacity")
+            return 0
+        end
+    end
+    local input = offset(source, start)
+    local out = builderBytes(L, builder, count)
+    local top: integer = 0
+    @unsafe do
+        top = scratchCapacity(escapes) - 1 - escapeIndex
+    end
+    local at: integer = 0
+    local written: integer = 0
+    local item: integer = 0
+    while item < escapeCount do
+        local absolute = scratchWord(escapes, top - item)
+        if absolute < start + at or absolute >= start + count then
+            raise(L, "AOT value stream escape position is invalid")
+            return 0
+        end
+        local slashAt = absolute - start
+        local literal = slashAt - at
+        if literal ~= 0 then
+            memcpy(offset(out, written), offset(input, at), toSize(literal))
+        end
+        written += literal
+        at = slashAt + 1
+        if at >= count then
+            raise(L, "AOT value stream has an incomplete escape")
+            return 0
+        end
+        local escaped = byteAt(input, at)
+        at += 1
+        local simple = simpleEscape(escaped)
+        if simple >= 0 then
+            @unsafe do
+                (out as uint8*)[written] = math.u32.wrap(simple)
+            end
+            written += 1
+        elseif escaped == 117 then
+            local codepoint = hex4(input, count, at)
+            if codepoint < 0 then
+                raise(L, "AOT value stream has an invalid Unicode escape")
+                return 0
+            end
+            at += 4
+            if codepoint >= 0xd800 and codepoint <= 0xdbff then
+                if at > count or count - at < 2 or byteAt(input, at) ~= BACKSLASH or byteAt(input, at + 1) ~= 117 then
+                    raise(L, "AOT value stream has an unmatched high surrogate")
+                    return 0
+                end
+                if item + 1 >= escapeCount or scratchWord(escapes, top - item - 1) ~= start + at then
+                    raise(L, "AOT value stream surrogate escape metadata is invalid")
+                    return 0
+                end
+                item += 1
+                at += 2
+                local low = hex4(input, count, at)
+                if low < 0xdc00 or low > 0xdfff then
+                    raise(L, "AOT value stream has an invalid low surrogate")
+                    return 0
+                end
+                at += 4
+                codepoint = 0x10000 + (codepoint - 0xd800) * 0x400 + low - 0xdc00
+            elseif codepoint >= 0xdc00 and codepoint <= 0xdfff then
+                raise(L, "AOT value stream has an unmatched low surrogate")
+                return 0
+            end
+            written += utf8(offset(out, written), codepoint)
+        else
+            raise(L, "AOT value stream has an unknown escape")
+            return 0
+        end
+        item += 1
+    end
+    if at < count then
+        memcpy(offset(out, written), offset(input, at), toSize(count - at))
+        written += count - at
+    end
+
+    return written
+end
+
+--- The stream's decoded bytes, which `unescape` and `unescapeIndexed` write.
+local function decoded(builder: Builder*): voidptr
+    @unsafe do
+        return builder.bytes as voidptr
+    end
+end
+
+local function escapedString(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    length: integer
+): nil
+    local written = unescape(L, builder, source, sourceLength, start, length)
+    lua_pushlstring(L, decoded(builder), toSize(written))
+end
+
+--- Leaves the pending value to the shape entry on top of the stack, which the
+--- object frame's key selected: the key is mapped through the frame's aliases
+--- first.
+local function selectEntry(L: voidptr, builder: Builder*, frame: Frame*, key: voidptr, keyLength: integer): nil
+    local entry = lua_gettop(L)
+    @unsafe do
+        if frame.aliases ~= 0 then
+            local aliases = math.i32.wrap(shapeMarker(L, builder, frame.shapeIndex, 1))
+            lua_pushlstring(L, key, toSize(keyLength))
+            lua_rawget(L, aliases)
+            lua_remove(L, aliases)
+            if lua_type(L, -1) == TNIL then
+                pop(L, 1)
+                lua_pushlstring(L, key, toSize(keyLength))
+            end
+            lua_insert(L, entry)
+        end
+        builder.pendingShapeIndex = lua_gettop(L)
+        builder.pendingShapeOwned = 1
+        builder.pendingMode = BUILD_OBJECT
+    end
+end
+
+local function selectKnown(L: voidptr, builder: Builder*, frame: Frame*, key: voidptr, keyLength: integer): nil
+    lua_pushlstring(L, key, toSize(keyLength))
+    @unsafe do
+        if frame.aliases == 0 then
+            lua_pushvalue(L, -1)
+        end
+        lua_rawget(L, frame.shapeIndex)
+    end
+    selectEntry(L, builder, frame, key, keyLength)
+end
+
+local function selectPlanned(
+    L: voidptr,
+    builder: Builder*,
+    frame: Frame*,
+    index: integer,
+    key: ShapeKey*,
+    start: integer
+): nil
+    @unsafe do
+        local bit = 1ULL << index
+        if (frame.seen & bit) ~= 0ULL then
+            duplicate(L, start)
+            return
+        end
+        frame.seen = frame.seen | bit
+        local keyLength = key.length as integer
+        if frame.aliases ~= 0 then
+            lua_rawgeti(L, frame.shapeIndex, math.i32.wrap(-(index + 1)))
+            if lua_type(L, -1) == TNIL then
+                pop(L, 1)
+                lua_pushlstring(L, key.bytes, key.length)
+            end
+        else
+            lua_pushlstring(L, key.bytes, key.length)
+        end
+        if key.scalar ~= 0 then
+            builder.pendingShapeIndex = 0
+            builder.pendingShapeOwned = 0
+            builder.pendingScalar = key.scalar
+            builder.pendingMode = BUILD_OBJECT
+            return
+        end
+        lua_rawgeti(L, frame.shapeIndex, math.i32.wrap(index + 1))
+        if lua_type(L, -1) == TNIL then
+            lua_settop(L, frame.tableIndex)
+            selectKnown(L, builder, frame, key.bytes, keyLength)
+            return
+        end
+        builder.pendingShapeIndex = lua_gettop(L)
+        builder.pendingShapeOwned = 1
+        builder.pendingMode = BUILD_OBJECT
+    end
+end
+
+local function keyMatches(
+    shapeKey: ShapeKey*,
+    key: voidptr,
+    keyLength: integer,
+    packedKey: uint64,
+    hash: uint64,
+    escaped: boolean
+): boolean
+    @unsafe do
+        if (shapeKey.length as integer) ~= keyLength then
+            return false
+        end
+        if not escaped and keyLength <= 7 then
+            return shapeKey.packed == packedKey
+        end
+        if keyLength > 7 and (shapeKey.hash as uint64) ~= hash then
+            return false
+        end
+        return memcmp(shapeKey.bytes, key, toSize(keyLength)) == 0
+    end
+end
+
+--- Selects the member the key at `start` names in the current object frame,
+--- leaving the pending value to its shape. `escapePositions`, when given,
+--- holds the key's backslashes from `escapeIndex` on.
+local function selectKey(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    length: integer,
+    escaped: boolean,
+    escapePositions: voidptr?,
+    escapeIndex: integer,
+    escapeCount: integer
+): nil
+    local keyLength = length
+    if not checkRange(L, sourceLength, start, length) then
+        return
+    end
+    @unsafe do
+        if builder.depth == 0 then
+            raise(L, "AOT value stream key is outside an object")
+            return
+        end
+        local frame = currentFrame(builder)
+        if frame.kind ~= KIND_OBJECT or frame.expectsKey == 0 then
+            raise(L, "AOT value stream object is not expecting a key")
+            return
+        end
+        frame.expectsKey = 0
+        local key = offset(source, start)
+        -- A skipped object is still one object: its names are read, and a
+        -- second member of one name is refused, as in any other.
+        if frame.mode == BUILD_SKIP then
+            if escaped then
+                if escapePositions ~= nil then
+                    keyLength = unescapeIndexed(
+                        L,
+                        builder,
+                        source,
+                        sourceLength,
+                        start,
+                        length,
+                        escapePositions as voidptr,
+                        escapeIndex,
+                        escapeCount
+                    )
+                else
+                    keyLength = unescape(L, builder, source, sourceLength, start, length)
+                end
+                key = decoded(builder)
+                frame = currentFrame(builder)
+            end
+            lua_pushlstring(L, key, toSize(keyLength))
+            noteKey(L, builder, frame, start, true)
+            pop(L, 1)
+            builder.pendingMode = BUILD_SKIP
+            return
+        end
+        if frame.mode == BUILD_ALL then
+            if escaped then
+                escapedString(L, builder, source, sourceLength, start, length)
+            else
+                lua_pushlstring(L, key, toSize(keyLength))
+            end
+            -- The object holds every member under its own name, so it answers
+            -- for itself; the set only knows the names a dropped null left
+            -- behind.
+            lua_pushvalue(L, -1)
+            lua_rawget(L, frame.tableIndex)
+            if lua_type(L, -1) ~= TNIL then
+                duplicate(L, start)
+                return
+            end
+            pop(L, 1)
+            if frame.seen ~= 0ULL then
+                noteKey(L, builder, frame, start, true)
+            end
+            builder.pendingMode = BUILD_ALL
+            return
+        end
+        if escaped then
+            if escapePositions ~= nil then
+                keyLength = unescapeIndexed(
+                    L,
+                    builder,
+                    source,
+                    sourceLength,
+                    start,
+                    length,
+                    escapePositions as voidptr,
+                    escapeIndex,
+                    escapeCount
+                )
+            else
+                keyLength = unescape(L, builder, source, sourceLength, start, length)
+            end
+            key = decoded(builder)
+            frame = currentFrame(builder)
+        end
+        if frame.plan ~= UINT32_MAX then
+            local plan = planAt(builder, frame.plan as integer)
+            local planCount = plan.count as integer
+            local packedKey: uint64 = 0ULL
+            local hash: uint64 = 0ULL
+            if keyLength > 7 then
+                hash = keyHash(key, keyLength)
+            end
+            if not escaped and keyLength <= 7 and start + keyLength < sourceLength then
+                packedKey = packed(key, keyLength + 1)
+            end
+            local expected = frame.expected as integer
+            if expected >= planCount then
+                expected = 0
+            end
+            local probe = probeOf(builder)
+            if planCount ~= 0 then
+                if not planKey(builder, plan, expected, probe) then
+                    raise(L, "AOT serde key plan is malformed")
+                    return
+                end
+                if keyMatches(probe, key, keyLength, packedKey, hash, escaped) then
+                    frame.expected = (expected + 1) as uint32
+                    selectPlanned(L, builder, frame, expected, probe, start)
+                    return
+                end
+            end
+            for index = 0, planCount - 1 do
+                if index ~= expected then
+                    if not planKey(builder, plan, index, probe) then
+                        raise(L, "AOT serde key plan is malformed")
+                        return
+                    end
+                    if keyMatches(probe, key, keyLength, packedKey, hash, escaped) then
+                        frame.expected = (index + 1) as uint32
+                        selectPlanned(L, builder, frame, index, probe, start)
+                        return
+                    end
+                end
+            end
+        end
+        -- Every name the plan does not index goes through the set, whether it
+        -- is selected, mapped, refused or skipped. The set may root itself
+        -- below the object, so the object's index is read again afterwards.
+        lua_pushlstring(L, key, toSize(keyLength))
+        noteKey(L, builder, frame, start, true)
+        pop(L, 1)
+        local tableIndex = frame.tableIndex
+        if frame.plan == UINT32_MAX then
+            lua_pushnil(L)
+            while lua_next(L, frame.shapeIndex) ~= 0 do
+                if lua_type(L, -2) == TSTRING then
+                    local shapeKey = lua_tolstring(L, -2, nil) as voidptr
+                    local shapeLength = lua_objlen(L, -2) as integer
+                    if shapeLength == keyLength and memcmp(shapeKey, key, toSize(keyLength)) == 0 then
+                        if lua_type(L, -1) == TBOOLEAN and lua_toboolean(L, -1) == 0 then
+                            lua_settop(L, tableIndex)
+                            builder.pendingMode = BUILD_SKIP
+                            return
+                        end
+                        lua_settop(L, tableIndex)
+                        selectKnown(L, builder, frame, key, keyLength)
+                        return
+                    end
+                end
+                pop(L, 1)
+            end
+        end
+        lua_settop(L, tableIndex)
+        local wildcard = math.i32.wrap(shapeMarker(L, builder, frame.shapeIndex, 2))
+        if lua_type(L, wildcard) ~= TNIL then
+            lua_pushlstring(L, key, toSize(keyLength))
+            lua_insert(L, wildcard)
+            selectEntry(L, builder, frame, key, keyLength)
+            return
+        end
+        lua_settop(L, tableIndex)
+        local reject = math.i32.wrap(shapeMarker(L, builder, frame.shapeIndex, 3))
+        if lua_toboolean(L, reject) ~= 0 then
+            lua_pushlstring(L, key, toSize(keyLength))
+            raiseText(L, "nupp: unknown member %s", lua_tolstring(L, -1, nil) as cstring)
+            return
+        end
+        lua_settop(L, tableIndex)
+        builder.pendingMode = BUILD_SKIP
+    end
+end
+
+local function builderString(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    length: integer,
+    escaped: boolean,
+    key: boolean,
+    eager: boolean
+): nil
+    if not checkRange(L, sourceLength, start, length) then
+        return
+    end
+    if key then
+        selectKey(L, builder, source, sourceLength, start, length, escaped, nil, 0, 0)
+        return
+    end
+    local wanted = scalarWanted(L, builder, eager)
+    if wanted then
+        scalarValidate(L, builder, eager, TSTRING, 0, 0, false)
+    end
+    if escaped and wanted then
+        escapedString(L, builder, source, sourceLength, start, length)
+    elseif escaped then
+        validateEscapedString(L, source, sourceLength, start, length)
+    elseif wanted then
+        lua_pushlstring(L, offset(source, start), toSize(length))
+    end
+    complete(L, builder, wanted, eager)
+end
+
+local function builderStringEscapes(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    length: integer,
+    escapes: voidptr,
+    escapeIndex: integer,
+    escapeCount: integer,
+    key: boolean,
+    eager: boolean
+): nil
+    if length < 64 then
+        builderString(L, builder, source, sourceLength, start, length, true, key, eager)
+        return
+    end
+    if key then
+        selectKey(L, builder, source, sourceLength, start, length, true, escapes, escapeIndex, escapeCount)
+        return
+    end
+    local wanted = scalarWanted(L, builder, eager)
+    if wanted then
+        scalarValidate(L, builder, eager, TSTRING, 0, 0, false)
+    end
+    local written = unescapeIndexed(L, builder, source, sourceLength, start, length, escapes, escapeIndex, escapeCount)
+    if wanted then
+        lua_pushlstring(L, decoded(builder), toSize(written))
+    end
+    complete(L, builder, wanted, eager)
+end
+
+--- Whether `length` bytes at `start` hold none of `.`, `e` and `E`: a number
+--- token written as an integer.
+local function integerSpelled(source: voidptr, start: integer, length: integer): boolean
+    local at = offset(source, start)
+    local count = toSize(length)
+    return memchr(at, DOT, count) == nil
+        and memchr(at, LETTER_LOWER_E, count) == nil
+        and memchr(at, LETTER_E, count) == nil
+end
+
+local function builderNumberSlice(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    length: integer,
+    eager: boolean
+): nil
+    if not scalarWanted(L, builder, eager) then
+        complete(L, builder, false, eager)
+        return
+    end
+    local value = numberSlice(L, endingOf(builder), source, sourceLength, start, length, "value stream")
+    local integerToken: integer = 0
+    if integerSpelled(source, start, length) then
+        integerToken = 1
+    end
+    scalarValidate(L, builder, eager, TNUMBER, value, integerToken, byteAt(source, start) == MINUS)
+    lua_pushnumber(L, value)
+    complete(L, builder, true, eager)
+end
+
+local function builderIntegerSlice(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    length: integer,
+    eager: boolean
+): nil
+    if not scalarWanted(L, builder, eager) then
+        complete(L, builder, false, eager)
+        return
+    end
+    local value = integerSlice(L, endingOf(builder), source, sourceLength, start, length)
+    scalarValidate(L, builder, eager, TNUMBER, value, 1, byteAt(source, start) == MINUS)
+    lua_pushnumber(L, value)
+    complete(L, builder, true, eager)
+end
+
+local function builderNumber(L: voidptr, builder: Builder*, value: number, eager: boolean): nil
+    local wanted = scalarWanted(L, builder, eager)
+    if wanted then
+        scalarValidate(L, builder, eager, TNUMBER, value, -1, signbit(value))
+        lua_pushnumber(L, value)
+    end
+    complete(L, builder, wanted, eager)
+end
+
+local function builderInteger64(
+    L: voidptr,
+    builder: Builder*,
+    magnitude: uint64,
+    negative: boolean,
+    eager: boolean
+): nil
+    local wanted = scalarWanted(L, builder, eager)
+    if wanted then
+        local value = magnitude as number
+        if negative then
+            value = -value
+        end
+        scalarValidate(L, builder, eager, TNUMBER, value, 1, negative)
+        lua_pushnumber(L, value)
+    end
+    complete(L, builder, wanted, eager)
+end
+
+local function builderDecimal64(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    length: integer,
+    magnitude: uint64,
+    exponent: integer,
+    negative: boolean,
+    exact: boolean,
+    eager: boolean
+): nil
+    local wanted = scalarWanted(L, builder, eager)
+    if wanted then
+        local value = decimal64Value(
+            L,
+            endingOf(builder),
+            source,
+            sourceLength,
+            start,
+            length,
+            magnitude,
+            exponent,
+            negative,
+            exact
+        )
+        scalarValidate(L, builder, eager, TNUMBER, value, 0, negative)
+        lua_pushnumber(L, value)
+    end
+    complete(L, builder, wanted, eager)
+end
+
+--- The eight digits at `at` as one number, or -1 when one of them is not a
+--- digit.
+local function eightDigits(source: voidptr, at: integer): integer
+    local value: integer = 0
+    for i = 0, 7 do
+        local byte = byteAt(source, at + i)
+        if not isDigit(byte) then
+            return -1
+        end
+        value = value * 10 + byte - DIGIT_0
+    end
+
+    return value
+end
+
+local function numberTokenValue(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    length: integer,
+    magnitude: uint64,
+    explicitExponent: integer,
+    fractionDigits: integer,
+    negative: boolean,
+    exact: boolean,
+    integerToken: boolean
+): number
+    if integerToken and exact then
+        local value = magnitude as number
+        if negative then
+            return -value
+        end
+        return value
+    end
+    if integerToken then
+        return numberSlice(L, endingOf(builder), source, sourceLength, start, length, "value stream integer")
+    end
+    local decimalExponent = explicitExponent - fractionDigits
+    local exponentFits = decimalExponent >= -2147483648 and decimalExponent <= 2147483647
+    local exponent: integer = 0
+    if exponentFits then
+        exponent = decimalExponent
+    end
+
+    return decimal64Value(
+        L,
+        endingOf(builder),
+        source,
+        sourceLength,
+        start,
+        length,
+        magnitude,
+        exponent,
+        negative,
+        exact and exponentFits
+    )
+end
+
+--- Reads the number token at `start`, before `limit`, and builds it. The
+--- answer is the byte after it with bit 31 set, or, for a token that is not
+--- a number, the one-based position of the byte that says so.
+local function builderNumberToken(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    limit: integer,
+    eager: boolean
+): integer
+    local at = start
+    local magnitudeDigits: integer = 0
+    local fractionDigits: integer = 0
+    local magnitude: uint64 = 0ULL
+    local negative = false
+    local exact = true
+    local integerToken = true
+    local explicitExponent: integer = 0
+    if limit > sourceLength or limit >= 2147483648 or start >= limit then
+        return start + 1
+    end
+    if byteAt(source, at) == MINUS then
+        negative = true
+        at += 1
+        if at >= limit then
+            return at + 1
+        end
+    end
+    local first = byteAt(source, at)
+    if first == DIGIT_0 then
+        magnitudeDigits = 1
+        at += 1
+        if at < limit and isDigit(byteAt(source, at)) then
+            return at + 1
+        end
+    elseif first >= DIGIT_0 + 1 and first <= DIGIT_0 + 9 then
+        while limit - at >= 8 and isDigit(byteAt(source, at + 7)) do
+            local eight = eightDigits(source, at)
+            if eight < 0 then
+                break
+            end
+            if exact and magnitudeDigits <= 11 then
+                magnitude = magnitude * 100000000ULL + (eight as uint64)
+            else
+                exact = false
+            end
+            magnitudeDigits += 8
+            at += 8
+        end
+        while at < limit and isDigit(byteAt(source, at)) do
+            if exact and magnitudeDigits < 19 then
+                magnitude = magnitude * 10ULL + ((byteAt(source, at) - DIGIT_0) as uint64)
+            else
+                exact = false
+            end
+            magnitudeDigits += 1
+            at += 1
+        end
+    else
+        return at + 1
+    end
+    if at < limit and byteAt(source, at) == DOT then
+        integerToken = false
+        at += 1
+        local fractionStart = at
+        while limit - at >= 8 and isDigit(byteAt(source, at + 7)) do
+            local eight = eightDigits(source, at)
+            if eight < 0 then
+                break
+            end
+            if exact and magnitudeDigits <= 11 then
+                magnitude = magnitude * 100000000ULL + (eight as uint64)
+            else
+                exact = false
+            end
+            magnitudeDigits += 8
+            fractionDigits += 8
+            at += 8
+        end
+        while at < limit and isDigit(byteAt(source, at)) do
+            if exact and magnitudeDigits < 19 then
+                magnitude = magnitude * 10ULL + ((byteAt(source, at) - DIGIT_0) as uint64)
+            else
+                exact = false
+            end
+            magnitudeDigits += 1
+            fractionDigits += 1
+            at += 1
+        end
+        if at == fractionStart then
+            return at + 1
+        end
+    end
+    if at < limit and (byteAt(source, at) == LETTER_LOWER_E or byteAt(source, at) == LETTER_E) then
+        integerToken = false
+        at += 1
+        local exponentNegative = false
+        if at < limit and (byteAt(source, at) == PLUS or byteAt(source, at) == MINUS) then
+            exponentNegative = byteAt(source, at) == MINUS
+            at += 1
+        end
+        local exponentStart = at
+        while at < limit and isDigit(byteAt(source, at)) do
+            if explicitExponent < 1000000 then
+                explicitExponent = explicitExponent * 10 + byteAt(source, at) - DIGIT_0
+            end
+            at += 1
+        end
+        if at == exponentStart then
+            return at + 1
+        end
+        if exponentNegative then
+            explicitExponent = -explicitExponent
+        end
+    end
+    -- The digits are below 10^magnitudeDigits, so the value is below 10^scale
+    -- and only a token past 10^308 has to be read to know whether it is
+    -- finite. One that is not is refused at its first byte, skipped or not:
+    -- the encoder would refuse the infinity. Underflow to zero stands.
+    local length = at - start
+    local value: number = 0
+    local haveValue = false
+    if not (integerToken and exact) and explicitExponent + magnitudeDigits - fractionDigits > 308 then
+        value = numberTokenValue(
+            L,
+            builder,
+            source,
+            sourceLength,
+            start,
+            length,
+            magnitude,
+            explicitExponent,
+            fractionDigits,
+            negative,
+            exact,
+            integerToken
+        )
+        haveValue = true
+        if not isFinite(value) then
+            return start + 1
+        end
+    end
+    local wanted = scalarWanted(L, builder, eager)
+    if wanted then
+        if not haveValue then
+            value = numberTokenValue(
+                L,
+                builder,
+                source,
+                sourceLength,
+                start,
+                length,
+                magnitude,
+                explicitExponent,
+                fractionDigits,
+                negative,
+                exact,
+                integerToken
+            )
+        end
+        local integral: integer = 0
+        if integerToken then
+            integral = 1
+        end
+        scalarValidate(L, builder, eager, TNUMBER, value, integral, negative)
+        lua_pushnumber(L, value)
+    end
+    complete(L, builder, wanted, eager)
+
+    return 2147483648 + at
+end
+
+local function builderPushedScalar(L: voidptr, builder: Builder*, eager: boolean): nil
+    local wanted = scalarWanted(L, builder, eager)
+    if wanted then
+        local actual = lua_type(L, -1) as integer
+        local value: number = 0
+        if actual == TNUMBER then
+            value = lua_tonumber(L, -1)
+        end
+        scalarValidate(L, builder, eager, actual, value, -1, signbit(value))
+    else
+        pop(L, 1)
+    end
+    complete(L, builder, wanted, eager)
+end
+
+local function builderBoolean(L: voidptr, builder: Builder*, value: boolean, eager: boolean): nil
+    local wanted = scalarWanted(L, builder, eager)
+    if wanted then
+        scalarValidate(L, builder, eager, TBOOLEAN, 0, 0, false)
+        if value then
+            lua_pushboolean(L, 1)
+        else
+            lua_pushboolean(L, 0)
+        end
+    end
+    complete(L, builder, wanted, eager)
+end
+
+local function builderNull(L: voidptr, builder: Builder*, eager: boolean): nil
+    local wanted = nullWanted(L, builder, eager)
+    if wanted then
+        @unsafe do
+            lua_pushvalue(L, builder.nullIndex)
+        end
+    end
+    complete(L, builder, wanted, eager)
+end
+
+--- Checks the object's required members and fills its defaults.
+local function finishObject(L: voidptr, builder: Builder*, frame: Frame*): nil
+    @unsafe do
+        local tableIndex = frame.tableIndex
+        local required = math.i32.wrap(shapeMarker(L, builder, frame.shapeIndex, 7))
+        if lua_type(L, required) == TTABLE then
+            local count = lua_objlen(L, required) as integer
+            for at = 1, count do
+                lua_rawgeti(L, required, math.i32.wrap(at))
+                lua_pushvalue(L, -1)
+                lua_rawget(L, tableIndex)
+                if lua_type(L, -1) == TNIL then
+                    raiseText(L, "nupp: missing required member %s", lua_tolstring(L, -2, nil) as cstring)
+                    return
+                end
+                pop(L, 2)
+            end
+        end
+        lua_settop(L, tableIndex)
+        if frame.plan ~= UINT32_MAX and planAt(builder, frame.plan as integer).compiled ~= nil then
+            lua_rawgeti(L, frame.shapeIndex, -66)
+        else
+            shapeMarker(L, builder, frame.shapeIndex, 8)
+        end
+        local defaults = lua_gettop(L)
+        if lua_type(L, defaults) == TTABLE then
+            lua_pushnil(L)
+            while lua_next(L, defaults) ~= 0 do
+                lua_pushvalue(L, -2)
+                lua_rawget(L, tableIndex)
+                if lua_type(L, -1) == TNIL then
+                    pop(L, 1)
+                    lua_pushvalue(L, -2)
+                    lua_pushvalue(L, -2)
+                    lua_rawset(L, tableIndex)
+                else
+                    pop(L, 1)
+                end
+                pop(L, 1)
+            end
+        end
+        lua_settop(L, tableIndex)
+    end
+end
+
+--- Hands the object to its shape's factory, whose answer replaces it: false
+--- when the shape has none.
+local function finalizeObject(L: voidptr, builder: Builder*, frame: Frame*): boolean
+    @unsafe do
+        local tableIndex = frame.tableIndex
+        if frame.plan ~= UINT32_MAX and planAt(builder, frame.plan as integer).compiled ~= nil then
+            lua_rawgeti(L, frame.shapeIndex, -67)
+        else
+            shapeMarker(L, builder, frame.shapeIndex, 12)
+        end
+        local factory = lua_gettop(L)
+        if lua_type(L, factory) == TNIL then
+            lua_settop(L, tableIndex)
+            return false
+        end
+        if lua_type(L, factory) ~= TFUNCTION then
+            raise(L, "nupp: serde factory is not callable")
+            return false
+        end
+        lua_pushvalue(L, tableIndex)
+        lua_call(L, 1, 1)
+        lua_remove(L, tableIndex)
+    end
+
+    return true
+end
+
+local function builderClose(L: voidptr, builder: Builder*, eager: boolean): nil
+    @unsafe do
+        if builder.depth == 0 then
+            raise(L, "AOT value stream close has no container")
+            return
+        end
+        local frame = currentFrame(builder)
+        if frame.kind == KIND_OBJECT and frame.expectsKey == 0 then
+            raise(L, "AOT value stream object has an unmatched key")
+            return
+        end
+        local markerIndex = builder.objectMarkerIndex
+        if frame.kind == KIND_ARRAY then
+            markerIndex = builder.arrayMarkerIndex
+        end
+        if eager then
+            if markerIndex ~= 0 then
+                lua_pushvalue(L, markerIndex)
+                lua_setmetatable(L, frame.tableIndex)
+            end
+            builder.depth = math.u32.wrap(builder.depth - 1)
+            complete(L, builder, true, true)
+            return
+        end
+        local pushed = frame.mode ~= BUILD_SKIP
+        if pushed and lua_gettop(L) ~= frame.tableIndex then
+            raise(L, "AOT value stream container is not on top")
+            return
+        end
+        if pushed then
+            if frame.kind == KIND_ARRAY
+                and frame.mode == BUILD_ARRAY
+                and frame.tuple ~= 0
+                and (frame.count as integer) ~= (lua_objlen(L, frame.shapeIndex) as integer)
+            then
+                raise(L, "nupp: tuple length does not match")
+                return
+            end
+            if frame.kind == KIND_OBJECT and frame.mode == BUILD_OBJECT then
+                if frame.plan ~= UINT32_MAX then
+                    local plan = planAt(builder, frame.plan as integer)
+                    local missing = plan.required & ~frame.seen
+                    if missing ~= 0ULL then
+                        local probe = probeOf(builder)
+                        if not planKey(builder, plan, trailingZeros(missing), probe) then
+                            raise(L, "AOT serde key plan is malformed")
+                            return
+                        end
+                        lua_pushlstring(L, probe.bytes, probe.length)
+                        raiseText(L, "nupp: missing required member %s", lua_tolstring(L, -1, nil) as cstring)
+                        return
+                    end
+                    if plan.defaults ~= 0 then
+                        finishObject(L, builder, frame)
+                    end
+                    if plan.factory ~= 0 and finalizeObject(L, builder, frame) then
+                        markerIndex = 0
+                    end
+                else
+                    finishObject(L, builder, frame)
+                    if finalizeObject(L, builder, frame) then
+                        markerIndex = 0
+                    end
+                end
+                if markerIndex ~= 0 then
+                    if frame.plan ~= UINT32_MAX and planAt(builder, frame.plan as integer).compiled ~= nil then
+                        lua_rawgeti(L, frame.shapeIndex, -65)
+                    else
+                        shapeMarker(L, builder, frame.shapeIndex, 4)
+                    end
+                    local serdeMetatable = lua_gettop(L)
+                    if lua_type(L, serdeMetatable) ~= TNIL then
+                        lua_setmetatable(L, frame.tableIndex)
+                        markerIndex = 0
+                    else
+                        lua_settop(L, math.i32.wrap(serdeMetatable - 1))
+                    end
+                end
+            end
+            if markerIndex ~= 0 then
+                lua_pushvalue(L, markerIndex)
+                lua_setmetatable(L, frame.tableIndex)
+            end
+        end
+        local shapeIndex = frame.shapeIndex
+        builder.depth = math.u32.wrap(builder.depth - 1)
+        if shapeIndex ~= 0 then
+            lua_remove(L, shapeIndex)
+        end
+        complete(L, builder, pushed, eager)
+    end
+end
+
+local function builderFinish(L: voidptr, builder: Builder*): nil
+    @unsafe do
+        if builder.depth ~= 0 then
+            raise(L, "AOT value stream has an unclosed container")
+            return
+        end
+        if builder.rootDone == 0 or builder.rootIndex == 0 then
+            raise(L, "AOT value stream has no root")
+            return
+        end
+        if builder.rootIndex ~= lua_gettop(L) then
+            raise(L, "AOT value stream root is not on top")
+        end
+    end
+end
+
+@visibility("hidden")
+export function ks_rt_builder_init(
+    L: voidptr,
+    builder: voidptr,
+    nullIndex: int64,
+    arrayMarker: int64,
+    objectMarker: int64,
+    maxDepth: uint64,
+    byteCapacity: uint64,
+    selectionShape: int64,
+    arrayShapeMarker: int64,
+    serdeMarkers: int64,
+    eager: uint64
+): nil
+    local depth = (maxDepth as uint32) as integer
+    if jit.arch == "x86" and depth > 4294967295 // ffi.sizeof(Frame) then
+        raise(L, "AOT value stream depth capacity overflows")
+        depth = 0
+    end
+    -- An eager stream takes no selection shape and no serde markers.
+    local selection = math.i32.wrap(selectionShape as integer)
+    local arrayShape = math.i32.wrap(arrayShapeMarker as integer)
+    local serde = math.i32.wrap(serdeMarkers as integer)
+    if eager ~= 0ULL then
+        selection = 0
+        arrayShape = 0
+        serde = 0
+    end
+    builderInit(
+        L,
+        builder as Builder*,
+        math.i32.wrap(nullIndex as integer),
+        math.i32.wrap(arrayMarker as integer),
+        math.i32.wrap(objectMarker as integer),
+        depth,
+        (byteCapacity as uint32) as integer,
+        selection,
+        arrayShape,
+        serde
+    )
+end
+
+@visibility("hidden")
+export function ks_rt_builder_open(L: voidptr, builder: voidptr, kind: uint64, capacity: uint64, eager: uint64): nil
+    builderOpen(L, builder as Builder*, (kind as uint32) as integer, (capacity as uint32) as integer, eager ~= 0ULL)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_string(
+    L: voidptr,
+    builder: voidptr,
+    source: voidptr,
+    sourceLength: Size,
+    start: uint64,
+    length: uint64,
+    escaped: uint64,
+    key: uint64,
+    eager: uint64
+): nil
+    builderString(
+        L,
+        builder as Builder*,
+        source,
+        sourceLength as integer,
+        (start as uint32) as integer,
+        (length as uint32) as integer,
+        escaped ~= 0ULL,
+        key ~= 0ULL,
+        eager ~= 0ULL
+    )
+end
+
+@visibility("hidden")
+export function ks_rt_builder_string_escapes(
+    L: voidptr,
+    builder: voidptr,
+    source: voidptr,
+    sourceLength: Size,
+    start: uint64,
+    length: uint64,
+    escapes: voidptr,
+    escapeIndex: uint64,
+    escapeCount: uint64,
+    key: uint64,
+    eager: uint64
+): nil
+    builderStringEscapes(
+        L,
+        builder as Builder*,
+        source,
+        sourceLength as integer,
+        (start as uint32) as integer,
+        (length as uint32) as integer,
+        escapes,
+        (escapeIndex as uint32) as integer,
+        (escapeCount as uint32) as integer,
+        key ~= 0ULL,
+        eager ~= 0ULL
+    )
+end
+
+@visibility("hidden")
+export function ks_rt_builder_number_slice(
+    L: voidptr,
+    builder: voidptr,
+    source: voidptr,
+    sourceLength: Size,
+    start: uint64,
+    length: uint64,
+    eager: uint64
+): nil
+    builderNumberSlice(
+        L,
+        builder as Builder*,
+        source,
+        sourceLength as integer,
+        (start as uint32) as integer,
+        (length as uint32) as integer,
+        eager ~= 0ULL
+    )
+end
+
+@visibility("hidden")
+export function ks_rt_builder_integer_slice(
+    L: voidptr,
+    builder: voidptr,
+    source: voidptr,
+    sourceLength: Size,
+    start: uint64,
+    length: uint64,
+    eager: uint64
+): nil
+    builderIntegerSlice(
+        L,
+        builder as Builder*,
+        source,
+        sourceLength as integer,
+        (start as uint32) as integer,
+        (length as uint32) as integer,
+        eager ~= 0ULL
+    )
+end
+
+@visibility("hidden")
+export function ks_rt_builder_number(L: voidptr, builder: voidptr, value: number, eager: uint64): nil
+    builderNumber(L, builder as Builder*, value, eager ~= 0ULL)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_integer64(
+    L: voidptr,
+    builder: voidptr,
+    magnitude: uint64,
+    negative: uint64,
+    eager: uint64
+): nil
+    builderInteger64(L, builder as Builder*, magnitude, negative ~= 0ULL, eager ~= 0ULL)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_decimal64(
+    L: voidptr,
+    builder: voidptr,
+    source: voidptr,
+    sourceLength: Size,
+    start: uint64,
+    length: uint64,
+    magnitude: uint64,
+    exponent: int64,
+    negative: uint64,
+    exact: uint64,
+    eager: uint64
+): nil
+    builderDecimal64(
+        L,
+        builder as Builder*,
+        source,
+        sourceLength as integer,
+        (start as uint32) as integer,
+        (length as uint32) as integer,
+        magnitude,
+        math.i32.wrap(exponent as integer),
+        negative ~= 0ULL,
+        exact ~= 0ULL,
+        eager ~= 0ULL
+    )
+end
+
+@visibility("hidden")
+export function ks_rt_builder_boolean(L: voidptr, builder: voidptr, value: uint64, eager: uint64): nil
+    builderBoolean(L, builder as Builder*, value ~= 0ULL, eager ~= 0ULL)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_null(L: voidptr, builder: voidptr, eager: uint64): nil
+    builderNull(L, builder as Builder*, eager ~= 0ULL)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_close(L: voidptr, builder: voidptr, eager: uint64): nil
+    builderClose(L, builder as Builder*, eager ~= 0ULL)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_key_scratch(
+    L: voidptr,
+    builder: voidptr,
+    scratch: voidptr,
+    start: uint64,
+    length: uint64
+): nil
+    scratchU8Push(L, scratch, (start as uint32) as integer, (length as uint32) as integer)
+    builderKey(L, builder as Builder*)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_string_scratch(
+    L: voidptr,
+    builder: voidptr,
+    scratch: voidptr,
+    start: uint64,
+    length: uint64,
+    eager: uint64
+): nil
+    scratchU8Push(L, scratch, (start as uint32) as integer, (length as uint32) as integer)
+    builderPushedScalar(L, builder as Builder*, eager ~= 0ULL)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_pushed_scalar(L: voidptr, builder: voidptr, eager: uint64): nil
+    builderPushedScalar(L, builder as Builder*, eager ~= 0ULL)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_key(L: voidptr, builder: voidptr): nil
+    builderKey(L, builder as Builder*)
+end
+
+@visibility("hidden")
+export function ks_rt_builder_query(L: voidptr, builder: voidptr, which: uint64): uint64
+    return builderQuery(L, builder as Builder*, (which as uint32) as integer) as uint64
+end
+
+@visibility("hidden")
+export function ks_rt_builder_number_token(
+    L: voidptr,
+    builder: voidptr,
+    source: voidptr,
+    sourceLength: Size,
+    start: uint64,
+    limit: uint64,
+    eager: uint64
+): uint64
+    return builderNumberToken(
+        L,
+        builder as Builder*,
+        source,
+        sourceLength as integer,
+        (start as uint32) as integer,
+        (limit as uint32) as integer,
+        eager ~= 0ULL
+    ) as uint64
+end
+
+@visibility("hidden")
+export function ks_rt_builder_finish(L: voidptr, builder: voidptr): nil
+    builderFinish(L, builder as Builder*)
+end
+
+--- The layout facts the runtime table states, so a registrar can check its
+--- blocks and the fields it reads.
+export const BUILDER_BYTES = ffi.sizeof(Builder)
+
+export const BUILDER_DEPTH = ffi.offsetof(Builder, "depth")
+export const BUILDER_FRAMES = ffi.offsetof(Builder, "frames")
+export const BUILDER_INLINE_FRAMES = ffi.offsetof(Builder, "inlineFrames")
+export const FRAME_BYTES = ffi.sizeof(Frame)
+export const FRAME_KIND = ffi.offsetof(Frame, "kind")
+export const FRAME_COUNT = ffi.offsetof(Frame, "count")
