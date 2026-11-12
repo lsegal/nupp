@@ -476,16 +476,14 @@ local FEATURES: {[string]: native.Feature} = {
     },
     -- The AOT code generator: LLVM and lld, which the compiler reaches and a
     -- program built by it never does, so a standalone program carries no LLVM.
-    -- Built in only where the pinned LLVM is (scripts/toolchain decides).
+    -- A host built with it links them in, where the pinned LLVM is
+    -- (scripts/toolchain decides); anywhere else the compiler finds the code
+    -- generator library itself, so no provider is asked for anything.
     ["native.codegen"] = {
         name = "codegen",
         modules = {"nupp.compiler.aot.llvm.codegen"},
         runtimeModule = "nupp.compiler.aot.llvm.codegen",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "codegen",
         host = "native-codegen",
-        library = "nupp_native",
         binary = true,
         -- Asked for, never required: a host built where no LLVM is still runs
         -- the compiler, whose `@aot` then says what is missing.

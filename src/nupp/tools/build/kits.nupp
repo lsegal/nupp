@@ -231,6 +231,82 @@ local function unpack(record: kits.Record, archive: string, entry: string): stri
     return nil
 end
 
+--- The largest kit archive fetched, whatever a record claims.
+const FETCH_LIMIT = 1 << 30
+
+--- Fetches the kit archive at the HTTPS `url` into `path`, refusing a body
+--- that is not `size` bytes. The file is written only once the whole body has
+--- arrived; the caller checks its digest before unpacking it.
+--- @return nil, or why it could not be fetched
+local function fetch(url: string, path: string, size: integer): string?
+    if url:sub(1, 8) ~= "https://" then
+        return "kits are fetched over HTTPS only, not " .. url
+    end
+    if size > FETCH_LIMIT then
+        return ("the kit archive at %s is %d bytes, past the %d a kit may be"):format(url, size, FETCH_LIMIT)
+    end
+    local address, invalid = io.URI.of(url)
+    if address == nil then
+        return "the kit URL " .. url .. " is not a URI: " .. tostring(invalid)
+    end
+    local http = io.http
+    -- The archive's bytes are what its digest covers, so nothing is decoded,
+    -- and a body longer than the record says is cut off one byte past it.
+    local client = http.Client.create({
+        compressed = false,
+        maxbytes = size + 1,
+        timeoutms = 600000,
+        stalltimeoutms = 60000,
+    })
+    local response, err = client:send(http.Request(url = address as io.URI))
+    if response == nil then
+        client:close()
+
+        return "cannot fetch " .. url .. ": " .. tostring(err)
+    end
+    local answered = response as http.Response
+    if not answered:ok() then
+        local status = answered.status
+        answered:close()
+        client:close()
+
+        return ("fetching %s answered %d"):format(url, status)
+    end
+    local pieces: {string} = {}
+    local received = 0
+    local failure: string? = nil
+    while true do
+        local piece, readErr = answered.body:read(65536)
+        if piece == nil then
+            failure = "reading " .. url .. " failed: " .. tostring(readErr)
+            break
+        elseif piece == "" then
+            break
+        end
+        pieces[#pieces + 1] = piece as string
+        received = received + #(piece as string)
+        if received > size then
+            break
+        end
+    end
+    answered:close()
+    client:close()
+    if failure ~= nil then
+        return failure
+    end
+    if received ~= size then
+        return ("the kit archive is %d bytes; its catalog record says %d"):format(received, size)
+    end
+    local file, openErr = io.open(path, "wb")
+    if file == nil then
+        return "cannot write " .. path .. ": " .. tostring(openErr)
+    end
+    file:write(table.concat(pieces))
+    file:close()
+
+    return nil
+end
+
 --- The unpacked kit a catalog record names, installed in the per-user cache
 --- from `NUPP_STUB_DIR` or, failing that, from the record's URL.
 function kits.install(record: kits.Record): (string?, string?)
@@ -248,8 +324,7 @@ function kits.install(record: kits.Record): (string?, string?)
             ):format(record.artifact, record.platform)
         end
         archive = directory .. ".download"
-        local codegen = require("nupp.compiler.aot.llvm.codegen")
-        local fetchErr = codegen.fetchKit(record.url as string, archive as string, record.size)
+        local fetchErr = fetch(record.url as string, archive as string, record.size)
         if fetchErr ~= nil then
             return nil, "cannot fetch the link kit for " .. record.platform .. ": " .. fetchErr
         end
