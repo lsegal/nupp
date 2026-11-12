@@ -1,9 +1,8 @@
 -- The public process state machine joined to the real native provider.
 --
--- The fake-backed suite proves policy. This suite reaches the launcher's provider (or
--- builds one when run outside the launcher) through the same generated bootstrap a
--- program receives, so it proves the private binding, ABI, blocking readiness and real
--- child lifecycle together.
+-- The fake-backed suite proves policy. This suite reaches the FFI provider through the
+-- same generated bootstrap a program receives, with no Rust provider staged, so it
+-- proves the private binding, blocking readiness and real child lifecycle together.
 local test = require("assert")
 local native = require("nupp.compiler.native")
 local stdlib = require("nupp.compiler.stdlib")
@@ -62,17 +61,19 @@ end
 
 function M.beforeAll()
     math.randomseed(os.time())
-    local libraryPath = os.getenv("NUPP_NATIVE_LIBRARY")
-    if not libraryPath then
-        root = temporaryRoot()
-        os.execute("mkdir -p '" .. root .. "'")
-        local staged, problem = nativeStage.build(root, "out", {["native.process"] = true})
-        if not staged then
-            unavailable = tostring(problem)
-            return
-        end
-        libraryPath = root .. "/out/lib/nupp_native"
+    root = temporaryRoot()
+    os.execute("mkdir -p '" .. root .. "'")
+    local staged, problem = nativeStage.build(root, "out", {["native.process"] = true})
+    if not staged then
+        unavailable = tostring(problem)
+        return
     end
+    -- Processes stage no provider, so the library named here does not exist: a
+    -- provider symbol reached anywhere below fails instead of loading one.
+    for output in pairs(staged) do
+        assert(not output:find("/lib/", 1, true), "processes staged a native provider: " .. output)
+    end
+    local libraryPath = root .. "/out/lib/nupp_native"
 
     priorPreload = package.preload["nupp.runtime.native"]
     priorLoaded = package.loaded["nupp.runtime.native"]
@@ -267,11 +268,17 @@ function M.thePublicModuleSelectsOnlyItsPrivateProvider()
     ready()
     test.eq(native.forModule("io.internal.process"), "runtime.process")
     local feature = assert(native.feature("native.process"))
-    test.eq(feature.providerFeature, "base")
-    test.eq(feature.provider, "nupp_native")
+    -- Nupp spawns and reaps the child, and its readiness wait sleeps on the
+    -- runtime's Nupp wake handle, so nothing asks the Rust provider for anything.
+    test.eq(feature.providerFeature, nil)
+    test.eq(feature.provider, nil)
+    test.eq(feature.host, "native-process", "a linked host still starts processes")
     local expanded = native.expand({["native.process"] = true})
     assert(expanded["runtime.suspension"])
     assert(expanded["runtime.native"])
+    for _, selected in ipairs(native.features(expanded)) do
+        test.eq(selected.provider, nil, "processes selected a provider through " .. selected.name)
+    end
 
     test.eq(feature.runtimeModule, "nupp.runtime.provider.nativeprocess")
     assert(

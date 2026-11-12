@@ -712,15 +712,23 @@ function M.thePublicModuleAndNativeProviderHaveSeparateFeatureDependencies()
     ready():close()
     test.eq(native.forModule("io.http"), "runtime.http")
     local feature = assert(native.feature("native.http"))
-    -- HTTP is Nupp over the network and TLS providers; the native library is
-    -- needed only for the runtime's wake handle.
-    test.eq(feature.providerFeature, "base")
+    -- HTTP is Nupp over the network and TLS providers; only the URI handling
+    -- it parses requests with asks the Rust provider for anything.
+    test.eq(feature.provider, nil)
+    test.eq(feature.providerFeature, nil)
     test.eq(feature.runtimeModule, "nupp.runtime.provider.nativehttp")
     local expanded = native.expand({["native.http"] = true})
     assert(expanded["runtime.suspension"])
     assert(expanded["stdlib.io"])
     assert(expanded["native.net"] and expanded["native.tls"], "the transport carries net and TLS")
     assert(not stdlib.bootstrap(expanded):find("nuppNativeHttpClientCreate", 1, true))
+    local providerFeatures = {}
+    for _, selected in ipairs(native.features(expanded)) do
+        if selected.provider then
+            providerFeatures[#providerFeatures + 1] = selected.name .. ":" .. tostring(selected.providerFeature)
+        end
+    end
+    test.deepeq(providerFeatures, {"uri:uri"}, "HTTP reaches the provider only through URI handling")
 end
 
 return M

@@ -449,10 +449,11 @@ function M.nativeRuntimeMeasurementsArePortableAndNonThresholded()
     assert(measure:find("./bin/nupp build", 1, true), "clean measurement runners do not stage root modules")
     assert(measure:find("bench/native-runtime/run.sh", 1, true))
     assert(measure:find("bench/native-runtime/resource.sh", 1, true))
-    -- Net and HTTP are Nupp since #142; the provider build names only features
-    -- the provider crate still defines.
+    -- Net and HTTP are Nupp since #142 and ask the provider for nothing since
+    -- #195, so the benchmark's provider carries only the URI handling HTTP
+    -- needs; the build names only features the provider crate still defines.
     local features = measure:match("\nfeatures=([%w,%-]+)\n")
-    assert(features == "base,uri", "the measured provider build changed its features: " .. tostring(features))
+    assert(features == "uri","the measured provider build changed its features: " .. tostring(features))
     local providerFeatures = read(ROOT .. "/native/crates/native/Cargo.toml"):match("\n%[features%]\n(.-)\n%[")
     for feature in features:gmatch("[^,]+") do
         assert(

@@ -226,8 +226,9 @@ LuaJIT's FFI and stage no native artifact; whole-file transfers run in bounded
 steps on the calling Lua thread behind a bounded lane. Processes, sockets, TLS
 and HTTP call the operating system through FFI as well, with TLS and its
 cryptography and the HTTP/1.1 client written in Nupp, and so is the wake
-handle their waits share. URI uses Rust's `url`
-parser. Built-in message digests are
+handle their waits share; none of them stages `build/lib/nupp_native`. URI
+uses Rust's `url` parser, so HTTP, which parses its URLs with it, carries
+the provider for that alone. Built-in message digests are
 written in Nupp and stage no native artifact. The build binds builtin services
 to the selected target implementation; package descriptors do not replace them.
 The Rust facilities share the versioned `build/lib/nupp_native` sidecar.
