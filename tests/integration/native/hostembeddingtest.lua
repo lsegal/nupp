@@ -182,10 +182,12 @@ assert(require("lpeg").P("x"):match("x") == 2)
 local ffi = require("ffi")
 ffi.cdef([=[
 unsigned int nuppNativeAbiVersion(void);
-int nupp_luaopen_workers(void *state);
+unsigned long long nuppNativeFeatures(void);
+const void *nuppAotRuntime(void);
 ]=])
 assert(ffi.C.nuppNativeAbiVersion() == 2)
-assert(ffi.C.nupp_luaopen_workers ~= nil)
+assert(bit.band(tonumber(ffi.C.nuppNativeFeatures()), 4096) ~= 0, "the kit's provider has no AOT runtime")
+assert(ffi.C.nuppAotRuntime() ~= nil, "the AOT runtime found no Lua API in the linked program")
 ]]
     )
     status, output = run(quote(executable) .. " " .. quote(source))

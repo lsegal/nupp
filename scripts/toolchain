@@ -1216,10 +1216,15 @@ build_rust_embedding() {
     lpeg_prefix=${3:-}
     select_rust_tools
     rust_environment=$(rust_environment_material)
+    # nupp-native is one of its crates, so libnupp links the provider's AOT
+    # runtime too and exports nuppAotRuntime, as the provider does.
+    aot_runtime_for_provider
+    re_runtime=none
+    [ -z "$AOT_RUNTIME_OUT" ] || re_runtime=$(sha256 "$AOT_RUNTIME_OUT")
     digest=$({
-        printf '%s|%s|%s|%s|%s\n' \
+        printf '%s|%s|%s|%s|%s|%s\n' \
             nupp-native-embedding "$embedding_features" "$RUST_TOOL_MATERIAL" \
-            "$(rust_sources_digest)" "$KEY"
+            "$(rust_sources_digest)" "$KEY" "$re_runtime"
         printf '%s\n' "$rust_environment"
     } | sha256_stdin | cut -c1-16)
     out="$RUST_BUILD_ROOT/embedding/$digest"
@@ -1277,7 +1282,7 @@ EOF
             ;;
     esac
     export_list="$out/nupp.exports"
-    NUPP_CC="$CC" NUPP_EXPORT_LIST="$export_list" \
+    NUPP_AOT_RUNTIME_ARCHIVE="$AOT_RUNTIME_OUT" NUPP_CC="$CC" NUPP_EXPORT_LIST="$export_list" \
         NUPP_LUAJIT_PREFIX="$luajit_prefix" NUPP_LPEG_PREFIX="$lpeg_prefix" \
         RUSTC="$RUSTC" "$@" >&2
     [ -f "$RUST_EMBED_OUT" ] \
@@ -2371,11 +2376,15 @@ build_kit_linux() {
             awk -v v="$version" '$1 == v { printf "  %s;\n", $3 }' "$stub.exports" >> "$stub.map"
             printf '};\n' >> "$stub.map"
         done
+        # A function is defined under a name of its own and given the export's
+        # through an asm label: some exports are compiler builtins with fixed
+        # types, as aarch64's libgcc_s `__clear_cache` is to clang, which
+        # -fno-builtin does not stop it from checking a definition against.
         awk '{
             size = ($4 == "0") ? 8 : $4
             if ($2 == "TLS") printf "__thread char %s[%s];\n", $3, size
             else if ($2 == "OBJECT") printf "char %s[%s];\n", $3, size
-            else printf "void %s(void) {}\n", $3
+            else printf "void nupp_stub_%d(void) __asm__(\"%s\");\nvoid nupp_stub_%d(void) {}\n", NR, $3, NR
         }' "$stub.exports" > "$stub.c"
         "$CC" -shared -nostdlib -fPIC -w -fno-builtin -o "$out/lib/$soname" "$stub.c" \
             -Wl,--version-script="$stub.map" -Wl,-soname,"$soname"
