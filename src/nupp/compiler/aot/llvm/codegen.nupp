@@ -1,24 +1,42 @@
 --[[
-The code generator linked into the host: LLVM and lld, reached through the
-versioned native provider.
+The code generator: LLVM and lld, reached through LuaJIT's FFI.
 
-The calls into the provider are thin. What goes in is LLVM IR text and the
-options, checked here from `key=value` form, and what comes out is an object,
-the phase timings, and optionally the assembly and optimized IR; the crate
-behind it knows nothing about Nupp. The numeric-contract checks
-([](nupp.compiler.aot.llvm.contract)) and the report run here. A host built without
-the pinned LLVM reaches a prebuilt provider instead when one is named
-(`NUPP_CODEGEN_LIBRARY`, or `useLibrary`), and otherwise answers `available()`
-with the reason.
+What goes in is LLVM IR text and the options, checked here from `key=value`
+form; what comes out is an object, the phase timings, and optionally the
+assembly and optimized IR. The numeric-contract checks
+([](nupp.compiler.aot.llvm.contract)) and the report run here too.
+
+LLVM and lld are linked statically into one of two places, each exporting only
+the `nuppcg_*` names `native/codegen/symbols` lists: a Nupp host built with
+`native-codegen`, whose own process then has them, or the code generator
+library `scripts/toolchain codegen-library` links, which a source checkout
+stages beside its native provider. A checkout that has not built LLVM reaches a
+prebuilt library instead when one is named (`NUPP_CODEGEN_LIBRARY`, or
+`useLibrary`), and otherwise answers `available()` with the reason.
+
+Most of the surface is LLVM's C API. What it lacks is reached by its mangled
+C++ name: lld's drivers, run in process through `lld::lldMain`; the
+`raw_fd_ostream` their messages are written to; crash recovery around a link;
+and `writeArchiveToBuffer`. Import libraries come from lld-link's own `/lib
+/def:` mode. Strict floating-point fusion, which the C API cannot set either, is
+written into the target machine's options, found from a field beside it that
+the C API does set (see `strictFusion`).
 ]]
 module nupp.compiler.aot.llvm.codegen
 
 local native = require("nupp.runtime.native")
+local platform = require("nupp.runtime.provider.nativeplatform")
 
 local codegen = {}
 
---- The provider's feature bit for the code generator.
-const CODEGEN_FEATURE = 2048
+--- The code generator's own revision: part of every AOT cache key beside
+--- LLVM's version, so artifacts an earlier implementation produced are not
+--- taken for this one's.
+const CODEGEN_VERSION = 2
+
+const ffi: any = native.ffi
+
+const windows = ffi.os == "Windows"
 
 local declared = false
 
@@ -27,179 +45,259 @@ local function declare(): nil
         return
     end
     declared = true
-    local ffi: any = native.ffi
     ffi.cdef[[
-uint32_t nuppCodegenAvailable(void);
-int32_t nuppCodegenVersion(uint64_t *result);
-int32_t nuppCodegenCompile(
-    const char *ir, size_t irLength,
-    const char *name, size_t nameLength,
-    const char *options, size_t optionsLength,
-    uint64_t *object, uint64_t *timings, uint64_t *assembly, uint64_t *optimizedIr);
-int32_t nuppCodegenLink(const char *argv, size_t length, uint64_t *messages);
-int32_t nuppCodegenUnexitable(void);
-void nuppCodegenEndProcess(int32_t code);
-int32_t nuppCodegenImportLibrary(
-    const char *dll, size_t dllLength,
-    const char *path, size_t pathLength,
-    const char *names, size_t namesLength);
-int32_t nuppCodegenCompileFiles(const char *jobs, size_t length, uint32_t width, uint64_t *results);
-int32_t nuppCodegenArchive(
-    const char *path, size_t pathLength,
-    const char *members, size_t membersLength,
-    int32_t kind);
-int32_t nuppCodegenKitFetch(
-    const char *url, size_t urlLength,
-    const char *path, size_t pathLength,
-    uint64_t size);
+void nuppcg_LLVMGetVersion(unsigned *major, unsigned *minor, unsigned *patch);
+void *nuppcg_LLVMContextCreate(void);
+void nuppcg_LLVMContextDispose(void *context);
+void *nuppcg_LLVMCreateMemoryBufferWithMemoryRangeCopy(const char *data, size_t length, const char *name);
+int nuppcg_LLVMCreateMemoryBufferWithContentsOfFile(const char *path, void **buffer, char **message);
+void nuppcg_LLVMDisposeMemoryBuffer(void *buffer);
+const char *nuppcg_LLVMGetBufferStart(void *buffer);
+size_t nuppcg_LLVMGetBufferSize(void *buffer);
+int nuppcg_LLVMParseIRInContext2(void *context, void *buffer, void **module, char **message);
+int nuppcg_LLVMVerifyModule(void *module, int action, char **message);
+void nuppcg_LLVMDisposeModule(void *module);
+void *nuppcg_LLVMCloneModule(void *module);
+void nuppcg_LLVMSetTarget(void *module, const char *triple);
+char *nuppcg_LLVMPrintModuleToString(void *module);
+void nuppcg_LLVMDisposeMessage(char *message);
+char *nuppcg_LLVMGetErrorMessage(void *error);
+void nuppcg_LLVMDisposeErrorMessage(char *message);
+int nuppcg_LLVMGetTargetFromTriple(const char *triple, void **target, char **message);
+void *nuppcg_LLVMCreateTargetMachineOptions(void);
+void nuppcg_LLVMDisposeTargetMachineOptions(void *options);
+void nuppcg_LLVMTargetMachineOptionsSetCPU(void *options, const char *cpu);
+void nuppcg_LLVMTargetMachineOptionsSetFeatures(void *options, const char *features);
+void nuppcg_LLVMTargetMachineOptionsSetCodeGenOptLevel(void *options, int level);
+void nuppcg_LLVMTargetMachineOptionsSetRelocMode(void *options, int mode);
+void *nuppcg_LLVMCreateTargetMachineWithOptions(void *target, const char *triple, void *options);
+void nuppcg_LLVMDisposeTargetMachine(void *machine);
+void nuppcg_LLVMSetTargetMachineAsmVerbosity(void *machine, int verbose);
+int nuppcg_LLVMTargetMachineEmitToMemoryBuffer(void *machine, void *module, int kind, char **message, void **buffer);
+void *nuppcg_LLVMCreateTargetDataLayout(void *machine);
+void nuppcg_LLVMSetModuleDataLayout(void *module, void *layout);
+void nuppcg_LLVMDisposeTargetData(void *layout);
+void *nuppcg_LLVMCreatePassBuilderOptions(void);
+void nuppcg_LLVMPassBuilderOptionsSetLoopVectorization(void *options, int enable);
+void nuppcg_LLVMPassBuilderOptionsSetSLPVectorization(void *options, int enable);
+void nuppcg_LLVMPassBuilderOptionsSetLoopInterleaving(void *options, int enable);
+void nuppcg_LLVMPassBuilderOptionsSetLoopUnrolling(void *options, int enable);
+void *nuppcg_LLVMRunPasses(void *module, const char *pipeline, void *machine, void *options);
+void nuppcg_LLVMDisposePassBuilderOptions(void *options);
+void nuppcg_LLVMInitializeAArch64TargetInfo(void);
+void nuppcg_LLVMInitializeAArch64Target(void);
+void nuppcg_LLVMInitializeAArch64TargetMC(void);
+void nuppcg_LLVMInitializeAArch64AsmPrinter(void);
+void nuppcg_LLVMInitializeAArch64AsmParser(void);
+void nuppcg_LLVMInitializeAArch64Disassembler(void);
+void nuppcg_LLVMInitializeX86TargetInfo(void);
+void nuppcg_LLVMInitializeX86Target(void);
+void nuppcg_LLVMInitializeX86TargetMC(void);
+void nuppcg_LLVMInitializeX86AsmPrinter(void);
+void nuppcg_LLVMInitializeX86AsmParser(void);
+void nuppcg_LLVMInitializeX86Disassembler(void);
+void nuppcg_LLVMInitializeWebAssemblyTargetInfo(void);
+void nuppcg_LLVMInitializeWebAssemblyTarget(void);
+void nuppcg_LLVMInitializeWebAssemblyTargetMC(void);
+void nuppcg_LLVMInitializeWebAssemblyAsmPrinter(void);
+void nuppcg_LLVMInitializeWebAssemblyAsmParser(void);
+void nuppcg_LLVMInitializeWebAssemblyDisassembler(void);
+
+typedef struct { const char *data; size_t length; } nuppcg_StringRef;
+typedef struct { const char *const *data; size_t length; } nuppcg_Arguments;
+typedef struct { int32_t flavor; void *link; } nuppcg_Driver;
+typedef struct { const nuppcg_Driver *data; size_t length; } nuppcg_Drivers;
+typedef struct { int32_t status; bool canRunAgain; } nuppcg_LinkResult;
+nuppcg_LinkResult nuppcg_lldMain(nuppcg_Arguments arguments, void *out, void *err, nuppcg_Drivers drivers);
+bool nuppcg_lldCoffLink(nuppcg_Arguments arguments, void *out, void *err, bool exitEarly, bool disableOutput);
+bool nuppcg_lldElfLink(nuppcg_Arguments arguments, void *out, void *err, bool exitEarly, bool disableOutput);
+bool nuppcg_lldMinGWLink(nuppcg_Arguments arguments, void *out, void *err, bool exitEarly, bool disableOutput);
+bool nuppcg_lldMachOLink(nuppcg_Arguments arguments, void *out, void *err, bool exitEarly, bool disableOutput);
+bool nuppcg_lldWasmLink(nuppcg_Arguments arguments, void *out, void *err, bool exitEarly, bool disableOutput);
+void nuppcg_crashRecoveryEnable(bool posixUtilitySignals);
+void nuppcg_crashRecoveryDisable(void);
+void nuppcg_rawFdOstreamOpen(void *self, nuppcg_StringRef path, void *error);
+void nuppcg_rawFdOstreamClose(void *self);
+
+typedef struct {
+    void *buffer;
+    nuppcg_StringRef name;
+    int64_t modified;
+    uint32_t uid, gid, perms;
+} nuppcg_Member;
+typedef struct { const nuppcg_Member *data; size_t length; } nuppcg_Members;
+typedef struct { void *callback; intptr_t callable; } nuppcg_Warn;
+typedef struct { void *value; uint8_t flags; uint8_t unused[23]; } nuppcg_Expected;
+nuppcg_Expected nuppcg_writeArchiveToBuffer(
+    nuppcg_Members members, int32_t symbolTable, int32_t kind, bool deterministic, bool thin, nuppcg_Warn warn);
 ]]
 end
 
---- A provider the code generator is reached through: its namespace, and the
---- status and byte-handle readers that go with that namespace.
-record codegen.Provider
+--- A place the code generator is reached through: a namespace holding the
+--- `nuppcg_*` names, and where it came from.
+record codegen.Backend
     C: any
-    succeeded: function(integer, integer): nil
-    bytes: function(any): string
+    origin: string
+    initialized: boolean
 end
 
---- The prebuilt code generator named by `codegen.useLibrary`, when this
---- process's own provider was built without one.
+--- This process, when a host linked the code generator into it.
+local linked: codegen.Backend? = nil
+
+local probedProcess = false
+
+--- The prebuilt library `codegen.useLibrary` named.
 local fallback: string? = nil
 
---- Prebuilt providers already opened, by path, and why one could not be.
-local opened: {[string]: codegen.Provider} = {}
+--- Libraries already opened, by path, and why one could not be.
+local opened: {[string]: codegen.Backend} = {}
 
 local refused: {[string]: string} = {}
 
---- This process's provider, when it carries the code generator.
-local function own(): (codegen.Provider?, string?)
-    local ok, answer = pcall(function(): boolean
-        declare()
-        local C: any = native.C
-        if (C.nuppNativeFeatures() as integer) % (CODEGEN_FEATURE * 2) < CODEGEN_FEATURE then
-            return false
-        end
-
-        return C.nuppCodegenAvailable() ~= 0
+--- The process's own code generator, which a host built with
+--- `native-codegen` carries.
+local function processBackend(): codegen.Backend?
+    if probedProcess then
+        return linked
+    end
+    probedProcess = true
+    declare()
+    local found = pcall(function(): any
+        return ffi.C.nuppcg_LLVMGetVersion
     end)
-    if not ok then
-        return nil, "the native provider could not be loaded: " .. tostring(answer)
-    end
-    if answer ~= true then
-        return nil, "this nupp was built without the LLVM code generator; run scripts/toolchain llvm and rebuild"
+    if found then
+        linked = codegen.Backend(C = ffi.C, origin = "this process", initialized = false)
     end
 
-    return codegen.Provider(C = native.C, succeeded = native.succeeded, bytes = native.bytes), nil
+    return linked
 end
 
---- A prebuilt provider library, opened beside this process's own for its
---- code generator alone: a checkout that has not built LLVM links native
---- programs with the one `scripts/toolchain prebuilt-codegen` fetched. Its
---- byte handles and errors are its own, so they are read through it too.
-local function prebuilt(path: string): (codegen.Provider?, string?)
+--- A code generator library, opened for the life of the process: it is never
+--- unloaded while anything it returned may still be read.
+local function library(path: string): (codegen.Backend?, string?)
     if opened[path] ~= nil then
         return opened[path], nil
     end
     if refused[path] ~= nil then
         return nil, refused[path]
     end
+    declare()
     local ok, answer = pcall(function(): any
-        declare()
-        local ffi: any = native.ffi
-        -- Kept in `opened` for the life of the process, so it is never
-        -- unloaded while a handle it returned is still being read.
-        local library: any = ffi.load(path)
-        if (library.nuppNativeFeatures() as integer) % (CODEGEN_FEATURE * 2) < CODEGEN_FEATURE
-            or library.nuppCodegenAvailable() == 0
-        then
-            return nil
-        end
+        local loaded: any = ffi.load(path)
+        -- Resolving one name proves the library is a code generator rather
+        -- than some other shared library with the same file name.
+        local _ = loaded.nuppcg_LLVMGetVersion
 
-        return library
+        return loaded
     end)
-    if not ok or answer == nil then
-        refused[path] = not ok and "cannot load the prebuilt code generator " .. path .. ": " .. tostring(answer)
-            or "the prebuilt provider " .. path .. " was built without the LLVM code generator"
+    if not ok then
+        refused[path] = "cannot load the code generator " .. path .. ": " .. tostring(answer)
 
         return nil, refused[path]
     end
-    local ffi: any = native.ffi
-    local library: any = answer
+    local backend = codegen.Backend(C = answer, origin = path, initialized = false)
+    opened[path] = backend
 
-    local function succeeded(status: integer, level: integer): nil
-        if status ~= 0 then
-            error("nupp: " .. ffi.string(library.nuppNativeLastError()), level)
-        end
-    end
-
-    local function bytes(handle: any): string
-        local length = ffi.new("size_t[1]")
-        local status = library.nuppNativeBytesCopy(handle, nil, 0, length)
-        local count = (tonumber(length[0]) or 0) as integer
-        if count == 0 then
-            local released = library.nuppNativeBytesRelease(handle)
-            succeeded(status, 3)
-            succeeded(released, 3)
-
-            return ""
-        end
-        -- Capacity is the expected result of probing a nonempty value.
-        if status ~= 2 then
-            local released = library.nuppNativeBytesRelease(handle)
-            succeeded(status, 3)
-            succeeded(released, 3)
-        end
-        local buffer = ffi.new("uint8_t[?]", count)
-        status = library.nuppNativeBytesCopy(handle, buffer, count, length)
-        local released = library.nuppNativeBytesRelease(handle)
-        succeeded(status, 3)
-        succeeded(released, 3)
-
-        return ffi.string(buffer, count)
-    end
-
-    local provider = codegen.Provider(C = library, succeeded = succeeded, bytes = bytes)
-    opened[path] = provider
-
-    return provider, nil
+    return backend, nil
 end
 
---- The provider to reach the code generator through, or nil and why there is
---- none: this process's own, else `NUPP_CODEGEN_LIBRARY`, else the prebuilt
---- one `codegen.useLibrary` named.
-local function selected(): (codegen.Provider?, string?)
-    local found, why = own()
-    if found ~= nil then
-        return found, nil
+--- The code generator library's file name beside a native provider's: a
+--- checkout stages `nupp_codegen_dev` beside `nupp_native_dev`, and a prebuilt
+--- archive carries `nupp_codegen` beside `nupp_native`.
+function codegen.besideProvider(providerPath: string): string?
+    local directory, name = providerPath:match("^(.*[/\\])([^/\\]+)$")
+    if name == nil then
+        directory, name = "", providerPath
+    end
+    local renamed, count = (name as string):gsub("nupp_native", "nupp_codegen", 1)
+    if count == 0 then
+        return nil
+    end
+
+    return (directory as string) .. renamed
+end
+
+local function fileExists(path: string): boolean
+    local file = io.open(path, "rb")
+    if file == nil then
+        return false
+    end
+    file:close()
+
+    return true
+end
+
+--- The library a source checkout staged beside its native provider, when
+--- there is one.
+local function stagedLibrary(): string?
+    local provider = os.getenv("NUPP_NATIVE_LIBRARY")
+    if provider == nil or provider == "" then
+        return nil
+    end
+    local path = codegen.besideProvider(provider as string)
+    if path ~= nil and fileExists(path as string) then
+        return path
+    end
+
+    return nil
+end
+
+local UNAVAILABLE = "this nupp has no LLVM code generator; run scripts/toolchain llvm and rebuild, or name a prebuilt one with NUPP_CODEGEN_LIBRARY"
+
+--- The code generator to reach, or nil and why there is none: this process's
+--- own, else the library staged beside the provider, else
+--- `NUPP_CODEGEN_LIBRARY`, else the prebuilt one `codegen.useLibrary` named.
+local function selected(): (codegen.Backend?, string?)
+    local own = processBackend()
+    if own ~= nil then
+        return own, nil
+    end
+    local staged = stagedLibrary()
+    if staged ~= nil then
+        return library(staged as string)
     end
     local named = os.getenv("NUPP_CODEGEN_LIBRARY")
     if named ~= nil and named ~= "" then
-        return prebuilt(named as string)
+        return library(named as string)
     end
     if fallback ~= nil then
-        return prebuilt(fallback as string)
+        return library(fallback as string)
     end
 
-    return nil, why
+    return nil, UNAVAILABLE
 end
 
---- The provider, for a call that has already been told it is available.
+--- Initializes the three targets a build reaches, once per backend.
+local function initialized(backend: codegen.Backend): codegen.Backend
+    if not backend.initialized then
+        local C: any = backend.C
+        for _, target in ipairs({"AArch64", "X86", "WebAssembly"}) do
+            for _, part in ipairs({"TargetInfo", "Target", "TargetMC", "AsmPrinter", "AsmParser", "Disassembler"}) do
+                C["nuppcg_LLVMInitialize" .. target .. part]()
+            end
+        end
+        backend.initialized = true
+    end
+
+    return backend
+end
+
+--- The backend, for a call that has already been told it is available.
 --- @raises string when there is none
-local function reach(): codegen.Provider
+local function reach(): codegen.Backend
     local found, why = selected()
     if found == nil then
         error(why, 0)
     end
 
-    return found as codegen.Provider
+    return initialized(found as codegen.Backend)
 end
 
---- Names a prebuilt provider library to reach the code generator through
---- when this process's own was built without it.
+--- Names a prebuilt code generator library to reach when this process has
+--- none of its own.
 --- @return nil, or why that library cannot serve
 function codegen.useLibrary(path: string): string?
-    local _, why = prebuilt(path)
+    local _, why = library(path)
     if why == nil then
         fallback = path
     end
@@ -220,32 +318,122 @@ end
 --- `"llvm <version>; codegen <n>"`: part of every artifact's key.
 --- @raises string when the code generator is unavailable
 function codegen.version(): string
-    declare()
-    local ffi: any = native.ffi
-    local provider = reach()
-    local handle = ffi.new("uint64_t[1]")
-    provider.succeeded(provider.C.nuppCodegenVersion(handle), 2)
+    local backend = reach()
+    local parts: any = ffi.new("unsigned[3]")
+    backend.C.nuppcg_LLVMGetVersion(parts, parts + 1, parts + 2)
 
-    return provider.bytes(handle[0])
+    return (
+        "llvm %d.%d.%d; codegen %d"
+    ):format(
+        tonumber(parts[0]) as integer,
+        tonumber(parts[1]) as integer,
+        tonumber(parts[2]) as integer,
+        CODEGEN_VERSION
+    )
 end
 
---- The contents of a byte handle, or nil for the zero handle.
-local function take(provider: codegen.Provider, handle: any): string?
-    local ffi: any = native.ffi
-    if ffi.cast("uint64_t", handle) == 0 then
-        return nil
+--- Takes a message LLVM allocated with `malloc`, and frees it.
+local function message(C: any, slot: any): string
+    local text: any = slot[0]
+    slot[0] = nil
+    if text == nil then
+        return ""
     end
+    local copied = ffi.string(text)
+    C.nuppcg_LLVMDisposeMessage(text)
 
-    return provider.bytes(handle)
+    return copied
 end
 
---- A compiled module.
-record codegen.Compiled
-    object: string
-    report: string
-    assembly: string?
-    optimizedIr: string?
+--- Takes an `LLVMErrorRef`'s message, consuming the error.
+local function errorText(C: any, err: any): string
+    local text: any = C.nuppcg_LLVMGetErrorMessage(err)
+    local copied = ffi.string(text)
+    C.nuppcg_LLVMDisposeErrorMessage(text)
+
+    return copied
 end
+
+--- A memory buffer's bytes, after which the buffer is disposed.
+local function drain(C: any, buffer: any): string
+    local bytes = ffi.string(C.nuppcg_LLVMGetBufferStart(buffer), C.nuppcg_LLVMGetBufferSize(buffer))
+    C.nuppcg_LLVMDisposeMemoryBuffer(buffer)
+
+    return bytes
+end
+
+--- `FPOpFusion::Standard` and `FPOpFusion::Strict`.
+const FUSION_STANDARD = 1
+
+const FUSION_STRICT = 2
+
+--- How far into a target machine its options are searched for. They are a
+--- member of the `TargetMachine` base class, so where they sit does not depend
+--- on the target; in LLVM 23 `MCOptions` begins about 1400 bytes in. A layout that
+--- moved past the window is refused rather than read further.
+const OPTIONS_WINDOW = 2048
+
+--- Sets a target machine's `Options.AllowFPOpFusion` to `Strict`: no
+--- multiply-add is formed except where an instruction's own `contract` flag
+--- allows it, which Nupp emits only inside `@relax("fp-contract")` functions.
+---
+--- The C API has no setter for it, so the field is found. `MCOptions.AsmVerbose`
+--- is a field the C API does set, and the only byte of the machine that
+--- `LLVMSetTargetMachineAsmVerbosity` changes; it is bit 3 of the second byte of
+--- `MCOptions`. In `TargetOptions` the 32-bit enums `FloatABIType`,
+--- `AllowFPOpFusion`, `ThreadModel`, `EABIVersion`, `DebuggerTuning`, `VecLib`
+--- and `ExceptionModel` run, in that order, up to `MCOptions`, after a
+--- `std::string` whose size depends on the C++ standard library but whose end
+--- is 8-aligned either way; so the fusion mode sits 24 bytes before
+--- `MCOptions` whichever library LLVM was built with. The defaults around it
+--- are checked before it is written, so a repinned LLVM whose layout moved is
+--- refused rather than written into.
+--- @return nil, or why the field could not be found
+local function strictFusion(C: any, machine: any): string?
+    local base: any = ffi.cast("uint8_t *", machine)
+    local before: any = ffi.new("uint8_t[?]", OPTIONS_WINDOW)
+    ffi.copy(before, base, OPTIONS_WINDOW)
+    C.nuppcg_LLVMSetTargetMachineAsmVerbosity(machine, 0)
+    local quiet: any = ffi.new("uint8_t[?]", OPTIONS_WINDOW)
+    ffi.copy(quiet, base, OPTIONS_WINDOW)
+    C.nuppcg_LLVMSetTargetMachineAsmVerbosity(machine, 1)
+    local changed: integer? = nil
+    for offset = 0, OPTIONS_WINDOW - 1 do
+        if base[offset] ~= quiet[offset] then
+            local flipped = (tonumber(base[offset]) as integer) ~ (tonumber(quiet[offset]) as integer)
+            if changed ~= nil or flipped ~= 8 then
+                return "the target machine's assembly-verbosity flag is not where this LLVM keeps it"
+            end
+            changed = offset
+        end
+    end
+    if changed == nil or (changed as integer) < 32 then
+        return "the target machine's assembly-verbosity flag did not move"
+    end
+    -- The probe leaves the flag as the machine was created with it, so a
+    -- listing reads as it always has.
+    local verbose = (tonumber(before[changed as integer]) as integer) & 8 ~= 0
+    C.nuppcg_LLVMSetTargetMachineAsmVerbosity(machine, verbose and 1 or 0)
+    local options: any = ffi.cast("int32_t *", base + (changed as integer) - 1 - 28)
+    -- FloatABI::Default, FPOpFusion::Standard, ThreadModel::POSIX, EABI::Default.
+    if options[0] ~= 0 or options[1] ~= FUSION_STANDARD or options[2] ~= 0 or options[3] ~= 1 then
+        return "the target machine's floating-point options are not where this LLVM keeps them"
+    end
+    options[1] = FUSION_STRICT
+
+    return nil
+end
+
+--- `LLVMCodeGenLevelNone` .. `LLVMCodeGenLevelAggressive`, and `LLVMRelocPIC`.
+const RELOC_PIC = 2
+
+--- `LLVMAssemblyFile` and `LLVMObjectFile`.
+const ASSEMBLY_FILE = 0
+
+const OBJECT_FILE = 1
+
+--- `LLVMReturnStatusAction`.
+const RETURN_STATUS = 2
 
 --- What a compile is for. `triple` is the LLVM code-generation triple (never
 --- a public Nupp platform name); `cpu` and `features` are the module's
@@ -268,6 +456,156 @@ record codegen.Options
     --- Run the numeric-contract checks over the optimized IR, and over the
     --- assembly when it is produced.
     verify: boolean
+end
+
+--- What one compile produced: the object, the assembly and optimized IR when
+--- they were asked for, and microseconds spent parsing, optimizing and
+--- generating code.
+local record Output
+    object: string
+    assembly: string?
+    optimizedIr: string?
+    timings: {number}
+end
+
+--- Microseconds since `started`, a reading of the monotonic clock.
+local function since(started: uint64): number
+    return (tonumber(platform.monotonic() - started) as number) / 1000
+end
+
+--- A target machine for `options`, with strict floating-point fusion.
+--- @raises string when the target or its machine cannot be had
+local function targetMachine(C: any, options: codegen.Options): any
+    local target: any = ffi.new("void *[1]")
+    local err: any = ffi.new("char *[1]")
+    if C.nuppcg_LLVMGetTargetFromTriple(options.triple, target, err) ~= 0 then
+        error("target " .. options.triple .. ": " .. message(C, err), 0)
+    end
+    local settings: any = C.nuppcg_LLVMCreateTargetMachineOptions()
+    C.nuppcg_LLVMTargetMachineOptionsSetCPU(settings, options.cpu)
+    C.nuppcg_LLVMTargetMachineOptionsSetFeatures(settings, options.features)
+    C.nuppcg_LLVMTargetMachineOptionsSetCodeGenOptLevel(settings, options.opt)
+    C.nuppcg_LLVMTargetMachineOptionsSetRelocMode(settings, RELOC_PIC)
+    local machine: any = C.nuppcg_LLVMCreateTargetMachineWithOptions(target[0], options.triple, settings)
+    C.nuppcg_LLVMDisposeTargetMachineOptions(settings)
+    if machine == nil then
+        error("cannot create a target machine for " .. options.triple, 0)
+    end
+    local refusal = strictFusion(C, machine)
+    if refusal ~= nil then
+        C.nuppcg_LLVMDisposeTargetMachine(machine)
+        error("cannot set strict floating-point fusion: " .. refusal, 0)
+    end
+
+    return machine
+end
+
+--- Emits a module as an object or an assembly listing. Code generation
+--- rewrites IR (CodeGenPrepare), so it works on a copy and the module can be
+--- emitted again.
+--- @raises string when code generation fails
+local function emit(C: any, machine: any, module: any, kind: integer): string
+    local copy: any = C.nuppcg_LLVMCloneModule(module)
+    local err: any = ffi.new("char *[1]")
+    local buffer: any = ffi.new("void *[1]")
+    local failed = C.nuppcg_LLVMTargetMachineEmitToMemoryBuffer(machine, copy, kind, err, buffer) ~= 0
+    C.nuppcg_LLVMDisposeModule(copy)
+    if failed then
+        error("code generation: " .. message(C, err), 0)
+    end
+
+    return drain(C, buffer[0])
+end
+
+--- Compiles one module of LLVM IR text: parsed and verified, given the
+--- target's triple and data layout (the emitter names neither, so one text
+--- serves every target), optimized with `default<O{opt}>`, then emitted.
+--- @raises string when any phase fails
+local function compileModule(
+    backend: codegen.Backend,
+    ir: string,
+    name: string,
+    options: codegen.Options,
+    wantAssembly: boolean,
+    wantOptimizedIr: boolean
+): Output
+    local C: any = backend.C
+    local machine: any = targetMachine(C, options)
+    local context: any = C.nuppcg_LLVMContextCreate()
+    local module: any = nil
+    local ok, result = pcall(function(): Output
+        local started = platform.monotonic()
+        local buffer: any = C.nuppcg_LLVMCreateMemoryBufferWithMemoryRangeCopy(ir, #ir, name)
+        local parsed: any = ffi.new("void *[1]")
+        local err: any = ffi.new("char *[1]")
+        -- Borrows the buffer, which is disposed here either way.
+        local failed = C.nuppcg_LLVMParseIRInContext2(context, buffer, parsed, err) ~= 0
+        C.nuppcg_LLVMDisposeMemoryBuffer(buffer)
+        if failed then
+            error(name .. ": " .. message(C, err), 0)
+        end
+        module = parsed[0]
+        local invalid = C.nuppcg_LLVMVerifyModule(module, RETURN_STATUS, err) ~= 0
+        local why = message(C, err)
+        if invalid then
+            error(name .. ": invalid IR: " .. why, 0)
+        end
+        C.nuppcg_LLVMSetTarget(module, options.triple)
+        local layout: any = C.nuppcg_LLVMCreateTargetDataLayout(machine)
+        C.nuppcg_LLVMSetModuleDataLayout(module, layout)
+        C.nuppcg_LLVMDisposeTargetData(layout)
+        local parsing = since(started)
+
+        started = platform.monotonic()
+        local passes: any = C.nuppcg_LLVMCreatePassBuilderOptions()
+        local vectorize = options.opt >= 2 and 1 or 0
+        C.nuppcg_LLVMPassBuilderOptionsSetLoopVectorization(passes, vectorize)
+        C.nuppcg_LLVMPassBuilderOptionsSetSLPVectorization(passes, vectorize)
+        C.nuppcg_LLVMPassBuilderOptionsSetLoopInterleaving(passes, vectorize)
+        C.nuppcg_LLVMPassBuilderOptionsSetLoopUnrolling(passes, vectorize)
+        local problem: any = C.nuppcg_LLVMRunPasses(module, ("default<O%d>"):format(options.opt), machine, passes)
+        C.nuppcg_LLVMDisposePassBuilderOptions(passes)
+        if problem ~= nil then
+            error("optimization: " .. errorText(C, problem), 0)
+        end
+        local optimizing = since(started)
+        local optimizedIr: string? = nil
+        if wantOptimizedIr then
+            local printed: any = ffi.new("char *[1]")
+            printed[0] = C.nuppcg_LLVMPrintModuleToString(module)
+            optimizedIr = message(C, printed)
+        end
+
+        started = platform.monotonic()
+        local object = emit(C, machine, module, OBJECT_FILE)
+        local generating = since(started)
+        local assembly: string? = wantAssembly and emit(C, machine, module, ASSEMBLY_FILE) or nil
+
+        return Output(
+            object = object,
+            assembly = assembly,
+            optimizedIr = optimizedIr,
+            timings = {parsing, optimizing, generating}
+        )
+    end)
+    if module ~= nil then
+        C.nuppcg_LLVMDisposeModule(module)
+    end
+    C.nuppcg_LLVMContextDispose(context)
+    C.nuppcg_LLVMDisposeTargetMachine(machine)
+    if not ok then
+        error(result, 0)
+    end
+
+    return result as Output
+end
+
+--- A compiled module.
+record codegen.Compiled
+    object: string
+    report: string
+    assembly: string?
+    optimizedIr: string?
 end
 
 --- Reads `key=value` lines: triple, cpu, features, opt, assembly,
@@ -366,67 +704,41 @@ local function optionText(options: {[string]: string}): string
     return table.concat(lines, "\n")
 end
 
---- The checked options an options table names, in the provider's positional
---- form: triple, cpu, features, opt, then whether to return the assembly and
---- the optimized IR. Verifying needs the optimized IR, and the assembly when it
---- is asked for; outputs nobody keeps are produced only to verify.
+--- The checked options an options table names.
 --- @raises string when the options are refused
-local function nativeOptions(options: {[string]: string}, kept: boolean): (codegen.Options, string)
+local function checkedOptions(options: {[string]: string}): codegen.Options
     local parsed, err = codegen.parseOptions(optionText(options))
     if parsed == nil then
         error(err, 0)
     end
-    local checked = parsed as codegen.Options
-    local fields = {
-        checked.triple,
-        checked.cpu,
-        checked.features,
-        tostring(checked.opt),
-        checked.assembly and (kept or checked.verify) and "1" or "0",
-        ((kept and checked.optimizedIr) or checked.verify) and "1" or "0",
-    }
 
-    return checked, table.concat(fields, "\31")
-end
-
---- The phase timings a provider answers: microseconds, space-separated.
-local function timings(text: string): {number}
-    local out: {number} = {}
-    for number in text:gmatch("%S+") do
-        out[#out + 1] = tonumber(number) or 0
-    end
-
-    return out
+    return parsed as codegen.Options
 end
 
 --- Compiles LLVM IR text. Options: `triple` (required), `cpu`, `features`,
 --- `opt` (0-3), `assembly`, `optimized-ir`, `verify` ("1" to enable).
+--- Verifying needs the optimized IR, and the assembly when it is asked for;
+--- outputs nobody keeps are produced only to verify.
 --- @return the compiled module, or nil and why not
 function codegen.compile(ir: string, name: string, options: {[string]: string}): (codegen.Compiled?, string?)
     local ok, result = pcall(function(): codegen.Compiled
-        declare()
-        local ffi: any = native.ffi
-        local checked, text = nativeOptions(options, true)
-        local provider = reach()
-        local C: any = provider.C
-        local object = ffi.new("uint64_t[1]")
-        local spent = ffi.new("uint64_t[1]")
-        local assembly = ffi.new("uint64_t[1]")
-        local optimized = ffi.new("uint64_t[1]")
-        provider.succeeded(
-            C.nuppCodegenCompile(ir, #ir, name, #name, text, #text, object, spent, assembly, optimized),
-            2
+        local checked = checkedOptions(options)
+        local backend = reach()
+        local output = compileModule(
+            backend,
+            ir,
+            name,
+            checked,
+            checked.assembly,
+            checked.optimizedIr or checked.verify
         )
-        local objectBytes = take(provider, object[0]) or ""
-        local listing = take(provider, assembly[0])
-        local optimizedIr = take(provider, optimized[0])
-        local found: {string} = checked.verify and violations(optimizedIr or "", listing) or {}
+        local found: {string} = checked.verify and violations(output.optimizedIr or "", output.assembly) or {}
 
         return codegen.Compiled(
-            object = objectBytes,
-            report = codegen.report(timings(take(provider, spent[0]) or ""), #objectBytes, found),
-            assembly = listing,
-            optimizedIr = checked.optimizedIr and optimizedIr or nil
+            object = output.object,
+            report = codegen.report(output.timings, #output.object, found),
+            assembly = output.assembly,
+            optimizedIr = checked.optimizedIr and output.optimizedIr or nil
         )
     end)
     if not ok then
@@ -449,17 +761,103 @@ record codegen.Outcome
     error: string?
 end
 
---- Reads and removes a file a compile job wrote beside its object.
-local function consume(path: string): string?
+local function readFile(path: string): string?
     local file = io.open(path, "rb")
     if file == nil then
         return nil
     end
     local text = file:read("*a") as string
     file:close()
-    os.remove(path)
 
     return text
+end
+
+local function writeFile(path: string, contents: string): string?
+    local file, err = io.open(path, "wb")
+    if file == nil then
+        return "cannot write " .. path .. ": " .. tostring(err)
+    end
+    file:write(contents)
+    file:close()
+
+    return nil
+end
+
+--- Reads and removes a file a compile job wrote beside its object.
+local function consume(path: string): string?
+    local text = readFile(path)
+    if text ~= nil then
+        os.remove(path)
+    end
+
+    return text
+end
+
+--- Compiles one job here: its object, and its optimized IR and assembly beside
+--- it as `.ll` and `.s` when it verifies; answers the phase timings.
+--- @raises string when the job fails
+local function runJob(backend: codegen.Backend, job: codegen.Job, options: codegen.Options): {number}
+    local ir = readFile(job.ir)
+    if ir == nil then
+        error("cannot read " .. job.ir, 0)
+    end
+    local output = compileModule(
+        backend,
+        ir as string,
+        job.ir,
+        options,
+        options.assembly and options.verify,
+        options.verify
+    )
+    local err = writeFile(job.object, output.object)
+    if err ~= nil then
+        error(err, 0)
+    end
+    for _, pair in ipairs({{output.optimizedIr, ".ll"}, {output.assembly, ".s"}}) do
+        if pair[1] ~= nil then
+            err = writeFile(job.object .. (pair[2] as string), pair[1] as string)
+            if err ~= nil then
+                error(err, 0)
+            end
+        end
+    end
+
+    return output.timings
+end
+
+local posixDeclared = false
+
+local function declarePosix(): nil
+    if posixDeclared then
+        return
+    end
+    posixDeclared = true
+    ffi.cdef[[
+int nuppcg_fork(void) __asm__("fork");
+int nuppcg_waitpid(int pid, int *status, int options) __asm__("waitpid");
+void nuppcg_exit(int status) __asm__("_exit");
+int nuppcg_dup2(int from, int to) __asm__("dup2");
+int nuppcg_creat(const char *path, unsigned int mode) __asm__("creat");
+int nuppcg_close(int fd) __asm__("close");
+]]
+end
+
+--- `waitpid` answers at once for a child that has not exited (the same
+--- value on Linux and macOS).
+const WNOHANG = 1
+
+--- A job's timings as the text a forked child writes, and back.
+local function timingText(timings: {number}): string
+    return ("%s %s %s"):format(tostring(timings[1]), tostring(timings[2]), tostring(timings[3]))
+end
+
+local function timingsOf(text: string): {number}
+    local out: {number} = {}
+    for number in text:gmatch("%S+") do
+        out[#out + 1] = tonumber(number) or 0
+    end
+
+    return out
 end
 
 --- An object file's size in bytes, or zero when it cannot be read.
@@ -474,42 +872,152 @@ local function fileSize(path: string): integer
     return size
 end
 
+--- Compiles every job in a child process of its own, at most `width` at a
+--- time. LLVM ends a process on an internal error (`report_fatal_error`, a
+--- failed assertion in legalization), and the process is the user's `nupp`; a
+--- child that dies instead is that one module's error, carrying what LLVM
+--- printed. Children run side by side, which is also what makes a build's units
+--- compile in parallel.
+---
+--- A child touches nothing but LLVM, the files it writes and the allocator,
+--- and nothing else in `nupp` uses LLVM from another thread, so no lock LLVM
+--- needs can be held by a thread the fork left behind.
+local function forked(
+    backend: codegen.Backend,
+    jobs: {codegen.Job},
+    checked: {codegen.Options},
+    width: integer
+): {{string}}
+    declarePosix()
+    local C: any = ffi.C
+    local results: {[integer]: {string}} = {}
+    local running: {[integer]: integer} = {}
+    local runningCount: integer = 0
+    local nextJob: integer = 1
+    local status: any = ffi.new("int[1]")
+    while nextJob <= #jobs or runningCount > 0 do
+        while nextJob <= #jobs and runningCount < width do
+            local job = jobs[nextJob]
+            os.remove(job.object .. ".report")
+            local errors = C.nuppcg_creat(job.object .. ".stderr", tonumber("644", 8) as integer)
+            local pid = C.nuppcg_fork()
+            if pid == 0 then
+                -- The child: its diagnostics go to its own file, and it leaves
+                -- with `_exit`, running nothing the parent registered.
+                if errors >= 0 then
+                    C.nuppcg_dup2(errors, 2)
+                end
+                local ok, answer = pcall(runJob, backend, job, checked[nextJob])
+                local text = ok and timingText(answer as {number}) or tostring(answer)
+                writeFile(job.object .. ".report", text)
+                C.nuppcg_exit(ok and 0 or 1)
+            end
+            if errors >= 0 then
+                C.nuppcg_close(errors)
+            end
+            if pid < 0 then
+                local ok, answer = pcall(runJob, backend, job, checked[nextJob])
+                results[nextJob] = ok and {"ok", timingText(answer as {number})} or {"error", tostring(answer)}
+                os.remove(job.object .. ".stderr")
+            else
+                running[pid] = nextJob
+                runningCount = runningCount + 1
+            end
+            nextJob = nextJob + 1
+        end
+        if runningCount > 0 then
+            -- Only these children, each by its pid: nupp has children of its
+            -- own (the comptime worker service, processes a program starts),
+            -- and reaping one of theirs, as waiting for any child would, leaves
+            -- its owner waiting for an exit it will never see.
+            local finished: integer? = nil
+            local lost = false
+            while finished == nil do
+                for pid in pairs(running) do
+                    local answer = C.nuppcg_waitpid(pid, status, WNOHANG)
+                    if answer == pid then
+                        finished = pid
+                        break
+                    end
+                    if answer < 0 then
+                        -- Not waitable any more; judged by what it wrote below.
+                        finished = pid
+                        lost = true
+                        break
+                    end
+                end
+                if finished == nil then
+                    platform.sleep(2)
+                end
+            end
+            local index = running[finished as integer] as integer
+            running[finished as integer] = nil
+            runningCount = runningCount - 1
+            local job = jobs[index]
+            local report = consume(job.object .. ".report") or ""
+            local printed = consume(job.object .. ".stderr") or ""
+            local code = tonumber(status[0]) as integer
+            if lost then
+                results[index] = report ~= "" and {"ok", report}
+                    or {"error", "the process compiling " .. job.ir .. " could not be waited for"}
+            elseif code & 0x7f == 0 then
+                results[index] = (code >> 8) & 0xff == 0 and {"ok", report} or {"error", report}
+            else
+                local said = (printed:match("^%s*(.-)%s*$")) as string
+                results[
+                    index
+                ] = {
+                    "error",
+                    (
+                        "LLVM stopped compiling %s (signal %d)%s"
+                    ):format(job.ir, code & 0x7f, said == "" and "" or ": " .. said),
+                }
+            end
+        end
+    end
+    local ordered: {{string}} = {}
+    for index = 1, #jobs do
+        ordered[index] = results[index] or {"error", "not compiled"}
+    end
+
+    return ordered
+end
+
 --- Compiles IR files to objects, `width` at a time, each where LLVM's
 --- ending the process on an internal error ends only that job: a job that
 --- crashes is an outcome with an error, and the build goes on to report it.
---- A job that verifies has its optimized IR and assembly written beside its
---- object as `.ll` and `.s`, which are checked here and then removed.
+--- Without `fork` (Windows) the jobs run here, one after another. A job that
+--- verifies has its optimized IR and assembly written beside its object as
+--- `.ll` and `.s`, which are checked here and then removed.
 --- @return one outcome per job, in order, or nil and why none ran
 function codegen.compileFiles(jobs: {codegen.Job}, width: integer): ({codegen.Outcome}?, string?)
     local ok, result = pcall(function(): {codegen.Outcome}
-        declare()
-        local ffi: any = native.ffi
-        local records: {string} = {}
         local checked: {codegen.Options} = {}
         for position, job in ipairs(jobs) do
-            local options, text = nativeOptions(job.options, false)
-            checked[position] = options
-            records[position] = job.ir .. "\31" .. job.object .. "\31" .. text
+            checked[position] = checkedOptions(job.options)
         end
-        local provider = reach()
-        local C: any = provider.C
-        local joined = table.concat(records, "\0") .. "\0"
-        local handle = ffi.new("uint64_t[1]")
-        provider.succeeded(C.nuppCodegenCompileFiles(joined, #joined, width, handle), 2)
-        local text = take(provider, handle[0]) or ""
+        local backend = reach()
+        local answers: {{string}} = {}
+        if windows then
+            for position, job in ipairs(jobs) do
+                local done, answer = pcall(runJob, backend, job, checked[position])
+                answers[position] = done and {"ok", timingText(answer as {number})} or {"error", tostring(answer)}
+            end
+        else
+            answers = forked(backend, jobs, checked, math.max(width, 1))
+        end
         local outcomes: {codegen.Outcome} = {}
-        for record in text:gmatch("([^%z]*)%z") do
-            local position = #outcomes + 1
-            local job = jobs[position]
-            local optimizedIr = job ~= nil and consume(job.object .. ".ll") or nil
-            local listing = job ~= nil and consume(job.object .. ".s") or nil
-            local kind, body = record:match("^(%a+)\31(.*)$")
-            if kind == "ok" and job ~= nil then
-                local found = checked[position].verify and violations(optimizedIr or "", listing) or {}
-                local report = codegen.report(timings(body as string), fileSize(job.object), found)
+        for position, job in ipairs(jobs) do
+            local optimizedIr = consume(job.object .. ".ll")
+            local listing = consume(job.object .. ".s")
+            local answer = answers[position]
+            if answer[1] == "ok" then
+                local options = checked[position]
+                local found = options.verify and violations(optimizedIr or "", listing) or {}
+                local report = codegen.report(timingsOf(answer[2] as string), fileSize(job.object), found)
                 outcomes[position] = codegen.Outcome(report = report, error = nil)
             else
-                outcomes[position] = codegen.Outcome(report = nil, error = body or record)
+                outcomes[position] = codegen.Outcome(report = nil, error = answer[2])
             end
         end
 
@@ -522,43 +1030,126 @@ function codegen.compileFiles(jobs: {codegen.Job}, width: integer): ({codegen.Ou
     return result as {codegen.Outcome}, nil
 end
 
+--- Whether this process has run a lld whose state it cannot shed on the way
+--- out. On a Windows host an ELF, Mach-O or Wasm link leaves the process unable
+--- to exit through its static destructors (#71); `lld-link` with one thread
+--- does not.
+local unexitable = false
+
+local windowsDeclared = false
+
 --- Ends this process with `code` when a link left it unable to exit through
 --- its static destructors, which on a Windows host an ELF, Mach-O or Wasm link
 --- does; returns otherwise. The process's own buffered output is flushed
 --- first, since nothing after this runs.
 function codegen.endIfUnexitable(code: integer): nil
-    if not declared then
+    if not unexitable then
         return
     end
-    local provider = selected()
-    if provider == nil then
-        return
+    io.stdout:flush()
+    io.stderr:flush()
+    if not windowsDeclared then
+        windowsDeclared = true
+        ffi.cdef[[
+void *nuppcg_GetCurrentProcess(void) __asm__("GetCurrentProcess");
+int nuppcg_TerminateProcess(void *process, unsigned int code) __asm__("TerminateProcess");
+]]
     end
-    local C: any = provider.C
-    local ok, unexitable = pcall(function(): boolean
-        return C.nuppCodegenUnexitable() ~= 0
-    end)
-    if ok and unexitable then
-        io.stdout:flush()
-        io.stderr:flush()
-        C.nuppCodegenEndProcess(code)
+    local C: any = ffi.C
+    C.nuppcg_TerminateProcess(C.nuppcg_GetCurrentProcess(), code)
+end
+
+--- lld's `Flavor` enumerators, in lld/Common/Driver.h's order.
+const FLAVOR_GNU = 1
+
+const FLAVOR_MINGW = 2
+
+const FLAVOR_WINLINK = 3
+
+const FLAVOR_DARWIN = 4
+
+const FLAVOR_WASM = 5
+
+--- Room for an `llvm::raw_fd_ostream`, far more than any standard library
+--- lays one out in.
+const STREAM_BYTES = 1024
+
+--- Runs lld in process with `argv`, returning its status and everything it
+--- printed. lld ends a fatal error through `Process::Exit`, which returns to
+--- lldMain's recovery context only while crash recovery is enabled; otherwise
+--- it ends nupp, silently. It is enabled for the link alone, so the handlers it
+--- installs are the process's own again afterwards.
+--- @raises string when lld's message stream cannot be opened
+local function runLld(backend: codegen.Backend, argv: {string}): (integer, string)
+    local C: any = backend.C
+    local path = require("nupp.compiler.process").tmpname()
+    local stream: any = ffi.new("uint64_t[?]", STREAM_BYTES // 8)
+    local status: any = ffi.new("uint64_t[4]")
+    C.nuppcg_rawFdOstreamOpen(stream, ffi.new("nuppcg_StringRef", path, #path), status)
+    local opened: any = ffi.cast("int32_t *", status)
+    if opened[0] ~= 0 then
+        C.nuppcg_rawFdOstreamClose(stream)
+        os.remove(path)
+        error("cannot open " .. path .. " for lld's messages", 0)
     end
+    local arguments: any = ffi.new("const char *[?]", #argv)
+    for position, argument in ipairs(argv) do
+        arguments[position - 1] = argument
+    end
+    local drivers: any = ffi.new("nuppcg_Driver[5]", {
+        {FLAVOR_WINLINK, ffi.cast("void *", C.nuppcg_lldCoffLink)},
+        {FLAVOR_GNU, ffi.cast("void *", C.nuppcg_lldElfLink)},
+        {FLAVOR_MINGW, ffi.cast("void *", C.nuppcg_lldMinGWLink)},
+        {FLAVOR_DARWIN, ffi.cast("void *", C.nuppcg_lldMachOLink)},
+        {FLAVOR_WASM, ffi.cast("void *", C.nuppcg_lldWasmLink)},
+    })
+    C.nuppcg_crashRecoveryEnable(false)
+    local result: any = C.nuppcg_lldMain(
+        ffi.new("nuppcg_Arguments", arguments, #argv),
+        stream,
+        stream,
+        ffi.new("nuppcg_Drivers", drivers, 5)
+    )
+    C.nuppcg_crashRecoveryDisable()
+    -- Closing flushes the stream into the file.
+    C.nuppcg_rawFdOstreamClose(stream)
+    local text = readFile(path) or ""
+    os.remove(path)
+    local code = tonumber(result.status) as integer
+    if code ~= 0 and text == "" then
+        text = ("lld stopped with status %d and no message"):format(code)
+    end
+
+    return code, text
 end
 
 --- Runs lld in process. `argv[1]` picks the flavor: `ld64.lld`, `ld.lld`,
 --- `lld-link`, `wasm-ld`.
+---
+--- On a Windows host lld links with one thread. Its parallel executor is a
+--- static that only `llvm_shutdown` stops, which a lld of its own calls on the
+--- way out and nupp never does; left running, its destructor joins threads the
+--- process exit has already ended, and nupp never exits.
 --- @return lld's messages on success, or nil and the failure
 function codegen.link(argv: {string}): (string?, string?)
     local ok, result = pcall(function(): string
-        declare()
-        local ffi: any = native.ffi
-        local provider = reach()
-        local C: any = provider.C
-        local joined = table.concat(argv, "\0") .. "\0"
-        local messages = ffi.new("uint64_t[1]")
-        provider.succeeded(C.nuppCodegenLink(joined, #joined, messages), 2)
+        local backend = reach()
+        local arguments: {string} = {}
+        for position, argument in ipairs(argv) do
+            arguments[position] = argument
+        end
+        if windows then
+            arguments[#arguments + 1] = argv[1] == "lld-link" and "/threads:1" or "--threads=1"
+            if argv[1] ~= "lld-link" then
+                unexitable = true
+            end
+        end
+        local code, text = runLld(backend, arguments)
+        if code ~= 0 then
+            error(("lld exited %d: %s"):format(code, (text:match("^%s*(.-)%s*$")) as string), 0)
+        end
 
-        return take(provider, messages[0]) or ""
+        return text
     end)
     if not ok then
         return nil, tostring(result)
@@ -568,19 +1159,32 @@ function codegen.link(argv: {string}): (string?, string?)
 end
 
 --- Writes a MinGW import library naming `dll` as the provider of `names`;
---- an entry `{name, export}` imports `name` under `export`.
+--- an entry `{name, export}` imports `name` under `export`. lld-link's
+--- librarian mode writes it from a module-definition file.
 --- @return nil, or why it could not be written
 function codegen.importLibrary(dll: string, path: string, names: {{string}}): string?
     local ok, err = pcall(function(): nil
-        declare()
-        local provider = reach()
-        local C: any = provider.C
-        local entries: {string} = {}
-        for position, entry in ipairs(names) do
-            entries[position] = entry[2] ~= nil and entry[1] .. "\t" .. entry[2] or entry[1]
+        local backend = reach()
+        local lines = {"LIBRARY " .. dll, "EXPORTS"}
+        for _, entry in ipairs(names) do
+            lines[#lines + 1] = entry[2] ~= nil and "    " .. entry[1] .. "=" .. entry[2] or "    " .. entry[1]
         end
-        local joined = table.concat(entries, "\0") .. "\0"
-        provider.succeeded(C.nuppCodegenImportLibrary(dll, #dll, path, #path, joined, #joined), 2)
+        local definitions = path .. ".def"
+        local wrote = writeFile(definitions, table.concat(lines, "\n") .. "\n")
+        if wrote ~= nil then
+            error(wrote, 0)
+        end
+        local code, text = runLld(backend, {
+            "lld-link",
+            "/lib",
+            "/machine:x64",
+            "/def:" .. definitions,
+            "/out:" .. path
+        })
+        os.remove(definitions)
+        if code ~= 0 then
+            error(("import library %s: %s"):format(path, (text:match("^%s*(.-)%s*$")) as string), 0)
+        end
     end)
     if not ok then
         return tostring(err)
@@ -589,37 +1193,84 @@ function codegen.importLibrary(dll: string, path: string, names: {{string}}): st
     return nil
 end
 
---- The archive formats `codegen.archive` writes.
-const ARCHIVE: {[string]: integer} = {gnu = 0, bsd = 1, darwin = 2, coff = 3}
+--- The archive formats `codegen.archive` writes, as `object::Archive::Kind`.
+const ARCHIVE: {[string]: integer} = {gnu = 0, bsd = 2, darwin = 3, coff = 5}
+
+--- `SymtabWritingMode::NormalSymtab`.
+const NORMAL_SYMBOL_TABLE = 1
 
 --- Writes the indexed static archive `path` of `members` in `format`:
---- `gnu`, `bsd`, `darwin` or `coff`.
+--- `gnu`, `bsd`, `darwin` or `coff`. Deterministic: no times, owners or modes,
+--- so equal members give equal bytes.
 --- @return nil, or why it could not be written
 function codegen.archive(path: string, members: {string}, format: string): string?
     local ok, err = pcall(function(): nil
-        declare()
-        local provider = reach()
-        local C: any = provider.C
-        local joined = table.concat(members, "\0") .. "\0"
-        provider.succeeded(C.nuppCodegenArchive(path, #path, joined, #joined, ARCHIVE[format] or 0), 2)
-    end)
-    if not ok then
-        return tostring(err)
-    end
-
-    return nil
-end
-
---- Fetches the link kit archive at the HTTPS `url` into `path`, which is
---- written only once the whole body of `size` bytes has arrived. Its digest is
---- the caller's to check ([](nupp.tools.build.kitarchive)).
---- @return nil, or why it could not be fetched
-function codegen.fetchKit(url: string, path: string, size: integer): string?
-    local ok, err = pcall(function(): nil
-        declare()
-        local provider = reach()
-        local C: any = provider.C
-        provider.succeeded(C.nuppCodegenKitFetch(url, #url, path, #path, size), 2)
+        local backend = reach()
+        local C: any = backend.C
+        local entries: any = ffi.new("nuppcg_Member[?]", #members)
+        local names: {string} = {}
+        local loaded = 0
+        local problem: string? = nil
+        for position, member in ipairs(members) do
+            local buffer: any = ffi.new("void *[1]")
+            local why: any = ffi.new("char *[1]")
+            if C.nuppcg_LLVMCreateMemoryBufferWithContentsOfFile(member, buffer, why) ~= 0 then
+                problem = member .. ": " .. message(C, why)
+                break
+            end
+            local name = (member:match("([^/\\]+)$") or member) as string
+            names[position] = name
+            local entry: any = entries[position - 1]
+            entry.buffer = buffer[0]
+            entry.name.data = name
+            entry.name.length = #name
+            entry.modified = 0
+            entry.uid = 0
+            entry.gid = 0
+            entry.perms = tonumber("644", 8)
+            loaded = position
+        end
+        local bytes: string? = nil
+        if problem == nil then
+            local warnings: {string} = {}
+            -- A warning arrives as an `Error` passed by reference; taking its
+            -- payload leaves the caller's copy nothing to destroy.
+            local warn: any = ffi.cast("void (*)(intptr_t, void *)", function(_: any, raised: any): nil
+                local slot: any = ffi.cast("void **", raised)
+                local payload: any = slot[0]
+                slot[0] = nil
+                if payload ~= nil then
+                    warnings[#warnings + 1] = errorText(C, payload)
+                end
+            end)
+            local result: any = C.nuppcg_writeArchiveToBuffer(
+                ffi.new("nuppcg_Members", entries, #members),
+                NORMAL_SYMBOL_TABLE,
+                ARCHIVE[format] or 0,
+                true,
+                false,
+                ffi.new("nuppcg_Warn", ffi.cast("void *", warn), 0)
+            )
+            warn:free()
+            if result.flags & 1 ~= 0 then
+                problem = errorText(C, result.value)
+            elseif #warnings > 0 then
+                C.nuppcg_LLVMDisposeMemoryBuffer(result.value)
+                problem = table.concat(warnings, "; ")
+            else
+                bytes = drain(C, result.value)
+            end
+        end
+        for position = 1, loaded do
+            C.nuppcg_LLVMDisposeMemoryBuffer(entries[position - 1].buffer)
+        end
+        if problem ~= nil then
+            error("archive " .. path .. ": " .. (problem as string), 0)
+        end
+        local wrote = writeFile(path, bytes as string)
+        if wrote ~= nil then
+            error(wrote, 0)
+        end
     end)
     if not ok then
         return tostring(err)

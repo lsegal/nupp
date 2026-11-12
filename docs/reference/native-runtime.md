@@ -15,16 +15,15 @@ The boundary is deliberately narrow:
 
 | Layer | Owner | Responsibilities |
 | --- | --- | --- |
-| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, and the filesystem, process, network, TLS and HTTP services, which call the operating system through FFI |
-| native provider | Rust | clocks, URI, the readiness generation and its wake handle, and the AOT code generator |
+| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, driving LLVM and lld as the AOT code generator, and the filesystem, process, network, TLS and HTTP services, which call the operating system through FFI |
+| native provider | Rust | clocks, URI, and the readiness generation and its wake handle |
 | GPU provider | Nupp | GPU contexts, resources, validation, dispatch, readback, and cost records, over the pinned wgpu-native library |
 | host | Rust | payload discovery, LuaJIT state lifetime, native preload registration, workers, components, embedding handles, and shutdown |
 | VM and compatibility modules | C | LuaJIT and the retained LPeg module |
 | generated AOT | C, platform object code, or shader code | compiler-admitted kernels and their bindings |
 
 Rust resources cross into LuaJIT as fixed-width values and generational
-handles. Nupp code never receives a Rust reference, future, Tokio handle, or
-AOT code generator handle. Rust executor threads never enter LuaJIT; they
+handles. Nupp code never receives a Rust reference, future, or Tokio handle. Rust executor threads never enter LuaJIT; they
 publish bounded completion records which the owning Lua lane consumes.
 
 ## Compiler-selected features
@@ -163,15 +162,14 @@ claim that every executable byte is Rust. Native builds still retain:
   embedding SDK's protected LuaJIT stack, callback, and longjmp boundary while
   Rust owns every persistent SDK resource. The host executable, its workers,
   channels and shared bytes are a native Nupp program, `host/program`;
-- `ring`'s bounded C and assembly implementation under its Rust API, which the
-  code generator's link-kit download still uses;
 - compiled AOT code. The AOT runtime a builder entry calls, through a table the
   provider hands it, is a native Nupp program (`native/aotruntime`) that
   `scripts/toolchain` compiles with the checkout's own compiler and links into
   the provider, so the first provider a checkout builds, before it has a
   compiler, has none;
-- LLVM and lld, linked into `nupp` as the AOT code generator and never into the
-  programs it builds;
+- LLVM and lld, the AOT code generator, linked into `nupp` (or, in a source
+  checkout, into the code generator library beside its provider) and never into
+  the programs it builds;
 - the pinned, prebuilt wgpu-native library, which a GPU program loads beside
   itself;
 - operating-system libraries, GPU drivers, and platform SDKs selected by Rust

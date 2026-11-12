@@ -6,6 +6,8 @@
 #
 # A section header names the host crate features that bring its symbols in, and
 # `always` is every build. A section applies when any feature it names is on.
+# A host built with `native-codegen` also exports the code generator's aliases,
+# which native/codegen/symbols lists with the LLVM and lld names they stand for.
 #
 # The LuaJIT C API is exported so that a host linking the dynamic library can
 # use the state nupp_runtime_lua_state returns, and so that an ahead-of-time
@@ -220,16 +222,3 @@ nuppNativeAvailableParallelism
 [native-panic-probe]
 # The provider's test-only panic probe, which no release build selects.
 nuppNativePanicProbe
-
-[native-codegen]
-# The code generator, declared by the compiler rather than a header.
-nuppCodegenArchive
-nuppCodegenAvailable
-nuppCodegenCompile
-nuppCodegenCompileFiles
-nuppCodegenEndProcess
-nuppCodegenImportLibrary
-nuppCodegenKitFetch
-nuppCodegenLink
-nuppCodegenUnexitable
-nuppCodegenVersion

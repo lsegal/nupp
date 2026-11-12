@@ -14,10 +14,11 @@ on:
     paths:
       - '.github/actions/pinned-llvm/**'
       - '.github/workflows/cross-link.yml'
-      - 'native/crates/codegen/**'
+      - 'native/codegen/**'
       - 'native/crates/native/c/**'
       - 'scripts/toolchain'
       - 'scripts/toolchain.pins'
+      - 'src/nupp/compiler/aot/llvm/codegen.nupp'
       - 'src/nupp/compiler/aot/llvm/coff.nupp'
       - 'src/nupp/compiler/aot/llvm/profile.nupp'
       - 'src/nupp/tools/build/aotllvm.nupp'

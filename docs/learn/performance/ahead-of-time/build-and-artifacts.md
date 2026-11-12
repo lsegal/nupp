@@ -48,8 +48,11 @@ library's debug map names its objects the same way, so one project built in
 two checkouts produces the same library. A source outside the project keeps
 its absolute path.
 
-A `nupp` built from source without the code generator refuses `require` and
-says so; `scripts/toolchain llvm` provides the pinned LLVM a checkout links in.
+A source checkout reaches the same LLVM and lld as a shared library beside its
+native provider: `scripts/toolchain llvm` builds the pinned LLVM, and the
+checkout links the code generator library from it. One that has not built LLVM
+fetches the pinned prebuilt library instead, and one with neither refuses
+`require` and says so.
 
 The numeric contract is the code generator's too. No fast-math flag is ever
 set, a multiply and an add fuse only inside a function that asked for it with

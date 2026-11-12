@@ -23,7 +23,6 @@ native-process = []
 native-tls = []
 native-checksum = []
 native-compression = []
-native-codegen = ["nupp-native/codegen"]
 # The provider's test-only panic probe; no release build selects it.
 native-panic-probe = ["nupp-native/panic-probe"]
 # The embedding ABI starts no workers and refuses a host that declares them;

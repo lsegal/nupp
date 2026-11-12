@@ -264,19 +264,25 @@ nupp-codegen-<platform>.tar.gz
 nupp-kit-<platform>.tar.gz
 ```
 
-The first holds that release's native provider built with the LLVM code
-generator, and the second its link kit. `scripts/toolchain.pins` pins each by
+The first holds that release's code generator library, LLVM and lld linked
+into one shared library, beside its native provider; the second holds its link
+kit. `scripts/toolchain.pins` pins each by
 `PREBUILT_TAG`, a URL, and a SHA-256 per platform, and the release notes list
 the same digests. `scripts/toolchain prebuilt-codegen` and `prebuilt-kit` fetch
 an asset, verify it before unpacking, refuse one with any other digest, and
 cache it by digest. `NUPP_HOST_SOURCE_DIR`, `NUPP_HOST_SOURCE_BASE_URL` and
 `NUPP_HOST_OFFLINE` work as they do for source archives.
 
-`nupp aot --emit executable` and `kind = "program"` targets use them when this
-tree's own provider was built without the code generator. The prebuilt
-provider is loaded beside this tree's own, for its code generator only.
-`NUPP_CODEGEN_LIBRARY` names such a library directly. A platform with no
-pinned assets still needs `scripts/toolchain llvm`.
+`nupp aot --emit executable` and `kind = "program"` targets use the prebuilt
+code generator library when this tree has not linked one of its own from the
+pinned LLVM; the compiler loads it through LuaJIT's FFI. `NUPP_CODEGEN_LIBRARY`
+names such a library directly. The archive's provider is what a checkout
+without Cargo starts the compiler on. A platform with no pinned assets still
+needs `scripts/toolchain llvm`.
+
+A released `nupp` carries no separate library: its host links LLVM and lld in
+statically and exports the same `nuppcg_*` names, listed in
+`native/codegen/symbols`, while every LLVM, lld and C++ name stays local.
 
 ## Cross-target stub acquisition
 

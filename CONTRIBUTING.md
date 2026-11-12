@@ -166,16 +166,23 @@ later, once a tag carrying it is published and the pin moves to it.
 ### Prebuilt code generator
 
 Linking a native program -- `nupp aot --emit executable`, or a `kind =
-"program"` target -- needs the LLVM code generator and a link kit. A checkout
-that has built neither gets both from a stage-zero release too: the `PREBUILT_*`
-pins in `scripts/toolchain.pins` name, per platform, the release's native
-provider built with the code generator (`nupp-codegen-<platform>.tar.gz`) and
-its link kit (`nupp-kit-<platform>.tar.gz`). The first link fetches them with
+"program"` target -- needs the LLVM code generator and a link kit. The code
+generator is LLVM and lld linked into one shared library, which the compiler
+drives through LuaJIT's FFI (`src/nupp/compiler/aot/llvm/codegen.nupp`); what it
+exports is `native/codegen/symbols`. Where the pinned LLVM is built,
+`bin/nupp` links that library (`scripts/toolchain codegen-library`) and stages
+it beside the native provider in `build/lib`.
+
+A checkout that has built neither gets both from a stage-zero release too: the
+`PREBUILT_*` pins in `scripts/toolchain.pins` name, per platform, the release's
+code generator archive (`nupp-codegen-<platform>.tar.gz`, the code generator
+library and the native provider) and its link kit
+(`nupp-kit-<platform>.tar.gz`). The first link fetches them with
 `scripts/toolchain prebuilt-codegen` and `prebuilt-kit`, checks each against its
 digest, and caches it once per machine, so it does not wait on
-`scripts/toolchain llvm` or Cargo. A provider this tree built with LLVM is used
-instead whenever there is one, and `NUPP_CODEGEN_LIBRARY` names a provider
-library outright.
+`scripts/toolchain llvm` or Cargo. A code generator this tree linked itself is
+used instead whenever there is one, and `NUPP_CODEGEN_LIBRARY` names a code
+generator library outright.
 
 The pins are empty for a platform no release has published assets for yet, and
 a checkout there still needs `scripts/toolchain llvm`. To publish them, run the

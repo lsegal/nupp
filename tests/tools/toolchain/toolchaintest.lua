@@ -361,9 +361,8 @@ end
 
 -- A pin written out a second time somewhere that cannot read the pins file. Each
 -- of these agreed only because whoever bumped the pin remembered it: the profiler
--- labels a trace from any other LuaJIT unsupported, the notice every archive
--- carries names what was pinned, and llvm-sys is the C API the code generator is
--- compiled against, `231` for LLVM 23.1.
+-- labels a trace from any other LuaJIT unsupported, and the notice every archive
+-- carries names what was pinned.
 function M.handCopiedPinsAgreeWithThePinsFile()
     local recorded = pins()
     local profile = read(ROOT .. "/src/debug/profile/init.nupp")
@@ -380,14 +379,6 @@ function M.handCopiedPinsAgreeWithThePinsFile()
     assert(
         notice:find("| `" .. recorded.LPEG_VERSION .. "` |", 1, true),
         "host/NOTICE.md names an LPeg version other than LPEG_VERSION"
-    )
-
-    local major, minor = recorded.LLVM_VERSION:match("^(%d+)%.(%d+)%.")
-    local manifest = read(ROOT .. "/native/crates/codegen/Cargo.toml")
-    local bound = manifest:match('llvm%-sys = { version = "=(%d+)%.')
-    assert(
-        bound == major .. minor,
-        ("llvm-sys is pinned to the %s C API and LLVM_VERSION is %s"):format(tostring(bound), recorded.LLVM_VERSION)
     )
 
     -- The archive names an offline builder is told to supply.
@@ -589,15 +580,18 @@ function M.aDamagedCachedLuajitIsBuiltAgain()
     os.execute("rm -rf " .. quote(directory))
 end
 
--- A completed LLVM from a different toolchain is not the code generator the
--- native provider builder would select for this launcher.
-function M.launcherCodegenMarkersFollowTheExactAvailableLlvm()
+-- A completed LLVM from a different toolchain is not the one the code generator
+-- library is linked from, so the launcher stages that library beside its
+-- provider only for the exact pinned LLVM, or one named outright. The provider
+-- itself is the same either way: it carries no code generator.
+function M.launcherStagesTheCodegenLibraryForTheExactAvailableLlvm()
     local directory = temporary()
     local root = directory .. "/root"
     local cache = directory .. "/cache"
     assert(os.execute("mkdir -p " .. quote(root .. "/scripts") .. " " .. quote(cache .. "/llvm/old")) == 0)
     write(cache .. "/llvm/old/.complete", "an unrelated completed LLVM\n")
     write(root .. "/provider", "fixture provider\n")
+    write(root .. "/codegen", "fixture code generator\n")
     write(
         root .. "/scripts/toolchain",
         [[#!/bin/sh
@@ -612,14 +606,19 @@ case "$1" in
         printf '%s\n' "$2" > "$ROOT/features"
         printf '%s\n' "$ROOT/provider"
         ;;
+    codegen-library)
+        printf '%s\n' "$ROOT/codegen"
+        ;;
     *) exit 92 ;;
 esac
 ]]
     )
     assert(os.execute("chmod +x " .. quote(root .. "/scripts/toolchain")) == 0)
     local launcher = read(ROOT .. "/bin/nupp")
-    local available = assert(launcher:match("(llvm_is_available%(%) {.-\n})"))
-    local buildNative = assert(launcher:match("(build_native%(%) {.-\n})"))
+    local functions = {}
+    for _, name in ipairs({"llvm_is_available", "install_library", "stage_codegen", "build_native"}) do
+        functions[#functions + 1] = assert(launcher:match("(" .. name .. "%(%) {.-\n})"), name)
+    end
     local script = directory .. "/stage.sh"
     write(
         script,
@@ -630,29 +629,32 @@ esac
         )
         .. "\n"
         .. "NUPP_NATIVE_LIBRARY=\"$ROOT/build/lib/provider\"\n"
-        .. available
-        .. "\n"
-        .. buildNative
+        .. "CODEGEN_LIBRARY=\"$ROOT/build/lib/codegen\"\n"
+        .. table.concat(functions, "\n")
         .. "\nbuild_native\n"
     )
     assert(os.execute("chmod +x " .. quote(script)) == 0)
-    for _, selection in ipairs({"unrelated", "exact", "explicit"}) do
+    for _, selection in ipairs({"unrelated", "exact", "explicit", "unrelated"}) do
         os.remove(root .. "/exact-llvm")
         os.remove(root .. "/queries")
         if selection == "exact" then
             write(root .. "/exact-llvm", "done\n")
         end
+        -- A marker the provider-with-code-generator layout left is cleared.
+        assert(os.execute("mkdir -p " .. quote(root .. "/build/lib")) == 0)
+        write(root .. "/build/lib/provider.codegen", "")
         local prefix = selection == "explicit" and forPath(root .. "/explicit-prefix") or ""
         local status, output = run({NUPP_LLVM_PREFIX = prefix}, "", script)
         assert(status == 0, output)
-        local features = read(root .. "/features")
+        assert(read(root .. "/features") == "base,uri\n", selection .. ": the provider asked for more than base,uri")
+        local staged = io.open(root .. "/build/lib/codegen", "rb")
         local expected = selection ~= "unrelated"
-        assert((features:find(",codegen", 1, true) ~= nil) == expected, selection .. ": " .. features)
-        local marker = io.open(root .. "/build/lib/provider.codegen", "rb")
-        assert((marker ~= nil) == expected, selection .. ": staged marker disagrees with selected features")
-        if marker then
-            marker:close()
+        assert((staged ~= nil) == expected, selection .. ": the staged code generator disagrees with the LLVM found")
+        if staged then
+            assert(staged:read("*a") == "fixture code generator\n", selection)
+            staged:close()
         end
+        assert(io.open(root .. "/build/lib/provider.codegen", "rb") == nil, selection .. ": a stale marker was kept")
         local queried = io.open(root .. "/queries", "rb")
         assert((queried ~= nil) == (selection ~= "explicit"), selection .. ": unexpected LLVM query")
         if queried then
@@ -1103,24 +1105,58 @@ function M.gpuIsAPinnedPrebuiltLibraryRatherThanAHostFeature()
     assert(driver:find("-e '^WGPU_'", 1, true), "a wgpu-native bump rebuilds the native toolchain")
 end
 
--- The macOS host exports exactly host/include/nupp.exports, so a name left there
--- after its definition moved to Nupp fails that link and only that link.
-function M.everyListedCodegenExportIsARustDefinition()
+-- The code generator's library and a host built with it export exactly the
+-- aliases native/codegen/symbols lists, and the compiler resolves exactly the
+-- names it declares. A name only one of the two has fails only where it is
+-- first called, so the two lists are held together here.
+function M.everyCodegenAliasIsDeclaredByTheCompiler()
     -- A Windows checkout may translate the list's line endings.
-    local list = read(ROOT .. "/host/include/nupp.exports"):gsub("\r\n", "\n")
-    local codegen = read(ROOT .. "/native/crates/native/src/codegen.rs")
-    local section = assert(
-        list:match("%[native%-codegen%]\n(.-)\n%[") or list:match("%[native%-codegen%]\n(.*)$"),
-        "the export list has no native-codegen section"
-    )
-    local stale = {}
-    for line in section:gmatch("[^\n]+") do
-        local name = line:match("^%s*(nupp[%w_]+)%s*$")
-        if name and not codegen:find('extern "C" fn ' .. name .. "(", 1, true) then
-            stale[#stale + 1] = name
+    local symbols = read(ROOT .. "/native/codegen/symbols"):gsub("\r\n", "\n")
+    local exported, targets = {}, {}
+    for line in symbols:gmatch("[^\n]+") do
+        local alias, target, only = line:match("^(%S+)%s+(%S+)%s*(%S*)$")
+        if alias and not alias:find("^#") then
+            assert(alias:match("^nuppcg_[%w_]+$"), "an alias outside the nuppcg_ namespace: " .. alias)
+            assert(only == "" or only == "darwin" or only == "!darwin", "an unknown platform for " .. alias)
+            exported[alias] = true
+            targets[#targets + 1] = target
         end
     end
-    assert(#stale == 0, "the export list names codegen symbols nothing defines: " .. table.concat(stale, ", "))
+    local codegen = read(ROOT .. "/src/nupp/compiler/aot/llvm/codegen.nupp")
+    local declared = {}
+    -- Helpers redirected to the C library with `__asm__` are not aliases.
+    for line in codegen:gmatch("[^\n]+") do
+        if not line:find("__asm__", 1, true) then
+            for name in line:gmatch("[%s%*](nuppcg_[%w_]+)%(") do
+                declared[name] = true
+            end
+        end
+    end
+    local missing, unused = {}, {}
+    for name in pairs(declared) do
+        if not exported[name] then
+            missing[#missing + 1] = name
+        end
+    end
+    for name in pairs(exported) do
+        if not declared[name] then
+            unused[#unused + 1] = name
+        end
+    end
+    table.sort(missing)
+    table.sort(unused)
+    assert(#missing == 0, "the compiler declares code generator names no alias exports: " .. table.concat(missing, ", "))
+    assert(#unused == 0, "native/codegen/symbols exports aliases the compiler never declares: " .. table.concat(unused, ", "))
+    -- Every target is an LLVM C name or an Itanium-mangled llvm or lld one, so
+    -- none of them is a name a host already exports for something else.
+    for _, target in ipairs(targets) do
+        assert(
+            target:match("^LLVM%w+$") or target:match("^_ZN3lld") or target:match("^_ZN4llvm"),
+            "an unexpected target: " .. target
+        )
+    end
+    local list = read(ROOT .. "/host/include/nupp.exports"):gsub("\r\n", "\n")
+    assert(not list:find("[native-codegen]", 1, true), "host/include/nupp.exports still lists the code generator")
 end
 
 function M.deletedCHostDoesNotContributeCacheInputs()
@@ -1573,9 +1609,11 @@ end
 -- suite made for Linux x86-64, fetched by a `curl` that answers from a table of
 -- hosts and logs each URL it was asked for. What the release host serves is the
 -- case's to say: "codegen" and "kit" are the archives, anything else is served
--- as is. Each archive's digest is pinned unless `pinned` replaces it. A
--- code generator built as a whole provider lists its `features`.
-local function prebuiltFixture(serves, pinned, features)
+-- as is. Each archive's digest is pinned unless `pinned` replaces it. The
+-- code generator archive carries the release's provider, listing its
+-- `features`, and the code generator library unless `noLibrary` leaves it out,
+-- as archives from before the library did.
+local function prebuiltFixture(serves, pinned, features, noLibrary)
     local directory = temporary()
     local root = directory .. "/root"
     local bin = directory .. "/bin"
@@ -1589,7 +1627,10 @@ local function prebuiltFixture(serves, pinned, features)
     }) do
         assert(os.execute("mkdir -p " .. quote(path)) == 0)
     end
-    write(directory .. "/codegen/libnupp_native.so", "a provider with the code generator\n")
+    write(directory .. "/codegen/libnupp_native.so", "the release's provider\n")
+    if not noLibrary then
+        write(directory .. "/codegen/libnupp_codegen.so", "the code generator library\n")
+    end
     if features then
         write(directory .. "/codegen/features", features .. "\n")
     end
@@ -1682,21 +1723,21 @@ end
 
 -- A clean checkout fetches the pinned code generator from the release that
 -- published it, checks it against the digest beside the stage-zero pin, and
--- answers with the provider library unpacked under that digest. The second
--- ask is a cache hit: nothing is fetched again.
+-- answers with the code generator library unpacked under that digest. The
+-- second ask is a cache hit: nothing is fetched again.
 function M.thePrebuiltCodeGeneratorIsFetchedVerifiedAndCached()
     local fixture = prebuiltFixture({["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"})
     local status, output = run(fixture.environment, "prebuilt-codegen x86_64-unknown-linux-gnu", fixture.driver)
     assert(status == 0, "the pinned code generator was not fetched:\n" .. output)
     local library = assert(output:match("([^\n]+)%s*$"))
     assert(
-        library:find("/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so", 1, true),
+        library:find("/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_codegen.so", 1, true),
         "the code generator was not installed under its digest:\n" .. output
     )
     assert(
         read(
-            fixture.directory .. "/cache/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so"
-        ) == "a provider with the code generator\n",
+            fixture.directory .. "/cache/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_codegen.so"
+        ) == "the code generator library\n",
         "the unpacked library is not the published one"
     )
     assert(
@@ -1708,6 +1749,20 @@ function M.thePrebuiltCodeGeneratorIsFetchedVerifiedAndCached()
     local again, againOutput = run(fixture.environment, "prebuilt-codegen x86_64-unknown-linux-gnu", fixture.driver)
     assert(again == 0, "a cached code generator was fetched again:\n" .. againOutput)
     assert(select(2, served(fixture):gsub("\n", "")) == 1, "a cached code generator was fetched again")
+    os.execute("rm -rf " .. quote(fixture.directory))
+end
+
+-- An archive from before the code generator was a library of its own carries
+-- only a provider. It is refused as a code generator by name, rather than
+-- handed to a compiler that finds no `nuppcg_` names in it.
+function M.aPrebuiltArchiveWithoutTheCodegenLibraryIsRefused()
+    local fixture = prebuiltFixture({["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"}, nil, nil, true)
+    local status, output = run(fixture.environment, "prebuilt-codegen x86_64-unknown-linux-gnu", fixture.driver)
+    assert(status ~= 0, "an archive without the code generator library was used:\n" .. output)
+    assert(
+        output:find("has no libnupp_codegen.so; it predates the code generator library", 1, true),
+        "the refusal does not say why:\n" .. output
+    )
     os.execute("rm -rf " .. quote(fixture.directory))
 end
 
@@ -1795,11 +1850,12 @@ esac
     return fixture
 end
 
--- With Cargo unusable, the compiler's own provider is the pinned prebuilt code
--- generator, which a release builds as a whole provider. bin/nupp and stage
--- zero both ask `native-rust` for it, so neither builds Rust (#172).
+-- With Cargo unusable, the compiler's own provider is the one in the pinned
+-- prebuilt code generator archive. bin/nupp and stage zero both ask
+-- `native-rust` for it, so neither builds Rust (#172); stage zero still asks
+-- for `codegen`, which no provider carries any more and selects nothing.
 function M.nativeRustWithoutCargoAnswersThePrebuiltProvider()
-    local fixture = cargolessFixture("base,codegen,uri")
+    local fixture = cargolessFixture("base,uri")
     for _, features in ipairs({"base,uri", "base,uri,codegen", "base,gpu,uri"}) do
         local status, output = run(fixture.environment, "native-rust " .. features, fixture.driver)
         assert(status == 0, "native-rust " .. features .. " needed Cargo:\n" .. output)
@@ -1832,7 +1888,7 @@ end
 -- NUPP_PREBUILT_PROVIDER=0 keeps the prebuilt provider out even without Cargo:
 -- the build asks for Cargo and fetches nothing.
 function M.thePrebuiltProviderCanBeDeclined()
-    local fixture = cargolessFixture("base,codegen,uri")
+    local fixture = cargolessFixture("base,uri")
     fixture.environment.NUPP_PREBUILT_PROVIDER = "0"
     write(fixture.directory .. "/root/rust-toolchain.toml", read(ROOT .. "/rust-toolchain.toml"))
     local status, output = run(fixture.environment, "native-rust base,uri", fixture.driver)

@@ -173,11 +173,11 @@ exit 0
     ):format(quote(fake), quote(record), quote(built), quote(root .. "/stage0.lua"))
     assert(os.execute(environment .. quote(root .. "/bin/nupp") .. " clean") == 0)
     local asked = read(record)
-    -- `codegen` joins the union only where a pinned LLVM is available, which a
-    -- machine naming NUPP_LLVM_PREFIX (CI's) has.
+    -- The code generator is a library of its own, staged beside the provider
+    -- where a pinned LLVM is available; the provider is the same either way.
     local union = "native-rust base,uri"
     assert(
-        asked == union .. "\n" or asked == union .. ",codegen\n",
+        asked == union .. "\n",
         "the launcher requested the wrong development providers: " .. asked
     )
     assert(
