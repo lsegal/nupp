@@ -106,15 +106,15 @@ STAGE0_URL='https://github.com/lsegal/nupp/releases/download/${STAGE0_TAG}/nupp-
 # release carrying the assets is pinned for that platform yet, and a checkout
 # there keeps needing its own LLVM. `stage0-assets.yml` publishes them into a
 # release and prints the lines to paste here.
-PREBUILT_TAG=v0.0.15-nupp-prebuilt.2
+PREBUILT_TAG=v0.0.15-nupp-prebuilt.3
 PREBUILT_CODEGEN_URL='https://github.com/lsegal/nupp/releases/download/${PREBUILT_TAG}/nupp-codegen-${PREBUILT_TARGET}.tar.gz'
 PREBUILT_KIT_URL='https://github.com/lsegal/nupp/releases/download/${PREBUILT_TAG}/nupp-kit-${PREBUILT_TARGET}.tar.gz'
-PREBUILT_CODEGEN_SHA256_LINUX_X86_64=b10b72b201afc796417a892710894e3c2634f2cdd4f38884203713fe4744ffa1
-PREBUILT_CODEGEN_SHA256_MACOS_AARCH64=5da3b29b9332048ab526b9532e140b540896098df82c0089b914add248fc0b20
-PREBUILT_CODEGEN_SHA256_WINDOWS_X86_64=09f6a6d11c213d4f06473f20ea5d6f59bd2579b776ab3824a8497e7ed2fe4952
-PREBUILT_KIT_SHA256_LINUX_X86_64=d2d48e3c9a24a49b141742add5684d399787a9f9602a1837defb1d718ca396ea
-PREBUILT_KIT_SHA256_MACOS_AARCH64=c2b706d96b34ca107b30f407bc40f781428e1ebd83b20aa5e119ff911d0004e0
-PREBUILT_KIT_SHA256_WINDOWS_X86_64=a2656944c6c2b14afd1aa3e2853291295508d8f39f3be9858a6eed5450628fd1
+PREBUILT_CODEGEN_SHA256_LINUX_X86_64=d37b57e7a6919e9d49d51df5272c35d06f69f341bdacd7f280f6ca25a89cfc72
+PREBUILT_CODEGEN_SHA256_MACOS_AARCH64=9d4eb45cb1d41c2a060310b8a274a0cd434fd80c8de1bd0d1f9c54d7b439145d
+PREBUILT_CODEGEN_SHA256_WINDOWS_X86_64=4573e707933df505253ea918d166cded9ec2e4a62a27b4c74f07dfa1b1e1b2de
+PREBUILT_KIT_SHA256_LINUX_X86_64=938dc45557652ebd08be63e5c400e2d8523451e2cae27e43a2ed7b4702fde910
+PREBUILT_KIT_SHA256_MACOS_AARCH64=51b32b31764a3e192be9418206299f5afda116f0b251bf226eca1eee911cee64
+PREBUILT_KIT_SHA256_WINDOWS_X86_64=de32a4b34ff91b9591adbcf3ca859c091988d00e47b930e1528ee28de950fd7c
 
 # Opt-in browser guest inputs. These do not change the native toolchain key.
 # The guest image is built from these sources; no unpublished image is pinned.
