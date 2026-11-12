@@ -23,7 +23,7 @@ export function verifyGuest(repo, source) {
   for (const name of ['matching-source.tar.gz', ...readdirSync(path.join(repo, 'host/notices')).map(name => `notices/${name}`)]) {
     if (!manifest.assets[name]) throw new Error(`Guest distribution is missing ${name}`);
   }
-  for (const file of ['runtime/luajit/bridge.lua', 'runtime/luajit/guest-init.c', 'runtime/luajit/linux.config', 'runtime/luajit/vm-worker.mjs', 'runtime/luajit/assets.mjs']) {
+  for (const file of ['runtime/luajit/bridge.lua', 'runtime/luajit/guest/pid1.nupp', 'runtime/luajit/linux.config', 'runtime/luajit/vm-worker.mjs', 'runtime/luajit/assets.mjs']) {
     if (manifest.inputs?.[file] !== digest(readFileSync(path.join(repo, file)))) throw new Error(`The browser guest is stale: ${file}`);
   }
   for (const [name, record] of Object.entries(manifest.assets)) {

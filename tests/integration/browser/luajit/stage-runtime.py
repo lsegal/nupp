@@ -15,7 +15,7 @@ manifest = json.loads((source / 'guest-manifest.json').read_text())
 for name, record in manifest['assets'].items():
     data = (source / name).read_bytes()
     assert len(data) == record['bytes'] and hashlib.sha256(data).hexdigest() == record['sha256'], name
-for name in ('runtime/luajit/guest-init.c', 'runtime/luajit/linux.config', 'scripts/browser-guest.py'):
+for name in ('runtime/luajit/guest/pid1.nupp', 'runtime/luajit/linux.config', 'scripts/browser-guest.py'):
     assert hashlib.sha256((root / name).read_bytes()).hexdigest() == manifest['inputs'][name], f'compiled guest input changed: {name}'
 shutil.copytree(source, destination)
 data = gzip.decompress((source / 'assets/initramfs.gz').read_bytes())

@@ -1,0 +1,13 @@
+--- The browser guest's `libssp_nonshared.a`.
+---
+--- GCC's i386 PIC stack protector calls a hidden, executable-local trampoline,
+--- which glibc supplies through libc_nonshared. musl exports only the failure
+--- handler itself, so the guest's archive supplies the trampoline.
+module runtime.luajit.guest.ssp
+
+cdef function __stack_chk_fail()
+
+@visibility("hidden")
+export function __stack_chk_fail_local(): nil
+    __stack_chk_fail()
+end
