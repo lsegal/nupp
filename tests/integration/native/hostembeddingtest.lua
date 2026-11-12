@@ -182,6 +182,14 @@ function M.dynamicSdkLinksAndRunsFromC()
             not output:lower():find("luajit", 1, true),
             "the staged embedding library retains a LuaJIT cache dependency:\n" .. output
         )
+        -- Its own install name is @rpath-relative and everything else it
+        -- loads is the system's, so no build-cache path survives staging.
+        for dependency in output:gmatch("\n%s+(%S+)") do
+            assert(
+                dependency:find("^@rpath/") or dependency:find("^/usr/lib/") or dependency:find("^/System/Library/"),
+                "the staged embedding library depends on a build path:\n" .. output
+            )
+        end
     end
 end
 
