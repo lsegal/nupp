@@ -39,7 +39,7 @@ The commands, in the order `nupp help` lists them:
 - [`run`](#run): compile and run a Nupp or Lua program
 - [`import-c`](#import-c): generate typed Nupp bindings from a C header
 - [`migrate`](#migrate): migrate typed foreign source into Nupp
-- [`export-c`](#export-c): export canonical C declarations for Nupp structs and C functions
+- [`export-c`](#export-c): export canonical C declarations for Nupp structs, constants and C functions
 - [`rock`](#rock): create and package typed LuaRocks libraries
 - [`lsp`](#lsp): language-server and semantic source operations
 - [`version`](#version): print the compiler version
@@ -442,6 +442,8 @@ its `cdef function` declarations. The program is written to `--output`.
 `--emit static-library` and `--emit shared-library` build it as a library,
 which needs no `main`; `--archive` links static archives in and `--exports`
 names every symbol the executable or shared library exports.
+`--emit llvm-library` writes the LLVM IR such a library is compiled from,
+for `--triple`, to `--output` or standard output, and links nothing.
 
 Examples:
 
@@ -453,6 +455,7 @@ Examples:
     nupp aot --format json src/kernel.nupp
     nupp aot --emit executable --output build/host src/host.nupp
     nupp aot --emit shared-library --exports nupp.exports --output build/libhost.so src/host.nupp
+    nupp aot --emit llvm-library --triple i686-unknown-linux-gnu src/runtime.nupp
 
 Usage:
   nupp aot [options] FILE
@@ -463,7 +466,8 @@ Arguments:
 Options:
   --emit ARTIFACT  Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or a
                    native program linked as an executable, static-library or
-                   shared-library.
+                   shared-library, or a native library's LLVM IR
+                   (llvm-library).
   --output PATH    Where a native program is written.
   --archive PATH   A static archive a native program links in whole; repeat for
                    more.
@@ -2175,7 +2179,7 @@ planner. `--dry-run` reports the complete plan without writing or removing files
 ### `export-c`
 
 ```text [nupp export-c --help]
-Export canonical C declarations for Nupp structs and C functions.
+Export canonical C declarations for Nupp structs, constants and C functions.
 
 Examples:
 
@@ -2524,8 +2528,8 @@ Commands:
   run              Compile and run a Nupp or Lua program.
   import-c         Generate typed Nupp bindings from a C header.
   migrate          Migrates annotated Lua or retired serialization APIs.
-  export-c         Export canonical C declarations for Nupp structs and C
-                   functions.
+  export-c         Export canonical C declarations for Nupp structs, constants
+                   and C functions.
   rock             Package and check typed LuaRocks libraries.
   lsp              Language-server and semantic source operations.
   version          Print the compiler version.

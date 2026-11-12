@@ -73,6 +73,7 @@ local function luaModule(): voidptr?
         return (0ULL - 2ULL) as voidptr
     end
     -- And null on glibc and musl, so a null handle is no failure here.
+
     return nil
 end
 
@@ -266,6 +267,7 @@ export function ks_rt_bind(): int32
     end
     lua_type = found as function(L: voidptr, index: int32): int32
     bound = true
+
     return 1
 end
 

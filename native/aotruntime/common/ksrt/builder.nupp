@@ -5,7 +5,7 @@ schema the entry was compiled with.
 ]]
 module ksrt.builder
 
-const {type Size} = require("ksrt.build")
+const {type Size, ksSize as toSize} = require("ksrt.build")
 const {
     ksError as raise,
     ksErrorText as raiseText,
@@ -151,10 +151,12 @@ cdef struct Builder
     keys: ShapeKey[64]
     dupIndex: int32
     dupSerial: uint32
+
     --- Where `strtod` says a number ended, and the plan key a lookup reads.
     --- Only the runtime reads them, and generated code sets their bytes aside
     --- with the rest (`runtime.BUILDER_BYTES`).
     ending: voidptr?
+
     probe: ShapeKey
 end
 
@@ -326,8 +328,8 @@ local function ensureFrames(L: voidptr, builder: Builder*): nil
             return
         end
         local bytes = (builder.frameCapacity as integer) * ffi.sizeof(Frame)
-        local frames = lua_newuserdata(L, bytes as Size)
-        memcpy(frames, builder.inlineFrames as voidptr, (16 * ffi.sizeof(Frame)) as Size)
+        local frames = lua_newuserdata(L, toSize(bytes))
+        memcpy(frames, builder.inlineFrames as voidptr, toSize(16 * ffi.sizeof(Frame)))
         builder.frames = frames
         local destination = (builder.frameRootIndex as integer) + 1
         lua_insert(L, math.i32.wrap(destination))
@@ -367,7 +369,7 @@ local function builderBytes(L: voidptr, builder: Builder*, needed: integer): voi
         if size == 0 then
             size = 1
         end
-        local bytes = lua_newuserdata(L, size as Size)
+        local bytes = lua_newuserdata(L, toSize(size))
         if builder.byteRootIndex == 0 then
             builder.byteRootIndex = math.i32.wrap(rootBelow(L, builder))
         else
@@ -441,6 +443,7 @@ local function shapeMarker(L: voidptr, builder: Builder*, shapeIndex: integer, m
         lua_rawgeti(L, markers, marker)
         lua_rawget(L, math.i32.wrap(shapeIndex))
     end
+
     return lua_gettop(L)
 end
 
@@ -650,6 +653,7 @@ local function scalarWanted(L: voidptr, builder: Builder*, eager: boolean): bool
         end
     end
     raise(L, "pull shape entries must be true, false, object shapes, or array shapes")
+
     return false
 end
 
@@ -815,6 +819,7 @@ local function nullWanted(L: voidptr, builder: Builder*, eager: boolean): boolea
         end
     end
     clearPending(L, builder)
+
     return true
 end
 
@@ -824,6 +829,7 @@ local function keyHash(bytes: voidptr, length: integer): uint64
     for at = 0, length - 1 do
         hash = ((hash ~ (byteAt(bytes, at) as uint64)) * 16777619ULL) & 0xffffffffULL
     end
+
     return hash
 end
 
@@ -834,6 +840,7 @@ local function packed(bytes: voidptr, length: integer): uint64
     for at = 0, length - 1 do
         word = word | ((byteAt(bytes, at) as uint64) << (8 * at))
     end
+
     return word
 end
 
@@ -880,7 +887,7 @@ local function planKey(builder: Builder*, plan: ShapePlan*, index: integer, key:
         local header = 12 + index * 24
         local at = blobU32(blob, header + 16) as integer
         local length = blobU32(blob, header) as integer
-        key.length = length as Size
+        key.length = toSize(length)
         key.hash = blobU32(blob, header + 4) as uint32
         key.packed = packed(offset(blob, header + 8), 8)
         local scalar = blobU32(blob, header + 20) as integer
@@ -936,7 +943,7 @@ local function shapePlan(L: voidptr, builder: Builder*, shapeIndex: integer): in
                 builder.planCount = (planCount + 1) as uint32
                 plan.identity = identity
                 plan.compiled = blob
-                plan.compiledLength = compiledLength as Size
+                plan.compiledLength = toSize(compiledLength)
                 plan.first = first as uint32
                 plan.count = count as uint32
                 plan.required = blobU32(blob, 4) | (blobU32(blob, 8) << 32)
@@ -994,7 +1001,7 @@ local function shapePlan(L: voidptr, builder: Builder*, shapeIndex: integer): in
         builder.planCount = (planCount + 1) as uint32
         plan.identity = identity
         plan.compiled = nil
-        plan.compiledLength = 0 as Size
+        plan.compiledLength = toSize(0)
         plan.first = first as uint32
         plan.count = math.u32.wrap((builder.keyCount as integer) - first)
         plan.required = 0ULL
@@ -1182,8 +1189,7 @@ local function builderQuery(L: voidptr, builder: Builder*, query: integer): inte
         local kind = frame.kind as integer
         if query == 1 then
             return kind
-        end
-        if query == 3 then
+        elseif query == 3 then
             if frame.count > 0 then
                 return kind + 256
             end
@@ -1269,6 +1275,7 @@ local function unicodeEscape(L: voidptr, input: voidptr, count: integer, at: int
         raise(L, "AOT value stream has an unmatched low surrogate")
         return 0
     end
+
     return codepoint
 end
 
@@ -1287,6 +1294,7 @@ local function simpleEscape(escaped: integer): integer
     elseif escaped == 116 then
         return 9
     end
+
     return -1
 end
 
@@ -1295,17 +1303,24 @@ local function checkRange(L: voidptr, sourceLength: integer, start: integer, len
         raise(L, "AOT value stream string range is out of bounds")
         return false
     end
+
     return true
 end
 
-local function validateEscapedString(L: voidptr, source: voidptr, sourceLength: integer, start: integer, count: integer): nil
+local function validateEscapedString(
+    L: voidptr,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    count: integer
+): nil
     if not checkRange(L, sourceLength, start, count) then
         return
     end
     local input = offset(source, start)
     local at: integer = 0
     while at < count do
-        local slash = memchr(offset(input, at), BACKSLASH, (count - at) as Size)
+        local slash = memchr(offset(input, at), BACKSLASH, toSize(count - at))
         if slash == nil then
             return
         end
@@ -1332,7 +1347,14 @@ end
 
 --- Decodes the escaped string at `start` into the stream's byte storage,
 --- answering its decoded length.
-local function unescape(L: voidptr, builder: Builder*, source: voidptr, sourceLength: integer, start: integer, count: integer): integer
+local function unescape(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    count: integer
+): integer
     if not checkRange(L, sourceLength, start, count) then
         return 0
     end
@@ -1347,16 +1369,16 @@ local function unescape(L: voidptr, builder: Builder*, source: voidptr, sourceLe
     local at: integer = 0
     local written: integer = 0
     while at < count do
-        local slash = memchr(offset(input, at), BACKSLASH, (count - at) as Size)
+        local slash = memchr(offset(input, at), BACKSLASH, toSize(count - at))
         if slash == nil then
-            memcpy(offset(out, written), offset(input, at), (count - at) as Size)
+            memcpy(offset(out, written), offset(input, at), toSize(count - at))
             written += count - at
             break
         end
         local slashAt = ((slash as uint64) - (input as uint64)) as integer
         local literal = slashAt - at
         if literal ~= 0 then
-            memcpy(offset(out, written), offset(input, at), literal as Size)
+            memcpy(offset(out, written), offset(input, at), toSize(literal))
         end
         written += literal
         at = slashAt + 1
@@ -1385,6 +1407,7 @@ local function unescape(L: voidptr, builder: Builder*, source: voidptr, sourceLe
             return 0
         end
     end
+
     return written
 end
 
@@ -1433,7 +1456,7 @@ local function unescapeIndexed(
         local slashAt = absolute - start
         local literal = slashAt - at
         if literal ~= 0 then
-            memcpy(offset(out, written), offset(input, at), literal as Size)
+            memcpy(offset(out, written), offset(input, at), toSize(literal))
         end
         written += literal
         at = slashAt + 1
@@ -1486,9 +1509,10 @@ local function unescapeIndexed(
         item += 1
     end
     if at < count then
-        memcpy(offset(out, written), offset(input, at), (count - at) as Size)
+        memcpy(offset(out, written), offset(input, at), toSize(count - at))
         written += count - at
     end
+
     return written
 end
 
@@ -1499,9 +1523,16 @@ local function decoded(builder: Builder*): voidptr
     end
 end
 
-local function escapedString(L: voidptr, builder: Builder*, source: voidptr, sourceLength: integer, start: integer, length: integer): nil
+local function escapedString(
+    L: voidptr,
+    builder: Builder*,
+    source: voidptr,
+    sourceLength: integer,
+    start: integer,
+    length: integer
+): nil
     local written = unescape(L, builder, source, sourceLength, start, length)
-    lua_pushlstring(L, decoded(builder), written as Size)
+    lua_pushlstring(L, decoded(builder), toSize(written))
 end
 
 --- Leaves the pending value to the shape entry on top of the stack, which the
@@ -1512,12 +1543,12 @@ local function selectEntry(L: voidptr, builder: Builder*, frame: Frame*, key: vo
     @unsafe do
         if frame.aliases ~= 0 then
             local aliases = math.i32.wrap(shapeMarker(L, builder, frame.shapeIndex, 1))
-            lua_pushlstring(L, key, keyLength as Size)
+            lua_pushlstring(L, key, toSize(keyLength))
             lua_rawget(L, aliases)
             lua_remove(L, aliases)
             if lua_type(L, -1) == TNIL then
                 pop(L, 1)
-                lua_pushlstring(L, key, keyLength as Size)
+                lua_pushlstring(L, key, toSize(keyLength))
             end
             lua_insert(L, entry)
         end
@@ -1528,7 +1559,7 @@ local function selectEntry(L: voidptr, builder: Builder*, frame: Frame*, key: vo
 end
 
 local function selectKnown(L: voidptr, builder: Builder*, frame: Frame*, key: voidptr, keyLength: integer): nil
-    lua_pushlstring(L, key, keyLength as Size)
+    lua_pushlstring(L, key, toSize(keyLength))
     @unsafe do
         if frame.aliases == 0 then
             lua_pushvalue(L, -1)
@@ -1538,7 +1569,14 @@ local function selectKnown(L: voidptr, builder: Builder*, frame: Frame*, key: vo
     selectEntry(L, builder, frame, key, keyLength)
 end
 
-local function selectPlanned(L: voidptr, builder: Builder*, frame: Frame*, index: integer, key: ShapeKey*, start: integer): nil
+local function selectPlanned(
+    L: voidptr,
+    builder: Builder*,
+    frame: Frame*,
+    index: integer,
+    key: ShapeKey*,
+    start: integer
+): nil
     @unsafe do
         local bit = 1ULL << index
         if (frame.seen & bit) ~= 0ULL then
@@ -1593,7 +1631,7 @@ local function keyMatches(
         if keyLength > 7 and (shapeKey.hash as uint64) ~= hash then
             return false
         end
-        return memcmp(shapeKey.bytes, key, keyLength as Size) == 0
+        return memcmp(shapeKey.bytes, key, toSize(keyLength)) == 0
     end
 end
 
@@ -1650,7 +1688,7 @@ local function selectKey(
                 key = decoded(builder)
                 frame = currentFrame(builder)
             end
-            lua_pushlstring(L, key, keyLength as Size)
+            lua_pushlstring(L, key, toSize(keyLength))
             noteKey(L, builder, frame, start, true)
             pop(L, 1)
             builder.pendingMode = BUILD_SKIP
@@ -1660,7 +1698,7 @@ local function selectKey(
             if escaped then
                 escapedString(L, builder, source, sourceLength, start, length)
             else
-                lua_pushlstring(L, key, keyLength as Size)
+                lua_pushlstring(L, key, toSize(keyLength))
             end
             -- The object holds every member under its own name, so it answers
             -- for itself; the set only knows the names a dropped null left
@@ -1741,7 +1779,7 @@ local function selectKey(
         -- Every name the plan does not index goes through the set, whether it
         -- is selected, mapped, refused or skipped. The set may root itself
         -- below the object, so the object's index is read again afterwards.
-        lua_pushlstring(L, key, keyLength as Size)
+        lua_pushlstring(L, key, toSize(keyLength))
         noteKey(L, builder, frame, start, true)
         pop(L, 1)
         local tableIndex = frame.tableIndex
@@ -1751,7 +1789,7 @@ local function selectKey(
                 if lua_type(L, -2) == TSTRING then
                     local shapeKey = lua_tolstring(L, -2, nil) as voidptr
                     local shapeLength = lua_objlen(L, -2) as integer
-                    if shapeLength == keyLength and memcmp(shapeKey, key, keyLength as Size) == 0 then
+                    if shapeLength == keyLength and memcmp(shapeKey, key, toSize(keyLength)) == 0 then
                         if lua_type(L, -1) == TBOOLEAN and lua_toboolean(L, -1) == 0 then
                             lua_settop(L, tableIndex)
                             builder.pendingMode = BUILD_SKIP
@@ -1768,7 +1806,7 @@ local function selectKey(
         lua_settop(L, tableIndex)
         local wildcard = math.i32.wrap(shapeMarker(L, builder, frame.shapeIndex, 2))
         if lua_type(L, wildcard) ~= TNIL then
-            lua_pushlstring(L, key, keyLength as Size)
+            lua_pushlstring(L, key, toSize(keyLength))
             lua_insert(L, wildcard)
             selectEntry(L, builder, frame, key, keyLength)
             return
@@ -1776,7 +1814,7 @@ local function selectKey(
         lua_settop(L, tableIndex)
         local reject = math.i32.wrap(shapeMarker(L, builder, frame.shapeIndex, 3))
         if lua_toboolean(L, reject) ~= 0 then
-            lua_pushlstring(L, key, keyLength as Size)
+            lua_pushlstring(L, key, toSize(keyLength))
             raiseText(L, "nupp: unknown member %s", lua_tolstring(L, -1, nil) as cstring)
             return
         end
@@ -1812,7 +1850,7 @@ local function builderString(
     elseif escaped then
         validateEscapedString(L, source, sourceLength, start, length)
     elseif wanted then
-        lua_pushlstring(L, offset(source, start), length as Size)
+        lua_pushlstring(L, offset(source, start), toSize(length))
     end
     complete(L, builder, wanted, eager)
 end
@@ -1844,7 +1882,7 @@ local function builderStringEscapes(
     end
     local written = unescapeIndexed(L, builder, source, sourceLength, start, length, escapes, escapeIndex, escapeCount)
     if wanted then
-        lua_pushlstring(L, decoded(builder), written as Size)
+        lua_pushlstring(L, decoded(builder), toSize(written))
     end
     complete(L, builder, wanted, eager)
 end
@@ -1853,8 +1891,10 @@ end
 --- token written as an integer.
 local function integerSpelled(source: voidptr, start: integer, length: integer): boolean
     local at = offset(source, start)
-    local count = length as Size
-    return memchr(at, DOT, count) == nil and memchr(at, LETTER_LOWER_E, count) == nil and memchr(at, LETTER_E, count) == nil
+    local count = toSize(length)
+    return memchr(at, DOT, count) == nil
+        and memchr(at, LETTER_LOWER_E, count) == nil
+        and memchr(at, LETTER_E, count) == nil
 end
 
 local function builderNumberSlice(
@@ -1908,7 +1948,13 @@ local function builderNumber(L: voidptr, builder: Builder*, value: number, eager
     complete(L, builder, wanted, eager)
 end
 
-local function builderInteger64(L: voidptr, builder: Builder*, magnitude: uint64, negative: boolean, eager: boolean): nil
+local function builderInteger64(
+    L: voidptr,
+    builder: Builder*,
+    magnitude: uint64,
+    negative: boolean,
+    eager: boolean
+): nil
     local wanted = scalarWanted(L, builder, eager)
     if wanted then
         local value = magnitude as number
@@ -1936,7 +1982,18 @@ local function builderDecimal64(
 ): nil
     local wanted = scalarWanted(L, builder, eager)
     if wanted then
-        local value = decimal64Value(L, endingOf(builder), source, sourceLength, start, length, magnitude, exponent, negative, exact)
+        local value = decimal64Value(
+            L,
+            endingOf(builder),
+            source,
+            sourceLength,
+            start,
+            length,
+            magnitude,
+            exponent,
+            negative,
+            exact
+        )
         scalarValidate(L, builder, eager, TNUMBER, value, 0, negative)
         lua_pushnumber(L, value)
     end
@@ -1954,6 +2011,7 @@ local function eightDigits(source: voidptr, at: integer): integer
         end
         value = value * 10 + byte - DIGIT_0
     end
+
     return value
 end
 
@@ -1987,7 +2045,19 @@ local function numberTokenValue(
     if exponentFits then
         exponent = decimalExponent
     end
-    return decimal64Value(L, endingOf(builder), source, sourceLength, start, length, magnitude, exponent, negative, exact and exponentFits)
+
+    return decimal64Value(
+        L,
+        endingOf(builder),
+        source,
+        sourceLength,
+        start,
+        length,
+        magnitude,
+        exponent,
+        negative,
+        exact and exponentFits
+    )
 end
 
 --- Reads the number token at `start`, before `limit`, and builds it. The
@@ -2160,6 +2230,7 @@ local function builderNumberToken(
         lua_pushnumber(L, value)
     end
     complete(L, builder, wanted, eager)
+
     return 2147483648 + at
 end
 
@@ -2269,6 +2340,7 @@ local function finalizeObject(L: voidptr, builder: Builder*, frame: Frame*): boo
         lua_call(L, 1, 1)
         lua_remove(L, tableIndex)
     end
+
     return true
 end
 
@@ -2530,7 +2602,13 @@ export function ks_rt_builder_number(L: voidptr, builder: voidptr, value: number
 end
 
 @visibility("hidden")
-export function ks_rt_builder_integer64(L: voidptr, builder: voidptr, magnitude: uint64, negative: uint64, eager: uint64): nil
+export function ks_rt_builder_integer64(
+    L: voidptr,
+    builder: voidptr,
+    magnitude: uint64,
+    negative: uint64,
+    eager: uint64
+): nil
     builderInteger64(L, builder as Builder*, magnitude, negative ~= 0ULL, eager ~= 0ULL)
 end
 
@@ -2579,7 +2657,13 @@ export function ks_rt_builder_close(L: voidptr, builder: voidptr, eager: uint64)
 end
 
 @visibility("hidden")
-export function ks_rt_builder_key_scratch(L: voidptr, builder: voidptr, scratch: voidptr, start: uint64, length: uint64): nil
+export function ks_rt_builder_key_scratch(
+    L: voidptr,
+    builder: voidptr,
+    scratch: voidptr,
+    start: uint64,
+    length: uint64
+): nil
     scratchU8Push(L, scratch, (start as uint32) as integer, (length as uint32) as integer)
     builderKey(L, builder as Builder*)
 end
@@ -2641,6 +2725,7 @@ end
 --- The layout facts the runtime table states, so a registrar can check its
 --- blocks and the fields it reads.
 export const BUILDER_BYTES = ffi.sizeof(Builder)
+
 export const BUILDER_DEPTH = ffi.offsetof(Builder, "depth")
 export const BUILDER_FRAMES = ffi.offsetof(Builder, "frames")
 export const BUILDER_INLINE_FRAMES = ffi.offsetof(Builder, "inlineFrames")

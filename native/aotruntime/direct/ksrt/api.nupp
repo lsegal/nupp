@@ -12,7 +12,7 @@ const {type Size} = require("ksrt.build")
 cdef function luaL_addlstring(borrows B: voidptr, borrows s: voidptr, l: Size)
 cdef function luaL_addvalue(borrows B: voidptr)
 cdef function luaL_buffinit(borrows L: voidptr, borrows B: voidptr)
-cdef function luaL_error(borrows L: voidptr, format: cstring, ...): int32
+cdef function luaL_error(borrows L: voidptr, borrows format: cstring, ...): int32
 cdef function luaL_pushresult(borrows B: voidptr)
 cdef function lua_call(borrows L: voidptr, nargs: int32, nresults: int32)
 cdef function lua_checkstack(borrows L: voidptr, extra: int32): int32
@@ -38,7 +38,7 @@ cdef function lua_remove(borrows L: voidptr, index: int32)
 cdef function lua_setmetatable(borrows L: voidptr, index: int32): int32
 cdef function lua_settop(borrows L: voidptr, index: int32)
 cdef function lua_toboolean(borrows L: voidptr, index: int32): int32
-cdef function lua_tolstring(borrows L: voidptr, index: int32, len: voidptr?): voidptr?
+cdef function lua_tolstring(borrows L: voidptr, index: int32, borrows len: voidptr?): voidptr?
 cdef function lua_tonumber(borrows L: voidptr, index: int32): number
 cdef function lua_topointer(borrows L: voidptr, index: int32): voidptr?
 cdef function lua_touserdata(borrows L: voidptr, index: int32): voidptr?
@@ -204,7 +204,7 @@ export function ksToboolean(L: voidptr, index: int32): int32
 end
 
 @visibility("hidden")
-export function ksTolstring(L: voidptr, index: int32, len: voidptr?): voidptr?
+export function ksTolstring(L: voidptr, index: int32, borrows len: voidptr?): voidptr?
     return lua_tolstring(L, index, len)
 end
 

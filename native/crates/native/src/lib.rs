@@ -320,7 +320,7 @@ mod tests {
     fn the_definition_declares_every_export_and_feature_bit() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         // The ABI is defined in Nupp; the C header is generated from it.
-        let definition = std::fs::read_to_string(root.join("../../abi/nupp_native.nupp")).unwrap();
+        let definition = std::fs::read_to_string(root.join("../../abi/nuppnative.nupp")).unwrap();
         for (name, value) in [
             ("BASE", FEATURE_BASE),
             ("URI", FEATURE_URI),

@@ -204,7 +204,7 @@ luaJIT_profile_stop
 luaJIT_profile_dumpstack
 LUAJIT_VERSION_SYM
 
-# The native provider, native/abi/nupp_native.nupp.
+# The native provider, native/abi/nuppnative.nupp.
 nuppNativeAbiVersion
 nuppNativeFeatures
 nuppNativeLastError

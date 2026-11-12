@@ -30,7 +30,7 @@ local function temporary()
     return path
 end
 
-local DEFINITION = ROOT .. "/native/abi/nupp_native.nupp"
+local DEFINITION = ROOT .. "/native/abi/nuppnative.nupp"
 
 --- The header `scripts/native-abi-header` generates from the definition.
 local function header()

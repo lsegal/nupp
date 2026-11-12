@@ -82,7 +82,7 @@ as the provider. So the version stays at 2, and the ABI grows by addition:
 - A symbol can be deleted once no provider module uses it and the pinned
   stage-zero bundle does not name it. `rustabitest` checks that every
   `nuppNative*` name in the pinned bundle is still declared in the ABI's
-  definition, `native/abi/nupp_native.nupp`, and that its version is the one
+  definition, `native/abi/nuppnative.nupp`, and that its version is the one
   the bundle requires. The C header is generated from that definition by
   `scripts/native-abi-header`, and `rustabitest` compiles it and calls the
   provider through it.
