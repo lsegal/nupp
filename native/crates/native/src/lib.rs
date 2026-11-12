@@ -170,7 +170,6 @@ pub extern "C" fn nuppNativeAvailableParallelism() -> usize {
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(no_mangle)]
 /// Answers a readiness generation that never moves.
 ///
 /// Readiness is Nupp's now (`nupp.runtime.native`). The pinned stage-zero

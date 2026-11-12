@@ -15,16 +15,16 @@ The boundary is deliberately narrow:
 
 | Layer | Owner | Responsibilities |
 | --- | --- | --- |
-| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, driving LLVM and lld as the AOT code generator, and the filesystem, process, network, TLS and HTTP services, which call the operating system through FFI |
-| native provider | Rust | clocks, URI, and the readiness generation and its wake handle |
+| language and compiler | Nupp | types, effects, ownership, suspension policy, feature selection, AOT analysis and emission, driving LLVM and lld as the AOT code generator, the filesystem, process, network, TLS and HTTP services, which call the operating system through FFI, and the readiness generation and its wake handle |
+| native provider | Rust | clocks and URI |
 | GPU provider | Nupp | GPU contexts, resources, validation, dispatch, readback, and cost records, over the pinned wgpu-native library |
 | host | Rust | payload discovery, LuaJIT state lifetime, native preload registration, workers, components, embedding handles, and shutdown |
 | VM and compatibility modules | C | LuaJIT and the retained LPeg module |
 | generated AOT | C, platform object code, or shader code | compiler-admitted kernels and their bindings |
 
 Rust resources cross into LuaJIT as fixed-width values and generational
-handles. Nupp code never receives a Rust reference, future, or Tokio handle. Rust executor threads never enter LuaJIT; they
-publish bounded completion records which the owning Lua lane consumes.
+handles. Nupp code never receives a Rust reference, and no Rust thread enters
+LuaJIT.
 
 ## Compiler-selected features
 
@@ -41,7 +41,7 @@ and a GPU-free program stages no wgpu-native library.
 | UUID | `uuid` | provider archive |
 | URI | `uri` | provider archive |
 | HTTP client | `base`: HTTP/1.1 in Nupp over the network and TLS services | none |
-| TCP, UDP, DNS, and Unix path sockets | `base`: Nupp sockets through FFI, sleeping on the wake handle | none |
+| TCP, UDP, DNS, and Unix path sockets | `base`: Nupp sockets through FFI | none |
 | TLS over a network stream | none: TLS 1.2/1.3 and its cryptography in Nupp | none |
 | child processes and pipes | `process` | `native-process` |
 | native GPU compute | none: Nupp over wgpu-native | none: `lib/wgpu_native` beside the program |
@@ -99,27 +99,27 @@ panic's text as the last error.
 
 ### Readiness
 
-The Rust provider keeps one process-wide readiness generation, which its
-families advance when something a caller could be waiting for changes.
-`nuppNativePoll` snapshots it and
-`nuppNativeWait` sleeps until it moves past a snapshot. A caller polls first,
-checks what it is waiting for with the families' non-blocking calls, and waits
-from the snapshot, so an edge after the poll ends the wait at once and none is
-lost.
+`nupp.runtime.native` keeps one readiness generation per Lua state, which a
+family advances with `native.advance` when something a caller could be waiting
+for changes. A family snapshots it first, checks what it is waiting for with
+non-blocking calls, and sleeps from the snapshot, so an edge after the snapshot
+ends the sleep at once and none is lost. One snapshot serves every family in a
+pass.
 
-The families Nupp provides through FFI -- sockets, TLS and HTTP, processes and
-their pipes -- own no thread that could advance the generation. Each sleeps in
-one `poll` (`WSAPoll` or `WaitForMultipleObjects` on Windows) over its own
-handles and the provider's wake handle, so its wait still ends for any
-generation advance, and a scheduler polling every source between bounded waits
-sees whichever family moves first. `nupp.runtime.native` keeps one snapshot for all of them, and each
-family's readiness source sleeps from it. GPU `synchronize` is the exception:
+The families -- sockets, TLS and HTTP, processes and their pipes -- run on the
+state's own thread. Each sleeps in one `poll` (`WSAPoll` or
+`WaitForMultipleObjects` on Windows) over its own handles and the state's wake
+handle, a manual-reset event on Windows and a pipe elsewhere that every advance
+signals. A scheduler polling every source between bounded waits therefore sees
+whichever family moves first. GPU `synchronize` is the exception:
 wgpu-native reports finished work only when asked, so its readiness source
 polls the device and sleeps one bounded slice between polls. It is still a
 suspension, so a task deadline reaches the wait and other tasks run meanwhile.
 
-The per-family poll and wait calls that came before are superseded and stay
-declared, because the pinned stage-zero compiler still calls them.
+The provider's `nuppNativePoll` and `nuppNativeWait`, and the per-family poll
+and wait calls that came before them, are superseded. The two stay exported,
+answering a generation that never moves, because the pinned stage-zero
+compiler still calls them.
 
 ## Native implementations
 
