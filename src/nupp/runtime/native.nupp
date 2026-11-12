@@ -40,8 +40,8 @@ native.BUFFER_TOO_SMALL = 6
 -- into the provider -- a handle's release -- can then run after the library is
 -- gone and jump into unmapped code. Taking one more reference that nothing ever
 -- releases keeps the provider's code there for every finalizer, whatever order
--- the state closes in. Best effort: a platform that
--- cannot be asked keeps the old behaviour.
+-- the state closes in. Best effort: a platform that cannot be asked keeps the
+-- old behaviour.
 local function pin(loaded: any): any
     local library: any = ffi
     pcall(function(): nil
