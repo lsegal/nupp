@@ -1758,12 +1758,10 @@ end
 function M.aPrebuiltArchiveWithoutTheCodegenLibraryIsRefused()
     local fixture = prebuiltFixture({["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"}, nil, nil, true)
     local status, output = run(fixture.environment, "prebuilt-codegen x86_64-unknown-linux-gnu", fixture.driver)
-    assert(status ~= 0, "an archive without the code generator library was used:
-" .. output)
+    assert(status ~= 0, "an archive without the code generator library was used:\n" .. output)
     assert(
         output:find("has no libnupp_codegen.so; it predates the code generator library", 1, true),
-        "the refusal does not say why:
-" .. output
+        "the refusal does not say why:\n" .. output
     )
     os.execute("rm -rf " .. quote(fixture.directory))
 end
