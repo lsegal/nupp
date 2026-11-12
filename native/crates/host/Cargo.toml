@@ -10,9 +10,6 @@ name = "nupp"
 path = "src/lib.rs"
 crate-type = ["rlib", "staticlib", "cdylib"]
 
-[dependencies]
-nupp-native = { path = "../native", default-features = false, features = ["base"] }
-
 [features]
 default = []
 lpeg = []
@@ -22,8 +19,6 @@ native-process = []
 native-tls = []
 native-checksum = []
 native-compression = []
-# The provider's test-only panic probe; no release build selects it.
-native-panic-probe = ["nupp-native/panic-probe"]
 # The embedding ABI starts no workers and refuses a host that declares them;
 # the feature remains so one feature list selects both the host executable and
 # the embedding SDK.

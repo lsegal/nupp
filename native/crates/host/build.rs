@@ -7,6 +7,8 @@ const LUAJIT_PREFIX_ENV: &str = "NUPP_LUAJIT_PREFIX";
 /// Where `scripts/toolchain` wants this build's resolved export list, for the
 /// Linux link of `libnupp.so` it makes from the static archive.
 const EXPORT_LIST_ENV: &str = "NUPP_EXPORT_LIST";
+/// The native provider's static archive, which every embedding links.
+const PROVIDER_ARCHIVE_ENV: &str = "NUPP_NATIVE_PROVIDER_ARCHIVE";
 
 fn main() {
     println!("cargo:rerun-if-env-changed={LUAJIT_PREFIX_ENV}");
@@ -67,6 +69,7 @@ fn main() {
         println!("cargo:rustc-link-lib=static=lpeg");
     }
 
+    provider();
     export_list(&repository, &prefix, &target());
 
     let vmdef = lua_module(&prefix, "vmdef");
@@ -84,6 +87,28 @@ fn main() {
     if !target.contains("windows") && !target.contains("apple") {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+/// Links the native provider's static archive, which `scripts/toolchain`
+/// compiles from `native/provider` (a Nupp native program, with the AOT
+/// runtime in it) and names in NUPP_NATIVE_PROVIDER_ARCHIVE.
+fn provider() {
+    println!("cargo:rerun-if-env-changed={PROVIDER_ARCHIVE_ENV}");
+    let archive = PathBuf::from(
+        env::var_os(PROVIDER_ARCHIVE_ENV)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| panic!("the embedding library needs {PROVIDER_ARCHIVE_ENV}")),
+    );
+    println!("cargo:rerun-if-changed={}", archive.display());
+    let directory = archive.parent().expect("the provider archive has a directory");
+    let name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("lib"))
+        .and_then(|name| name.strip_suffix(".a"))
+        .expect("the provider archive is named lib<name>.a");
+    println!("cargo:rustc-link-search=native={}", directory.display());
+    println!("cargo:rustc-link-lib=static={name}");
 }
 
 /// The symbols `host/include/nupp.exports` names for this build's features,

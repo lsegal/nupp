@@ -23,6 +23,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, ThreadId};
 
+// The native provider, a Nupp native program whose static archive build.rs
+// links (NUPP_NATIVE_PROVIDER_ARCHIVE).
+unsafe extern "C" {
+    fn nuppNativeAbiVersion() -> u32;
+}
+
 const COMPONENT_MAGIC: &[u8] = b"-- NUPP-COMPONENT 1\n";
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -185,10 +191,11 @@ impl HostRuntime {
     }
 
     pub fn owned(open_libraries: bool, executable: Option<&Path>) -> Result<Self, HostError> {
-        // This call links the selected provider crate into every host. The
+        // This call links the native provider's archive into every host. The
         // production build retains dead code and exports dynamic symbols so
         // LuaJIT FFI can resolve the provider's remaining C ABI by name.
-        let _ = nupp_native::nuppNativeAbiVersion();
+        // SAFETY: the provider's ABI version takes nothing and touches nothing.
+        let _ = unsafe { nuppNativeAbiVersion() };
         let lua = Lua::new(open_libraries).map_err(HostError::Lua)?;
         lua.install_host_record().map_err(HostError::Lua)?;
         lua.install_compiled_features(open_libraries)

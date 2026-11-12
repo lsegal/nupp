@@ -1,14 +1,13 @@
 --[[
-The versioned Rust-native provider ABI, an internal boundary between the
-compiler's runtime and the provider built from the same checkout. The pinned
-stage-zero compiler also loads it and requires this version exactly, so the ABI
-grows only by addition: see "Provider ABI evolution" in
-docs/reference/native-runtime.md. A call that returns an int32 status returns
-NUPP_NATIVE_INTERNAL for a panic inside it rather than aborting.
+The versioned native provider ABI, an internal boundary between the compiler's
+runtime and the provider built from the same checkout (native/provider). The
+pinned stage-zero compiler also loads it and requires this version exactly, so
+the ABI grows only by addition: see "Provider ABI evolution" in
+docs/reference/native-runtime.md.
 
 This is the ABI's definition. The header a C consumer includes is generated from
-it (`scripts/native-abi-header`, which runs `nupp export-c`), and the provider's
-own tests hold its exports and feature bits to it.
+it (`scripts/native-abi-header`, which runs `nupp export-c`), and the toolchain
+tests hold the provider's exports and feature bits to it.
 
 A call that copies bytes into caller-owned storage writes the byte count to its
 length output first, then returns BUFFER_TOO_SMALL when the capacity is short.
@@ -69,8 +68,3 @@ cdef function nuppNativeBytesCopy(handle: uint64, data: uint8*?, capacity: uint6
 cdef function nuppNativeBytesRelease(handle: uint64): int32
 
 cdef function nuppNativeAvailableParallelism(): uint64
-
---- Test-only: defined only by a provider built with its panic-probe feature,
---- which no release selects. It panics inside the export boundary, so it
---- returns NUPP_NATIVE_INTERNAL with the panic as the last error.
-cdef function nuppNativePanicProbe(): int32

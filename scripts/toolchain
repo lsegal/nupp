@@ -799,9 +799,9 @@ codegen_archive() {
 
 # The compiler's own native provider, for a checkout with no compiler yet to
 # build one with: the one in the pinned prebuilt code generator archive, built
-# with PREBUILT_PROVIDER_FEATURES. `native-rust` answers with it until there is
+# with PREBUILT_PROVIDER_FEATURES. `native-provider` answers with it until there is
 # a compiler, or whenever NUPP_PREBUILT_PROVIDER=1 asks for it. That is how
-# bin/nupp and the stage-zero compiler both start: each asks `native-rust` for
+# bin/nupp and the stage-zero compiler both start: each asks `native-provider` for
 # a provider, and neither knows where the answer came from. The library is the
 # release's, not this tree's, so a checkout whose provider sources have moved
 # past the pin runs the provider the pin names until its first compiler builds
@@ -1137,7 +1137,7 @@ provider_features() {
     done
 }
 
-# Whether `native-rust` answers with the pinned prebuilt provider rather than
+# Whether `native-provider` answers with the pinned prebuilt provider rather than
 # this checkout's: when NUPP_PREBUILT_PROVIDER=1 asks for it, and otherwise
 # while there is no compiler to build one with.
 prebuilt_provider_wanted() {

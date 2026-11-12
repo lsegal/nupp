@@ -227,7 +227,7 @@ export NUPP_NATIVE_LIBRARY="$LUA_ROOT/build/lib/$RUST_NATIVE_FILENAME"
 # for it (nupp.compiler.aot.llvm.codegen), when the pinned LLVM is built.
 CODEGEN_LIBRARY="$LUA_ROOT/build/lib/$CODEGEN_FILENAME"
 
-# This makes the Rust provider a prerequisite for building Nupp itself, rather
+# This makes the native provider a prerequisite for building Nupp itself, rather
 # than only for a target that asked for a native facility. Stage 0 reaches it
 # while listing the sources it is about to compile, so there is no ordering in
 # which the compiler builds it for itself first.
@@ -242,11 +242,11 @@ llvm_is_available() {
     "$ROOT/scripts/toolchain" llvm --available >/dev/null 2>&1
 }
 
-# Whether a provider built now carries the AOT runtime: once there is a compiler
-# to build it with, and not inside the runtime's own build, which runs this
-# launcher on a provider without it (`scripts/toolchain`, "the AOT runtime").
-aot_runtime_expected() {
-    [ -f "$BUILT" ] && [ "${NUPP_AOT_RUNTIME_ARCHIVE+set}" != set ]
+# Whether a provider staged now is this checkout's own: once there is a
+# compiler to build it with. Before then it is the pinned prebuilt one
+# (`scripts/toolchain`, "the native provider").
+own_provider_expected() {
+    [ -f "$BUILT" ]
 }
 
 # Copies a built library beside its destination and renames it onto it, never
@@ -290,21 +290,25 @@ build_native() {
     # select; unlike a packaged build, `nupp run` loads this one development
     # provider rather than staging a target-specific union beside the program.
     #
-    # A machine without Cargo gets the pinned prebuilt provider from the same
-    # request, without Cargo or rustc being asked anything (`scripts/toolchain`,
-    # "the prebuilt native provider").
-    built=$("$ROOT/scripts/toolchain" native-rust base) || return 1
+    # The provider is a Nupp program, so a checkout with no compiler yet gets
+    # the pinned prebuilt one from the same request (`scripts/toolchain`, "the
+    # prebuilt native provider"). So does the compiler that is building this
+    # checkout's own, should nothing be staged for it to run on.
+    if [ -n "${NUPP_NATIVE_PROVIDER_BUILD:-}" ]; then
+        built=$(NUPP_PREBUILT_PROVIDER=1 "$ROOT/scripts/toolchain" native-provider base) || return 1
+    else
+        built=$("$ROOT/scripts/toolchain" native-provider base) || return 1
+    fi
     mkdir -p "$ROOT/build/lib"
     stage_codegen || return 1
-    # The AOT runtime is a Nupp program, so a provider built before there was a
-    # compiler to build it has none; `native_is_current` asks for another once
-    # there is one.
-    if aot_runtime_expected; then
-        : > "$NUPP_NATIVE_LIBRARY.aotruntime"
+    # A provider staged before there was a compiler is the prebuilt one;
+    # `native_is_current` asks for this checkout's own once there is one.
+    if own_provider_expected && [ -z "${NUPP_NATIVE_PROVIDER_BUILD:-}" ]; then
+        : > "$NUPP_NATIVE_LIBRARY.own"
     else
-        rm -f "$NUPP_NATIVE_LIBRARY.aotruntime"
+        rm -f "$NUPP_NATIVE_LIBRARY.own"
     fi
-    install_library "$built" "$NUPP_NATIVE_LIBRARY" "the Rust native provider"
+    install_library "$built" "$NUPP_NATIVE_LIBRARY" "the native provider"
 }
 
 . "$ROOT/scripts/luajit.sh"
@@ -578,14 +582,10 @@ native_is_current() {
     # The launcher owns the broad development feature union, so changing that
     # union invalidates its staged copy.
     [ ! "$ROOT/bin/nupp" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
-    [ -z "$(find "$ROOT/runtime" "$ROOT/native" "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" -type f \
-        \( -name '*.rs' -o -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.toml' -o -name 'Cargo.lock' \
-            -o -name '*.nupp' \) \
+    [ -z "$(find "$ROOT/native/provider" "$ROOT/native/aotruntime" -type f -name '*.nupp' \
         -newer "$NUPP_NATIVE_LIBRARY" 2>/dev/null | head -n 1)" ] || return 1
     [ ! "$ROOT/scripts/toolchain" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
     [ ! "$ROOT/scripts/toolchain.pins" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
-    [ ! "$ROOT/rust-toolchain.toml" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
-    [ ! "$ROOT/.cargo/config.toml" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
     # A tree staged before the pinned LLVM existed lacks the code generator,
     # and one staged before the code generator's exports moved is stale.
     if [ -f "$CODEGEN_LIBRARY" ]; then
@@ -593,7 +593,7 @@ native_is_current() {
     else
         ! llvm_is_available || return 1
     fi
-    [ -f "$NUPP_NATIVE_LIBRARY.aotruntime" ] || ! aot_runtime_expected
+    [ -f "$NUPP_NATIVE_LIBRARY.own" ] || ! own_provider_expected
 }
 
 # A worker runs on the provider the command that started it staged, for the
@@ -603,7 +603,9 @@ native_is_current() {
 # library under the parent, and inside a worker's address-space ceiling rustc
 # could not even load.
 native_is_usable() {
-    if [ "$worker" = yes ]; then
+    # The compiler building this checkout's provider runs on whichever one is
+    # staged, since asking for a current one would build it again.
+    if [ "$worker" = yes ] || [ -n "${NUPP_NATIVE_PROVIDER_BUILD:-}" ]; then
         [ -f "$NUPP_NATIVE_LIBRARY" ]
         return
     fi

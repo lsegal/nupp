@@ -214,7 +214,3 @@ nuppAotRuntime
 nuppNativeBytesCopy
 nuppNativeBytesRelease
 nuppNativeAvailableParallelism
-
-[native-panic-probe]
-# The provider's test-only panic probe, which no release build selects.
-nuppNativePanicProbe
