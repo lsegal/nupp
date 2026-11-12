@@ -2094,7 +2094,7 @@ build_kit() {
         darwin) build_wgpu_static; kit_wgpu=$WGPU_STATIC ;;
     esac
     # Public feature sets can share a Rust host but advertise different kit metadata.
-    digest=$(printf 'kit-6|%s|%s|%s' "$(basename "$host_out")" "$features" "${kit_wgpu:+$WGPU_VERSION}" \
+    digest=$(printf 'kit-7|%s|%s|%s' "$(basename "$host_out")" "$features" "${kit_wgpu:+$WGPU_VERSION}" \
         | sha256_stdin | cut -c1-16)
     out="$PREFIX/kits/$digest"
     KIT_OUT=$out
@@ -2103,7 +2103,11 @@ build_kit() {
     case "$PLATFORM-$(uname -s)" in
         darwin-*) ;;
         posix-Linux) build_kit_linux "$features" "$host_out" "$out"; release_lock; return 0 ;;
-        windows-*) build_kit_windows "$features" "$host_out" "$out"; release_lock; return 0 ;;
+        windows-*)
+            build_kit_windows "$features" "$host_out" "$out" "$selected_cargo_features"
+            release_lock
+            return 0
+            ;;
         *) die "link kits are built on macOS, Linux and Windows" ;;
     esac
     note "staging the link kit"
@@ -2222,12 +2226,21 @@ build_kit_windows() {
     features=$1
     host_out=$2
     out=$3
+    host_features=$4
     note "staging the link kit"
     rm -rf "$out"
     mkdir -p "$out/lib"
     cp "$host_out/libnupp-host.a" "$out/libnupp-runtime.a"
     cp "$PREFIX/luajit/lib/libluajit-5.1.a" "$out/libluajit-5.1.a"
     cp "$host_out/libnupp-host-imports.a" "$out/lib/libnupp-host-imports.a"
+    # A program linked from the kit's runtime exports what the stub host
+    # exports, so LuaJIT's FFI finds the provider in its own process. The list
+    # also pulls the provider's members out of the runtime archive, which none
+    # of the program's own references reach.
+    {
+        printf 'EXPORTS\n'
+        host_stub_exports "$host_features" "$PREFIX/luajit" | sed 's/^/    /'
+    } > "$out/nupp-runtime.def"
     # A native program linked as a DLL starts from the CRT's DLL startup
     # object where the recorded link has the program's.
     dllcrt=$("$CC" -print-file-name=dllcrt2.o)
@@ -2304,6 +2317,7 @@ EOF
         printf '{\n  "schemaVersion": 1,\n  "platform": "windows",\n  "target": "%s",\n' "$(kit_target)"
         printf '  "features": "%s",\n  "runtime": "libnupp-runtime.a",\n' "$features"
         printf '  "luajit": "libluajit-5.1.a",\n'
+        printf '  "exports": "nupp-runtime.def",\n'
         printf '  "argv": ['
         awk '{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); printf "%s\"%s\"", (NR > 1 ? ", " : ""), $0 }' "$out/argv"
         printf ']\n}\n'

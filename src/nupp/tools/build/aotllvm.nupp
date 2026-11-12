@@ -626,7 +626,8 @@ end
 --- lld's MinGW driver replays it with this program's archives, loaded whole,
 --- where the probe's object was. A DLL starts from the CRT's DLL startup object
 --- in place of the program's, and an export list replaces the probe's export
---- of everything.
+--- of everything. `runtimeExports`, the kit's module definition for its
+--- runtime, adds the runtime's exports to everything else the link exports.
 local function linkWindows(
     kit: string,
     manifest: any,
@@ -634,7 +635,8 @@ local function linkWindows(
     runtime: string,
     archives: {string},
     flags: {string},
-    mode: LinkMode
+    mode: LinkMode,
+    runtimeExports: string?
 ): string?
     if type(manifest.argv) ~= "table" then
         return "the link kit at " .. kit .. " records no link"
@@ -673,6 +675,8 @@ local function linkWindows(
     -- lld's MinGW driver reads a `.def` input as the module definition.
     if mode.exports ~= nil then
         argv[#argv + 1] = mode.exports as string
+    elseif runtimeExports ~= nil then
+        argv[#argv + 1] = runtimeExports as string
     end
     local _, err = codegen.link(argv)
     if err ~= nil then
@@ -725,7 +729,13 @@ local function link(
     if manifest.platform == "linux" then
         return linkLinux(kit, manifest, machine, output, archive, archives, flags, how)
     elseif manifest.platform == "windows" then
-        return linkWindows(kit, manifest, output, archive, archives, flags, how)
+        -- The runtime archive is not loaded whole, so its provider is linked
+        -- and exported only for the names the kit's definition file lists.
+        local definition: string? = nil
+        if runtime == "runtime" and type(manifest.exports) == "string" then
+            definition = kit .. "/" .. (manifest.exports as string)
+        end
+        return linkWindows(kit, manifest, output, archive, archives, flags, how, definition)
     elseif manifest.platform ~= "macos" then
         return "the link kit at " .. kit .. " is for " .. tostring(manifest.platform) .. ", which this nupp cannot link"
     end
