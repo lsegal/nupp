@@ -3,9 +3,11 @@
 
 Two claims, really. The default one is about the compiler: starting from the
 stage zero a checkout is pinned to, it compiles itself three times and the last
-two results must agree. `--binary` is about packaging: the stamped binary must
-stamp another identical to itself, which is what the payload format's
-determinism rests on.
+two results must agree -- its Lua, and the LLVM IR of the native programs it
+ships (the provider, the host, the embedding library), each stage running on
+the provider the stage before it linked. `--binary` is about packaging: the
+stamped binary must stamp another identical to itself, which is what the
+payload format's determinism rests on.
 ]]
 module nupp.tools.cli.fixpoint
 
@@ -27,6 +29,16 @@ local REPORT_SCHEMA = {
         stage0 = {type = "string", description = "The stage-zero compiler the run started from."},
         emittedStage0 = {type = "string", description = "Where the stage-zero bundle was written, if anywhere."},
         bytes = {type = "integer", description = "The size of the verified binary, for --binary."},
+        native = {
+            type = "array",
+            items = {type = "string"},
+            description = "The native programs stages two and three lowered to identical LLVM IR."
+        },
+        nativeRelinked = {
+            type = "boolean",
+            description = "Whether each of those stages ran on the native provider the stage "
+            .. "before it linked, rather than on this process's."
+        },
         reason = {type = "string", description = "Why it failed, in one phrase. Absent when ok is true."},
     },
     required = {"ok", "kind", "diagnostics"},

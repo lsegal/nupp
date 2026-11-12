@@ -1696,12 +1696,11 @@ end
 
 -- What the compiler produced, which is what a fixpoint is a claim about.
 --
--- A native provider is excluded because it is not the compiler's output: Cargo
--- built it, into a target directory named after the stage, and a shared library
--- records the path it was built in. Two stages therefore hold two different
--- files that say the same thing, and comparing them would test Cargo's
--- reproducibility rather than the compiler's. The generated Lua beside them is
--- still compared byte for byte.
+-- A staged native provider is excluded because it is not this stage's output:
+-- a build copies it from the toolchain cache, where the checkout's own compiler
+-- put it, so two stages hold the same file whatever they would have built. The
+-- fixpoint has each stage lower the native programs itself and compares that IR
+-- instead (`nativePrograms`). The generated Lua is compared byte for byte.
 local function treeDigest(path)
     local files, parts = listFiles(path), {}
     for _, file in ipairs(files) do
@@ -2086,16 +2085,18 @@ local function stage0Compiler(root: string, config: manifest.Config): string?, s
     return path, nil
 end
 
---- Runs a compiler to build this project into `outDir`.
+--- Runs a compiler with `args` from the project root.
 ---
 --- `packageRoot` is the output tree that compiler's own modules live in, or nil for a
 --- stage zero, which is one self-contained file and loads nothing beside it.
-local function buildWithCompiler(
+--- `provider` is the native provider it runs on, or nil for the one this process
+--- runs on.
+local function runWithCompiler(
     root: string,
     compiler: string,
     packageRoot: string?,
-    outDir: string,
-    targetName: string?
+    provider: string?,
+    args: {string}
 ): boolean
     local argv = {"luajit"}
     if packageRoot then
@@ -2103,18 +2104,122 @@ local function buildWithCompiler(
         argv[#argv + 1] = "package.path=" .. string.format("%q", packageRoot .. "/?.lua;") .. " .. package.path"
     end
     argv[#argv + 1] = compiler
-    argv[#argv + 1] = "build"
-    argv[#argv + 1] = "--output"
-    argv[#argv + 1] = outDir
-    if targetName then
-        argv[#argv + 1] = "--target"
-        argv[#argv + 1] = targetName
+    for _, arg in ipairs(args) do
+        argv[#argv + 1] = arg
+    end
+    local env: {[string]: string} = {}
+    if not packageRoot then
+        env.NUPP_COMPILER_ROOT = fs.dirname(compiler)
+        env.NUPP_STAGE0 = compiler
+    end
+    if provider then
+        env.NUPP_NATIVE_LIBRARY = provider
     end
 
-    return process.run(argv, {
-        cwd = root,
-        env = not packageRoot and {NUPP_COMPILER_ROOT = fs.dirname(compiler), NUPP_STAGE0 = compiler} or nil
-    }) == 0
+    return process.run(argv, {cwd = root, env = next(env) and env or nil}) == 0
+end
+
+--- Runs a compiler to build this project into `outDir`.
+local function buildWithCompiler(
+    root: string,
+    compiler: string,
+    packageRoot: string?,
+    provider: string?,
+    outDir: string,
+    targetName: string?
+): boolean
+    local args = {"build", "--output", outDir}
+    if targetName then
+        args[#args + 1] = "--target"
+        args[#args + 1] = targetName
+    end
+
+    return runWithCompiler(root, compiler, packageRoot, provider, args)
+end
+
+--- A native program the compiler ships: the provider its runtime loads, the host a
+--- packaged binary runs in, the embedding library. They are Nupp, so they are as much
+--- the compiler's output as its Lua is.
+type NativeProgram = {name: string, entry: string, exports: string?}
+
+--- The native programs this project's compiler ships, their sources written under
+--- `directory` by the project's own toolchain driver, the same one a build asks for
+--- its native providers. A project without one ships none.
+local function nativePrograms(root: string, directory: string): ({NativeProgram}?, string?)
+    local driver = join(root, "scripts/toolchain")
+    if not fs.exists(driver) then
+        return {}, nil
+    end
+    -- Windows hands a spawned command to cmd.exe, which does not read a shebang.
+    local shell = jit.os == "Windows" and "sh.exe" or "sh"
+    local status, output = process.capture({shell, driver, "native-sources", directory}, {cwd = root})
+    if status ~= 0 then
+        return nil, "scripts/toolchain native-sources failed: " .. output
+    end
+    local programs: {NativeProgram} = {}
+    local byName: {[string]: NativeProgram} = {}
+    for line in output:gmatch("[^\r\n]+") do
+        local name, entry = line:match("^program (%S+) (.+)$")
+        if name then
+            local program: NativeProgram = {name = name, entry = entry}
+            programs[#programs + 1] = program
+            byName[name] = program
+        end
+        local exported, file = line:match("^exports (%S+) (.+)$")
+        if exported and byName[exported] then
+            byName[exported].exports = file
+        end
+    end
+    if #programs == 0 then
+        return nil, "scripts/toolchain native-sources named no native program"
+    end
+
+    return programs, nil
+end
+
+--- Has a stage's compiler lower every native program to LLVM IR in `outDir`, one
+--- `NAME.ll` each, and returns the first that would not lower.
+local function lowerNative(
+    root: string,
+    compiler: string,
+    packageRoot: string?,
+    provider: string?,
+    programs: {NativeProgram},
+    outDir: string
+): string?
+    fs.mkdir(outDir)
+    for _, program in ipairs(programs) do
+        local args = {"aot", "--emit", "llvm-library", "--output", join(outDir, program.name .. ".ll"), program.entry}
+        if not runWithCompiler(root, compiler, packageRoot, provider, args) then
+            return program.name
+        end
+    end
+
+    return nil
+end
+
+--- Has a stage's compiler link the native provider into `outDir`, for the next stage
+--- to run on, and returns where it is.
+local function linkProvider(
+    root: string,
+    compiler: string,
+    packageRoot: string?,
+    provider: string?,
+    program: NativeProgram,
+    outDir: string
+): string?
+    local output = join(outDir, deps.sharedLibraryName("nupp_native"))
+    local args = {"aot", "--emit", "shared-library", "--output", output}
+    if program.exports then
+        args[#args + 1] = "--exports"
+        args[#args + 1] = program.exports as string
+    end
+    args[#args + 1] = program.entry
+    if not runWithCompiler(root, compiler, packageRoot, provider, args) then
+        return nil
+    end
+
+    return output
 end
 
 --- Where the compiler a stage built lives, so the next stage can be run from it.
@@ -2164,20 +2269,74 @@ function project.fixpoint(root: string?, opts: project.FixpointOptions?): intege
     end
 
     local stages = {"_stage1", "_stage2", "_stage3"}
+    local nativeDir = join(root, "_native")
     for _, stage in ipairs(stages) do
         removeTree(join(root, stage))
     end
+    removeTree(nativeDir)
+    local programs, programsErr = nativePrograms(root, nativeDir)
+    if not programs then
+        say(opts, "NUPP0004", "nupp: " .. tostring(programsErr) .. "\n")
+        if opts.result then
+            opts.result.reason = "the native programs could not be written"
+        end
+        return 1
+    end
+    local providerProgram: NativeProgram? = nil
+    for _, program in ipairs(programs) do
+        if program.name == "provider" then
+            providerProgram = program
+        end
+    end
+    -- Linking needs a code generator, which a checkout without LLVM or a prebuilt one
+    -- does not have. The native programs are still lowered and compared then; what is
+    -- lost is each stage running on the provider the stage before it built.
+    local relink = providerProgram ~= nil and require("nupp.tools.build.aotllvm").selected() == true
     -- Stage zero is one file that loads nothing beside it; every stage after it is an
-    -- output tree, and is run with that tree on the module path.
+    -- output tree, and is run with that tree on the module path. A stage is everything
+    -- the compiler before it produced: its Lua, its native programs' IR and the
+    -- provider the next stage runs on. Stage one's native programs are not built:
+    -- stage zero lowers with an older release's lowering, which the native sources
+    -- are not held to, as the Lua sources are not held to its generator.
     local compiler: string = stage0
     local packageRoot: string? = nil
-    for _, stage in ipairs(stages) do
-        if not buildWithCompiler(root, compiler, packageRoot, stage, targetName) then
+    local provider: string? = nil
+    for index, stage in ipairs(stages) do
+        if not buildWithCompiler(root, compiler, packageRoot, provider, stage, targetName) then
             say(opts, "NUPP0004", ("nupp: %s did not build %s\n"):format(compiler, stage))
             if opts.result then
                 opts.result.reason = "a stage did not build"
             end
             return 1
+        end
+        if index > 1 and #programs > 0 then
+            local stageNative = join(nativeDir, stage)
+            local failed = lowerNative(root, compiler, packageRoot, provider, programs, stageNative)
+            if failed then
+                say(opts, "NUPP0004", ("nupp: %s did not lower the native %s for %s\n"):format(compiler, failed, stage))
+                if opts.result then
+                    opts.result.reason = "a stage did not lower a native program"
+                end
+                return 1
+            end
+            if relink then
+                local linked = linkProvider(
+                    root,
+                    compiler,
+                    packageRoot,
+                    provider,
+                    providerProgram as NativeProgram,
+                    stageNative
+                )
+                if not linked then
+                    say(opts, "NUPP0004", ("nupp: %s did not link the native provider for %s\n"):format(compiler, stage))
+                    if opts.result then
+                        opts.result.reason = "a stage did not link the native provider"
+                    end
+                    return 1
+                end
+                provider = linked
+            end
         end
         compiler, packageRoot = stageMain(root, config, target, stage), join(root, stage)
     end
@@ -2188,6 +2347,26 @@ function project.fixpoint(root: string?, opts: project.FixpointOptions?): intege
         say(opts, "NUPP0004", "nupp: self-hosting fixpoint mismatch; stages kept for inspection\n")
         if opts.result then
             opts.result.reason = "the two stages differ"
+        end
+        return 1
+    end
+    local differing: {string} = {}
+    for _, program in ipairs(programs) do
+        local name = program.name .. ".ll"
+        if hashFile(join(join(nativeDir, stages[2]), name)) ~= hashFile(join(join(nativeDir, stages[3]), name)) then
+            differing[#differing + 1] = program.name
+        end
+    end
+    if #differing > 0 then
+        say(
+            opts,
+            "NUPP0004",
+            ("nupp: self-hosting fixpoint mismatch in the native %s; stages kept for inspection\n"):format(
+                table.concat(differing, ", ")
+            )
+        )
+        if opts.result then
+            opts.result.reason = "the two stages lower a native program differently"
         end
         return 1
     end
@@ -2202,6 +2381,7 @@ function project.fixpoint(root: string?, opts: project.FixpointOptions?): intege
     for _, stage in ipairs(stages) do
         removeTree(join(root, stage))
     end
+    removeTree(nativeDir)
 
     -- After the verification and from the compiler it verified, which is the whole
     -- claim a published stage zero makes: the bytes another checkout will start from
@@ -2223,12 +2403,29 @@ function project.fixpoint(root: string?, opts: project.FixpointOptions?): intege
         end
     end
 
+    local nativeNames: {string} = {}
+    for _, program in ipairs(programs) do
+        nativeNames[#nativeNames + 1] = program.name
+    end
     if opts.result then
         opts.result.target = targetName
         opts.result.stage0 = stage0
         opts.result.emittedStage0 = opts.emitStage0
+        opts.result.native = nativeNames
+        opts.result.nativeRelinked = relink
     else
         io.write(("fixpoint ok: %s rebuilds itself byte-identically\n"):format(stage0))
+        if #nativeNames > 0 then
+            io.write(
+                (
+                    "native programs lower identically: %s%s\n"
+                ):format(
+                    table.concat(nativeNames, ", "),
+                    relink and " (each stage on the provider the stage before it linked)" or
+                    " (not relinked: no code generator)"
+                )
+            )
+        end
         if opts.emitStage0 then
             io.write(("wrote the stage-zero compiler to %s\n"):format(opts.emitStage0))
         end
