@@ -15,7 +15,7 @@ on:
       - '.github/actions/pinned-llvm/**'
       - '.github/workflows/cross-link.yml'
       - 'native/codegen/**'
-      - 'native/crates/native/c/**'
+      - 'native/provider/**'
       - 'scripts/toolchain'
       - 'scripts/toolchain.pins'
       - 'src/nupp/compiler/aot/llvm/codegen.nupp'

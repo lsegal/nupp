@@ -33,7 +33,7 @@ reachable program and closes their dependencies. The build then asks
 `scripts/toolchain` for an exact-feature provider and host. Default Cargo
 features are disabled, and a GPU-free program stages no wgpu-native library.
 
-| Nupp facility | Rust provider feature | Host feature when linked into a stub |
+| Nupp facility | Provider feature | Host feature when linked into a stub |
 | --- | --- | --- |
 | clocks and timer suspension | `base` | base host |
 | paths and files | none: Nupp calls the operating system through FFI | none |
@@ -66,9 +66,10 @@ is Rust even though C and C++ applications call it.
 
 The provider has one consumer built from a different checkout: the pinned
 stage-zero compiler. A fresh checkout's first build runs the previous release's
-compiler against the provider this checkout has just built, and that compiler
-requires version 2 exactly. Every other caller is built from the same checkout
-as the provider. So the version stays at 2, and the ABI grows by addition:
+compiler against the pinned prebuilt provider, and later ones (`nupp fixpoint`
+included) against the provider this checkout built. That compiler requires
+version 2 exactly. Every other caller is built from the same checkout as the
+provider. So the version stays at 2, and the ABI grows by addition:
 
 - A minor change never renumbers. It adds exports, a feature bit, or an enum
   value an older caller never receives. It does not change a signature, a
@@ -145,9 +146,11 @@ The current implementation choices are:
   bundle file. It is not constant time.
 - Nupp owns the HTTP/1.1 client, connection pooling, streaming, HTTP and SOCKS5
   proxies, and gzip and deflate decoding, over those sockets and TLS.
-- Tokio owns the Rust provider's remaining asynchronous executor.
-- Rust standard APIs, `windows-sys`, and narrow `libc` calls cover the
-  platform details the Rust provider and host need.
+- The native provider itself is a Nupp native program (`native/provider`):
+  the ABI's version and feature bits, its error slot, the machine's
+  parallelism, and the AOT runtime's table, with the runtime compiled in.
+  `scripts/toolchain native-provider` builds it with the checkout's compiler;
+  before there is one, the checkout runs on the pinned prebuilt provider.
 
 These libraries are implementation details. The Nupp modules define the public
 contracts and may intentionally expose less than the underlying crate.

@@ -241,14 +241,14 @@ corresponding false values to allow it. An offline miss names the archive and
 the source-directory setting needed to supply it.
 
 Cargo dependencies use the committed `Cargo.lock` and Cargo checksums rather
-than the archive list above. Provision an offline source tree once, then name it
-for Rust-native builds:
+than the archive list above. The embedding SDK is the one Rust build left.
+Provision an offline source tree once, then name it for that build:
 
 ```sh
 ./scripts/toolchain rust-vendor /opt/nupp-rust-sources
 NUPP_RUST_VENDOR_DIR=/opt/nupp-rust-sources \
 NUPP_HOST_OFFLINE=1 \
-./scripts/toolchain native-rust uri
+./scripts/toolchain host-library lpeg
 ```
 
 An offline Rust build without `NUPP_RUST_VENDOR_DIR` fails before Cargo runs.
@@ -320,7 +320,7 @@ the same macOS bytes unsigned.
 ## Third-party notices
 
 The compiler-owned stub links LuaJIT, its selected LPeg module, and
-one feature-selected Rust provider archive. A stamped binary or provider is a
+the native provider's archive. A stamped binary or provider is a
 distribution of what it links, so the notices ship in
 [`host/NOTICE.md`](https://github.com/nupp-lang/nupp/blob/main/host/NOTICE.md)
 and `host/notices/`. C-source notices are carried as they arrive in the pinned

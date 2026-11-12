@@ -500,7 +500,7 @@ jobs:
         run: ./bin/nupp check
 
       # The Windows host ABI is selected through rustup, then shared by the
-      # Rust provider, application host, and embedding SDK. Exercise that
+      # application host and embedding SDK. Exercise that
       # contract before the expensive native and full-suite gates so a test
       # fixture cannot accidentally model Windows as an invented Unix host.
       #
@@ -538,7 +538,7 @@ jobs:
           export NUPP_COMPILER_ROOT="$compiler_root"
           export NUPP_LUA_CORPUS="$compiler_root/.ci-corpus/teal/tl.lua"
           export NUPP_NATIVE_LIBRARY
-          NUPP_NATIVE_LIBRARY=$(./scripts/toolchain native-rust base)
+          NUPP_NATIVE_LIBRARY=$(./scripts/toolchain native-provider base)
           # `tests/run` refuses to start on Windows without these, the same way
           # the whole-suite step below names them. This step reaches the runner
           # directly rather than through `nupp test`, so it has to name them

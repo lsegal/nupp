@@ -41,10 +41,9 @@ Everything else is provisioned. `scripts/toolchain` fetches LuaJIT, LuaRocks
 and LPeg by pinned revision, refuses any archive whose SHA-256 is not the
 one written down, builds each with that compiler pair, and caches the result
 beside the repository so every worktree shares one build. Cargo resolves the
-Rust-native crates, including networking and TLS, through the committed
-lockfile. The toolchain driver builds Nupp's Rust native providers, executable
-host, and embedding libraries; `bin/nupp` runs it for what is missing and
-nothing more. See [Native runtime and support](https://nupp.dev/reference/native-runtime/)
+embedding SDK's crate through the committed lockfile. The toolchain driver
+builds Nupp's native provider, executable host, and embedding libraries;
+`bin/nupp` runs it for what is missing and nothing more. See [Native runtime and support](https://nupp.dev/reference/native-runtime/)
 for the feature mapping, retained non-Rust boundaries, and release matrix.
 
 ### LuaJIT
@@ -233,7 +232,7 @@ alongside:
 | Carried | How | For |
 | --- | --- | --- |
 | `LuaJIT` | linked into the stub | running anything |
-| Rust native provider | linked into the stub | filesystem, networking, TLS, clocks, payload checks, and child processes |
+| Native provider | linked into the stub | the provider ABI and the AOT runtime |
 | Vendored JSON codec | in the payload | JSON, `--json`, and the LSP |
 | LPeg 1.1 | detected and linked | general PEG and direct LPeg patterns |
 | LPeg `re.lua` | in the payload | runtime textual grammars |

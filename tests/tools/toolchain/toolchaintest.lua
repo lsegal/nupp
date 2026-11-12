@@ -602,7 +602,7 @@ case "$1" in
         [ -f "$ROOT/exact-llvm" ] || exit 1
         printf '%s\n' "$ROOT/exact-prefix"
         ;;
-    native-rust)
+    native-provider)
         printf '%s\n' "$2" > "$ROOT/features"
         printf '%s\n' "$ROOT/provider"
         ;;
@@ -616,7 +616,7 @@ esac
     assert(os.execute("chmod +x " .. quote(root .. "/scripts/toolchain")) == 0)
     local launcher = read(ROOT .. "/bin/nupp")
     local functions = {}
-    for _, name in ipairs({"llvm_is_available", "install_library", "stage_codegen", "build_native"}) do
+    for _, name in ipairs({"llvm_is_available", "own_provider_expected", "install_library", "stage_codegen", "build_native"}) do
         functions[#functions + 1] = assert(launcher:match("(" .. name .. "%(%) {.-\n})"), name)
     end
     local script = directory .. "/stage.sh"
@@ -628,6 +628,7 @@ esac
             forPath(cache .. "/current")
         )
         .. "\n"
+        .. "BUILT=\"$ROOT/build/nupp/tools/main.lua\"\n"
         .. "NUPP_NATIVE_LIBRARY=\"$ROOT/build/lib/provider\"\n"
         .. "CODEGEN_LIBRARY=\"$ROOT/build/lib/codegen\"\n"
         .. table.concat(functions, "\n")
@@ -845,22 +846,6 @@ function M.rustupSelectsOnlyThePinnedToolchain()
     assert(not driver:find("RUSTUP_TOOLCHAIN=stable", 1, true), "the moving stable alias remains a toolchain fallback")
 end
 
--- Cargo gives a macOS cdylib an absolute install name beneath target-dir by
--- default. The Rust provider's target directory is a content cache; recording
--- it would make a linked consumer reach back into that cache after the dylib
--- had been staged or packaged elsewhere.
-function M.macOSRustProviderUsesARelocatableInstallName()
-    local driver = read(ROOT .. "/scripts/toolchain")
-    assert(
-        driver:find('set -- "$CARGO" rustc \\\n        --manifest-path "$ROOT/Cargo.toml" \\\n        --package nupp-native', 1, true),
-        "the Rust provider is not built through cargo rustc"
-    )
-    assert(
-        driver:find("-install_name,@rpath/$filename", 1, true),
-        "the macOS Rust provider records its content-cache path"
-    )
-end
-
 -- A release archive is published by digest, so its bytes are its files' names,
 -- contents and executable bits: not the clock, the user, the umask, or the
 -- extended attributes and AppleDouble files macOS tar adds. The release job
@@ -987,7 +972,7 @@ function M.macOSHostLinkersCarryTheSecurityFramework()
     assert(security >= 1 and foundation >= 1, "not every macOS toolchain linker carries the trust-store frameworks")
 end
 
--- The application archive is the Nupp host merged with the exact-feature Rust
+-- The application archive is the Nupp host merged with the native
 -- provider, LuaJIT and LPeg. Windows links the provider's import members
 -- normally so it does not force-load flattened std/import objects; other hosts
 -- retain the authoritative archive directly.
@@ -1036,7 +1021,7 @@ function M.staticHostsRetainTheRustApplicationArchive()
     end
 
     assert(
-        hasOneCodegenUnit("nupp-native") and hasOneCodegenUnit("nupp-native-host"),
+        hasOneCodegenUnit("nupp-native-host"),
         "the ordinary Windows host archive can split name-resolved Rust exports across codegen units"
     )
     local windowsHost = assert(
@@ -1829,10 +1814,11 @@ function M.anUnpinnedPrebuiltIsRefusedWithoutAFetch()
     assert(read(DRIVER):find("-e '^PREBUILT_'", 1, true), "a prebuilt pin bump rebuilds the native toolchain")
 end
 
--- A fixture for `native-rust` on a machine with no Cargo: the code generator
--- is this machine's prebuilt provider, so the driver is told it runs on Linux
--- x86-64, the platform the fixture pins, whatever the suite runs on.
-local function cargolessFixture(features)
+-- A fixture for `native-provider` in a checkout with no compiler yet: the code
+-- generator is this machine's prebuilt provider, so the driver is told it runs
+-- on Linux x86-64, the platform the fixture pins, whatever the suite runs on.
+-- Cargo is unusable too, since no provider is built with it.
+local function compilerlessFixture(features)
     local fixture = prebuiltFixture({["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"}, nil, features)
     write(
         fixture.directory .. "/bin/uname",
@@ -1850,32 +1836,29 @@ esac
     return fixture
 end
 
--- With Cargo unusable, the compiler's own provider is the one in the pinned
--- prebuilt code generator archive. bin/nupp and stage zero both ask
--- `native-rust` for it, so neither builds Rust (#172); stage zero still asks
--- for `codegen`, which no provider carries any more and selects nothing.
-function M.nativeRustWithoutCargoAnswersThePrebuiltProvider()
-    local fixture = cargolessFixture("base")
-    for _, features in ipairs({"base", "base,codegen"}) do
-        local status, output = run(fixture.environment, "native-rust " .. features, fixture.driver)
-        assert(status == 0, "native-rust " .. features .. " needed Cargo:\n" .. output)
+-- Before a checkout has a compiler to build its own provider with, the one it
+-- runs on is the pinned prebuilt one. bin/nupp asks `native-provider` for it,
+-- and stage zero asks `native-rust`, the name it knows, for `codegen`, which no
+-- provider carries any more and selects nothing.
+function M.aCheckoutWithoutACompilerRunsOnThePrebuiltProvider()
+    local fixture = compilerlessFixture("base")
+    for _, command in ipairs({"native-provider base", "native-rust base,codegen"}) do
+        local status, output = run(fixture.environment, command, fixture.driver)
+        assert(status == 0, command .. " was refused:\n" .. output)
         local library = assert(output:match("([^\n]+)%s*$"))
         assert(
             library:find("/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so", 1, true),
-            "native-rust did not answer the prebuilt provider:\n" .. output
+            command .. " did not answer the prebuilt provider:\n" .. output
         )
-        assert(output:find("prebuilt native provider instead of Cargo", 1, true), "the choice is not said:\n" .. output)
+        assert(output:find("prebuilt native provider", 1, true), "the choice is not said:\n" .. output)
     end
     assert(select(2, served(fixture):gsub("\n", "")) == 1, "the prebuilt provider was not fetched once")
 
-    local status, output = run(fixture.environment, "native-rust base,panic-probe", fixture.driver)
-    assert(status ~= 0, "a feature the prebuilt provider lacks was handed out:\n" .. output)
-    assert(output:find("has no panic-probe feature", 1, true), "the refusal does not say why:\n" .. output)
-
-    -- `gpu` went with the stage-zero pin past #14 (#36), and `uri` with the pin
-    -- past #200 (#206); no provider has either.
-    for _, retired in ipairs({"gpu", "uri"}) do
-        status, output = run(fixture.environment, "native-rust base," .. retired, fixture.driver)
+    -- `gpu` went with the stage-zero pin past #14 (#36), `uri` with the pin
+    -- past #200 (#206), and the panic probe with the Rust provider (#209); no
+    -- provider has any of them.
+    for _, retired in ipairs({"gpu", "uri", "panic-probe"}) do
+        local status, output = run(fixture.environment, "native-provider base," .. retired, fixture.driver)
         assert(status ~= 0, "the retired " .. retired .. " feature was handed out:\n" .. output)
         assert(output:find("has no " .. retired .. " feature", 1, true), "the refusal does not say why:\n" .. output)
     end
@@ -1886,22 +1869,21 @@ end
 -- has no features file. It is refused as a provider rather than handed to a
 -- compiler that cannot tell what it carries.
 function M.aCodeGeneratorWithoutProviderFeaturesIsNotAProvider()
-    local fixture = cargolessFixture(nil)
-    local status, output = run(fixture.environment, "native-rust base", fixture.driver)
+    local fixture = compilerlessFixture(nil)
+    local status, output = run(fixture.environment, "native-provider base", fixture.driver)
     assert(status ~= 0, "a code-generator-only library was handed out as the provider:\n" .. output)
     assert(output:find("carries no provider features", 1, true), "the refusal does not say why:\n" .. output)
     os.execute("rm -rf " .. quote(fixture.directory))
 end
 
--- NUPP_PREBUILT_PROVIDER=0 keeps the prebuilt provider out even without Cargo:
--- the build asks for Cargo and fetches nothing.
+-- NUPP_PREBUILT_PROVIDER=0 keeps the prebuilt provider out even with no
+-- compiler: the build asks for one and fetches nothing.
 function M.thePrebuiltProviderCanBeDeclined()
-    local fixture = cargolessFixture("base")
+    local fixture = compilerlessFixture("base")
     fixture.environment.NUPP_PREBUILT_PROVIDER = "0"
-    write(fixture.directory .. "/root/rust-toolchain.toml", read(ROOT .. "/rust-toolchain.toml"))
-    local status, output = run(fixture.environment, "native-rust base", fixture.driver)
+    local status, output = run(fixture.environment, "native-provider base", fixture.driver)
     assert(status ~= 0, "a declined prebuilt provider was used:\n" .. output)
-    assert(output:find("no Cargo found", 1, true), "the build did not ask for Cargo:\n" .. output)
+    assert(output:find("build it first", 1, true), "the build did not ask for a compiler:\n" .. output)
     assert(served(fixture) == "", "a declined prebuilt provider was fetched:\n" .. served(fixture))
     os.execute("rm -rf " .. quote(fixture.directory))
 end

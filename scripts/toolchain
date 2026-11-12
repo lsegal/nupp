@@ -1203,6 +1203,8 @@ write_aot_runtime_build() {
 # time. Returns 1 when that compiler cannot, for want of a code generator.
 build_native_provider() {
     provider_features "${1:-}"
+    [ -f "$ROOT/build/nupp/tools/main.lua" ] \
+        || die "the native provider is built by this checkout's compiler; build it first (./bin/nupp --version)"
     np_digest=$(printf '%s|%s|%s\n' nupp-native "$(native_provider_digest)" "$KEY" | sha256_stdin | cut -c1-16)
     np_out="$PREFIX/native-provider/$np_digest"
     NATIVE_PROVIDER_OUT="$np_out/$(native_provider_filename)"

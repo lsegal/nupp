@@ -273,7 +273,7 @@ jobs:
           # The stub runs the compiler, which reads its own doc comments
           # through nupp.peg, so it carries LPeg.
           bootstrap_host=$(./scripts/toolchain host lpeg)
-          native_library=$(./scripts/toolchain native-rust files,process)
+          native_library=$(./scripts/toolchain native-provider base)
 
           # Stage 0 through the launcher, which stages the native file provider that
           # listing the compiler's own sources reaches. Stage 1 through the stub, so
