@@ -2376,11 +2376,15 @@ build_kit_linux() {
             awk -v v="$version" '$1 == v { printf "  %s;\n", $3 }' "$stub.exports" >> "$stub.map"
             printf '};\n' >> "$stub.map"
         done
+        # A function is defined under a name of its own and given the export's
+        # through an asm label: some exports are compiler builtins with fixed
+        # types, as aarch64's libgcc_s `__clear_cache` is to clang, which
+        # -fno-builtin does not stop it from checking a definition against.
         awk '{
             size = ($4 == "0") ? 8 : $4
             if ($2 == "TLS") printf "__thread char %s[%s];\n", $3, size
             else if ($2 == "OBJECT") printf "char %s[%s];\n", $3, size
-            else printf "void %s(void) {}\n", $3
+            else printf "void nupp_stub_%d(void) __asm__(\"%s\");\nvoid nupp_stub_%d(void) {}\n", NR, $3, NR
         }' "$stub.exports" > "$stub.c"
         "$CC" -shared -nostdlib -fPIC -w -fno-builtin -o "$out/lib/$soname" "$stub.c" \
             -Wl,--version-script="$stub.map" -Wl,-soname,"$soname"
