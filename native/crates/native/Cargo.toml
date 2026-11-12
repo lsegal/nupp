@@ -13,10 +13,6 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 [features]
 default = ["base"]
 base = []
-uri = ["base", "dep:url"]
 # A test-only export that panics inside the boundary: nuppNativePanicProbe.
 panic-probe = ["base"]
-
-[dependencies]
-url = { version = "2.5.7", optional = true }
 

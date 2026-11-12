@@ -43,12 +43,11 @@ export const NUPP_NATIVE_OUT_OF_RANGE = 7
 export const NUPP_NATIVE_UNAVAILABLE = 8
 
 export const NUPP_NATIVE_FEATURE_BASE = 1
--- Bit 1 was UUIDs, bit 2 the GPU provider, bit 4 HTTP, bits 5 to 7 processes,
--- files and the file-transfer lane, bits 8 and 9 the network and TLS families
--- bit 13 their endpoint calls and bit 14 the readiness generation. Nupp
--- provides all of them now, and bit 11, the code generator, is a library of its
--- own (native/codegen/symbols).
-export const NUPP_NATIVE_FEATURE_URI = 8
+-- Bit 1 was UUIDs, bit 2 the GPU provider, bit 3 URIs, bit 4 HTTP, bits 5 to 7
+-- processes, files and the file-transfer lane, bits 8 and 9 the network and TLS
+-- families bit 13 their endpoint calls and bit 14 the readiness generation.
+-- Nupp provides all of them now, and bit 11, the code generator, is a library
+-- of its own (native/codegen/symbols).
 
 --- The AOT runtime, `nuppAotRuntime`: a provider built before its checkout had
 --- a compiler to build the runtime with has none.
@@ -75,28 +74,3 @@ cdef function nuppNativeAvailableParallelism(): uint64
 --- which no release selects. It panics inside the export boundary, so it
 --- returns NUPP_NATIVE_INTERNAL with the panic as the last error.
 cdef function nuppNativePanicProbe(): int32
-
---- Present when NUPP_NATIVE_FEATURE_URI is set. URI values are immutable
---- generational handles. Text and components are copied into caller-owned
---- storage; `kind` is one of the NUPP_NATIVE_URI_* parts.
-export const NUPP_NATIVE_URI_TEXT = 0
-
-export const NUPP_NATIVE_URI_SCHEME = 1
-export const NUPP_NATIVE_URI_AUTHORITY = 2
-export const NUPP_NATIVE_URI_USERNAME = 3
-export const NUPP_NATIVE_URI_PASSWORD = 4
-export const NUPP_NATIVE_URI_HOST = 5
-export const NUPP_NATIVE_URI_PATH = 6
-export const NUPP_NATIVE_URI_QUERY = 7
-export const NUPP_NATIVE_URI_FRAGMENT = 8
-cdef function nuppNativeUriParse(data: uint8*?, length: uint64, output: uint64*?): int32
-cdef function nuppNativeUriRelease(uri: uint64): int32
-cdef function nuppNativeUriPart(
-    uri: uint64,
-    kind: uint32,
-    output: uint8*?,
-    capacity: uint64,
-    length: uint64*?,
-    present: int32*?
-): int32
-cdef function nuppNativeUriPort(uri: uint64, port: int32*?): int32

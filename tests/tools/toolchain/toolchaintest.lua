@@ -646,7 +646,7 @@ esac
         local prefix = selection == "explicit" and forPath(root .. "/explicit-prefix") or ""
         local status, output = run({NUPP_LLVM_PREFIX = prefix}, "", script)
         assert(status == 0, output)
-        assert(read(root .. "/features") == "base,uri\n", selection .. ": the provider asked for more than base,uri")
+        assert(read(root .. "/features") == "base\n", selection .. ": the provider asked for more than base")
         local staged = io.open(root .. "/build/lib/codegen", "rb")
         local expected = selection ~= "unrelated"
         assert((staged ~= nil) == expected, selection .. ": the staged code generator disagrees with the LLVM found")
@@ -1855,8 +1855,8 @@ end
 -- `native-rust` for it, so neither builds Rust (#172); stage zero still asks
 -- for `codegen`, which no provider carries any more and selects nothing.
 function M.nativeRustWithoutCargoAnswersThePrebuiltProvider()
-    local fixture = cargolessFixture("base,uri")
-    for _, features in ipairs({"base,uri", "base,uri,codegen"}) do
+    local fixture = cargolessFixture("base")
+    for _, features in ipairs({"base", "base,codegen"}) do
         local status, output = run(fixture.environment, "native-rust " .. features, fixture.driver)
         assert(status == 0, "native-rust " .. features .. " needed Cargo:\n" .. output)
         local library = assert(output:match("([^\n]+)%s*$"))
@@ -1872,19 +1872,22 @@ function M.nativeRustWithoutCargoAnswersThePrebuiltProvider()
     assert(status ~= 0, "a feature the prebuilt provider lacks was handed out:\n" .. output)
     assert(output:find("has no panic-probe feature", 1, true), "the refusal does not say why:\n" .. output)
 
-    -- `gpu` went with the stage-zero pin past #14 (#36); no provider has it.
-    status, output = run(fixture.environment, "native-rust base,gpu,uri", fixture.driver)
-    assert(status ~= 0, "the retired gpu feature was handed out:\n" .. output)
-    assert(output:find("has no gpu feature", 1, true), "the refusal does not say why:\n" .. output)
+    -- `gpu` went with the stage-zero pin past #14 (#36), and `uri` with the pin
+    -- past #200 (#206); no provider has either.
+    for _, retired in ipairs({"gpu", "uri"}) do
+        status, output = run(fixture.environment, "native-rust base," .. retired, fixture.driver)
+        assert(status ~= 0, "the retired " .. retired .. " feature was handed out:\n" .. output)
+        assert(output:find("has no " .. retired .. " feature", 1, true), "the refusal does not say why:\n" .. output)
+    end
     os.execute("rm -rf " .. quote(fixture.directory))
 end
 
 -- A code generator built with `codegen` alone, as releases before #172 were,
--- has no `uri` and no features file. It is refused as a provider rather than
--- handed to a compiler that fails on its first URI.
+-- has no features file. It is refused as a provider rather than handed to a
+-- compiler that cannot tell what it carries.
 function M.aCodeGeneratorWithoutProviderFeaturesIsNotAProvider()
     local fixture = cargolessFixture(nil)
-    local status, output = run(fixture.environment, "native-rust base,uri", fixture.driver)
+    local status, output = run(fixture.environment, "native-rust base", fixture.driver)
     assert(status ~= 0, "a code-generator-only library was handed out as the provider:\n" .. output)
     assert(output:find("carries no provider features", 1, true), "the refusal does not say why:\n" .. output)
     os.execute("rm -rf " .. quote(fixture.directory))
@@ -1893,10 +1896,10 @@ end
 -- NUPP_PREBUILT_PROVIDER=0 keeps the prebuilt provider out even without Cargo:
 -- the build asks for Cargo and fetches nothing.
 function M.thePrebuiltProviderCanBeDeclined()
-    local fixture = cargolessFixture("base,uri")
+    local fixture = cargolessFixture("base")
     fixture.environment.NUPP_PREBUILT_PROVIDER = "0"
     write(fixture.directory .. "/root/rust-toolchain.toml", read(ROOT .. "/rust-toolchain.toml"))
-    local status, output = run(fixture.environment, "native-rust base,uri", fixture.driver)
+    local status, output = run(fixture.environment, "native-rust base", fixture.driver)
     assert(status ~= 0, "a declined prebuilt provider was used:\n" .. output)
     assert(output:find("no Cargo found", 1, true), "the build did not ask for Cargo:\n" .. output)
     assert(served(fixture) == "", "a declined prebuilt provider was fetched:\n" .. served(fixture))

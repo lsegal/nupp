@@ -9,8 +9,8 @@ name: Publish the prebuilt code generator with stage zero
 #
 # The code generator archive holds the code generator library (LLVM and lld,
 # which the compiler drives through LuaJIT's FFI) and the release's native
-# provider (`base` and `uri`), so a checkout without Cargo bootstraps the
-# compiler on it too.
+# provider (`base`), so a checkout without Cargo bootstraps the compiler on it
+# too.
 #
 # Run by hand only. It builds the provider with Cargo and LLVM, which is why it
 # never runs on a pull request or on main (#139): nothing a checkout or CI does

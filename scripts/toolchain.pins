@@ -85,8 +85,8 @@ LLVM_DIRECTORY='llvm-project-${LLVM_VERSION}.src'
 # the source the compiler actually loads is reproducible from the tag by anyone
 # who rebuilds it. `scripts/toolchain stage0` verifies it after decompressing
 # and before installing, and an offline builder may supply either spelling.
-STAGE0_TAG=v0.0.15-nupp-readiness.1
-STAGE0_SHA256=db5f5bcf4ba88054a634a43148a9d15c95b5f8d6d43c5a64e7283fdc26f5ae0f
+STAGE0_TAG=v0.0.15-nupp-uri.1
+STAGE0_SHA256=e67c3306f97ecea72ea54cccd4671a8bf94a5697681d17de83412aac41ae6048
 STAGE0_URL='https://github.com/lsegal/nupp/releases/download/${STAGE0_TAG}/nupp-stage0-${STAGE0_TAG}.lua.gz'
 
 # The prebuilt code generator and link kit published beside a stage zero, per
@@ -97,10 +97,10 @@ STAGE0_URL='https://github.com/lsegal/nupp/releases/download/${STAGE0_TAG}/nupp-
 # zero they are fetched, verified and cached by digest, never compiled against,
 # so moving them rebuilds nothing native.
 #
-# The code generator is a whole provider (`base`, `uri` and `codegen`), so a
-# checkout that cannot run Cargo also starts the compiler on it: `native-rust`
-# answers with it when Cargo is missing or NUPP_PREBUILT_PROVIDER=1. A release
-# whose archive predates that carries no `features` file and is refused there.
+# The code generator is a whole provider (`base` and `codegen`), so a checkout
+# that cannot run Cargo also starts the compiler on it: `native-rust` answers
+# with it when Cargo is missing or NUPP_PREBUILT_PROVIDER=1. A release whose
+# archive predates that carries no `features` file and is refused there.
 #
 # The digests are of the archives as published. An empty tag or digest means no
 # release carrying the assets is pinned for that platform yet, and a checkout

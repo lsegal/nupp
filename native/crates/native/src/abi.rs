@@ -112,16 +112,16 @@ impl Handle {
     }
 
     #[cfg_attr(
-        not(feature = "uri"),
-        allow(dead_code, reason = "only URIs store handles")
+        not(test),
+        allow(dead_code, reason = "no export stores a handle any more")
     )]
     pub const fn raw(self) -> u64 {
         self.0
     }
 
     #[cfg_attr(
-        not(feature = "uri"),
-        allow(dead_code, reason = "only URIs store handles")
+        not(test),
+        allow(dead_code, reason = "no export stores a handle any more")
     )]
     fn new(index: usize, generation: u32) -> Self {
         debug_assert!(index < u32::MAX as usize);
@@ -159,8 +159,8 @@ impl<T> Arena<T> {
     }
 
     #[cfg_attr(
-        not(feature = "uri"),
-        allow(dead_code, reason = "only URIs store handles")
+        not(test),
+        allow(dead_code, reason = "no export stores a handle any more")
     )]
     pub fn insert(&mut self, value: T) -> Result<Handle, Status> {
         let index = if let Some(index) = self.free.pop() {

@@ -175,7 +175,7 @@ exit 0
     local asked = read(record)
     -- The code generator is a library of its own, staged beside the provider
     -- where a pinned LLVM is available; the provider is the same either way.
-    local union = "native-rust base,uri"
+    local union = "native-rust base"
     assert(
         asked == union .. "\n",
         "the launcher requested the wrong development providers: " .. asked
