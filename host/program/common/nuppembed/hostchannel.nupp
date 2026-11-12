@@ -88,7 +88,7 @@ export const UNKNOWN = 1
 export const ALREADY_ANSWERED = 2
 
 --- `nupp_value` in host/include/nupp.h.
-export cdef struct HostValue
+cdef struct HostValue
     kind: uint32
     boolean: int32
     number: number
@@ -250,6 +250,9 @@ export function nuppEmbedChannelNew(runtime: uint64): uint64
     return channel as uint64
 end
 
+--- Scratch for draining a map.
+local key: uint64[1]
+
 local function freeRequest(request: uint64)
     @unsafe do
         local r = request as Request*
@@ -278,7 +281,6 @@ end
 --- shutting down.
 export function nuppEmbedChannelClear(channel: uint64): nil
     local c = channel as Channel*
-    local key: uint64[1]
     @unsafe do
         while map.nuppHostMapCount(c.requests) > 0LL do
             freeRequest(map.nuppHostMapTakeAny(c.requests, key))
@@ -651,7 +653,7 @@ local function callHandler(
     local call = erased as function(
         runtime: voidptr?,
         request: uint64,
-        kind: cstring,
+        borrows kind: cstring,
         arguments: voidptr?,
         count: uint64,
         userdata: voidptr?
@@ -855,7 +857,7 @@ end
 local function ready(L: voidptr): int32
     local channel = requiredChannel(L)
     lua_createtable(L, 0, 0)
-    local index = 0
+    local index: integer = 0
     @unsafe do
         local c = channel as Channel*
         while c.readyHead ~= 0ULL do
@@ -916,7 +918,7 @@ end
 local function drain(L: voidptr): int32
     local channel = requiredChannel(L)
     luaL_checktype(L, 1, TTABLE)
-    local slot = 0
+    local slot: integer = 0
     local c = channel as Channel*
     @unsafe do
         while c.pushHead ~= 0ULL do

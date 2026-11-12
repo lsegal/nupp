@@ -64,6 +64,7 @@ cdef function lua_createtable(borrows L: voidptr, narr: int32, nrec: int32)
 cdef function lua_call(borrows L: voidptr, nargs: int32, nresults: int32)
 cdef function luaL_ref(borrows L: voidptr, t: int32): int32
 cdef function luaL_unref(borrows L: voidptr, t: int32, ref: int32)
+cdef function lua_concat(borrows L: voidptr, n: int32)
 
 const REGISTRY = -10000
 const GLOBALS = -10002
@@ -71,7 +72,6 @@ const MULTRET = -1
 
 const TNIL = 0
 const TBOOLEAN = 1
-const TLIGHTUSERDATA = 2
 const TNUMBER = 3
 const TSTRING = 4
 const TTABLE = 5
@@ -83,6 +83,16 @@ const ERRRUN = 2
 --- state's, not a runtime's, because every runtime attached to one state shares
 --- the providers generated code has already observed.
 const HOST_FROZEN_KEY = "nupp.host.frozen"
+const LPEG_MODULE = "lpeg"
+
+--- Scratch for one C call at a time: each is read before anything that could
+--- reach this module again runs.
+local scratchLength: uint64[1]
+local versionMajor: int32[1]
+local versionMinor: int32[1]
+local versionBuild: int64[1]
+local versionConsumed: int32[1]
+local problem: uint8[256]
 
 --- The kinds a managed value has on its way into or out of Lua.
 export const VALUE_NIL = 0
@@ -94,7 +104,7 @@ export const VALUE_REFERENCE = 5
 
 --- One managed value. `data` is borrowed going in; coming out, it is an
 --- allocation of `length` bytes the caller frees, or 0 when `length` is 0.
-export cdef struct Value
+cdef struct Value
     kind: int32
     boolean: int32
     number: number
@@ -105,7 +115,7 @@ end
 
 --- What a protected operation reads and writes. `error` is a failure's text,
 --- allocated, `errorLength` bytes long and terminated.
-export cdef struct Call
+cdef struct Call
     status: int32
     error: uint64
     errorLength: uint64
@@ -124,10 +134,14 @@ end
 
 -- Failures ---------------------------------------------------------------------
 
+local function recordOf(call: uint64): Call*
+    return call as Call*
+end
+
 --- Copies `length` bytes of failure text into the call, replacing any before.
 --- Without memory for the copy the text is dropped, and the caller reports the
 --- failure in its own words.
-local function copyError(borrows call: Call*, text: uint64, length: uint64)
+local function copyError(borrows call: Call*, borrows text: voidptr, length: uint64)
     @unsafe do
         call.status = ERRRUN
         if call.error ~= 0ULL then
@@ -140,7 +154,7 @@ local function copyError(borrows call: Call*, text: uint64, length: uint64)
             return
         end
         if length ~= 0ULL then
-            memcpy(copy as voidptr, text as voidptr, length)
+            memcpy(copy as voidptr, text, length)
         end
         (copy as uint8*)[length as integer] = 0
         call.error = copy as uint64
@@ -149,18 +163,17 @@ local function copyError(borrows call: Call*, text: uint64, length: uint64)
 end
 
 local function fail(borrows call: Call*, borrows text: cstring)
-    copyError(call, text as uint64, strlen(text))
+    copyError(call, text as voidptr, strlen(text))
 end
 
 --- Records the error value on top of the stack. This runs protected, because
 --- converting a numeric error to text may allocate.
 local function capture(borrows L: voidptr, borrows call: Call*, status: int32)
-    local length: uint64[1]
-    local text = lua_tolstring(L, -1, length as voidptr)
+    local text = lua_tolstring(L, -1, scratchLength as voidptr)
     if text == nil then
         fail(call, "unknown LuaJIT error")
     else
-        copyError(call, text as uint64, length[0])
+        copyError(call, text as voidptr, scratchLength[0])
     end
     @unsafe do
         call.status = status
@@ -331,30 +344,26 @@ end
 
 --- Whether `version` names LuaJIT 2.1.1784535649 or newer, spelled exactly.
 local function recentLuaJit(borrows version: cstring): boolean
-    local major: int32[1]
-    local minor: int32[1]
-    local release: int64[1]
-    local consumed: int32[1]
-    consumed[0] = -1
-    if sscanf(version, "LuaJIT %d.%d.%lld%n", major, minor, release, consumed) ~= 3 then
+    versionConsumed[0] = -1
+    if sscanf(version, "LuaJIT %d.%d.%lld%n", versionMajor, versionMinor, versionBuild, versionConsumed) ~= 3 then
         return false
     end
-    if consumed[0] < 0 then
+    if versionConsumed[0] < 0 then
         return false
     end
     @unsafe do
-        if (version as uint8*)[consumed[0] as integer] ~= 0 then
+        if (version as uint8*)[versionConsumed[0] as integer] ~= 0 then
             return false
         end
     end
-    if major[0] ~= 2 then
-        return major[0] > 2
+    if versionMajor[0] ~= 2 then
+        return versionMajor[0] > 2
     end
-    if minor[0] ~= 1 then
-        return minor[0] > 1
+    if versionMinor[0] ~= 1 then
+        return versionMinor[0] > 1
     end
 
-    return release[0] >= 1784535649LL
+    return versionBuild[0] >= 1784535649LL
 end
 
 --- Reads the state's own jit library, raw and through the C API alone, so the
@@ -410,7 +419,7 @@ end
 --- passing a state with no jit library at all only when `allowMissing`.
 export function nuppEmbedLuaVerify(borrows L: voidptr, call: uint64, allowMissing: boolean): int32
     @unsafe do
-        (call as Call*).integer = allowMissing and 1LL or 0LL
+        recordOf(call).integer = allowMissing and 1LL or 0LL
     end
 
     return protect(L, call as Call*, verifyCompatibility)
@@ -471,10 +480,10 @@ local function addFeature(L: voidptr): int32
     return 0
 end
 
-export function nuppEmbedLuaAddFeature(borrows L: voidptr, call: uint64, borrows name: voidptr, length: uint64): int32
+export function nuppEmbedLuaAddFeature(borrows L: voidptr, call: uint64, name: uint64, length: uint64): int32
     @unsafe do
-        (call as Call*).first = name as uint64
-        (call as Call*).firstLength = length
+        recordOf(call).first = name as uint64
+        recordOf(call).firstLength = length
     end
 
     return protect(L, call as Call*, addFeature)
@@ -498,7 +507,7 @@ export function nuppEmbedLuaAddBuildFeatures(borrows L: voidptr, call: uint64, o
         if ends then
             if at > start then
                 local first = @unsafe(((list as uint64) + (start as uint64)) as voidptr)
-                local status = nuppEmbedLuaAddFeature(L, call, first, (at - start) as uint64)
+                local status = nuppEmbedLuaAddFeature(L, call, first as uint64, (at - start) as uint64)
                 if status ~= 0 then
                     return status
                 end
@@ -508,7 +517,7 @@ export function nuppEmbedLuaAddBuildFeatures(borrows L: voidptr, call: uint64, o
         at = at + 1
     end
     if build.LPEG and openLibraries then
-        return nuppEmbedLuaPreload(L, call, "lpeg", build.nuppHostBuildOpenLpeg)
+        return nuppEmbedLuaPreload(L, call, LPEG_MODULE as uint64, build.nuppHostBuildOpenLpeg)
     end
 
     return 0
@@ -534,14 +543,14 @@ end
 export function nuppEmbedLuaAddResource(
     borrows L: voidptr,
     call: uint64,
-    borrows path: cstring,
+    path: uint64,
     data: uint64,
     length: uint64
 ): int32
     @unsafe do
-        (call as Call*).first = path as uint64
-        (call as Call*).second = data
-        (call as Call*).secondLength = length
+        recordOf(call).first = path as uint64
+        recordOf(call).second = data
+        recordOf(call).secondLength = length
     end
 
     return protect(L, call as Call*, addResource)
@@ -567,12 +576,12 @@ end
 export function nuppEmbedLuaPreload(
     borrows L: voidptr,
     call: uint64,
-    borrows module: cstring,
+    module: uint64,
     opener: function(L: voidptr): int32
 ): int32
     @unsafe do
-        (call as Call*).first = module as uint64
-        (call as Call*).opener = opener
+        recordOf(call).first = module as uint64
+        recordOf(call).opener = opener
     end
 
     return protect(L, call as Call*, preloadOpener)
@@ -615,12 +624,12 @@ end
 export function nuppEmbedLuaRegisterAotBuilders(
     borrows L: voidptr,
     call: uint64,
-    borrows key: cstring,
+    key: uint64,
     registrar: function(L: voidptr): int32
 ): int32
     @unsafe do
-        (call as Call*).first = key as uint64
-        (call as Call*).opener = registrar
+        recordOf(call).first = key as uint64
+        recordOf(call).opener = registrar
     end
 
     return protect(L, call as Call*, registerAotBuilders)
@@ -672,9 +681,9 @@ export function nuppEmbedLuaInstallHostChannel(
     opener: function(L: voidptr): int32
 ): int32
     @unsafe do
-        (call as Call*).first = channel
-        (call as Call*).opener = opener
-        (call as Call*).answer = 0LL
+        recordOf(call).first = channel
+        recordOf(call).opener = opener
+        recordOf(call).answer = 0LL
     end
 
     return protect(L, call as Call*, installHostChannel)
@@ -699,7 +708,7 @@ end
 
 export function nuppEmbedLuaClearHostChannel(borrows L: voidptr, call: uint64, channel: uint64): int32
     @unsafe do
-        (call as Call*).first = channel
+        recordOf(call).first = channel
     end
 
     return protect(L, call as Call*, clearHostChannel)
@@ -742,7 +751,7 @@ end
 
 local function installComponent(L: voidptr): int32
     local call = callOf(L)
-    local status = 0
+    local status: int32 = 0
     @unsafe do
         status = luaL_loadbuffer(L, call.first as voidptr, call.firstLength, call.second as cstring)
     end
@@ -757,12 +766,11 @@ local function installComponent(L: voidptr): int32
         fail(call, "a Nupp component descriptor did not return a table")
         return 0
     end
-    local problem: uint8[160]
     lua_getfield(L, -1, "format")
     local format = lua_tointeger(L, -1)
     lua_settop(L, -2)
     if format ~= 1LL then
-        snprintf(problem, 160ULL, "unsupported Nupp component format %d", format as int32)
+        snprintf(problem, 256ULL, "unsupported Nupp component format %d", format as int32)
         fail(call, problem as cstring)
         return 0
     end
@@ -772,7 +780,7 @@ local function installComponent(L: voidptr): int32
     if hostAbi ~= 1LL then
         snprintf(
             problem,
-            160ULL,
+            256ULL,
             "Nupp component requires compiler host ABI %d, but this runtime provides ABI 1",
             hostAbi as int32
         )
@@ -809,12 +817,12 @@ export function nuppEmbedLuaInstallComponent(
     call: uint64,
     chunk: uint64,
     length: uint64,
-    borrows name: cstring
+    name: uint64
 ): int32
     @unsafe do
-        (call as Call*).first = chunk
-        (call as Call*).firstLength = length
-        (call as Call*).second = name as uint64
+        recordOf(call).first = chunk
+        recordOf(call).firstLength = length
+        recordOf(call).second = name as uint64
     end
 
     return protect(L, call as Call*, installComponent)
@@ -864,9 +872,9 @@ export function nuppEmbedLuaStartComponent(
     count: uint64
 ): int32
     @unsafe do
-        (call as Call*).integer = reference as int64
-        (call as Call*).values = arguments
-        (call as Call*).count = count
+        recordOf(call).integer = reference as int64
+        recordOf(call).values = arguments
+        recordOf(call).count = count
     end
 
     return protect(L, call as Call*, startComponent)
@@ -898,10 +906,10 @@ end
 
 --- Roots the export `name` of the component `component` roots. The call
 --- answers the new reference.
-export function nuppEmbedLuaFindExport(borrows L: voidptr, call: uint64, component: int32, borrows name: cstring): int32
+export function nuppEmbedLuaFindExport(borrows L: voidptr, call: uint64, component: int32, name: uint64): int32
     @unsafe do
-        (call as Call*).integer = component as int64
-        (call as Call*).first = name as uint64
+        recordOf(call).integer = component as int64
+        recordOf(call).first = name as uint64
     end
 
     return protect(L, call as Call*, findExport)
@@ -920,9 +928,8 @@ local function addPackagePath(L: voidptr): int32
     end
     lua_getfield(L, -1, "path")
     local existing: voidptr? = nil
-    local existingLength: uint64[1]
     if lua_type(L, -1) == TSTRING then
-        existing = lua_tolstring(L, -1, existingLength as voidptr)
+        existing = lua_tolstring(L, -1, scratchLength as voidptr)
     end
     @unsafe do
         local directory = call.first as voidptr
@@ -935,7 +942,7 @@ local function addPackagePath(L: voidptr): int32
     if existing == nil then
         lua_pushstring(L, "")
     else
-        lua_pushlstring(L, existing as voidptr, existingLength[0])
+        lua_pushlstring(L, existing as voidptr, scratchLength[0])
     end
     lua_concat(L, 5)
     lua_setfield(L, -3, "path")
@@ -943,11 +950,9 @@ local function addPackagePath(L: voidptr): int32
     return 0
 end
 
-cdef function lua_concat(borrows L: voidptr, n: int32)
-
-export function nuppEmbedLuaAddPackagePath(borrows L: voidptr, call: uint64, borrows directory: cstring): int32
+export function nuppEmbedLuaAddPackagePath(borrows L: voidptr, call: uint64, directory: uint64): int32
     @unsafe do
-        (call as Call*).first = directory as uint64
+        recordOf(call).first = directory as uint64
     end
 
     return protect(L, call as Call*, addPackagePath)
@@ -956,7 +961,6 @@ end
 --- Takes the member `second` of the table on top of the stack, which `first`
 --- names when it is a module, and roots it.
 local function takeMember(borrows L: voidptr, borrows call: Call*)
-    local problem: uint8[256]
     local owner = "the managed value"
     @unsafe do
         if call.first ~= 0ULL then
@@ -1003,12 +1007,12 @@ end
 export function nuppEmbedLuaModuleMember(
     borrows L: voidptr,
     call: uint64,
-    borrows module: cstring,
-    borrows name: cstring
+    module: uint64,
+    name: uint64
 ): int32
     @unsafe do
-        (call as Call*).first = module as uint64
-        (call as Call*).second = name as uint64
+        recordOf(call).first = module as uint64
+        recordOf(call).second = name as uint64
     end
 
     return protect(L, call as Call*, moduleMember)
@@ -1026,11 +1030,11 @@ end
 
 --- Roots `value[name]` for the value `value` roots. The call answers the new
 --- reference.
-export function nuppEmbedLuaValueMember(borrows L: voidptr, call: uint64, value: int32, borrows name: cstring): int32
+export function nuppEmbedLuaValueMember(borrows L: voidptr, call: uint64, value: int32, name: uint64): int32
     @unsafe do
-        (call as Call*).first = 0ULL
-        (call as Call*).integer = value as int64
-        (call as Call*).second = name as uint64
+        recordOf(call).first = 0ULL
+        recordOf(call).integer = value as int64
+        recordOf(call).second = name as uint64
     end
 
     return protect(L, call as Call*, valueMember)
@@ -1048,7 +1052,7 @@ end
 --- Gives a reference back to the registry.
 export function nuppEmbedLuaRelease(borrows L: voidptr, call: uint64, reference: int32): int32
     @unsafe do
-        (call as Call*).integer = reference as int64
+        recordOf(call).integer = reference as int64
     end
 
     return protect(L, call as Call*, release)
@@ -1093,17 +1097,16 @@ local function takeValue(borrows L: voidptr, borrows call: Call*, index: int32, 
             value.kind = VALUE_NUMBER
             value.number = lua_tonumber(L, index)
         elseif kind == TSTRING then
-            local length: uint64[1]
-            local text = lua_tolstring(L, index, length as voidptr)
+            local text = lua_tolstring(L, index, scratchLength as voidptr)
             value.kind = VALUE_BYTES
-            value.length = length[0]
-            if length[0] ~= 0ULL and text ~= nil then
-                local copy = malloc(length[0])
+            value.length = scratchLength[0]
+            if scratchLength[0] ~= 0ULL and text ~= nil then
+                local copy = malloc(scratchLength[0])
                 if copy == nil then
                     fail(call, "out of memory copying a managed result")
                     return false
                 end
-                memcpy(copy as voidptr, text as voidptr, length[0])
+                memcpy(copy as voidptr, text as voidptr, scratchLength[0])
                 value.data = copy as uint64
             end
         else
@@ -1173,11 +1176,11 @@ export function nuppEmbedLuaCallFunction(
     count: uint64
 ): int32
     @unsafe do
-        (call as Call*).integer = callable as int64
-        (call as Call*).first = arguments
-        (call as Call*).count = count
-        (call as Call*).values = 0ULL
-        (call as Call*).answer = 0LL
+        recordOf(call).integer = callable as int64
+        recordOf(call).first = arguments
+        recordOf(call).count = count
+        recordOf(call).values = 0ULL
+        recordOf(call).answer = 0LL
     end
 
     return protect(L, call as Call*, callValues)
@@ -1187,7 +1190,7 @@ end
 export function nuppEmbedLuaCallValues(call: uint64): uint64
     @unsafe do
         local values = (call as Call*).values
-        (call as Call*).values = 0ULL
+        recordOf(call).values = 0ULL
         return values
     end
 end
