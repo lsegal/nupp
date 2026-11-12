@@ -219,6 +219,20 @@ pub unsafe extern "C" fn nuppNativeWait(
     })
 }
 
+#[unsafe(no_mangle)]
+/// Opens no handle: the wake handle is Nupp's now. The pinned stage-zero
+/// compiler's runtime still asks for one, and without it sleeps in bounded
+/// slices, so the export stays until the pin moves past it.
+pub extern "C" fn nuppNativeWakeOpen(_handle: *mut u64) -> i32 {
+    boundary(|| failed(Status::Unavailable, "the provider opens no wake handle"))
+}
+
+#[unsafe(no_mangle)]
+/// Refuses every handle, since `nuppNativeWakeOpen` opens none.
+pub extern "C" fn nuppNativeWakeClose(_handle: u64) -> i32 {
+    boundary(|| failed(Status::InvalidArgument, "wake handle is not open"))
+}
+
 #[cfg(feature = "panic-probe")]
 #[unsafe(no_mangle)]
 /// Panics inside the export boundary, for tests that cross a provider panic
@@ -331,6 +345,9 @@ mod tests {
         assert_eq!(unsafe { nuppNativeWait(seen, 0, &mut found) }, 0);
         assert_eq!(found, seen);
         assert!(nuppNativeFeatures() & (1 << 14) == 0, "readiness is Nupp's");
+        let mut handle = 0;
+        assert_eq!(nuppNativeWakeOpen(&mut handle), Status::Unavailable.code());
+        assert_eq!(nuppNativeWakeClose(handle), Status::InvalidArgument.code());
         assert_eq!(
             unsafe { nuppNativePoll(ptr::null_mut()) },
             Status::InvalidArgument.code()

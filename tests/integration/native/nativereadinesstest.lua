@@ -125,7 +125,7 @@ function M.theFamiliesThatSleepOnReadinessNeedNoRustProvider()
     local source = file:read("*a")
     file:close()
     assert(not source:find("nuppNativePoll", 1, true), "readiness still polls the Rust provider")
-    assert(not source:find("nuppNativeWake", 1, true), "readiness still opens the Rust provider's wake handle")
+    assert(not source:find("nuppNativeWakeOpen", 1, true), "readiness still opens the Rust provider's wake handle")
 end
 
 return M

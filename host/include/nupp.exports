@@ -215,6 +215,8 @@ nuppNativeBytesCopy
 nuppNativeBytesRelease
 nuppNativePoll
 nuppNativeWait
+nuppNativeWakeOpen
+nuppNativeWakeClose
 nuppNativeAvailableParallelism
 
 [native-panic-probe]

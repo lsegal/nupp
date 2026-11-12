@@ -365,8 +365,7 @@ local function openWake(): any?
     local O_NONBLOCK: integer = ffi.os == "OSX" and 0x4 or 0x800
     for _, descriptor in ipairs({read, write}) do
         local flags = C.nupp_native_fcntl(descriptor, F_GETFL, ffi.new("int", 0))
-        if
-            flags < 0
+        if flags < 0
             or C.nupp_native_fcntl(descriptor, F_SETFL, ffi.new("int", flags | O_NONBLOCK)) ~= 0
             or C.nupp_native_fcntl(descriptor, F_SETFD, ffi.new("int", FD_CLOEXEC)) ~= 0
         then

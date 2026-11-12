@@ -116,10 +116,11 @@ wgpu-native reports finished work only when asked, so its readiness source
 polls the device and sleeps one bounded slice between polls. It is still a
 suspension, so a task deadline reaches the wait and other tasks run meanwhile.
 
-The provider's `nuppNativePoll` and `nuppNativeWait`, and the per-family poll
-and wait calls that came before them, are superseded. The two stay exported,
-answering a generation that never moves, because the pinned stage-zero
-compiler still calls them.
+The provider's `nuppNativePoll`, `nuppNativeWait`, `nuppNativeWakeOpen` and
+`nuppNativeWakeClose`, and the per-family poll and wait calls that came before
+them, are superseded. The four stay exported, answering a generation that never
+moves and opening no wake handle, because the pinned stage-zero compiler still
+names them.
 
 ## Native implementations
 
