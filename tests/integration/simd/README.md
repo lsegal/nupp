@@ -19,7 +19,7 @@ x64, baseline, AVX2, AVX512F and NEON.
 The ordinary integration jobs stay separate.
 `runtime-boundaries.json` records modeled layouts outside those execution rows.
 Windows ARM64 and Windows32 are not supported by the native toolchain: it
-explicitly accepts only x86_64 GNU/GNU-LLVM Rust hosts. Linux32 has a modeled
+explicitly accepts only x86_64 MinGW hosts. Linux32 has a modeled
 layout and SIMD target but no provisioned 32-bit process in this matrix; it is
 recorded as not executed. A target layout is not evidence of a working runtime.
 
