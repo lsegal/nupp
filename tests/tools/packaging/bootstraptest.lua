@@ -202,11 +202,11 @@ local function plantedTree(stage0Body)
     -- keyed on is newer than the library -- and the pins file above is one of
     -- those. Staged for real, this tree has no `rust-toolchain.toml` to name a
     -- toolchain with, so the build these cases are watching never starts. Each
-    -- carries the marker of a provider built with the code generator, or a
-    -- machine that names a pinned LLVM (CI's does) stages it again for that.
+    -- has a code generator library beside it, or a machine that names a pinned
+    -- LLVM (CI's does) stages the provider again to link one.
     for _, name in ipairs({"libnupp_native_dev.dylib", "libnupp_native_dev.so", "nupp_native_dev.dll",}) do
         plant("build/lib/" .. name, "")
-        plant("build/lib/" .. name .. ".codegen", "")
+        plant("build/lib/" .. name:gsub("nupp_native", "nupp_codegen"), "")
     end
 
     local env = (

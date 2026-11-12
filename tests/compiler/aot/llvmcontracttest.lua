@@ -128,13 +128,13 @@ function M.compileRefusesBadOptionsBeforeTheProvider()
     assert(tostring(err):find("codegen opt `9` is not 0-3", 1, true), tostring(err))
 end
 
--- A prebuilt provider that cannot be opened is refused with its path, and is
--- not taken up in place of the process's own.
+-- A prebuilt code generator that cannot be opened is refused with its path,
+-- and is not taken up in place of the one this process already reaches.
 function M.aPrebuiltCodeGeneratorThatCannotBeLoadedIsRefused()
     local available = codegen.available()
-    local missing = "/nonexistent/nupp-prebuilt/libnupp_native.so"
+    local missing = "/nonexistent/nupp-prebuilt/libnupp_codegen.so"
     local err = codegen.useLibrary(missing)
-    assert(err and err:find("cannot load the prebuilt code generator " .. missing, 1, true), tostring(err))
+    assert(err and err:find("cannot load the code generator " .. missing, 1, true), tostring(err))
     assert(codegen.available() == available, "a refused prebuilt changed whether the code generator is available")
 end
 
@@ -193,6 +193,192 @@ function M.compiledKernelsVerifyCleanWhereLlvmIsLinked()
         assert(compiled.optimizedIr == nil, triple .. ": the optimized IR was not asked for")
         assert(compiled.report:find("object%-bytes=%d+\n$"), triple .. ": " .. compiled.report)
     end
+end
+
+local FUSIBLE = [[
+define double @blessed(double %a, double %b, double %c) #0 {
+  %r = call double @llvm.fmuladd.f64(double %a, double %b, double %c)
+  ret double %r
+}
+define double @flagged(double %a, double %b, double %c) #0 {
+  %m = fmul contract double %a, %b
+  %r = fadd contract double %m, %c
+  ret double %r
+}
+attributes #0 = { nounwind }
+]]
+
+-- The functions of an assembly listing, each with its own lines.
+local function functionsOf(assembly)
+    local bodies, current = {}, nil
+    for line in assembly:gmatch("[^\n]+") do
+        local label = line:match("^_?([%w_]+):")
+        if label == "blessed" or label == "flagged" then
+            current = label
+            bodies[current] = ""
+        elseif current then
+            bodies[current] = bodies[current] .. line .. "\n"
+        end
+    end
+
+    return bodies
+end
+
+-- Fusion is strict: `llvm.fmuladd` alone is not licence to form a fused
+-- multiply-add, which LLVM's default mode would take it as. An instruction's
+-- own `contract` flag still is, so the target demonstrably could fuse both.
+function M.onlyContractFlagsFuseAMultiplyAdd()
+    if not codegen.available() then
+        return
+    end
+    for triple, fused in pairs({["x86_64-unknown-linux-gnu"] = "vfmadd", ["arm64-apple-macosx11.0.0"] = "fmadd"}) do
+        local options = {triple = triple, opt = "3", assembly = "1"}
+        if triple:find("^x86_64") then
+            options.features = "+avx2,+fma"
+        end
+        local compiled = assert(codegen.compile(FUSIBLE, "fusible", options))
+        local bodies = functionsOf(compiled.assembly)
+        assert(bodies.blessed and bodies.flagged, triple .. ": no listing of both functions:\n" .. compiled.assembly)
+        assert(not bodies.blessed:find(fused, 1, true), triple .. ": fmuladd was fused:\n" .. bodies.blessed)
+        assert(bodies.flagged:find(fused, 1, true), triple .. ": contract flags were not fused:\n" .. bodies.flagged)
+    end
+end
+
+function M.invalidIrIsAnErrorNotAnAbort()
+    if not codegen.available() then
+        return
+    end
+    local compiled, err = codegen.compile("define void @f() { ret i32 1 }", "bad", {triple = "x86_64-unknown-linux-gnu"})
+    assert(compiled == nil)
+    assert(tostring(err):find("bad", 1, true), tostring(err))
+end
+
+local function scratch(suffix)
+    return require("nupp.compiler.process").tmpname() .. suffix
+end
+
+local function contents(path)
+    local file = io.open(path, "rb")
+    if not file then
+        return nil
+    end
+    local text = file:read("*a")
+    file:close()
+
+    return text
+end
+
+local function writeTo(path, text)
+    local file = assert(io.open(path, "wb"))
+    file:write(text)
+    file:close()
+end
+
+-- An ELF object of the kernel, written to a scratch file.
+local function kernelObject()
+    local compiled = assert(codegen.compile(KERNEL, "scale", {triple = "x86_64-unknown-linux-gnu"}))
+    local path = scratch(".o")
+    writeTo(path, compiled.object)
+
+    return path
+end
+
+-- lld runs in process, more than once in one process, and a failed link
+-- answers with what lld printed rather than ending nupp.
+function M.lldLinksAndReportsWhatItPrinted()
+    if not codegen.available() then
+        return
+    end
+    local object = kernelObject()
+    local missing = scratch(".absent.o")
+    for _ = 1, 2 do
+        local output = scratch(".so")
+        local messages, err = codegen.link({"ld.lld", "-shared", object, "-o", output})
+        assert(messages, tostring(err))
+        assert(contents(output):sub(1, 4) == "\127ELF", "lld wrote no shared object")
+        os.remove(output)
+    end
+    local messages, err = codegen.link({"ld.lld", missing, "-o", scratch(".so")})
+    assert(messages == nil, "a link of a missing object succeeded")
+    assert(tostring(err):find("lld exited 1", 1, true), tostring(err))
+    assert(tostring(err):find(missing, 1, true), tostring(err))
+    os.remove(object)
+end
+
+-- An archive is indexed by the members' definitions, and deterministic: the
+-- same members give the same bytes.
+function M.archivesAreIndexedAndDeterministic()
+    if not codegen.available() then
+        return
+    end
+    local object = kernelObject()
+    for _, format in ipairs({"gnu", "darwin"}) do
+        local first, second = scratch(".a"), scratch(".a")
+        assert(codegen.archive(first, {object}, format) == nil)
+        assert(codegen.archive(second, {object}, format) == nil)
+        local bytes = assert(contents(first))
+        assert(bytes:sub(1, 8) == "!<arch>\n", format .. ": not an archive")
+        assert(bytes == contents(second), format .. ": the same member gave different bytes")
+        local index = format == "gnu" and "/               " or "__.SYMDEF"
+        assert(bytes:find(index, 1, true), format .. ": the archive has no symbol index")
+        assert(bytes:find("scale\0", 1, true), format .. ": the index does not name the kernel")
+        os.remove(first)
+        os.remove(second)
+    end
+    local missing = scratch(".absent.o")
+    local err = codegen.archive(scratch(".a"), {missing}, "gnu")
+    assert(err and err:find(missing, 1, true), tostring(err))
+    os.remove(object)
+end
+
+-- An import library names its DLL and imports each name through `__imp_`.
+function M.importLibrariesNameEveryExport()
+    if not codegen.available() then
+        return
+    end
+    local path = scratch(".a")
+    local err = codegen.importLibrary("kernel32.dll", path, {{"GetCurrentProcess"}, {"TerminateProcess"}})
+    assert(err == nil, tostring(err))
+    local bytes = assert(contents(path))
+    assert(bytes:sub(1, 8) == "!<arch>\n", "not an archive")
+    for _, name in ipairs({"kernel32.dll", "__imp_GetCurrentProcess", "__imp_TerminateProcess"}) do
+        assert(bytes:find(name, 1, true), "the import library does not name " .. name)
+    end
+    os.remove(path)
+end
+
+-- Each job of a batch is its own outcome: one module that fails leaves the
+-- others' objects and reports alone.
+function M.compileFilesAnswersEachJob()
+    if not codegen.available() then
+        return
+    end
+    local good, bad = scratch(".ll"), scratch(".ll")
+    writeTo(good, KERNEL)
+    writeTo(bad, "define void @f() { ret i32 1 }\n")
+    local jobs = {}
+    for _, ir in ipairs({good, bad, good}) do
+        jobs[#jobs + 1] = {
+            ir = ir,
+            object = scratch(".o"),
+            options = {triple = "x86_64-unknown-linux-gnu", verify = "1", assembly = "1"},
+        }
+    end
+    local outcomes = assert(codegen.compileFiles(jobs, 2))
+    assert(#outcomes == 3)
+    for _, position in ipairs({1, 3}) do
+        local outcome = outcomes[position]
+        assert(outcome.error == nil, tostring(outcome.error))
+        assert(outcome.report:find("object%-bytes=%d+\n$"), outcome.report)
+        assert(#contents(jobs[position].object) > 0)
+        assert(contents(jobs[position].object .. ".ll") == nil, "a verifying job's IR was left behind")
+    end
+    assert(outcomes[2].report == nil and outcomes[2].error:find(bad, 1, true), tostring(outcomes[2].error))
+    for _, job in ipairs(jobs) do
+        os.remove(job.object)
+    end
+    os.remove(good)
+    os.remove(bad)
 end
 
 return M
