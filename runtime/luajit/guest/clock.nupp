@@ -1,0 +1,16 @@
+--- The browser guest's mailbox clock, `nupp/libnupp-browser.so`.
+---
+--- The host updates the clock in shared memory behind LuaJIT's back. A load
+--- LuaJIT compiles itself can be hoisted out of a loop, so the bridge reads the
+--- clock through this C call instead, which LuaJIT never sees into and so loads
+--- the value afresh every time it is called.
+module runtime.luajit.guest.clock
+
+export function nupp_browser_clock(borrows address: voidptr): number
+    local now: number = 0
+    @unsafe do
+        now = (address as number*)[0]
+    end
+
+    return now
+end
