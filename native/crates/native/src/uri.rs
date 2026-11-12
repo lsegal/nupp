@@ -1,7 +1,7 @@
 //! Immutable WHATWG URLs behind the versioned native handle ABI.
 
 use super::{failed, input};
-use nupp_native_abi::{Arena, Handle, Status, boundary};
+use crate::abi::{Arena, Handle, Status, boundary};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 use url::{Position, Url};
@@ -306,7 +306,7 @@ mod tests {
                 unsafe { nuppNativeUriParse(source.as_ptr(), source.len(), &mut handle) },
                 Status::InvalidArgument.code()
             );
-            nupp_native_abi::with_last_error(|error| assert_eq!(error.to_str().unwrap(), reason));
+            crate::abi::with_last_error(|error| assert_eq!(error.to_str().unwrap(), reason));
         }
     }
 }
