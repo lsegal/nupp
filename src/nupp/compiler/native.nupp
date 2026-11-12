@@ -759,11 +759,7 @@ local FEATURES: {[string]: native.Feature} = {
         -- so is the wake handle they sleep on; nothing reaches the provider.
         module = "nupp.runtime.provider.nativenet",
         runtimeModule = "nupp.runtime.provider.nativenet",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "base",
         host = "native-net",
-        library = "nupp_native",
         binary = true,
         requires = {
             "runtime.net_contract",
@@ -794,13 +790,9 @@ local FEATURES: {[string]: native.Feature} = {
         -- backend ABI is not something to promise by accident.
         module = "nupp.runtime.provider.nativeprocess",
         runtimeModule = "nupp.runtime.provider.nativeprocess",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
         -- Nupp spawns and reaps the child itself, and the wake handle its
         -- readiness wait shares is Nupp's too; nothing reaches the provider.
-        providerFeature = "base",
         host = "native-process",
-        library = "nupp_native",
         binary = true,
         requires = {
             "runtime.process_contract",
@@ -856,10 +848,8 @@ local FEATURES: {[string]: native.Feature} = {
         name = "http",
         module = "nupp.runtime.provider.nativehttp",
         runtimeModule = "nupp.runtime.provider.nativehttp",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "base",
-        library = "nupp_native",
+        -- The client is Nupp; only the URI handling it requires reaches the
+        -- Rust provider.
         binary = true,
         -- A request that races its upload against the response head performs one
         -- through `coroutine`, so the task runtime travels with the client.

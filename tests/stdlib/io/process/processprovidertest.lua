@@ -71,17 +71,18 @@ local function preloadNative(libraryPath)
 end
 
 function M.beforeAll()
-    local libraryPath = os.getenv("NUPP_NATIVE_LIBRARY")
-    if not libraryPath then
-        root = temporaryRoot()
-        os.execute("mkdir -p '" .. root .. "'")
-        local staged, problem = nativeStage.build(root, "out", {["native.process"] = true})
-        if not staged then
-            unavailable = tostring(problem)
-            return
-        end
-        libraryPath = root .. "/out/lib/nupp_native"
+    root = temporaryRoot()
+    os.execute("mkdir -p '" .. root .. "'")
+    local staged, problem = nativeStage.build(root, "out", {["native.process"] = true})
+    if not staged then
+        unavailable = tostring(problem)
+        return
     end
+    -- Nupp spawns, reaps and waits on children itself, so processes stage no
+    -- provider, and the library named here does not exist: a provider symbol
+    -- reached anywhere below fails instead of quietly loading one.
+    test.eq(next(staged), nil, "processes staged a native provider")
+    local libraryPath = root .. "/out/lib/nupp_native"
     nativeLibrary = libraryPath
     priorPreload = package.preload["nupp.runtime.native"]
     priorLoaded = package.loaded["nupp.runtime.native"]

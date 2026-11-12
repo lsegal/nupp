@@ -1,9 +1,8 @@
 -- The public process state machine joined to the real native provider.
 --
--- The fake-backed suite proves policy. This suite reaches the launcher's provider (or
--- builds one when run outside the launcher) through the same generated bootstrap a
--- program receives, so it proves the private binding, ABI, blocking readiness and real
--- child lifecycle together.
+-- The fake-backed suite proves policy. This suite reaches the FFI provider through the
+-- same generated bootstrap a program receives, with no Rust provider staged, so it
+-- proves the private binding, blocking readiness and real child lifecycle together.
 local test = require("assert")
 local native = require("nupp.compiler.native")
 local stdlib = require("nupp.compiler.stdlib")
@@ -62,17 +61,17 @@ end
 
 function M.beforeAll()
     math.randomseed(os.time())
-    local libraryPath = os.getenv("NUPP_NATIVE_LIBRARY")
-    if not libraryPath then
-        root = temporaryRoot()
-        os.execute("mkdir -p '" .. root .. "'")
-        local staged, problem = nativeStage.build(root, "out", {["native.process"] = true})
-        if not staged then
-            unavailable = tostring(problem)
-            return
-        end
-        libraryPath = root .. "/out/lib/nupp_native"
+    root = temporaryRoot()
+    os.execute("mkdir -p '" .. root .. "'")
+    local staged, problem = nativeStage.build(root, "out", {["native.process"] = true})
+    if not staged then
+        unavailable = tostring(problem)
+        return
     end
+    -- Processes stage no provider, so the library named here does not exist: a
+    -- provider symbol reached anywhere below fails instead of loading one.
+    test.eq(next(staged), nil, "processes staged a native provider")
+    local libraryPath = root .. "/out/lib/nupp_native"
 
     priorPreload = package.preload["nupp.runtime.native"]
     priorLoaded = package.loaded["nupp.runtime.native"]
