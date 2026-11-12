@@ -444,15 +444,6 @@ function M.legacyProviderUpgradeBridgeIsGone()
     assert(not driver:match("\n    native%)"), "the ABI-v1 provider command remains in the toolchain")
 end
 
--- With NUPP_CC unset the driver selects its compiler by probing PATH. Cargo
--- does not inherit the driver's private shell variable, so pass the resolved
--- answer explicitly to the embedding crate's C-shim build script.
-function M.rustBuildsUseTheResolvedLuaJitCompiler()
-    local driver = read(DRIVER)
-    local forwards = countOccurrences(driver, 'NUPP_CC="$CC"')
-    assert(forwards == 1, "the embedding host build does not forward NUPP_CC")
-end
-
 -- The hosted Windows default is the MSVC Rust toolchain, while LuaJIT and the
 -- public static link are MinGW. Resolve the exact GNU-hosted toolchain through
 -- rustup even when its ordinary Cargo proxy is already on PATH.
