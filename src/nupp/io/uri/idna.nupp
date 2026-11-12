@@ -1,0 +1,790 @@
+@!internal
+--[[
+UTS #46 ToASCII for the host of a special-scheme URL, as the URL Standard's
+domain-to-ASCII asks for it and as the `idna` crate behind the `url` crate
+performs it: non-transitional, with CheckHyphens and VerifyDnsLength off,
+CheckBidi and CheckJoiners on, and the URL Standard's forbidden domain code
+points as the ASCII deny list.
+
+[](nupp.io.uri.whatwg) hands it the percent-decoded host when the native
+provider parses; a host of lowercase letters and dots is returned untouched
+without reading any table. The Unicode data lives in
+[](nupp.io.uri.idnatables), which is decoded the first time a host needs it.
+Every refusal has the one reason the `url` crate gives, because it is the only
+thing a caller is told either way.
+]]
+module nupp.io.uri.idna
+
+local utf8 = require("utf8")
+
+const FAILURE = "invalid international domain name"
+const REPLACEMENT = 0xFFFD
+const MAX_U32 = 4294967295
+
+-- Punycode decoding and encoding stop at these lengths, as the crate's do.
+const DECODE_LIMIT = 2000
+const ENCODE_LIMIT = 1000
+
+-- The URL Standard's ASCII deny list: what is glyphless, and the forbidden domain
+-- code points. Upper case letters are mapped to lower case rather than denied.
+local DENIED: {[integer]: boolean} = {[127] = true}
+for byte = 0, 32 do
+    DENIED[byte] = true
+end
+for index = 1, #"%#/:<>?@[\\]^|" do
+    DENIED[("%#/:<>?@[\\]^|"):byte(index) as integer] = true
+end
+
+----------------------------------------------------------------------------
+-- Tables
+----------------------------------------------------------------------------
+
+--[[
+The tables arrive as run-length text in lowercase hexadecimal. A run is its
+length followed by its value, and runs cover every code point from U+0000 in
+order:
+
+- MAPPING: `V` valid, `I` ignored, `D` disallowed, `O+n`/`O-n` mapped to the code
+  point n away, `Mx,y` mapped to the code points x and y; each run ends in `;`.
+- COMBINING: `:c;`, the canonical combining class c.
+- MARKS: `M` a combining mark, `N` anything else.
+- BIDI: one letter per class IDNA reads (`L R A N E S C T O B M`), `X` for the rest.
+- JOINING: the joining type letter, `D L R T C` or `U`.
+
+DECOMPOSITIONS lists `d=x,y;` for each code point d past the previous one whose
+full canonical decomposition is x, y; COMPOSITIONS lists `x,y=c;`, the primary
+composite c of x and y.
+]]
+local type Runs = {
+    starts: {integer},
+    values: {any}
+}
+
+local type Tables = {
+    mapping: Runs,
+    decompositions: {[integer]: {integer}},
+    compositions: {[integer]: {[integer]: integer}},
+    combining: {[integer]: integer},
+    marks: Runs,
+    bidi: Runs,
+    joining: Runs
+}
+
+local loaded: Tables? = nil
+
+local function runs(text: string, pattern: string, read: function(string, string): any): Runs
+    local starts: {integer} = {}
+    local values: {any} = {}
+    local at: integer = 0
+    for length, value, payload in text:gsub("%s", ""):gmatch(pattern) do
+        starts[#starts + 1] = at
+        values[#values + 1] = read(value, payload)
+        at = at + (tonumber(length, 16) as integer)
+    end
+
+    return {starts = starts, values = values}
+end
+
+local function letter(value: string, _: string): any
+    return value
+end
+
+local function find(table: Runs, codepoint: integer): any
+    local starts = table.starts
+    local low: integer = 1
+    local high: integer = #starts
+    while low < high do
+        local middle = math.floor((low + high + 1) / 2) as integer
+        if starts[middle] <= codepoint then
+            low = middle
+        else
+            high = middle - 1
+        end
+    end
+
+    return table.values[low]
+end
+
+local function hexList(text: string): {integer}
+    local out: {integer} = {}
+    for value in text:gmatch("[0-9a-f]+") do
+        out[#out + 1] = tonumber(value, 16) as integer
+    end
+
+    return out
+end
+
+local function tables(): Tables
+    if loaded ~= nil then
+        return loaded
+    end
+    local data = require("nupp.io.uri.idnatables")
+    local mapping = runs(data.MAPPING, "([0-9a-f]+)([VIDOM])([^;]*);", function(kind: string, payload: string): any
+        if kind == "O" then
+            local distance = tonumber(payload:sub(2), 16) as integer
+            return payload:sub(1, 1) == "-" and -distance or distance
+        elseif kind == "M" then
+            return hexList(payload)
+        end
+
+        return kind
+    end)
+    local decompositions: {[integer]: {integer}} = {}
+    local previous: integer = 0
+    for delta, parts in data.DECOMPOSITIONS:gsub("%s", ""):gmatch("([0-9a-f]+)=([^;]*);") do
+        previous = previous + (tonumber(delta, 16) as integer)
+        decompositions[previous] = hexList(parts)
+    end
+    local compositions: {[integer]: {[integer]: integer}} = {}
+    for first, second, composite in data.COMPOSITIONS:gsub("%s", ""):gmatch("([0-9a-f]+),([0-9a-f]+)=([0-9a-f]+);") do
+        local key = tonumber(first, 16) as integer
+        local seconds = compositions[key] or {}
+        seconds[tonumber(second, 16) as integer] = tonumber(composite, 16) as integer
+        compositions[key] = seconds
+    end
+    -- Few code points have a nonzero class, and normalization asks for the class
+    -- of every one, so the nonzero runs are spread into a lookup table.
+    local combining: {[integer]: integer} = {}
+    local at: integer = 0
+    for length, class in data.COMBINING:gsub("%s", ""):gmatch("([0-9a-f]+):([0-9a-f]+);") do
+        local count = tonumber(length, 16) as integer
+        local value = tonumber(class, 16) as integer
+        if value ~= 0 then
+            for codepoint = at, at + count - 1 do
+                combining[codepoint] = value
+            end
+        end
+        at = at + count
+    end
+    local built: Tables = {
+        mapping = mapping,
+        decompositions = decompositions,
+        compositions = compositions,
+        combining = combining,
+        marks = runs(data.MARKS, "([0-9a-f]+)([MN])()", letter),
+        bidi = runs(data.BIDI, "([0-9a-f]+)([LRANESCTOBMX])()", letter),
+        joining = runs(data.JOINING, "([0-9a-f]+)([DLRTCU])()", letter),
+    }
+    loaded = built
+
+    return built
+end
+
+----------------------------------------------------------------------------
+-- Mapping and normalization
+----------------------------------------------------------------------------
+
+-- Appends what UTS #46 maps a code point to. A disallowed code point becomes
+-- U+FFFD, itself disallowed; an ignored one vanishes, unless `validating`, which
+-- is how a decoded Punycode label is held to having needed no mapping.
+local function map(data: Tables, codepoint: integer, out: {integer}, validating: boolean): nil
+    local value = find(data.mapping, codepoint)
+    if value == "V" then
+        out[#out + 1] = codepoint
+    elseif type(value) == "number" then
+        out[#out + 1] = codepoint + (value as integer)
+    elseif type(value) == "table" then
+        for _, part in ipairs(value as {integer}) do
+            out[#out + 1] = part
+        end
+    elseif value == "D" or validating then
+        out[#out + 1] = REPLACEMENT
+    end
+end
+
+const S_BASE = 0xAC00
+const L_BASE = 0x1100
+const V_BASE = 0x1161
+const T_BASE = 0x11A7
+const L_COUNT = 19
+const V_COUNT = 21
+const T_COUNT = 28
+const N_COUNT = 588
+const S_COUNT = 11172
+
+local function compose(data: Tables, first: integer, second: integer): integer?
+    if first >= L_BASE and first < L_BASE + L_COUNT and second >= V_BASE and second < V_BASE + V_COUNT then
+        return S_BASE + ((first - L_BASE) * V_COUNT + second - V_BASE) * T_COUNT
+    end
+    if first >= S_BASE
+        and first < S_BASE + S_COUNT
+        and (first - S_BASE) % T_COUNT == 0
+        and second > T_BASE
+        and second < T_BASE + T_COUNT
+    then
+        return first + second - T_BASE
+    end
+    local seconds = data.compositions[first]
+
+    return seconds ~= nil and seconds[second] or nil
+end
+
+-- Normalization Form C: canonical decomposition, canonical ordering, then
+-- canonical composition.
+local function nfc(data: Tables, points: {integer}): {integer}
+    local decomposed: {integer} = {}
+    for _, codepoint in ipairs(points) do
+        if codepoint >= S_BASE and codepoint < S_BASE + S_COUNT then
+            local index = codepoint - S_BASE
+            decomposed[#decomposed + 1] = L_BASE + math.floor(index / N_COUNT) as integer
+            decomposed[#decomposed + 1] = V_BASE + math.floor((index % N_COUNT) / T_COUNT) as integer
+            if index % T_COUNT ~= 0 then
+                decomposed[#decomposed + 1] = T_BASE + index % T_COUNT
+            end
+        else
+            local parts = data.decompositions[codepoint]
+            if parts == nil then
+                decomposed[#decomposed + 1] = codepoint
+            else
+                for _, part in ipairs(parts) do
+                    decomposed[#decomposed + 1] = part
+                end
+            end
+        end
+    end
+    local combining = data.combining
+    for index = 2, #decomposed do
+        local codepoint = decomposed[index]
+        local class = combining[codepoint]
+        if class ~= nil then
+            local at: integer = index
+            while at > 1 and (combining[decomposed[at - 1]] or 0) > class do
+                decomposed[at] = decomposed[at - 1]
+                at = at - 1
+            end
+            decomposed[at] = codepoint
+        end
+    end
+    local out: {integer} = {}
+    local starter: integer? = nil
+    local lastClass: integer = 0
+    for _, codepoint in ipairs(decomposed) do
+        local class = combining[codepoint] or 0
+        local composite: integer? = nil
+        if starter ~= nil and (#out == starter or (lastClass ~= 0 and lastClass < class)) then
+            composite = compose(data, out[starter], codepoint)
+        end
+        if composite ~= nil and starter ~= nil then
+            out[starter] = composite
+        else
+            out[#out + 1] = codepoint
+            if class == 0 then
+                starter = #out
+            end
+            lastClass = class
+        end
+    end
+
+    return out
+end
+
+local function mapNormalize(data: Tables, points: {integer}, validating: boolean): {integer}
+    local mapped: {integer} = {}
+    for _, codepoint in ipairs(points) do
+        map(data, codepoint, mapped, validating)
+    end
+
+    return nfc(data, mapped)
+end
+
+----------------------------------------------------------------------------
+-- Punycode (RFC 3492)
+----------------------------------------------------------------------------
+
+local function adapt(delta: integer, points: integer, first: boolean): integer
+    local value: integer = first and math.floor(delta / 700) as integer or math.floor(delta / 2) as integer
+    value = value + math.floor(value / points) as integer
+    local k: integer = 0
+    while value > 455 do
+        value = math.floor(value / 35) as integer
+        k = k + 36
+    end
+
+    return k + math.floor(36 * value / (value + 38)) as integer
+end
+
+local function threshold(k: integer, bias: integer): integer
+    if k <= bias then
+        return 1
+    elseif k >= bias + 26 then
+        return 26
+    end
+
+    return k - bias
+end
+
+-- Decodes the lower-case code points after `xn--`, or nil when they are not
+-- Punycode. Arithmetic past 32 bits fails, as the crate's checked arithmetic does.
+local function decode(input: {integer}): {integer}?
+    local delimiter: integer? = nil
+    for index = #input, 1, -1 do
+        if input[index] == 45 then
+            delimiter = index
+            break
+        end
+    end
+    local out: {integer} = {}
+    local from: integer = 1
+    if delimiter ~= nil then
+        for index = 1, delimiter - 1 do
+            out[index] = input[index]
+        end
+        if delimiter > 1 then
+            from = delimiter + 1
+        end
+    end
+    local codepoint: integer = 128
+    local bias: integer = 72
+    local i: integer = 0
+    local at: integer = from
+    while at <= #input do
+        local previous = i
+        local weight: integer = 1
+        local k: integer = 36
+        while true do
+            local byte = input[at]
+            if byte == nil then
+                return nil
+            end
+            at = at + 1
+            local digit: integer
+            if byte >= 48 and byte <= 57 then
+                digit = byte - 22
+            elseif byte >= 97 and byte <= 122 then
+                digit = byte - 97
+            else
+                return nil
+            end
+            i = i + digit * weight
+            if digit * weight > MAX_U32 or i > MAX_U32 then
+                return nil
+            end
+            local t = threshold(k, bias)
+            if digit < t then
+                break
+            end
+            weight = weight * (36 - t)
+            if weight > MAX_U32 then
+                return nil
+            end
+            k = k + 36
+        end
+        local length = #out + 1
+        bias = adapt(i - previous, length, previous == 0)
+        codepoint = codepoint + math.floor(i / length) as integer
+        i = i % length
+        if codepoint > 0x10FFFF or (codepoint >= 0xD800 and codepoint <= 0xDFFF) then
+            return nil
+        end
+        table.insert(out, i + 1, codepoint)
+        i = i + 1
+    end
+
+    return out
+end
+
+local function digitText(value: integer): string
+    return value < 26 and string.char(97 + value) or string.char(22 + value)
+end
+
+local function encode(input: {integer}): string
+    local out: {string} = {}
+    local basic: integer = 0
+    for _, codepoint in ipairs(input) do
+        if codepoint < 128 then
+            out[#out + 1] = string.char(codepoint)
+            basic = basic + 1
+        end
+    end
+    if basic > 0 then
+        out[#out + 1] = "-"
+    end
+    local codepoint: integer = 128
+    local delta: integer = 0
+    local bias: integer = 72
+    local processed = basic
+    while processed < #input do
+        local smallest: integer = 0x110000
+        for _, value in ipairs(input) do
+            if value >= codepoint and value < smallest then
+                smallest = value
+            end
+        end
+        delta = delta + (smallest - codepoint) * (processed + 1)
+        codepoint = smallest
+        for _, value in ipairs(input) do
+            if value < codepoint then
+                delta = delta + 1
+            elseif value == codepoint then
+                local q = delta
+                local k: integer = 36
+                while true do
+                    local t = threshold(k, bias)
+                    if q < t then
+                        break
+                    end
+                    out[#out + 1] = digitText(t + (q - t) % (36 - t))
+                    q = math.floor((q - t) / (36 - t)) as integer
+                    k = k + 36
+                end
+                out[#out + 1] = digitText(q)
+                bias = adapt(delta, processed + 1, processed == basic)
+                delta = 0
+                processed = processed + 1
+            end
+        end
+        delta = delta + 1
+        codepoint = codepoint + 1
+    end
+
+    return table.concat(out)
+end
+
+----------------------------------------------------------------------------
+-- Labels
+----------------------------------------------------------------------------
+
+local function after(points: {integer}, count: integer): {integer}
+    local out: {integer} = {}
+    for index = count + 1, #points do
+        out[#out + 1] = points[index]
+    end
+
+    return out
+end
+
+local function text(points: {integer}): string
+    local out: {string} = {}
+    for index, codepoint in ipairs(points) do
+        out[index] = string.char(codepoint)
+    end
+
+    return table.concat(out)
+end
+
+local function isAscii(points: {integer}): boolean
+    for _, codepoint in ipairs(points) do
+        if codepoint >= 128 then
+            return false
+        end
+    end
+
+    return true
+end
+
+-- Whether a mapped, lower-case code point is refused by the deny list.
+local function denied(codepoint: integer, dot: boolean): boolean
+    return codepoint == REPLACEMENT
+        or codepoint < 128
+        and (DENIED[codepoint] == true or (codepoint >= 65 and codepoint <= 90) or (dot and codepoint == 46))
+end
+
+-- Normalizes a decoded Punycode label and holds it to having been written
+-- already mapped and normalized.
+local function decoded(points: {integer}): {integer}?
+    local data = tables()
+    local normalized = mapNormalize(data, points, true)
+    for _, codepoint in ipairs(normalized) do
+        if denied(codepoint, true) then
+            return nil
+        end
+    end
+    for index = 1, math.min(#normalized, #points) do
+        if normalized[index] ~= points[index] then
+            return nil
+        end
+    end
+
+    return normalized
+end
+
+local function joins(points: {integer}, from: integer, step: integer, kind: string): boolean
+    local data = tables()
+    local at = from
+    while points[at] ~= nil do
+        local joining = find(data.joining, points[at])
+        if joining == kind or joining == "D" then
+            return true
+        elseif joining ~= "T" then
+            return false
+        end
+        at = at + step
+    end
+
+    return false
+end
+
+-- The validity criteria every label that went through mapping is held to: no
+-- leading combining mark, joiners only in the contexts RFC 5892 allows, and a
+-- length Punycode can encode.
+local function valid(points: {integer}, firstMark: boolean, contextJ: boolean): boolean
+    if firstMark and #points > 0 and find(tables().marks, points[1]) == "M" then
+        return false
+    end
+    if contextJ then
+        for index, codepoint in ipairs(points) do
+            local joiner = codepoint == 0x200C or codepoint == 0x200D
+            -- After a virama either joiner is fine; otherwise only a ZWNJ between
+            -- a left-joining and a right-joining letter, transparent marks aside.
+            if joiner and (index == 1 or tables().combining[points[index - 1]] ~= 9) then
+                local zwnj = index > 1 and codepoint == 0x200C
+                if not zwnj or not joins(points, index - 1, -1, "L") or not joins(points, index + 1, 1, "R") then
+                    return false
+                end
+            end
+        end
+    end
+
+    return isAscii(points) or #points <= ENCODE_LIMIT
+end
+
+local function startsWithAce(points: {integer}): boolean
+    return points[1] == 120 and points[2] == 110 and points[3] == 45 and points[4] == 45
+end
+
+-- A label after mapping that spells `xn--` is decoded in place.
+local function finish(points: {integer}, firstMark: boolean, contextJ: boolean): {integer}?
+    local label = points
+    local mark = firstMark
+    local joiners = contextJ
+    if startsWithAce(points) then
+        if not isAscii(points) or points[#points] == 45 or #points - 4 > DECODE_LIMIT then
+            return nil
+        end
+        local unicode = decode(after(points, 4))
+        if unicode == nil then
+            return nil
+        end
+        local normalized = decoded(unicode)
+        if normalized == nil then
+            return nil
+        end
+        label, mark, joiners = normalized, true, true
+    end
+    if not valid(label, mark, joiners) then
+        return nil
+    end
+
+    return label
+end
+
+local type Label = {
+    points: {integer},
+    written: string?
+}
+
+-- Appends the labels one input label becomes, or answers false when it is not
+-- a valid label. Mapping can turn a full stop variant into `.`, so one input
+-- label may become several.
+local function process(label: string, out: {Label}): boolean
+    if label == "" then
+        out[#out + 1] = {points = {}}
+        return true
+    end
+    local first = label:find("[\128-\255]")
+    if first == nil then
+        local points: {integer} = {}
+        for index = 1, #label do
+            local byte = label:byte(index) as integer
+            if byte >= 65 and byte <= 90 then
+                byte = byte + 32
+            elseif DENIED[byte] then
+                return false
+            end
+            points[index] = byte
+        end
+        if not startsWithAce(points) then
+            out[#out + 1] = {points = points}
+            return true
+        end
+        if label:sub(-1) == "-" or #label - 4 > DECODE_LIMIT then
+            return false
+        end
+        local unicode = decode(after(points, 4))
+        if unicode == nil then
+            return false
+        end
+        local normalized = decoded(unicode)
+        if normalized == nil or not valid(normalized, true, true) then
+            return false
+        end
+        -- A label that was already Punycode is written back as it was spelled.
+        out[#out + 1] = {points = normalized, written = label:lower()}
+        return true
+    end
+    -- One ASCII byte stays with the rest, in case what follows combines with it.
+    local split: integer = first > 1 and first - 1 or 1
+    local current: {integer} = {}
+    for index = 1, split - 1 do
+        local byte = label:byte(index) as integer
+        if byte >= 65 and byte <= 90 then
+            byte = byte + 32
+        elseif DENIED[byte] then
+            return false
+        end
+        current[index] = byte
+    end
+    local firstMark = split == 1
+    local contextJ = true
+    local rest: {integer} = {}
+    local at: integer = split
+    while at <= #label do
+        local codepoint, nextAt = utf8.decodeat(label, at)
+        rest[#rest + 1] = codepoint as integer
+        at = nextAt
+    end
+    for _, codepoint in ipairs(mapNormalize(tables(), rest, false)) do
+        if codepoint == 46 then
+            local finished = finish(current, firstMark, contextJ)
+            if finished == nil then
+                return false
+            end
+            out[#out + 1] = {points = finished}
+            current, firstMark, contextJ = {}, true, true
+        elseif denied(codepoint, false) then
+            return false
+        else
+            current[#current + 1] = codepoint
+        end
+    end
+    local finished = finish(current, firstMark, contextJ)
+    if finished == nil then
+        return false
+    end
+    out[#out + 1] = {points = finished}
+
+    return true
+end
+
+----------------------------------------------------------------------------
+-- Bidi (RFC 5893)
+----------------------------------------------------------------------------
+
+local function rightToLeft(data: Tables, labels: {Label}): boolean
+    for _, label in ipairs(labels) do
+        for _, c in ipairs(label.points) do
+            if c >= 0x0590
+                and not (c >= 0x0900 and c <= 0xFB1C)
+                and not (c >= 0x1F000 and c <= 0x3FFFF)
+                and not (c >= 0xFF00 and c <= 0x107FF)
+                and not (c >= 0x11000 and c <= 0x1E7FF)
+            then
+                local class = find(data.bidi, c)
+                if class == "R" or class == "A" or class == "N" then
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+local function within(class: string, allowed: string): boolean
+    return allowed:find(class, 1, true) ~= nil
+end
+
+local function bidiLabel(data: Tables, points: {integer}): boolean
+    if #points == 0 then
+        return true
+    end
+    local first = find(data.bidi, points[1]) as string
+    if not within(first, "LRA") then
+        return false
+    end
+    local ltr = first == "L"
+    local last: integer = #points
+    while last >= 2 and find(data.bidi, points[last]) == "M" do
+        last = last - 1
+    end
+    if last < 2 then
+        return true
+    end
+    local lastClass = find(data.bidi, points[last]) as string
+    if not within(lastClass, ltr and "LE" or "RAEN") then
+        return false
+    end
+    local numerals = ""
+    for index = 2, last - 1 do
+        local class = find(data.bidi, points[index]) as string
+        if not within(class, ltr and "LESCTOBM" or "RANESCTOBM") then
+            return false
+        end
+        if not ltr then
+            if numerals == "" and (class == "E" or class == "N") then
+                numerals = class
+            elseif numerals ~= "" and (class == "E" or class == "N") and class ~= numerals then
+                return false
+            end
+        end
+    end
+
+    return ltr or numerals == "" or not (lastClass == "E" or lastClass == "N") or lastClass == numerals
+end
+
+----------------------------------------------------------------------------
+-- Domains
+----------------------------------------------------------------------------
+
+--- Converts a percent-decoded host to its ASCII form.
+---
+--- @param domain the host's bytes, which need not be valid UTF-8
+--- @return the ASCII host, or nil when it is not a valid domain
+--- @return the reason, when it is not
+export function toascii(domain: string): (string?, string?)
+    local stop = domain:find("[^a-z.]")
+    if stop == nil then
+        return domain, nil
+    end
+    -- Text that is not UTF-8 decodes to U+FFFD, which no label may hold.
+    if not utf8.isvalid(domain) then
+        return nil, FAILURE
+    end
+    local labels: {string} = {}
+    for label in (domain .. "."):gmatch("([^.]*)%.") do
+        labels[#labels + 1] = label
+    end
+    -- The labels before the one holding the first byte past `a-z` and `.`, and
+    -- after them every plain lower-case label, are kept as written.
+    local before: integer = 0
+    for _ in domain:sub(1, stop - 1):gmatch("%.") do
+        before = before + 1
+    end
+    local written: {string} = {}
+    local processed: {Label} = {}
+    for index, label in ipairs(labels) do
+        local plain = label == ""
+            or (label:find("^[a-z][a-z0-9-]*$") ~= nil and label:sub(-1) ~= "-" and label:sub(3, 4) ~= "--")
+        if #processed == 0 and (index <= before or plain) then
+            written[#written + 1] = label
+        elseif not process(label, processed) then
+            return nil, FAILURE
+        end
+    end
+    local unicode = false
+    for _, label in ipairs(processed) do
+        unicode = unicode or not isAscii(label.points)
+    end
+    if unicode then
+        local data = tables()
+        if rightToLeft(data, processed) then
+            for _, label in ipairs(processed) do
+                if not bidiLabel(data, label.points) then
+                    return nil, FAILURE
+                end
+            end
+        end
+    end
+    for _, label in ipairs(processed) do
+        local points = label.points
+        if isAscii(points) then
+            written[#written + 1] = text(points)
+        elseif label.written ~= nil then
+            written[#written + 1] = label.written as string
+        else
+            written[#written + 1] = "xn--" .. encode(points)
+        end
+    end
+
+    return table.concat(written, "."), nil
+end

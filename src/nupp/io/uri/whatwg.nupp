@@ -395,7 +395,10 @@ local function forbiddenHost(byte: integer): boolean
         or byte == 124
 end
 
-local function parseHost(input: string, opaque: boolean, trustHosts: boolean): (string?, string?)
+--- A domain-to-ASCII converter: the ASCII host, or nil and the reason.
+local type ToAscii = function(string): (string?, string?)
+
+local function parseHost(input: string, opaque: boolean, trustHosts: boolean, toAscii: ToAscii?): (string?, string?)
     if input:sub(1, 1) == "[" then
         if input:sub(-1) ~= "]" then
             return nil, "invalid IPv6 address"
@@ -411,6 +414,19 @@ local function parseHost(input: string, opaque: boolean, trustHosts: boolean): (
         return encodeText(input, C0_SET), nil
     end
     local domain = percentDecode(input)
+    if toAscii ~= nil then
+        -- In the url crate's order: UTS #46 first, whose deny list refuses the
+        -- forbidden domain code points, then the empty and IPv4 checks.
+        local ascii, reason = toAscii(domain)
+        if ascii == nil then
+            return nil, reason
+        elseif ascii == "" then
+            return nil, "empty host"
+        elseif endsInANumber(ascii) then
+            return ipv4(ascii)
+        end
+        return ascii, nil
+    end
     local international = domain:find("[\128-\255]") ~= nil
     if not international then
         domain = domain:lower()
@@ -620,9 +636,17 @@ end
 --- @param base the URL a relative input is resolved against, when there is one
 --- @param trustHosts whether a host that needs IDNA is kept as written rather
 ---     than refused, for text a host URL parser reads afterwards
+--- @param toAscii the domain-to-ASCII step a special-scheme host goes through,
+---     when the caller carries one; without it a host that needs IDNA is
+---     refused or trusted as above
 --- @return the URL's components, or nil when the text is not a URL
 --- @return the reason, when it is not
-export function parse(text: string, base: contracts.UriParts?, trustHosts: boolean?): (contracts.UriParts?, string?)
+export function parse(
+    text: string,
+    base: contracts.UriParts?,
+    trustHosts: boolean?,
+    toAscii: ToAscii?
+): (contracts.UriParts?, string?)
     local refused = refusal(text)
     if refused ~= nil then
         return nil, refused
@@ -810,7 +834,7 @@ export function parse(text: string, base: contracts.UriParts?, trustHosts: boole
                 if collected == "" then
                     return nil, "empty host"
                 end
-                local host, reason = parseHost(collected, not special, trusted)
+                local host, reason = parseHost(collected, not special, trusted, toAscii)
                 if host == nil then
                     return nil, reason
                 end
@@ -823,7 +847,7 @@ export function parse(text: string, base: contracts.UriParts?, trustHosts: boole
                 if special and collected == "" then
                     return nil, "empty host"
                 end
-                local host, reason = parseHost(collected, not special, trusted)
+                local host, reason = parseHost(collected, not special, trusted, toAscii)
                 if host == nil then
                     return nil, reason
                 end
@@ -919,7 +943,7 @@ export function parse(text: string, base: contracts.UriParts?, trustHosts: boole
                     url.host = ""
                     state = PATH_START
                 else
-                    local host, reason = parseHost(collected, not special, trusted)
+                    local host, reason = parseHost(collected, not special, trusted, toAscii)
                     if host == nil then
                         return nil, reason
                     elseif host == "localhost" then
