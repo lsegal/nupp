@@ -67,6 +67,7 @@ const NAME_RELOAD = 3
 
 --- The answers `nuppembed.lua` writes; its `Value`.
 const LUA_NIL = 0
+
 const LUA_BOOLEAN = 1
 const LUA_NUMBER = 2
 const LUA_BYTES = 4
@@ -167,6 +168,7 @@ end
 --- A spin lock over everything below: names, entry counts and deferred frees.
 --- Each holder only touches these tables, never Lua.
 local lockWord: int64[1]
+
 local names: uint64 = 0ULL
 local entered: uint64 = 0ULL
 local deferred: uint64 = 0ULL
@@ -269,7 +271,13 @@ end
 
 --- Reports a failure through `error`, NUL bytes in the message turned to `?`
 --- so the terminated copy reads whole. Answers the status.
-local function report(error: uint64, status: integer, category: integer, borrows message: voidptr, length: uint64): int32
+local function report(
+    error: uint64,
+    status: integer,
+    category: integer,
+    borrows message: voidptr,
+    length: uint64
+): int32
     if error ~= 0ULL then
         local made = calloc(1ULL, ffi.sizeof(Error) as uint64)
         local copy = malloc(length + 1ULL)
@@ -890,7 +898,13 @@ export function nupp_runtime_new(config: uint64, out: uint64, error: uint64): in
             lua.nuppEmbedLuaClose(state as voidptr)
             return outOfMemory(error, ERROR_RUNTIME)
         end
-        local ok = stateStep(call, lua.nuppEmbedLuaOpenLibraries(state as voidptr, call), error, STATUS_RUNTIME, ERROR_RUNTIME)
+        local ok = stateStep(
+            call,
+            lua.nuppEmbedLuaOpenLibraries(state as voidptr, call),
+            error,
+            STATUS_RUNTIME,
+            ERROR_RUNTIME
+        )
         lua.nuppEmbedLuaCallFree(call)
         if not ok then
             lua.nuppEmbedLuaClose(state as voidptr)
@@ -1098,7 +1112,13 @@ local function addResource(runtime: uint64, path: uint64, data: uint64, length: 
     return status
 end
 
-export function nupp_runtime_add_resource(runtime: uint64, path: uint64, data: uint64, length: uint64, error: uint64): int32
+export function nupp_runtime_add_resource(
+    runtime: uint64,
+    path: uint64,
+    data: uint64,
+    length: uint64,
+    error: uint64
+): int32
     local state = enter(runtime, error)
     if state < 0LL then
         return entryStatus(state)
@@ -1175,7 +1195,12 @@ local function registerAotBuilders(runtime: uint64, key: uint64, registrar: uint
     return status
 end
 
-export function nupp_runtime_register_aot_builders(runtime: uint64, key: uint64, registrar: uint64, error: uint64): int32
+export function nupp_runtime_register_aot_builders(
+    runtime: uint64,
+    key: uint64,
+    registrar: uint64,
+    error: uint64
+): int32
     local state = enter(runtime, error)
     if state < 0LL then
         return entryStatus(state)
@@ -1192,7 +1217,14 @@ const EMPTY = ""
 const COMPONENT_MAGIC = "-- NUPP-COMPONENT 1\n"
 const DEFAULT_COMPONENT_NAME = "=component"
 
-local function loadComponent(runtime: uint64, data: uint64, length: uint64, name: uint64, out: uint64, error: uint64): int32
+local function loadComponent(
+    runtime: uint64,
+    data: uint64,
+    length: uint64,
+    name: uint64,
+    out: uint64,
+    error: uint64
+): int32
     if out == 0ULL then
         return invalid(error, ERROR_COMPONENT, "loading a component needs somewhere to put it")
     end
@@ -1211,7 +1243,12 @@ local function loadComponent(runtime: uint64, data: uint64, length: uint64, name
         chunkName = name
     end
     if length < 20ULL or memcmp(data as voidptr, COMPONENT_MAGIC as voidptr, 20ULL) ~= 0 then
-        return refuse(error, STATUS_RUNTIME, ERROR_COMPONENT, "not a Nupp component artifact (expected component format 1)")
+        return refuse(
+            error,
+            STATUS_RUNTIME,
+            ERROR_COMPONENT,
+            "not a Nupp component artifact (expected component format 1)"
+        )
     end
     if not usable(runtime, error, ERROR_COMPONENT) then
         return STATUS_RUNTIME
@@ -1332,7 +1369,13 @@ local function startComponent(runtime: uint64, component: uint64, argc: int32, a
     return STATUS_OK
 end
 
-export function nupp_component_start(runtime: uint64, component: uint64, argc: int32, argv: uint64, error: uint64): int32
+export function nupp_component_start(
+    runtime: uint64,
+    component: uint64,
+    argc: int32,
+    argv: uint64,
+    error: uint64
+): int32
     local state = enter(runtime, error)
     if state < 0LL then
         return entryStatus(state)
@@ -1558,7 +1601,12 @@ local function call(
     end
     if (answered as uint64) > capacity then
         discardAnswers(runtime, values, answered)
-        return refuse(error, STATUS_BUFFER_TOO_SMALL, ERROR_RUNTIME, "the result buffer is smaller than the call answered")
+        return refuse(
+            error,
+            STATUS_BUFFER_TOO_SMALL,
+            ERROR_RUNTIME,
+            "the result buffer is smaller than the call answered"
+        )
     end
     -- Every answer is named before any is written, so a refusal leaves the
     -- caller's buffer untouched and nothing it would have to free.
@@ -1778,7 +1826,13 @@ local function closeSession(runtime: uint64, name: Name*, ok: boolean, error: ui
 end
 
 --- The names of the fields a session table answers with.
-const MEMBER_NAMES = ffi.new<const voidptr[5]>({"member" as voidptr, "prepare" as voidptr, "apply" as voidptr, "poll" as voidptr, "close" as voidptr})
+const MEMBER_NAMES = ffi.new<const voidptr[5]>({
+    "member" as voidptr,
+    "prepare" as voidptr,
+    "apply" as voidptr,
+    "poll" as voidptr,
+    "close" as voidptr
+})
 
 --- Opens a session through `opener` of `nupp.tools.hostreload` with the
 --- LuaValues `arguments`, and issues its name into `out`.
@@ -1845,7 +1899,13 @@ local function openSession(
         local status: int32 = STATUS_RUNTIME
         if kindOf(values, answered, 1) == LUA_BYTES then
             local message = luaValueAt(values, 1)
-            status = report(error, STATUS_RUNTIME, ERROR_COMPONENT, @unsafe(message.data as voidptr), @unsafe(message.length))
+            status = report(
+                error,
+                STATUS_RUNTIME,
+                ERROR_COMPONENT,
+                @unsafe(message.data as voidptr),
+                @unsafe(message.length)
+            )
         else
             status = refuse(error, STATUS_RUNTIME, ERROR_COMPONENT, "the Nupp project has no watch build")
         end
@@ -2085,7 +2145,8 @@ const STEP_POLL = 3
 local function sameText(value: LuaValue*, borrows expected: cstring): boolean
     local length = strlen(expected)
     @unsafe do
-        return value.length == length and (length == 0ULL or memcmp(value.data as voidptr, expected as voidptr, length) == 0)
+        return value.length == length
+            and (length == 0ULL or memcmp(value.data as voidptr, expected as voidptr, length) == 0)
     end
 end
 
@@ -2118,7 +2179,14 @@ local function setMessage(name: Name*, data: uint64, length: uint64)
     end
 end
 
-local function reloadStep(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, step: integer, error: uint64): int32
+local function reloadStep(
+    runtime: uint64,
+    reload: uint64,
+    verdict: uint64,
+    generation: uint64,
+    step: integer,
+    error: uint64
+): int32
     local name = reloadFor(reload, error)
     if name == nil then
         return STATUS_INVALID_ARGUMENT
@@ -2211,7 +2279,14 @@ end
 
 --- Clears a step's outputs before any work, like every other output, so a
 --- step that fails leaves no earlier step's verdict for the host to act on.
-local function steppedReload(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, step: integer, error: uint64): int32
+local function steppedReload(
+    runtime: uint64,
+    reload: uint64,
+    verdict: uint64,
+    generation: uint64,
+    step: integer,
+    error: uint64
+): int32
     beginError(error)
     @unsafe do
         if verdict ~= 0ULL then
@@ -2231,15 +2306,33 @@ local function steppedReload(runtime: uint64, reload: uint64, verdict: uint64, g
     return status
 end
 
-export function nupp_reload_prepare(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, error: uint64): int32
+export function nupp_reload_prepare(
+    runtime: uint64,
+    reload: uint64,
+    verdict: uint64,
+    generation: uint64,
+    error: uint64
+): int32
     return steppedReload(runtime, reload, verdict, generation, STEP_PREPARE, error)
 end
 
-export function nupp_reload_apply(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, error: uint64): int32
+export function nupp_reload_apply(
+    runtime: uint64,
+    reload: uint64,
+    verdict: uint64,
+    generation: uint64,
+    error: uint64
+): int32
     return steppedReload(runtime, reload, verdict, generation, STEP_APPLY, error)
 end
 
-export function nupp_reload_poll(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, error: uint64): int32
+export function nupp_reload_poll(
+    runtime: uint64,
+    reload: uint64,
+    verdict: uint64,
+    generation: uint64,
+    error: uint64
+): int32
     return steppedReload(runtime, reload, verdict, generation, STEP_POLL, error)
 end
 
@@ -2354,7 +2447,14 @@ local function hostChannelOf(runtime: uint64, error: uint64): uint64
     end
 end
 
-local function hostRegister(runtime: uint64, kind: uint64, handler: uint64, cancel: uint64, userdata: uint64, error: uint64): int32
+local function hostRegister(
+    runtime: uint64,
+    kind: uint64,
+    handler: uint64,
+    cancel: uint64,
+    userdata: uint64,
+    error: uint64
+): int32
     if kind == 0ULL then
         return invalid(error, ERROR_CONFIGURATION, "nupp_host_register needs a kind")
     end
@@ -2633,7 +2733,9 @@ local function shutdown(runtime: uint64, error: uint64): int32
                             status = outOfMemory(error, ERROR_RUNTIME)
                         end
                     else
-                        if lua.nuppEmbedLuaRelease(r.state as voidptr, call, n.reference) ~= 0 and status == STATUS_OK then
+                        if lua.nuppEmbedLuaRelease(r.state as voidptr, call, n.reference) ~= 0
+                            and status == STATUS_OK
+                        then
                             status = luaFailure(error, call, ERROR_RUNTIME)
                         end
                         lua.nuppEmbedLuaCallFree(call)

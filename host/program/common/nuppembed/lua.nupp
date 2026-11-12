@@ -83,11 +83,13 @@ const ERRRUN = 2
 --- state's, not a runtime's, because every runtime attached to one state shares
 --- the providers generated code has already observed.
 const HOST_FROZEN_KEY = "nupp.host.frozen"
+
 const LPEG_MODULE = "lpeg"
 
 --- Scratch for one C call at a time: each is read before anything that could
 --- reach this module again runs.
 local scratchLength: uint64[1]
+
 local versionMajor: int32[1]
 local versionMinor: int32[1]
 local versionBuild: int64[1]
@@ -670,16 +672,23 @@ local function installHostChannel(L: voidptr): int32
         end
     end
     lua_settop(L, -2)
-    lua_getfield(L, GLOBALS, "package")
-    lua_getfield(L, -1, "preload")
-    if lua_type(L, -1) ~= TTABLE then
-        fail(call, "pinned LuaJIT did not install package.preload")
-        return 0
+    -- A bare state has no package library to preload the module into, and no
+    -- `require` to reach it with until libraries are opened.
+    lua_pushstring(L, "package")
+    lua_rawget(L, GLOBALS)
+    if lua_type(L, -1) == TTABLE then
+        lua_getfield(L, -1, "preload")
+        if lua_type(L, -1) ~= TTABLE then
+            fail(call, "pinned LuaJIT did not install package.preload")
+            return 0
+        end
+        @unsafe do
+            lua_pushcclosure(L, call.opener, 0)
+        end
+        lua_setfield(L, -2, "nupp.host.native")
     end
     @unsafe do
-        lua_pushcclosure(L, call.opener, 0)
-        lua_setfield(L, -2, "nupp.host.native")
-        lua_settop(L, -3)
+        lua_settop(L, 1)
         lua_pushstring(L, "__nuppHostChannel")
         lua_pushlightuserdata(L, call.first as voidptr)
         lua_rawset(L, GLOBALS)
@@ -1021,12 +1030,7 @@ local function moduleMember(L: voidptr): int32
 end
 
 --- Roots `require(module)[name]`. The call answers the new reference.
-export function nuppEmbedLuaModuleMember(
-    borrows L: voidptr,
-    call: uint64,
-    module: uint64,
-    name: uint64
-): int32
+export function nuppEmbedLuaModuleMember(borrows L: voidptr, call: uint64, module: uint64, name: uint64): int32
     @unsafe do
         recordOf(call).first = module as uint64
         recordOf(call).second = name as uint64

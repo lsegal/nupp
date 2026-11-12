@@ -42,7 +42,7 @@ local function sdk()
     end
     local status, output = run(("cd %s && ./scripts/toolchain host-library %s"):format(quote(ROOT), FEATURES))
     if status ~= 0 then
-        test.suite.skip("the Rust embedding SDK could not be built: " .. output)
+        test.suite.skip("the embedding SDK could not be built: " .. output)
     end
     cachedSdk = assert(output:match("([^\r\n]+)%s*$"), "toolchain named no SDK")
 
@@ -109,6 +109,36 @@ function M.staticSdkLinksAndRunsFromC()
     status, output = run(quote(executable) .. " " .. quote(fixture(directory)))
     assert(status == 0, output)
     assert(output:find("game.answer(41) = 42", 1, true), output)
+end
+
+-- The embedding ABI's own contract, tests/fixtures/embedabi.c, against the static
+-- SDK: configuration, names, values and their ownership, reentrancy, reload
+-- sessions, attaching, and thread affinity.
+function M.theEmbeddingAbiKeepsItsContract()
+    local directory, library = temporary(), sdk()
+    local executable = directory .. "/embedabi"
+    local threads = "-lpthread"
+    if jit.os == "Windows" then
+        executable = executable .. ".exe"
+        threads = ""
+    end
+    local status, output = run(
+        (
+            "%s -std=c11 -I%s %s %s %s %s -o %s"
+        ):format(
+            quote(compiler()),
+            quote(library),
+            quote(ROOT .. "/tests/fixtures/embedabi.c"),
+            quote(library .. "/libnupp.a"),
+            platformLibraries(library),
+            threads,
+            quote(executable)
+        )
+    )
+    assert(status == 0, output)
+    status, output = run(quote(executable))
+    assert(status == 0, output)
+    assert(output:find("embedabi: ok", 1, true), output)
 end
 
 function M.dynamicSdkLinksAndRunsFromC()

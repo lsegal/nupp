@@ -519,7 +519,13 @@ end
 
 --- Queues an inbound message for the next poll, taking `values`, and dropping
 --- the oldest past the bound. False without memory.
-export function nuppEmbedChannelPush(channel: uint64, kind: uint64, length: uint64, values: uint64, count: uint64): boolean
+export function nuppEmbedChannelPush(
+    channel: uint64,
+    kind: uint64,
+    length: uint64,
+    values: uint64,
+    count: uint64
+): boolean
     local push = calloc(1ULL, ffi.sizeof(Push) as uint64)
     local copy = copyBytes(kind, length)
     if push == nil or copy == 0ULL then
