@@ -1371,6 +1371,25 @@ local function binaryValues(
     return Value(text = integerArithmetic(body, op, left, right, a, b, meet), kind = meet)
 end
 
+--- Whether `node` is a numeric literal, negated or not, that no integer holds:
+--- a fraction, or a magnitude past 64 bits. An `LL` or `ULL` literal never is.
+local function fractional(node: any): boolean
+    local current = node
+    if current.kind == "unop" and ((current as cst.Unop).op as lexer.Token).text == "-" then
+        current = (current as cst.Unop).operand
+    end
+    if current.kind ~= "number" then
+        return false
+    end
+    local spelling = ((current as cst.NumberLit).token as lexer.Token).text
+    local amount = spelling:match("[lL][lL]$") == nil and tonumber(spelling) or nil
+    if amount == nil then
+        return false
+    end
+
+    return amount ~= math.floor(amount as number) or math.abs(amount as number) >= 2 ^ 63
+end
+
 local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?): Value
     local op = (node.op as lexer.Token).text
     if op == "and" or op == "or" then
@@ -1384,9 +1403,11 @@ local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?
     -- `n`'s width rather than widening it. A literal has no effects, so reading
     -- the other side first changes nothing. A bit operator's literal stays a
     -- number, as it is under LuaJIT, and is converted as LuaJIT converts one:
-    -- modulo 2^32, or beside a 64-bit integer, truncated.
-    local function operand(v: Value): Kind?
-        if BITWISE[op] ~= nil then
+    -- modulo 2^32, or beside a 64-bit integer, truncated. A fractional literal
+    -- beside an integer stays a number too: the operands meet in binary64, or
+    -- beside a 64-bit integer in it, truncated, as LuaJIT's arithmetic does.
+    local function operand(v: Value, literal: any): Kind?
+        if BITWISE[op] ~= nil or isInteger(v.kind) and fractional(literal) then
             return nil
         end
         return (v.kind.llvm ~= "ptr" and v.kind.llvm ~= "void") and v.kind or nil
@@ -1394,11 +1415,11 @@ local function binary(program: Program, body: Body, node: cst.Binop, want: Kind?
 
     if (node.lhs as any).kind == "number" and (node.rhs as any).kind ~= "number" then
         local right = expression(program, body, node.rhs, nil)
-        local left = expression(program, body, node.lhs, operand(right))
+        local left = expression(program, body, node.lhs, operand(right, node.lhs))
         return binaryValues(program, body, node, op, left, right, node.lhs, node.rhs)
     end
     local left = expression(program, body, node.lhs, ORDERS[op] == nil and BITWISE[op] == nil and want or nil)
-    local right = expression(program, body, node.rhs, operand(left))
+    local right = expression(program, body, node.rhs, operand(left, node.rhs))
 
     return binaryValues(program, body, node, op, left, right, node.lhs, node.rhs)
 end
