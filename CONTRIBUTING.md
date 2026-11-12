@@ -9,10 +9,12 @@ project work, use the
 
 Nupp is written in Nupp, so the first build starts from the previous release's
 compiler, lowered to one Lua file and fetched against a digest pinned in the
-tree. Building the real one takes C, C++, and the exact Rust toolchain in
-`rust-toolchain.toml`. The interpreter it runs on, the libraries it links and
-that first compiler are fetched from pinned sources and built by the checkout
-itself when the machine does not already have them.
+tree. That compiler builds the real one from this checkout's Nupp sources, and
+the real one builds the rest: the native provider, the executable host, the
+embedding library and the AOT runtime are native Nupp programs too. No Rust
+toolchain and no C++ compiler takes part. The interpreter it runs on, the
+libraries it links and that first compiler are fetched from pinned sources and
+built by the checkout itself when the machine does not already have them.
 
 ```bash
 git clone https://github.com/nupp-lang/nupp
@@ -22,30 +24,31 @@ cd nupp
 
 ## Requirements
 
-**A C and a C++ compiler**, either `clang` with `clang++` or `gcc` with `g++`,
-plus the shell, `tar` and a downloader. `NUPP_CC` and `NUPP_CXX` name them; with
-neither set, Unix probes `clang`, `cc` and `gcc` in that order. Windows probes
-the MinGW `gcc` pair first because the provisioned dependencies use GNU make;
-the corresponding C++ names are probed beside each C compiler.
-
-**Rust 1.98.0 with Cargo**, selected exactly rather than by a minimum version.
-Rustup reads the committed toolchain file automatically. `NUPP_RUSTC` and
-`NUPP_CARGO` may name an equivalent toolchain explicitly; the build refuses a
-different release so its content-addressed native artifacts remain reproducible.
-Windows uses the `x86_64-pc-windows-gnu` Rust toolchain because LuaJIT and the
-host's remaining protected C shims use the MinGW ABI. Install it with
-`rustup toolchain install 1.98.0-x86_64-pc-windows-gnu --profile minimal`; the
-build refuses the ABI-incompatible MSVC Rust host rather than mixing objects.
+**A POSIX shell, `tar` and a downloader.** No part of the compiler, runtime,
+host or native providers is written in Rust, C++ or C, so building Nupp needs
+no Rust toolchain, no Cargo, and no C or C++ compiler of its own. The C left in
+the tree is test fixtures, benchmark controls and the embedding examples, which
+are programs under test rather than parts of Nupp.
 
 Everything else is provisioned. `scripts/toolchain` fetches LuaJIT, LuaRocks
 and LPeg by pinned revision, refuses any archive whose SHA-256 is not the
-one written down, builds each with that compiler pair, and caches the result
-beside the repository so every worktree shares one build. Cargo resolves the
-Rust-native crates, including networking and TLS, through the committed
-lockfile. The toolchain driver builds Nupp's Rust native providers, executable
-host, and embedding libraries; `bin/nupp` runs it for what is missing and
-nothing more. See [Native runtime and support](https://nupp.dev/reference/native-runtime/)
-for the feature mapping, retained non-Rust boundaries, and release matrix.
+one written down, and caches the result beside the repository so every
+worktree shares one build. The native provider, the executable host, the
+embedding library and the AOT runtime are compiled by this checkout's own
+compiler and linked by the code generator described under [prebuilt code
+generator](#prebuilt-code-generator); `bin/nupp` runs the toolchain driver for
+what is missing and nothing more. See [Native runtime and
+support](https://nupp.dev/reference/native-runtime/) for which Nupp module
+replaced each former Rust crate, the retained third-party boundaries, and the
+release matrix.
+
+LuaJIT and LPeg are upstream C projects rather than part of Nupp. When the
+machine has no new enough LuaJIT, `scripts/toolchain` builds the pinned one
+from its verified sources with the machine's C compiler, which `NUPP_CC` names;
+with it unset, Unix probes `clang`, `cc` and `gcc` in that order, and Windows
+probes the MinGW `gcc` first because LuaJIT's build uses GNU make. That is the
+same compiler any C dependency of a project needs, and nothing of Nupp's own is
+compiled with it.
 
 ### LuaJIT
 
@@ -118,16 +121,15 @@ next command rather than by the next person who remembers to build.
 
 Downloaded sources and the classic toolchain components land beside the
 repository's common Git directory, so every worktree shares LuaJIT and LPeg.
-Rust host and provider outputs default to the worktree's `build/rust` and
-the worktree helper seeds that content-validated cache from the originating
-checkout. `NUPP_TOOLCHAIN_DIR` moves the shared store; `NUPP_RUST_BUILD_DIR`
-moves Rust outputs:
+The native provider, host and embedding library are compiled by each
+worktree's own compiler, so they stay with the worktree.
+`NUPP_TOOLCHAIN_DIR` moves the shared store:
 
 ```bash
 export NUPP_TOOLCHAIN_DIR=/var/cache/nupp/toolchain
 ```
 
-The cache is keyed by the compiler pair's own version output, so switching
+The cache is keyed by the C compiler's own version output, so switching
 `NUPP_CC` from Clang to GCC builds beside the previous answer rather than over
 it. `scripts/worktree BRANCH PATH [START_POINT]` seeds a new worktree with
 content-validated compiler caches and the test runner's last suite timings;
@@ -180,12 +182,16 @@ library and the native provider) and its link kit
 (`nupp-kit-<platform>.tar.gz`). The first link fetches them with
 `scripts/toolchain prebuilt-codegen` and `prebuilt-kit`, checks each against its
 digest, and caches it once per machine, so it does not wait on
-`scripts/toolchain llvm` or Cargo. A code generator this tree linked itself is
+`scripts/toolchain llvm`. A code generator this tree linked itself is
 used instead whenever there is one, and `NUPP_CODEGEN_LIBRARY` names a code
 generator library outright.
 
 The pins are empty for a platform no release has published assets for yet, and
-a checkout there still needs `scripts/toolchain llvm`. To publish them, run the
+a checkout there still needs `scripts/toolchain llvm`. LLVM and lld are
+upstream C++ projects, so building them from their pinned sources, and linking
+them into the code generator library, is the one step that needs a C++ compiler
+(`NUPP_CXX`, probed beside `NUPP_CC` when unset); a checkout using the
+prebuilt assets never does. To publish them, run the
 `stage0-assets.yml` workflow on the stage-zero tag. It builds both assets on
 each platform, adds them to that release, appends their digests to its notes,
 and prints the pin lines to commit. An offline builder supplies the assets
@@ -233,7 +239,7 @@ alongside:
 | Carried | How | For |
 | --- | --- | --- |
 | `LuaJIT` | linked into the stub | running anything |
-| Rust native provider | linked into the stub | filesystem, networking, TLS, clocks, payload checks, and child processes |
+| Native provider | linked into the stub | the provider ABI and the AOT runtime |
 | Vendored JSON codec | in the payload | JSON, `--json`, and the LSP |
 | LPeg 1.1 | detected and linked | general PEG and direct LPeg patterns |
 | LPeg `re.lua` | in the payload | runtime textual grammars |
@@ -307,10 +313,16 @@ editable by a repository admin whatever their bypass list says.
 What a change selects is decided by `.github/scripts/classify-changes.lua` from
 the paths it touches. It is deliberately conservative: a path no rule
 classifies selects every job, and so does any change to `nupp.lua`,
-`scripts/`, `.github/`, `Cargo.lock` or the Rust toolchain file.
+`scripts/` or `.github/`.
 `tests/tools/repository/cichangeclassifiertest.lua` asserts what representative files select, and
 `.github/ci-coverage.json` records what each job and step covers -- the two are
 held to the workflow itself on every run, before anything is provisioned.
+
+Nupp builds without Rust or C++, and CI keeps it that way: a `.rs`, `.cpp`,
+`.cxx`, `Cargo.toml` or `build.rs` file in first-party compiler, runtime or
+host code fails the build. The C-interop fixtures under `tests/fixtures` and the
+benchmark controls under `bench`, which are foreign code by design, are exempt
+by path.
 
 Measurements live in `.github/workflows/measurements.yml`, not in the gate. A
 benchmark harness that does not compile is a bug and fails there; a slower
