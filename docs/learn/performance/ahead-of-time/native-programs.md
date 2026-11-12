@@ -103,7 +103,7 @@ cdef function printf(borrows format: cstring, ...): int32
 
 local function main(): int32
     local count: int32 = 7
-    printf("%d %g %d\n", count, count + 0.5, (count * 2) as int32)
+    printf("%d %g %d\n", count, count / 2, (count * 2) as int32)
     return 0
 end
 ```

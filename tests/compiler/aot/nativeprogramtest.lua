@@ -297,7 +297,7 @@ local function main(): int32
             small.count,
             true,
             ratio,
-            count + 0.25,
+            count / 4,
             12LL
         )
     end
@@ -310,7 +310,7 @@ end
     assert(not output:find("NUPP2514", 1, true), output)
     local status, ran = run(quote(executable))
     test.eq(status, 0, ran)
-    test.eq(ran, "-7 9 4000000000 -5 65535 1 0.5 -6.75 12\n-21")
+    test.eq(ran, "-7 9 4000000000 -5 65535 1 0.5 -1.75 12\n-21")
 end
 
 -- `open` reads its mode after the flags as a variadic `int`, so an `int32` mode
@@ -922,7 +922,7 @@ local function main(): int32
         nodes[1].flag = other.id == 5 and not nodes[1].flag
         nodes.next = nil
         printf(
-            "%%d %%g %%g %%g %%.10g %%lld %%g %%g %%.17g %%d %%.10g %%g\n",
+            "%%d %%d %%d %%g %%u %%lld %%g %%d %%.17g %%d %%u %%d\n",
             nodes.flag,
             nodes.small,
             nodes.count,
@@ -938,7 +938,7 @@ local function main(): int32
         )
         local bytes = nodes as uint8*
         for i = 0, 2 * SIZE - 1 do
-            printf("%%g ", bytes[i])
+            printf("%%d ", bytes[i])
         end
     end
     printf("\n")
@@ -1025,7 +1025,7 @@ local function show(n: number, wide: Wide*): nil
         wide.small = n
         wide.id = n
         printf(
-            "%lld %llu %lld %llu %g %g %.10g\n",
+            "%lld %llu %lld %llu %d %d %u\n",
             signed,
             unsigned,
             wide.big,
