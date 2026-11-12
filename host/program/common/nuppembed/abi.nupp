@@ -161,14 +161,6 @@ local function flag(condition: boolean): int32
     return 0
 end
 
-local function flag64(condition: boolean): int64
-    if condition then
-        return 1LL
-    end
-
-    return 0LL
-end
-
 -- The process-wide registry ----------------------------------------------------
 
 --- A spin lock over everything below: names, entry counts and deferred frees.
