@@ -401,7 +401,7 @@ built by another release is refused by exact version rather than adapted.
 | Format | Version | Rule | Declared in |
 | --- | --- | --- | --- |
 | Native provider ABI | 2 | exact major | `native/abi/nuppnative.nupp` `NUPP_NATIVE_ABI_VERSION` |
-| Embedding ABI | 2 | exact, config `size` at least the struct | `native/crates/host/src/embed.rs` `EMBED_ABI_VERSION` |
+| Embedding ABI | 2 | exact, config `size` at least the struct | `host/program/common/nuppembed/abi.nupp` `EMBED_ABI_VERSION` |
 | Compiler host ABI | 1 | exact | `src/nupp/tools/build/package.nupp` `hostAbiVersion` |
 | Payload trailer | 1 | exact | `host/program/common/nupphost/payload.nupp` `FORMAT_VERSION` |
 | AOT runtime ABI | 1 | exact | `native/aotruntime/common/ksrt/runtime.nupp` `ABI_VERSION` |

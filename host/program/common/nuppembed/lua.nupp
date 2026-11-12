@@ -1,0 +1,1265 @@
+--- The embedding SDK's LuaJIT boundary: every Lua operation the C embedding
+--- ABI performs on a runtime's state.
+---
+--- Stack: each operation runs through `protect`, which records the caller's
+--- top and restores it, so an operation's stack effects are private even when
+--- it fails.
+---
+--- Longjmp: `protect` enters `lua_cpcall` without allocating, and inside it a
+--- `lua_pcall` runs the operation itself, so allocation failures, metamethod
+--- errors and errors from chunks and embedder callbacks all stop at a protected
+--- frame. Converting the error to text happens in that same frame, because it
+--- may allocate. No LuaJIT error escapes to a caller of this module.
+---
+--- Ownership: inputs are borrowed for one call. A reference an operation
+--- returns is one Lua registry owner, handed to the caller, which gives it back
+--- exactly once with `nuppEmbedLuaRelease`.
+---
+--- Thread affinity: a state and its references belong to the thread that made
+--- or attached it. The runtime checks that before it calls in here, and this
+--- module adds no locks of its own.
+module nuppembed.lua
+
+const build = require("nupphost.build")
+
+cdef function calloc(count: uint64, size: uint64): voidptr?
+cdef function malloc(size: uint64): voidptr?
+cdef function free(borrows p: voidptr)
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, count: uint64): voidptr
+cdef function strlen(borrows s: cstring): uint64
+cdef function getenv(borrows name: cstring): cstring?
+cdef function snprintf(borrows buffer: voidptr, size: uint64, borrows format: cstring, ...): int32
+cdef function sscanf(borrows text: cstring, borrows format: cstring, ...): int32
+
+cdef function luaL_newstate(): voidptr?
+cdef function lua_close(borrows L: voidptr)
+cdef function luaL_openlibs(borrows L: voidptr)
+cdef function lua_cpcall(borrows L: voidptr, f: function(L: voidptr): int32, borrows ud: voidptr): int32
+cdef function lua_pcall(borrows L: voidptr, nargs: int32, nresults: int32, handler: int32): int32
+cdef function luaL_loadbuffer(borrows L: voidptr, borrows buffer: voidptr, size: uint64, borrows name: cstring): int32
+cdef function lua_touserdata(borrows L: voidptr, index: int32): voidptr?
+cdef function lua_gettop(borrows L: voidptr): int32
+cdef function lua_settop(borrows L: voidptr, index: int32)
+cdef function lua_type(borrows L: voidptr, index: int32): int32
+cdef function lua_toboolean(borrows L: voidptr, index: int32): int32
+cdef function lua_tointeger(borrows L: voidptr, index: int32): int64
+cdef function lua_tonumber(borrows L: voidptr, index: int32): number
+cdef function lua_tolstring(borrows L: voidptr, index: int32, borrows length: voidptr?): voidptr?
+cdef function lua_getfield(borrows L: voidptr, index: int32, borrows k: cstring)
+cdef function lua_setfield(borrows L: voidptr, index: int32, borrows k: cstring)
+cdef function lua_rawget(borrows L: voidptr, index: int32)
+cdef function lua_rawset(borrows L: voidptr, index: int32)
+cdef function lua_rawgeti(borrows L: voidptr, index: int32, n: int32)
+cdef function lua_rawseti(borrows L: voidptr, index: int32, n: int32)
+cdef function lua_pushstring(borrows L: voidptr, borrows s: cstring)
+cdef function lua_pushlstring(borrows L: voidptr, borrows s: voidptr, length: uint64)
+cdef function lua_pushinteger(borrows L: voidptr, n: int64)
+cdef function lua_pushnumber(borrows L: voidptr, n: number)
+cdef function lua_pushboolean(borrows L: voidptr, b: int32)
+cdef function lua_pushnil(borrows L: voidptr)
+cdef function lua_pushvalue(borrows L: voidptr, index: int32)
+cdef function lua_pushlightuserdata(borrows L: voidptr, borrows p: voidptr)
+cdef function lua_pushcclosure(borrows L: voidptr, f: function(L: voidptr): int32, n: int32)
+cdef function lua_createtable(borrows L: voidptr, narr: int32, nrec: int32)
+cdef function lua_call(borrows L: voidptr, nargs: int32, nresults: int32)
+cdef function luaL_ref(borrows L: voidptr, t: int32): int32
+cdef function luaL_unref(borrows L: voidptr, t: int32, ref: int32)
+cdef function lua_concat(borrows L: voidptr, n: int32)
+
+const REGISTRY = -10000
+const GLOBALS = -10002
+const MULTRET = -1
+
+const TNIL = 0
+const TBOOLEAN = 1
+const TNUMBER = 3
+const TSTRING = 4
+const TTABLE = 5
+const TFUNCTION = 6
+
+const ERRRUN = 2
+
+--- The registry key that says a component has loaded into a state. It is the
+--- state's, not a runtime's, because every runtime attached to one state shares
+--- the providers generated code has already observed.
+const HOST_FROZEN_KEY = "nupp.host.frozen"
+
+const LPEG_MODULE = "lpeg"
+
+--- Scratch for one C call at a time: each is read before anything that could
+--- reach this module again runs.
+local scratchLength: uint64[1]
+
+local versionMajor: int32[1]
+local versionMinor: int32[1]
+local versionBuild: int64[1]
+local versionConsumed: int32[1]
+local problem: uint8[256]
+
+--- The kinds a managed value has on its way into or out of Lua.
+export const VALUE_NIL = 0
+
+export const VALUE_BOOLEAN = 1
+export const VALUE_NUMBER = 2
+export const VALUE_BYTES = 4
+export const VALUE_REFERENCE = 5
+
+--- One managed value. `data` is borrowed going in; coming out, it is an
+--- allocation of `length` bytes the caller frees, or 0 when `length` is 0.
+cdef struct Value
+    kind: int32
+    boolean: int32
+    number: number
+    data: uint64
+    length: uint64
+    reference: int32
+end
+
+--- What a protected operation reads and writes. `error` is a failure's text,
+--- allocated, `errorLength` bytes long and terminated.
+cdef struct Call
+    status: int32
+    error: uint64
+    errorLength: uint64
+    operation: function(L: voidptr): int32
+    first: uint64
+    firstLength: uint64
+    second: uint64
+    secondLength: uint64
+    third: uint64
+    integer: int64
+    opener: function(L: voidptr): int32
+    answer: int64
+    values: uint64
+    count: uint64
+end
+
+--- 1 for true, 0 for false.
+local function flag(condition: boolean): int32
+    if condition then
+        return 1
+    end
+
+    return 0
+end
+
+local function flag64(condition: boolean): int64
+    if condition then
+        return 1LL
+    end
+
+    return 0LL
+end
+
+-- Failures ---------------------------------------------------------------------
+
+local function recordOf(call: uint64): Call*
+    return call as Call*
+end
+
+--- Copies `length` bytes of failure text into the call, replacing any before.
+--- Without memory for the copy the text is dropped, and the caller reports the
+--- failure in its own words.
+local function copyError(borrows call: Call*, borrows text: voidptr, length: uint64)
+    @unsafe do
+        call.status = ERRRUN
+        if call.error ~= 0ULL then
+            free(call.error as voidptr)
+        end
+        call.error = 0ULL
+        call.errorLength = 0ULL
+        local copy = malloc(length + 1ULL)
+        if copy == nil then
+            return
+        end
+        if length ~= 0ULL then
+            memcpy(copy as voidptr, text, length)
+        end
+        (copy as uint8*)[length as integer] = 0
+        call.error = copy as uint64
+        call.errorLength = length
+    end
+end
+
+local function fail(borrows call: Call*, borrows text: cstring)
+    copyError(call, text as voidptr, strlen(text))
+end
+
+--- Records the error value on top of the stack. This runs protected, because
+--- converting a numeric error to text may allocate.
+local function capture(borrows L: voidptr, borrows call: Call*, status: int32)
+    local text = lua_tolstring(L, -1, scratchLength as voidptr)
+    if text == nil then
+        fail(call, "unknown LuaJIT error")
+    else
+        copyError(call, text as voidptr, scratchLength[0])
+    end
+    @unsafe do
+        call.status = status
+    end
+end
+
+local function callOf(borrows L: voidptr): Call*
+    return lua_touserdata(L, 1) as Call*
+end
+
+-- Protection -------------------------------------------------------------------
+
+--- The inner frame: the operation itself runs beneath this `lua_pcall`, so its
+--- error is caught while this frame can still turn it into text.
+local function dispatch(L: voidptr): int32
+    local call = callOf(L)
+    @unsafe do
+        lua_pushcclosure(L, call.operation, 0)
+    end
+    lua_pushlightuserdata(L, call as voidptr)
+    local status = lua_pcall(L, 1, 0, 0)
+    if status ~= 0 then
+        capture(L, call, status)
+    end
+
+    return 0
+end
+
+--- Runs `operation` protected with `call` at index 1. Nonzero is a failure,
+--- whose text is in the call when there was memory to copy it.
+local function protect(borrows L: voidptr, borrows call: Call*, operation: function(L: voidptr): int32): int32
+    local top = lua_gettop(L)
+    @unsafe do
+        call.status = 0
+        call.operation = operation
+    end
+    local status = lua_cpcall(L, dispatch, call as voidptr)
+    lua_settop(L, top)
+    @unsafe do
+        if status ~= 0 and call.status == 0 then
+            call.status = status
+        end
+        return call.status
+    end
+end
+
+--- A new, zeroed call, or 0 without memory.
+export function nuppEmbedLuaCall(): uint64
+    local call = calloc(1ULL, ffi.sizeof(Call) as uint64)
+    if call == nil then
+        return 0ULL
+    end
+
+    return call as uint64
+end
+
+--- Frees a call and the failure text it holds.
+export function nuppEmbedLuaCallFree(call: uint64): nil
+    if call == 0ULL then
+        return
+    end
+    @unsafe do
+        local error = (call as Call*).error
+        if error ~= 0ULL then
+            free(error as voidptr)
+        end
+    end
+    free(call as voidptr)
+end
+
+--- The failure text a call holds, or 0, and its length in `length[0]`.
+export function nuppEmbedLuaCallError(call: uint64, borrows length: uint64*): uint64
+    @unsafe do
+        length[0] = (call as Call*).errorLength
+        return (call as Call*).error
+    end
+end
+
+--- The integer an operation answered.
+export function nuppEmbedLuaCallAnswer(call: uint64): int64
+    @unsafe do
+        return (call as Call*).answer
+    end
+end
+
+-- Opening and attaching --------------------------------------------------------
+
+--- LuaJIT's capacity limits, raised before the state traces anything, because
+--- the size of the machine-code area is fixed when the first trace allocates
+--- it. This is nupp.tools.jitlimits.FLAGS, which says why each is raised;
+--- clitest holds the lists to one account. NUPP_JIT_DEFAULT keeps LuaJIT's own.
+local function raiseJitLimits(borrows L: voidptr)
+    if getenv("NUPP_JIT_DEFAULT") ~= nil then
+        return
+    end
+    local top = lua_gettop(L)
+    lua_getfield(L, GLOBALS, "jit")
+    if lua_type(L, -1) == TTABLE then
+        lua_getfield(L, -1, "opt")
+        if lua_type(L, -1) == TTABLE then
+            lua_getfield(L, -1, "start")
+            lua_pushstring(L, "maxtrace=20000")
+            lua_pushstring(L, "maxside=1000")
+            lua_pushstring(L, "sizemcode=16384")
+            lua_pushstring(L, "maxmcode=16384")
+            -- A LuaJIT built without the JIT refuses the flags; that is not a
+            -- reason to refuse to run.
+            lua_pcall(L, 4, 0, 0)
+        end
+    end
+    lua_settop(L, top)
+end
+
+--- Installs `source` as `package.preload[module]`, loaded under `name`.
+local function preloadSource(
+    borrows L: voidptr,
+    borrows call: Call*,
+    borrows module: cstring,
+    borrows source: cstring,
+    borrows name: cstring
+): boolean
+    local status = luaL_loadbuffer(L, source as voidptr, strlen(source), name)
+    if status ~= 0 then
+        capture(L, call, status)
+        return false
+    end
+    lua_getfield(L, GLOBALS, "package")
+    lua_getfield(L, -1, "preload")
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "pinned LuaJIT did not install package.preload")
+        return false
+    end
+    lua_pushvalue(L, -3)
+    lua_setfield(L, -2, module)
+    lua_settop(L, -4)
+
+    return true
+end
+
+local function openLibraries(L: voidptr): int32
+    local call = callOf(L)
+    luaL_openlibs(L)
+    raiseJitLimits(L)
+    if not preloadSource(L, call, "jit.vmdef", build.VMDEF, "=jit.vmdef") then
+        return 0
+    end
+    if not preloadSource(L, call, "jit.zone", build.ZONE, "=jit.zone") then
+        return 0
+    end
+    preloadSource(L, call, "jit.bc", build.BC, "=jit.bc")
+
+    return 0
+end
+
+--- Pushes `table[name]`, read raw, or nil when `table` is not a table.
+local function pushRawField(borrows L: voidptr, table: int32, borrows name: cstring)
+    if lua_type(L, table) == TTABLE then
+        lua_pushstring(L, name)
+        if table < 0 and table > REGISTRY then
+            lua_rawget(L, table - 1)
+        else
+            lua_rawget(L, table)
+        end
+    else
+        lua_pushnil(L)
+    end
+end
+
+--- Whether `version` names LuaJIT 2.1.1784535649 or newer, spelled exactly.
+local function recentLuaJit(borrows version: cstring): boolean
+    versionConsumed[0] = -1
+    if sscanf(version, "LuaJIT %d.%d.%lld%n", versionMajor, versionMinor, versionBuild, versionConsumed) ~= 3 then
+        return false
+    end
+    if versionConsumed[0] < 0 then
+        return false
+    end
+    @unsafe do
+        if (version as uint8*)[versionConsumed[0] as integer] ~= 0 then
+            return false
+        end
+    end
+    if versionMajor[0] ~= 2 then
+        return versionMajor[0] > 2
+    end
+    if versionMinor[0] ~= 1 then
+        return versionMinor[0] > 1
+    end
+
+    return versionBuild[0] >= 1784535649LL
+end
+
+--- Reads the state's own jit library, raw and through the C API alone, so the
+--- version checked is the one the host's LuaJIT reported rather than one
+--- opening libraries here would install, and a bare state needs no base
+--- library. A state with no jit library passes only when the caller is about to
+--- open libraries, which then installs this LuaJIT's.
+local function verifyCompatibility(L: voidptr): int32
+    local call = callOf(L)
+    lua_pushstring(L, "jit")
+    lua_rawget(L, GLOBALS)
+    if lua_type(L, -1) == TNIL then
+        lua_settop(L, -2)
+        lua_pushstring(L, "package")
+        lua_rawget(L, GLOBALS)
+        pushRawField(L, -1, "loaded")
+        pushRawField(L, -1, "jit")
+    end
+    @unsafe do
+        if lua_type(L, -1) == TNIL and call.integer ~= 0LL then
+            return 0
+        end
+    end
+    pushRawField(L, -1, "version")
+    local recent = false
+    if lua_type(L, -1) == TSTRING then
+        local text = lua_tolstring(L, -1, nil)
+        recent = text ~= nil and recentLuaJit(text as cstring)
+    end
+    if not recent then
+        fail(call, "nupp: attached state requires LuaJIT 2.1.1784535649 or newer")
+    end
+
+    return 0
+end
+
+--- A new state, or nil without memory.
+export function nuppEmbedLuaNewState(): voidptr?
+    return luaL_newstate()
+end
+
+export function nuppEmbedLuaClose(borrows L: voidptr): nil
+    lua_close(L)
+end
+
+--- Opens LuaJIT's libraries with the raised limits, and preloads its `jit.*`
+--- support modules.
+export function nuppEmbedLuaOpenLibraries(borrows L: voidptr, call: uint64): int32
+    return protect(L, call as Call*, openLibraries)
+end
+
+--- Refuses a state from a LuaJIT older than the one this library links,
+--- passing a state with no jit library at all only when `allowMissing`.
+export function nuppEmbedLuaVerify(borrows L: voidptr, call: uint64, allowMissing: boolean): int32
+    @unsafe do
+        recordOf(call).integer = flag64(allowMissing)
+    end
+
+    return protect(L, call as Call*, verifyCompatibility)
+end
+
+-- The host record --------------------------------------------------------------
+
+--- A state another runtime already set up keeps its record: replacing it would
+--- drop the features and resources that runtime declared.
+local function installHostRecord(L: voidptr): int32
+    local call = callOf(L)
+    lua_pushstring(L, "__nuppHost")
+    lua_rawget(L, GLOBALS)
+    if lua_type(L, -1) ~= TNIL then
+        local shared = false
+        if lua_type(L, -1) == TTABLE then
+            lua_getfield(L, -1, "hostAbi")
+            shared = lua_tointeger(L, -1) == 1LL
+            lua_settop(L, -2)
+        end
+        if not shared then
+            fail(call, "the Lua state has a __nuppHost global that is not a Nupp host record")
+        end
+        return 0
+    end
+    lua_settop(L, -2)
+    lua_createtable(L, 0, 3)
+    lua_pushinteger(L, 1LL)
+    lua_setfield(L, -2, "hostAbi")
+    lua_createtable(L, 0, 0)
+    lua_setfield(L, -2, "hostFeatures")
+    lua_createtable(L, 0, 0)
+    lua_setfield(L, -2, "resources")
+    lua_setfield(L, GLOBALS, "__nuppHost")
+
+    return 0
+end
+
+export function nuppEmbedLuaInstallHostRecord(borrows L: voidptr, call: uint64): int32
+    return protect(L, call as Call*, installHostRecord)
+end
+
+--- Sets `__nuppHost.hostFeatures[first]`, `firstLength` bytes long.
+local function addFeature(L: voidptr): int32
+    local call = callOf(L)
+    lua_getfield(L, GLOBALS, "__nuppHost")
+    lua_getfield(L, -1, "hostFeatures")
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "the Nupp host feature table is missing")
+        return 0
+    end
+    @unsafe do
+        lua_pushlstring(L, call.first as voidptr, call.firstLength)
+    end
+    lua_pushboolean(L, 1)
+    lua_rawset(L, -3)
+
+    return 0
+end
+
+export function nuppEmbedLuaAddFeature(borrows L: voidptr, call: uint64, name: uint64, length: uint64): int32
+    @unsafe do
+        recordOf(call).first = name as uint64
+        recordOf(call).firstLength = length
+    end
+
+    return protect(L, call as Call*, addFeature)
+end
+
+--- Declares each comma-separated feature the library was built with, and
+--- preloads LPeg when it was built with that and the state has libraries.
+export function nuppEmbedLuaAddBuildFeatures(borrows L: voidptr, call: uint64, openLibraries: boolean): int32
+    local list = build.FEATURES
+    local bytes = list as uint8*
+    local total = strlen(list) as integer
+    local start = 0
+    local at = 0
+    while at <= total do
+        local ends = at == total
+        if not ends then
+            @unsafe do
+                ends = bytes[at] == 44
+            end
+        end
+        if ends then
+            if at > start then
+                local first = @unsafe(((list as uint64) + (start as uint64)) as voidptr)
+                local status = nuppEmbedLuaAddFeature(L, call, first as uint64, (at - start) as uint64)
+                if status ~= 0 then
+                    return status
+                end
+            end
+            start = at + 1
+        end
+        at = at + 1
+    end
+    if build.LPEG and openLibraries then
+        return nuppEmbedLuaPreload(L, call, LPEG_MODULE as uint64, build.nuppHostBuildOpenLpeg)
+    end
+
+    return 0
+end
+
+--- Sets `__nuppHost.resources[first]` to the `secondLength` bytes at `second`.
+local function addResource(L: voidptr): int32
+    local call = callOf(L)
+    lua_getfield(L, GLOBALS, "__nuppHost")
+    lua_getfield(L, -1, "resources")
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "the Nupp host resource table is missing")
+        return 0
+    end
+    @unsafe do
+        lua_pushlstring(L, call.second as voidptr, call.secondLength)
+        lua_setfield(L, -2, call.first as cstring)
+    end
+
+    return 0
+end
+
+export function nuppEmbedLuaAddResource(
+    borrows L: voidptr,
+    call: uint64,
+    path: uint64,
+    data: uint64,
+    length: uint64
+): int32
+    @unsafe do
+        recordOf(call).first = path as uint64
+        recordOf(call).second = data
+        recordOf(call).secondLength = length
+    end
+
+    return protect(L, call as Call*, addResource)
+end
+
+local function preloadOpener(L: voidptr): int32
+    local call = callOf(L)
+    lua_getfield(L, GLOBALS, "package")
+    lua_getfield(L, -1, "preload")
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "pinned LuaJIT did not install package.preload")
+        return 0
+    end
+    @unsafe do
+        lua_pushcclosure(L, call.opener, 0)
+        lua_setfield(L, -2, call.first as cstring)
+    end
+
+    return 0
+end
+
+--- Installs `opener` as `package.preload[module]`.
+export function nuppEmbedLuaPreload(
+    borrows L: voidptr,
+    call: uint64,
+    module: uint64,
+    opener: function(L: voidptr): int32
+): int32
+    @unsafe do
+        recordOf(call).first = module as uint64
+        recordOf(call).opener = opener
+    end
+
+    return protect(L, call as Call*, preloadOpener)
+end
+
+local function registerAotBuilders(L: voidptr): int32
+    local call = callOf(L)
+    lua_getfield(L, GLOBALS, "__nuppAotBuilderModules")
+    if lua_type(L, -1) == TNIL then
+        lua_settop(L, -2)
+        lua_createtable(L, 0, 4)
+        lua_pushvalue(L, -1)
+        lua_setfield(L, GLOBALS, "__nuppAotBuilderModules")
+    end
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "the Nupp AOT builder table is invalid")
+        return 0
+    end
+    @unsafe do
+        lua_pushcclosure(L, call.opener, 0)
+    end
+    local status = lua_pcall(L, 0, 1, 0)
+    if status ~= 0 then
+        capture(L, call, status)
+        return 0
+    end
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "an AOT builder registrar must return a table")
+        return 0
+    end
+    @unsafe do
+        lua_setfield(L, -2, call.first as cstring)
+    end
+
+    return 0
+end
+
+--- Calls `registrar` and stores the table it returns under
+--- `__nuppAotBuilderModules[key]`.
+export function nuppEmbedLuaRegisterAotBuilders(
+    borrows L: voidptr,
+    call: uint64,
+    key: uint64,
+    registrar: function(L: voidptr): int32
+): int32
+    @unsafe do
+        recordOf(call).first = key as uint64
+        recordOf(call).opener = registrar
+    end
+
+    return protect(L, call as Call*, registerAotBuilders)
+end
+
+-- Markers ----------------------------------------------------------------------
+
+--- Gives `os.host` requests in this state to an embedding application. A state
+--- that already has a channel keeps it: the first runtime on a state answers
+--- its requests, and the answer says whether this one is it. Raw, so a globals
+--- metatable can neither fake nor hide the marker.
+local function installHostChannel(L: voidptr): int32
+    local call = callOf(L)
+    lua_pushstring(L, "__nuppHostChannel")
+    lua_rawget(L, GLOBALS)
+    @unsafe do
+        if lua_type(L, -1) ~= TNIL then
+            local present = lua_touserdata(L, -1)
+            call.answer = flag64((present ~= nil and present as uint64 == call.first))
+            return 0
+        end
+    end
+    lua_settop(L, -2)
+    -- A bare state has no package library to preload the module into, and no
+    -- `require` to reach it with until libraries are opened.
+    lua_pushstring(L, "package")
+    lua_rawget(L, GLOBALS)
+    if lua_type(L, -1) == TTABLE then
+        lua_getfield(L, -1, "preload")
+        if lua_type(L, -1) ~= TTABLE then
+            fail(call, "pinned LuaJIT did not install package.preload")
+            return 0
+        end
+        @unsafe do
+            lua_pushcclosure(L, call.opener, 0)
+        end
+        lua_setfield(L, -2, "nupp.host.native")
+    end
+    @unsafe do
+        lua_settop(L, 1)
+        lua_pushstring(L, "__nuppHostChannel")
+        lua_pushlightuserdata(L, call.first as voidptr)
+        lua_rawset(L, GLOBALS)
+        call.answer = 1LL
+    end
+
+    return 0
+end
+
+--- Installs `channel`, with `opener` as the `nupp.host.native` module, unless
+--- the state already has one. The call answers 1 when `channel` is the state's.
+export function nuppEmbedLuaInstallHostChannel(
+    borrows L: voidptr,
+    call: uint64,
+    channel: uint64,
+    opener: function(L: voidptr): int32
+): int32
+    @unsafe do
+        recordOf(call).first = channel
+        recordOf(call).opener = opener
+        recordOf(call).answer = 0LL
+    end
+
+    return protect(L, call as Call*, installHostChannel)
+end
+
+--- Detaches the channel, if it is this one, before its owner goes away.
+local function clearHostChannel(L: voidptr): int32
+    local call = callOf(L)
+    lua_pushstring(L, "__nuppHostChannel")
+    lua_rawget(L, GLOBALS)
+    local present = lua_touserdata(L, -1)
+    @unsafe do
+        if present ~= nil and present as uint64 == call.first then
+            lua_pushstring(L, "__nuppHostChannel")
+            lua_pushnil(L)
+            lua_rawset(L, GLOBALS)
+        end
+    end
+
+    return 0
+end
+
+export function nuppEmbedLuaClearHostChannel(borrows L: voidptr, call: uint64, channel: uint64): int32
+    @unsafe do
+        recordOf(call).first = channel
+    end
+
+    return protect(L, call as Call*, clearHostChannel)
+end
+
+--- Whether the worker adapter has been installed in this state, by the stamped
+--- Nupp host that built it or by whatever else did. Raw, so a globals
+--- metatable cannot answer for a marker that is not there.
+local function workerHostInstalled(L: voidptr): int32
+    local call = callOf(L)
+    lua_pushstring(L, "__nuppWorkerHost")
+    lua_rawget(L, GLOBALS)
+    @unsafe do
+        call.answer = flag64(not (lua_type(L, -1) == TNIL))
+    end
+
+    return 0
+end
+
+export function nuppEmbedLuaWorkerHostInstalled(borrows L: voidptr, call: uint64): int32
+    return protect(L, call as Call*, workerHostInstalled)
+end
+
+local function hostFrozen(L: voidptr): int32
+    local call = callOf(L)
+    lua_getfield(L, REGISTRY, HOST_FROZEN_KEY)
+    @unsafe do
+        call.answer = flag64(lua_toboolean(L, -1) ~= 0)
+    end
+
+    return 0
+end
+
+--- Whether a component has loaded into this state, through any runtime.
+export function nuppEmbedLuaHostFrozen(borrows L: voidptr, call: uint64): int32
+    return protect(L, call as Call*, hostFrozen)
+end
+
+-- Components -------------------------------------------------------------------
+
+local function installComponent(L: voidptr): int32
+    local call = callOf(L)
+    local status: int32 = 0
+    @unsafe do
+        status = luaL_loadbuffer(L, call.first as voidptr, call.firstLength, call.second as cstring)
+    end
+    if status == 0 then
+        status = lua_pcall(L, 0, 1, 0)
+    end
+    if status ~= 0 then
+        capture(L, call, status)
+        return 0
+    end
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "a Nupp component descriptor did not return a table")
+        return 0
+    end
+    lua_getfield(L, -1, "format")
+    local format = lua_tointeger(L, -1)
+    lua_settop(L, -2)
+    if format ~= 1LL then
+        snprintf(problem, 256ULL, "unsupported Nupp component format %d", format as int32)
+        fail(call, problem as cstring)
+        return 0
+    end
+    lua_getfield(L, -1, "hostAbi")
+    local hostAbi = lua_tointeger(L, -1)
+    lua_settop(L, -2)
+    if hostAbi ~= 1LL then
+        snprintf(
+            problem,
+            256ULL,
+            "Nupp component requires compiler host ABI %d, but this runtime provides ABI 1",
+            hostAbi as int32
+        )
+        fail(call, problem as cstring)
+        return 0
+    end
+    lua_getfield(L, -1, "install")
+    if lua_type(L, -1) ~= TFUNCTION then
+        fail(call, "a Nupp component descriptor has no installer")
+        return 0
+    end
+    status = lua_pcall(L, 0, 1, 0)
+    if status ~= 0 then
+        capture(L, call, status)
+        return 0
+    end
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "a Nupp component installer did not return a table")
+        return 0
+    end
+    @unsafe do
+        call.answer = luaL_ref(L, REGISTRY) as int64
+    end
+    lua_pushboolean(L, 1)
+    lua_setfield(L, REGISTRY, HOST_FROZEN_KEY)
+
+    return 0
+end
+
+--- Runs a component's descriptor chunk and its installer. The call answers the
+--- reference that roots the installed component.
+export function nuppEmbedLuaInstallComponent(
+    borrows L: voidptr,
+    call: uint64,
+    chunk: uint64,
+    length: uint64,
+    name: uint64
+): int32
+    @unsafe do
+        recordOf(call).first = chunk
+        recordOf(call).firstLength = length
+        recordOf(call).second = name as uint64
+    end
+
+    return protect(L, call as Call*, installComponent)
+end
+
+--- Sets `arg` to the `count` strings whose addresses are the array at `values`,
+--- each NUL-terminated.
+local function pushArguments(borrows L: voidptr, borrows call: Call*)
+    @unsafe do
+        local count = call.count
+        lua_createtable(L, count as int32, 0)
+        for index = 0, (count as integer) - 1 do
+            local text = ((call.values + (index as uint64) * 8ULL) as uint64*)[0]
+            lua_pushstring(L, text as cstring)
+            lua_rawseti(L, -2, math.i32.wrap(index + 1))
+        end
+    end
+    lua_setfield(L, GLOBALS, "arg")
+end
+
+local function startComponent(L: voidptr): int32
+    local call = callOf(L)
+    pushArguments(L, call)
+    @unsafe do
+        lua_rawgeti(L, REGISTRY, call.integer as int32)
+    end
+    lua_getfield(L, -1, "start")
+    if lua_type(L, -1) ~= TFUNCTION then
+        fail(call, "the component has no callable start")
+        return 0
+    end
+    local status = lua_pcall(L, 0, 0, 0)
+    if status ~= 0 then
+        capture(L, call, status)
+    end
+
+    return 0
+end
+
+--- Sets `arg` to the `count` NUL-terminated strings at `arguments`, then runs
+--- the start function of the component `reference` roots.
+export function nuppEmbedLuaStartComponent(
+    borrows L: voidptr,
+    call: uint64,
+    reference: int32,
+    arguments: uint64,
+    count: uint64
+): int32
+    @unsafe do
+        recordOf(call).integer = reference as int64
+        recordOf(call).values = arguments
+        recordOf(call).count = count
+    end
+
+    return protect(L, call as Call*, startComponent)
+end
+
+local function findExport(L: voidptr): int32
+    local call = callOf(L)
+    @unsafe do
+        lua_rawgeti(L, REGISTRY, call.integer as int32)
+    end
+    lua_getfield(L, -1, "exports")
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "the component has no export table")
+        return 0
+    end
+    @unsafe do
+        lua_getfield(L, -1, call.first as cstring)
+    end
+    if lua_type(L, -1) ~= TFUNCTION then
+        fail(call, "the component has no callable export")
+        return 0
+    end
+    @unsafe do
+        call.answer = luaL_ref(L, REGISTRY) as int64
+    end
+
+    return 0
+end
+
+--- Roots the export `name` of the component `component` roots. The call
+--- answers the new reference.
+export function nuppEmbedLuaFindExport(borrows L: voidptr, call: uint64, component: int32, name: uint64): int32
+    @unsafe do
+        recordOf(call).integer = component as int64
+        recordOf(call).first = name as uint64
+    end
+
+    return protect(L, call as Call*, findExport)
+end
+
+-- Modules and members ----------------------------------------------------------
+
+--- Prepends one directory's module patterns to package.path. A host naming a
+--- compiler tree means that tree, whatever else the process already has.
+local function addPackagePath(L: voidptr): int32
+    local call = callOf(L)
+    lua_getfield(L, GLOBALS, "package")
+    if lua_type(L, -1) ~= TTABLE then
+        fail(call, "pinned LuaJIT did not install package")
+        return 0
+    end
+    lua_getfield(L, -1, "path")
+    local existing: voidptr? = nil
+    if lua_type(L, -1) == TSTRING then
+        existing = lua_tolstring(L, -1, scratchLength as voidptr)
+    end
+    @unsafe do
+        local directory = call.first as voidptr
+        local length = strlen(call.first as cstring)
+        lua_pushlstring(L, directory, length)
+        lua_pushstring(L, "/?.lua;")
+        lua_pushlstring(L, directory, length)
+        lua_pushstring(L, "/?/init.lua;")
+    end
+    if existing == nil then
+        lua_pushstring(L, "")
+    else
+        lua_pushlstring(L, existing as voidptr, scratchLength[0])
+    end
+    lua_concat(L, 5)
+    lua_setfield(L, -3, "path")
+
+    return 0
+end
+
+export function nuppEmbedLuaAddPackagePath(borrows L: voidptr, call: uint64, directory: uint64): int32
+    @unsafe do
+        recordOf(call).first = directory as uint64
+    end
+
+    return protect(L, call as Call*, addPackagePath)
+end
+
+--- Takes the member `second` of the table on top of the stack, which `first`
+--- names when it is a module, and roots it.
+local function takeMember(borrows L: voidptr, borrows call: Call*)
+    local owner = "the managed value"
+    @unsafe do
+        if call.first ~= 0ULL then
+            owner = call.first as cstring
+        end
+    end
+    if lua_type(L, -1) ~= TTABLE then
+        snprintf(problem, 256ULL, "%s is not a table", owner)
+        fail(call, problem as cstring)
+        return
+    end
+    @unsafe do
+        lua_getfield(L, -1, call.second as cstring)
+        if lua_type(L, -1) == TNIL then
+            snprintf(problem, 256ULL, "%s has no member named %s", owner, call.second as cstring)
+            fail(call, problem as cstring)
+            return
+        end
+        call.answer = luaL_ref(L, REGISTRY) as int64
+    end
+end
+
+local function moduleMember(L: voidptr): int32
+    local call = callOf(L)
+    lua_getfield(L, GLOBALS, "require")
+    if lua_type(L, -1) ~= TFUNCTION then
+        fail(call, "pinned LuaJIT did not install require")
+        return 0
+    end
+    @unsafe do
+        lua_pushstring(L, call.first as cstring)
+    end
+    local status = lua_pcall(L, 1, 1, 0)
+    if status ~= 0 then
+        capture(L, call, status)
+        return 0
+    end
+    takeMember(L, call)
+
+    return 0
+end
+
+--- Roots `require(module)[name]`. The call answers the new reference.
+export function nuppEmbedLuaModuleMember(borrows L: voidptr, call: uint64, module: uint64, name: uint64): int32
+    @unsafe do
+        recordOf(call).first = module as uint64
+        recordOf(call).second = name as uint64
+    end
+
+    return protect(L, call as Call*, moduleMember)
+end
+
+local function valueMember(L: voidptr): int32
+    local call = callOf(L)
+    @unsafe do
+        lua_rawgeti(L, REGISTRY, call.integer as int32)
+    end
+    takeMember(L, call)
+
+    return 0
+end
+
+--- Roots `value[name]` for the value `value` roots. The call answers the new
+--- reference.
+export function nuppEmbedLuaValueMember(borrows L: voidptr, call: uint64, value: int32, name: uint64): int32
+    @unsafe do
+        recordOf(call).first = 0ULL
+        recordOf(call).integer = value as int64
+        recordOf(call).second = name as uint64
+    end
+
+    return protect(L, call as Call*, valueMember)
+end
+
+local function release(L: voidptr): int32
+    local call = callOf(L)
+    @unsafe do
+        luaL_unref(L, REGISTRY, call.integer as int32)
+    end
+
+    return 0
+end
+
+--- Gives a reference back to the registry.
+export function nuppEmbedLuaRelease(borrows L: voidptr, call: uint64, reference: int32): int32
+    @unsafe do
+        recordOf(call).integer = reference as int64
+    end
+
+    return protect(L, call as Call*, release)
+end
+
+-- Calls ------------------------------------------------------------------------
+
+local function valueAt(values: uint64, index: integer): Value*
+    return @unsafe((values + (index as uint64) * (ffi.sizeof(Value) as uint64)) as Value*)
+end
+
+local function pushValue(borrows L: voidptr, borrows value: Value*)
+    @unsafe do
+        local kind = value.kind
+        if kind == VALUE_NIL then
+            lua_pushnil(L)
+        elseif kind == VALUE_BOOLEAN then
+            lua_pushboolean(L, flag(value.boolean ~= 0))
+        elseif kind == VALUE_NUMBER then
+            lua_pushnumber(L, value.number)
+        elseif kind == VALUE_BYTES then
+            lua_pushlstring(L, value.data as voidptr, value.length)
+        else
+            lua_rawgeti(L, REGISTRY, value.reference)
+        end
+    end
+end
+
+--- Converts the value at `index` into `value`: a scalar in place, a string
+--- copied into an allocation, and anything else rooted. Nonzero `count` on the
+--- call is how many results were already converted, so a failure part way is
+--- undone by whoever frees them.
+local function takeValue(borrows L: voidptr, borrows call: Call*, index: int32, borrows value: Value*): boolean
+    local kind = lua_type(L, index)
+    @unsafe do
+        if kind == TNIL then
+            value.kind = VALUE_NIL
+        elseif kind == TBOOLEAN then
+            value.kind = VALUE_BOOLEAN
+            value.boolean = flag(lua_toboolean(L, index) ~= 0)
+        elseif kind == TNUMBER then
+            value.kind = VALUE_NUMBER
+            value.number = lua_tonumber(L, index)
+        elseif kind == TSTRING then
+            local text = lua_tolstring(L, index, scratchLength as voidptr)
+            value.kind = VALUE_BYTES
+            value.length = scratchLength[0]
+            if scratchLength[0] ~= 0ULL and text ~= nil then
+                local copy = malloc(scratchLength[0])
+                if copy == nil then
+                    fail(call, "out of memory copying a managed result")
+                    return false
+                end
+                memcpy(copy as voidptr, text as voidptr, scratchLength[0])
+                value.data = copy as uint64
+            end
+        else
+            lua_pushvalue(L, index)
+            value.kind = VALUE_REFERENCE
+            value.reference = luaL_ref(L, REGISTRY)
+        end
+    end
+
+    return true
+end
+
+local function callValues(L: voidptr): int32
+    local call = callOf(L)
+    local base = lua_gettop(L)
+    @unsafe do
+        lua_rawgeti(L, REGISTRY, call.integer as int32)
+    end
+    if lua_type(L, -1) ~= TFUNCTION then
+        fail(call, "the managed handle is not callable")
+        return 0
+    end
+    local count = 0
+    @unsafe do
+        count = call.count as integer
+        for index = 0, count - 1 do
+            pushValue(L, valueAt(call.first, index))
+        end
+    end
+    local status = lua_pcall(L, count as int32, MULTRET, 0)
+    if status ~= 0 then
+        capture(L, call, status)
+        return 0
+    end
+    local results = lua_gettop(L) - base
+    if results == 0 then
+        return 0
+    end
+    local values = calloc(results as uint64, ffi.sizeof(Value) as uint64)
+    if values == nil then
+        fail(call, "out of memory collecting managed results")
+        return 0
+    end
+    @unsafe do
+        call.values = values as uint64
+        call.answer = 0LL
+        for index = 0, results - 1 do
+            if not takeValue(L, call, math.i32.wrap(base + 1 + index), valueAt(call.values, index)) then
+                return 0
+            end
+            call.answer = (index + 1) as int64
+        end
+    end
+
+    return 0
+end
+
+--- Calls the function `callable` roots with `count` values at `arguments`.
+--- On return the call's `values` holds the results, an allocation of Value
+--- that `nuppEmbedLuaCallValues` reads, and the call answers how many were
+--- converted; a failure part way leaves only those to undo.
+export function nuppEmbedLuaCallFunction(
+    borrows L: voidptr,
+    call: uint64,
+    callable: int32,
+    arguments: uint64,
+    count: uint64
+): int32
+    @unsafe do
+        recordOf(call).integer = callable as int64
+        recordOf(call).first = arguments
+        recordOf(call).count = count
+        recordOf(call).values = 0ULL
+        recordOf(call).answer = 0LL
+    end
+
+    return protect(L, call as Call*, callValues)
+end
+
+--- The results the last call collected, which the caller now owns and frees.
+export function nuppEmbedLuaCallValues(call: uint64): uint64
+    @unsafe do
+        local values = (call as Call*).values
+        recordOf(call).values = 0ULL
+        return values
+    end
+end
+
+--- Frees `count` values from a call: their copied bytes, and their references
+--- given back to `L` unless it is nil.
+export function nuppEmbedLuaFreeValues(borrows L: voidptr?, values: uint64, count: integer): nil
+    if values == 0ULL then
+        return
+    end
+    local scratch = nuppEmbedLuaCall()
+    for index = 0, count - 1 do
+        local value = valueAt(values, index)
+        @unsafe do
+            if value.kind == VALUE_BYTES and value.data ~= 0ULL then
+                free(value.data as voidptr)
+            elseif value.kind == VALUE_REFERENCE and L ~= nil and scratch ~= 0ULL then
+                nuppEmbedLuaRelease(L as voidptr, scratch, value.reference)
+            end
+        end
+    end
+    nuppEmbedLuaCallFree(scratch)
+    free(values as voidptr)
+end
+
+-- Suspension -------------------------------------------------------------------
+
+--- One non-blocking pass over the suspension sources, when this state has
+--- loaded nupp.suspension. A state that never loaded it has registered no
+--- source, so there is nothing to drive.
+local function pollSuspension(L: voidptr): int32
+    lua_getfield(L, REGISTRY, "_LOADED")
+    if lua_type(L, -1) ~= TTABLE then
+        return 0
+    end
+    lua_getfield(L, -1, "nupp.suspension")
+    if lua_type(L, -1) ~= TTABLE then
+        return 0
+    end
+    lua_getfield(L, -1, "poll")
+    if lua_type(L, -1) ~= TFUNCTION then
+        return 0
+    end
+    lua_call(L, 0, 0)
+
+    return 0
+end
+
+export function nuppEmbedLuaPoll(borrows L: voidptr, call: uint64): int32
+    return protect(L, call as Call*, pollSuspension)
+end

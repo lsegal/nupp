@@ -127,4 +127,4 @@ for _, configuration in ipairs(CONFIGURATIONS) do
       median(row.flushes), median(row.traces)))
 end
 io.write("\n the shipped limits are in src/nupp/tools/jitlimits.nupp,\n")
-io.write(" host/program/common/nupphost/state.nupp and native/crates/host/c/lua_shim.c\n\n")
+io.write(" host/program/common/nupphost/state.nupp and host/program/common/nuppembed/lua.nupp\n\n")

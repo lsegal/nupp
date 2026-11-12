@@ -16,6 +16,7 @@ cdef function __error(): int32*
 cdef function clock_gettime_nsec_np(clock: int32): uint64
 cdef function _NSGetExecutablePath(borrows buffer: voidptr?, borrows size: uint32*): int32
 
+cdef function pthread_self(): uint64
 cdef function pthread_mutex_init(borrows mutex: voidptr, borrows attributes: voidptr?): int32
 cdef function pthread_mutex_destroy(borrows mutex: voidptr): int32
 cdef function pthread_mutex_lock(borrows mutex: voidptr): int32
@@ -172,6 +173,12 @@ export function nuppHostSysThreadJoin(borrows thread: voidptr): nil
         pthread_join((thread as uint64*)[0], nil)
     end
     free(thread)
+end
+
+--- The calling thread's identity, for checking that a caller is the thread
+--- that owns something.
+export function nuppHostSysThreadId(): uint64
+    return pthread_self()
 end
 
 --- Nanoseconds on the monotonic clock `nupp.runtime.provider.nativeplatform`

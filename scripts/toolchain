@@ -888,8 +888,7 @@ LOCK=""
 HOST_OUT=""
 NATIVE_OUT=""
 RUST_NATIVE_OUT=""
-RUST_EMBED_DYNAMIC_OUT=""
-RUST_EMBED_IMPORT_OUT=""
+NUPP_EMBED_OUT=""
 release_lock() { [ -n "$LOCK" ] && rm -rf "$LOCK"; LOCK=""; return 0; }
 
 # Says that this run is waiting and on whom: once after a short grace, then
@@ -1373,121 +1372,110 @@ embedding_library_filename() {
     esac
 }
 
-build_rust_embedding() {
-    luajit_prefix=$1
-    embedding_features=${2:-}
-    lpeg_prefix=${3:-}
-    select_rust_tools
-    rust_environment=$(rust_environment_material)
-    # nupp-native is one of its crates, so libnupp links the provider's AOT
-    # runtime too and exports nuppAotRuntime, as the provider does.
-    aot_runtime_for_provider
-    re_runtime=none
-    [ -z "$AOT_RUNTIME_OUT" ] || re_runtime=$(sha256 "$AOT_RUNTIME_OUT")
-    digest=$({
-        printf '%s|%s|%s|%s|%s|%s\n' \
-            nupp-native-embedding "$embedding_features" "$RUST_TOOL_MATERIAL" \
-            "$(rust_sources_digest)" "$KEY" "$re_runtime"
-        printf '%s\n' "$rust_environment"
-    } | sha256_stdin | cut -c1-16)
-    out="$RUST_BUILD_ROOT/embedding/$digest"
-    RUST_EMBED_OUT="$out/target/release/libnupp.a"
-    case "$PLATFORM" in
-        darwin) cargo_dynamic=libnupp.dylib ;;
-        windows)
-            cargo_dynamic=nupp.dll
-            RUST_EMBED_IMPORT_OUT="$out/target/release/libnupp.dll.a"
-            ;;
-        *) cargo_dynamic=libnupp.so ;;
-    esac
-    RUST_EMBED_DYNAMIC_OUT="$out/target/release/$cargo_dynamic"
+# Builds the C embedding SDK for one normalized feature list into
+# NUPP_EMBED_OUT: libnupp.a (the Nupp embedding library, the native provider,
+# LuaJIT and LPeg), the shared library linked from it and, on Windows, its
+# import library. The library is a native Nupp program,
+# host/program/common/nuppembed, compiled the way the host is.
+build_nupp_embedding() {
+    ne_luajit=$1
+    ne_features=${2:-}
+    ne_lpeg=${3:-}
+    ne_provider="base"
+    case ",$ne_features," in *,native-panic-probe,*) ne_provider="$ne_provider,panic-probe" ;; esac
+    build_rust_native "$ne_provider"
+    ne_provider_archive=$RUST_NATIVE_STATIC_OUT
+    ne_provider_libraries=$RUST_NATIVE_LIBS_OUT
+    ne_digest=$(printf '%s|%s|%s|%s|%s' \
+        nupp-embedding "$ne_features" "$(host_program_digest)" "$ne_provider_archive" "$KEY" \
+        | sha256_stdin | cut -c1-16)
+    ne_out="$PREFIX/nupp-embedding/$ne_digest"
+    NUPP_EMBED_OUT=$ne_out
+    ne_dynamic=$(embedding_library_filename)
 
-    take_lock "rust-embedding-$digest" "$out/.complete" || return 0
-    if [ -f "$out/.complete" ] && [ -f "$RUST_EMBED_OUT" ] \
-        && [ -f "$RUST_EMBED_DYNAMIC_OUT" ]; then
-        [ "$PLATFORM" != windows ] || [ -f "$RUST_EMBED_IMPORT_OUT" ] \
+    take_lock "nupp-embedding-$ne_digest" "$ne_out/.complete" || return 0
+    if [ -f "$ne_out/.complete" ] && [ -f "$ne_out/libnupp.a" ] && [ -f "$ne_out/$ne_dynamic" ]; then
+        [ "$PLATFORM" != windows ] || [ -f "$ne_out/libnupp.dll.a" ] \
             || die "the cached Windows embedding SDK has no import library"
         release_lock
         return 0
     fi
 
-    note "building the Rust embedding library with $RUSTC"
-    rm -rf "$out"
-    mkdir -p "$out"
-    set -- "$CARGO" rustc \
-        --manifest-path "$ROOT/Cargo.toml" \
-        --package nupp-native-host \
-        --lib \
-        --release \
-        --locked \
-        --no-default-features \
-        --target-dir "$out/target"
-    if offline; then
-        set -- "$@" --offline
-    fi
-    if [ -n "$embedding_features" ]; then
-        set -- "$@" --features "$embedding_features"
-    fi
-    vendor_arguments=$(rust_vendor_arguments)
-    if [ -n "$vendor_arguments" ]; then
-        while IFS= read -r config; do
-            set -- "$@" --config "$config"
-        done <<EOF
-$vendor_arguments
-EOF
-    fi
-    set -- "$@" --config "$(rust_remap_arguments)"
-    set -- "$@" -- -C link-dead-code
+    note "building the Nupp embedding library"
+    rm -rf "$ne_out"
+    mkdir -p "$ne_out/src"
+    write_host_program "$ne_out/src" "$ne_features" "$ne_luajit"
+    {
+        printf 'module embed\n\n'
+        printf 'const {nupp_config_init} = require("nuppembed.abi")\n\n'
+        printf -- '--- Names the embedding ABI, whose exports are the library.\n'
+        printf 'export function nuppEmbedAbi(): voidptr\n'
+        printf '    return nupp_config_init as voidptr\n'
+        printf 'end\n'
+    } > "$ne_out/src/embed.nupp"
+    "$ROOT/bin/nupp" aot --emit static-library --output "$(native_path "$ne_out/libnuppembed.a")" \
+        "$(native_path "$ne_out/src/embed.nupp")" >&2 \
+        || die "cannot compile the Nupp embedding library"
+    set -- "$ne_out/libnuppembed.a" "$ne_provider_archive" "$ne_luajit/lib/libluajit-5.1.a"
+    [ -z "$ne_lpeg" ] || set -- "$@" "$ne_lpeg/lib/liblpeg.a"
+    merge_static_archives "$ne_out/libnupp.a" "$@"
+    rm -f "$ne_out/libnuppembed.a"
+
+    # The shared library exports host/include/nupp.exports for this feature
+    # list and nothing else.
+    ne_exports="$ne_out/nupp.exports"
+    host_stub_exports "$ne_features" "$ne_luajit" embedding > "$ne_exports"
+    [ -s "$ne_exports" ] || die "the embedding build resolved no exports"
     case "$PLATFORM" in
         darwin)
-            set -- "$@" -C 'link-arg=-Wl,-install_name,@rpath/libnupp.dylib' \
-                -C "link-arg=-Wl,-oso_prefix,$out/target/"
+            sed 's/^/_/' "$ne_exports" > "$ne_out/nupp.exports.darwin"
+            set -- "$CC" -dynamiclib -o "$ne_out/$ne_dynamic" "-Wl,-force_load,$ne_out/libnupp.a" \
+                "-Wl,-exported_symbols_list,$ne_out/nupp.exports.darwin" \
+                -Wl,-install_name,@rpath/libnupp.dylib "-Wl,-oso_prefix,$ne_out/"
+            ;;
+        windows)
+            # The provider's import members go after the system libraries, as
+            # for the host, so MinGW's own import libraries answer first.
+            stage_application_archive "$ne_out/libnupp.a" "$ne_out/libnupp-dll.a" \
+                "$ne_out/libnupp-dll-imports.a"
+            {
+                printf 'EXPORTS\n'
+                sed 's/^/    /' "$ne_exports"
+            } > "$ne_out/nupp.def"
+            set -- "$CC" -shared -o "$ne_out/$ne_dynamic" \
+                -Wl,--whole-archive "$ne_out/libnupp-dll.a" -Wl,--no-whole-archive \
+                "$(native_path "$ne_out/nupp.def")" \
+                "-Wl,--out-implib,$(native_path "$ne_out/libnupp.dll.a")"
+            ;;
+        *)
+            # Each export is also an undefined reference, which is what pulls
+            # its member out of the archive.
+            {
+                printf '{\n  global:\n'
+                sed 's/.*/    &;/' "$ne_exports"
+                printf '  local: *;\n};\n'
+            } > "$ne_out/nupp.map"
+            set -- "$CC" -shared -o "$ne_out/$ne_dynamic" \
+                -Wl,-soname,libnupp.so "-Wl,--version-script=$ne_out/nupp.map"
+            while IFS= read -r ne_symbol; do
+                set -- "$@" "-Wl,--undefined=$ne_symbol"
+            done < "$ne_exports"
+            set -- "$@" "$ne_out/libnupp.a"
             ;;
     esac
-    export_list="$out/nupp.exports"
-    NUPP_AOT_RUNTIME_ARCHIVE="$AOT_RUNTIME_OUT" NUPP_CC="$CC" NUPP_EXPORT_LIST="$export_list" \
-        NUPP_LUAJIT_PREFIX="$luajit_prefix" NUPP_LPEG_PREFIX="$lpeg_prefix" \
-        RUSTC="$RUSTC" "$@" >&2
-    [ -f "$RUST_EMBED_OUT" ] \
-        || die "Cargo built nupp-native-host but did not write $RUST_EMBED_OUT"
-    [ -f "$RUST_EMBED_DYNAMIC_OUT" ] \
-        || die "Cargo built nupp-native-host but did not write $RUST_EMBED_DYNAMIC_OUT"
-    case "$PLATFORM" in
-        darwin|windows) ;;
-        *) link_embedding_library "$export_list" "$embedding_features" ;;
-    esac
-    [ "$PLATFORM" != windows ] || [ -f "$RUST_EMBED_IMPORT_OUT" ] \
-        || die "Cargo built nupp-native-host but did not write $RUST_EMBED_IMPORT_OUT"
-    printf 'done\n' > "$out/.complete"
+    while IFS= read -r ne_flag; do
+        [ -z "$ne_flag" ] || set -- "$@" "$ne_flag"
+    done <<EOF
+$(host_system_flags "$ne_features")
+$(cat "$ne_provider_libraries" 2>/dev/null)
+EOF
+    [ "$PLATFORM" != windows ] || set -- "$@" "$ne_out/libnupp-dll-imports.a"
+    "$@" >&2 || die "cannot link the Nupp embedding library"
+    rm -f "$ne_out/libnupp-dll.a" "$ne_out/libnupp-dll-imports.a"
+    [ "$PLATFORM" != windows ] || [ -f "$ne_out/libnupp.dll.a" ] \
+        || die "the Windows embedding link wrote no import library"
+    printf 'done\n' > "$ne_out/.complete"
     release_lock
-}
-
-# rustc writes its own version script for a cdylib, naming only Rust exports and
-# hiding the rest, and a linker takes one such script. So on Linux libnupp.so is
-# linked here instead, from the static archive, with a version script made from
-# the build's resolved copy of host/include/nupp.exports. Each export is also an
-# undefined reference, which is what pulls its member out of the archive.
-link_embedding_library() {
-    export_list=$1
-    [ -s "$export_list" ] || die "the embedding build wrote no export list at $export_list"
-    version_script="$out/nupp.map"
-    {
-        printf '{\n  global:\n'
-        sed 's/.*/    &;/' "$export_list"
-        printf '  local: *;\n};\n'
-    } > "$version_script"
-    system_flags=$(host_system_flags "$2")
-    set -- "$CC" -shared -o "$RUST_EMBED_DYNAMIC_OUT.linked" \
-        -Wl,-soname,libnupp.so -Wl,--version-script="$version_script"
-    while IFS= read -r symbol; do
-        set -- "$@" "-Wl,--undefined=$symbol"
-    done < "$export_list"
-    set -- "$@" "$RUST_EMBED_OUT"
-    for flag in $system_flags; do
-        set -- "$@" "$flag"
-    done
-    "$@" >&2 || die "cannot link libnupp.so from the embedding archive"
-    mv "$RUST_EMBED_DYNAMIC_OUT.linked" "$RUST_EMBED_DYNAMIC_OUT"
 }
 
 shared_flags() {
@@ -1878,7 +1866,7 @@ host_string_literal() {
 
 # Writes the generated half of a host program into DIRECTORY: its manifest, its
 # entry, which defines the C `main`, and `nupphost.build`. The features are the
-# host crate's names as `select_host_features` normalized them.
+# host's feature names as `select_host_features` normalized them.
 write_host_program() {
     hp_directory=$1
     hp_features=$2
@@ -1959,11 +1947,13 @@ merge_static_archives() {
 # The symbols the stub executable exports by name, one per line: the LuaJIT C
 # API and the native provider, which LuaJIT's FFI resolves in its own process.
 # That is host/include/nupp.exports for this feature list, less the embedding
-# API, which only the embedding SDK defines. The code generator's aliases are
+# API, which only the embedding SDK defines; given a third argument, it is the
+# embedding SDK's own list, that API included. The code generator's aliases are
 # added by host_stub_export_flags, from native/codegen/symbols.
 host_stub_exports() {
     hx_features=$1
     hx_luajit=$2
+    hx_embedding=${3:-}
     hx_include=$(cat "$hx_luajit/.include")
     hx_version=$(sed -n 's/^#define LUAJIT_VERSION_SYM[ 	]*//p' "$hx_include/luajit.h" | tr -d '\r')
     hx_applies=false
@@ -1980,7 +1970,7 @@ host_stub_exports() {
                 done
                 continue
                 ;;
-            nupp_*) continue ;;
+            nupp_*) [ -n "$hx_embedding" ] || continue ;;
         esac
         [ "$hx_applies" = true ] || continue
         [ "$hx_line" = LUAJIT_VERSION_SYM ] && hx_line=$hx_version
@@ -2097,8 +2087,8 @@ EOF
     release_lock
 }
 
-# Stages the Nupp executable and static application entry, or the Rust
-# embedding SDK, for one exact compiler-selected feature set.
+# Stages the Nupp executable and static application entry, or the embedding
+# SDK, for one exact compiler-selected feature set.
 build_host() {
     kind=$1
     features=${2:-}
@@ -2124,24 +2114,23 @@ build_host() {
     luajit_prefix=$(build_luajit; printf '%s' "$PREFIX/luajit")
 
     if [ "$kind" = library ]; then
-        build_rust_embedding "$luajit_prefix" "$selected_cargo_features" "$selected_lpeg_prefix"
-        rust_embedding=$RUST_EMBED_OUT
-        rust_dynamic=$RUST_EMBED_DYNAMIC_OUT
+        build_nupp_embedding "$luajit_prefix" "$selected_cargo_features" "$selected_lpeg_prefix"
+        embedding=$NUPP_EMBED_OUT
         dynamic_name=$(embedding_library_filename)
-        out=$stage_out
-        digest=$stage_digest
+        digest=$(printf '%s|%s' "$stage_digest" "$(basename "$embedding")" | sha256_stdin | cut -c1-16)
+        out="$PREFIX/host/$digest"
         HOST_OUT=$out
 
         take_lock "host-$digest" "$out/.complete" || return 0
         [ -f "$out/.complete" ] && [ -f "$out/libnupp.a" ] \
             && [ -f "$out/$dynamic_name" ] && { release_lock; return 0; }
-        note "staging the Rust embedding SDK"
+        note "staging the embedding SDK"
         rm -rf "$out"
         mkdir -p "$out"
-        cp "$rust_embedding" "$out/libnupp.a"
-        cp "$rust_dynamic" "$out/$dynamic_name"
+        cp "$embedding/libnupp.a" "$out/libnupp.a"
+        cp "$embedding/$dynamic_name" "$out/$dynamic_name"
         if [ "$PLATFORM" = windows ]; then
-            cp "$RUST_EMBED_IMPORT_OUT" "$out/libnupp.dll.a"
+            cp "$embedding/libnupp.dll.a" "$out/libnupp.dll.a"
         fi
         cp "$ROOT/host/include/nupp.h" "$out/nupp.h"
         {
