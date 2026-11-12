@@ -1734,7 +1734,9 @@ local function removeTree(path)
         return 0
     end
     if package.config:sub(1, 1) == "\\" then
-        return process.run({"cmd", "/d", "/c", "if", "exist", path, "rmdir", "/s", "/q", path})
+        -- cmd reads a forward slash as a switch: "/Users" in a drive path is one.
+        local native = path:gsub("/", "\\")
+        return process.run({"cmd", "/d", "/c", "if", "exist", native, "rmdir", "/s", "/q", native})
     end
 
     return process.run({"rm", "-rf", path})
@@ -2140,7 +2142,11 @@ end
 --- A native program the compiler ships: the provider its runtime loads, the host a
 --- packaged binary runs in, the embedding library. They are Nupp, so they are as much
 --- the compiler's output as its Lua is.
-type NativeProgram = {name: string, entry: string, exports: string?}
+local type NativeProgram = {
+    name: string,
+    entry: string,
+    exports: string?
+}
 
 --- The native programs this project's compiler ships, their sources written under
 --- `directory` by the project's own toolchain driver, the same one a build asks for
@@ -2166,8 +2172,9 @@ local function nativePrograms(root: string, directory: string): ({NativeProgram}
             byName[name] = program
         end
         local exported, file = line:match("^exports (%S+) (.+)$")
-        if exported and byName[exported] then
-            byName[exported].exports = file
+        local owner = exported and byName[exported] or nil
+        if owner then
+            owner.exports = file
         end
     end
     if #programs == 0 then
@@ -2329,7 +2336,11 @@ function project.fixpoint(root: string?, opts: project.FixpointOptions?): intege
                     stageNative
                 )
                 if not linked then
-                    say(opts, "NUPP0004", ("nupp: %s did not link the native provider for %s\n"):format(compiler, stage))
+                    say(
+                        opts,
+                        "NUPP0004",
+                        ("nupp: %s did not link the native provider for %s\n"):format(compiler, stage)
+                    )
                     if opts.result then
                         opts.result.reason = "a stage did not link the native provider"
                     end
@@ -2361,9 +2372,9 @@ function project.fixpoint(root: string?, opts: project.FixpointOptions?): intege
         say(
             opts,
             "NUPP0004",
-            ("nupp: self-hosting fixpoint mismatch in the native %s; stages kept for inspection\n"):format(
-                table.concat(differing, ", ")
-            )
+            (
+                "nupp: self-hosting fixpoint mismatch in the native %s; stages kept for inspection\n"
+            ):format(table.concat(differing, ", "))
         )
         if opts.result then
             opts.result.reason = "the two stages lower a native program differently"
@@ -2421,8 +2432,8 @@ function project.fixpoint(root: string?, opts: project.FixpointOptions?): intege
                     "native programs lower identically: %s%s\n"
                 ):format(
                     table.concat(nativeNames, ", "),
-                    relink and " (each stage on the provider the stage before it linked)" or
-                    " (not relinked: no code generator)"
+                    relink and " (each stage on the provider the stage before it linked)"
+                    or " (not relinked: no code generator)"
                 )
             )
         end
