@@ -1,0 +1,370 @@
+--- The browser guest's PID 1, `/init`, and the snapshot gate before LuaJIT
+--- starts. No application data enters a snapshot.
+---
+--- Built for i386 Linux against musl 1.2, where `size_t` and `long` are 32 bits
+--- wide and `off_t` and `time_t` are 64.
+module runtime.luajit.guest.pid1
+
+cdef function __errno_location(): int32*
+cdef function strerror(code: int32): cstring
+cdef function perror(borrows message: cstring)
+cdef function dprintf(fd: int32, borrows format: cstring, ...): int32
+cdef function strcmp(borrows a: voidptr, borrows b: cstring): int32
+cdef function memset(borrows s: voidptr, c: int32, n: uint32): voidptr
+cdef function explicit_bzero(borrows s: voidptr, n: uint32)
+cdef function fopen(borrows path: cstring, borrows mode: cstring): voidptr?
+cdef function fgets(borrows buffer: voidptr, size: int32, borrows file: voidptr): voidptr?
+cdef function fclose(borrows file: voidptr): int32
+cdef function sscanf(borrows s: voidptr, borrows format: cstring, ...): int32
+cdef function strtok_r(borrows s: voidptr?, borrows delimiters: cstring, borrows state: voidptr): voidptr?
+-- open and ioctl are variadic in C, and a variadic argument passes as a
+-- double here, as LuaJIT passes it. Their third argument is declared instead:
+-- on i386 a variadic callee reads its arguments from the stack as a fixed one
+-- does, and open reads the mode only when it creates the file.
+cdef function open(borrows path: cstring, flags: int32, mode: uint32): int32
+cdef function read(fd: int32, borrows buffer: voidptr, count: uint32): int32
+cdef function write(fd: int32, borrows buffer: voidptr, count: uint32): int32
+cdef function close(fd: int32): int32
+cdef function dup2(from: int32, to: int32): int32
+cdef function ioctl(fd: int32, request: int32, borrows argument: voidptr?): int32
+cdef function mount(
+    borrows source: cstring,
+    borrows target: cstring,
+    borrows kind: cstring,
+    flags: uint32,
+    borrows data: voidptr?
+): int32
+cdef function mmap(
+    borrows address: voidptr?,
+    length: uint32,
+    protection: int32,
+    flags: int32,
+    fd: int32,
+    offset: int64
+): voidptr
+cdef function munmap(borrows address: voidptr, length: uint32): int32
+cdef function tcgetattr(fd: int32, borrows settings: voidptr): int32
+cdef function tcsetattr(fd: int32, actions: int32, borrows settings: voidptr): int32
+cdef function __settimeofday_time64(borrows now: voidptr, borrows zone: voidptr?): int32
+cdef function setenv(borrows name: cstring, borrows value: cstring, overwrite: int32): int32
+cdef function fork(): int32
+cdef function execl(borrows path: cstring, borrows arg: cstring, ...): int32
+cdef function waitpid(pid: int32, borrows status: voidptr, options: int32): int32
+cdef function pause(): int32
+cdef function _exit(status: int32)
+
+cdef struct Termios
+    iflag: uint32
+    oflag: uint32
+    cflag: uint32
+    lflag: uint32
+    line: uint8
+    cc: uint8[32]
+    ispeed: uint32
+    ospeed: uint32
+end
+
+--- `struct rand_pool_info` with room for 32 bytes.
+cdef struct Seed
+    bits: int32
+    length: int32
+    bytes: uint8[32]
+end
+
+--- musl's 64-bit `struct timeval`, which `__settimeofday_time64` takes.
+cdef struct Timeval
+    seconds: int64
+    microseconds: int64
+end
+
+const MIB = 1048576
+const MAILBOX_BYTES = 8388608
+const START_MAGIC = 1397773646
+const START_VERSION = 1
+
+const EINTR = 4
+const ENOMEM = 12
+const EINVAL = 22
+const EPROTO = 71
+
+const O_WRONLY = 1
+const O_RDWR = 2
+const O_CREAT = 64
+const O_TRUNC = 512
+const O_CLOEXEC = 524288
+const PROT_READ_WRITE = 3
+const MAP_SHARED = 1
+const MAP_PRIVATE_ANONYMOUS = 34
+const MAP_FAILED = 4294967295ULL
+const ECHO = 8
+const ICANON = 2
+const VTIME = 5
+const VMIN = 6
+const TCSANOW = 0
+-- RNDADDENTROPY and RNDRESEEDCRNG, from the pinned Linux random ABI:
+-- `_IOW('R', 0x03, int[2])` and `_IO('R', 0x07)`.
+const RNDADDENTROPY = 1074287107
+const RNDRESEEDCRNG = 20999
+
+local settings: Termios
+local seed: Seed
+local now: Timeval
+local line: uint8[256]
+local args: uint8[4096]
+local command: uint8[16]
+local freeKib: uint32[1]
+local address: uint32[1]
+local cursor: voidptr[1]
+local status: int32[1]
+
+local function setErrno(code: int32): nil
+    @unsafe do
+        __errno_location()[0] = code
+    end
+end
+
+local function errno(): int32
+    local code: int32 = 0
+    @unsafe do
+        code = __errno_location()[0]
+    end
+
+    return code
+end
+
+--- Reports `operation` with errno on the console and stops for good: PID 1 has
+--- nowhere to return to.
+local function fail(operation: cstring): nil
+    dprintf(1, "@@NUPP_INIT_ERROR@@ %s: %s\n", operation, strerror(errno()))
+    perror(operation)
+    while true do
+        pause()
+    end
+end
+
+--- The address `offset` bytes past `base`.
+local function at(borrows base: voidptr, offset: integer): voidptr
+    return ((base as uint64) + (offset as uint64)) as voidptr
+end
+
+local function saveFile(name: cstring, borrows data: voidptr, size: integer): nil
+    local fd = open(name, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 384)
+    if fd < 0 then
+        fail(name)
+    end
+    local done: integer = 0
+    while done < size do
+        local count = write(fd, at(data, done), math.u32.wrap(size - done))
+        if count < 0 and errno() == EINTR then
+            count = 0
+        elseif count <= 0 then
+            fail("write startup file")
+        end
+        done = done + count
+    end
+    if close(fd) ~= 0 then
+        fail("close startup file")
+    end
+end
+
+--- Zeroes every free page, so a snapshot of guest memory holds nothing a
+--- previous boot left there.
+local function scrubFreePages(): nil
+    local info = fopen("/proc/meminfo", "r")
+    if info == nil then
+        fail("open meminfo")
+    end
+    freeKib[0] = 0
+    while fgets(line as voidptr, 256, info as voidptr) ~= nil do
+        if sscanf(line as voidptr, "MemFree: %lu kB", freeKib as voidptr) == 1 then
+            break
+        end
+    end
+    fclose(info as voidptr)
+    if freeKib[0] < 2048 then
+        setErrno(ENOMEM)
+        fail("snapshot reserve")
+    end
+    local size = math.u32.wrap((freeKib[0] - 2048) * 1024)
+    local pages = mmap(nil, size, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, -1, 0LL)
+    if (pages as uint64) == MAP_FAILED then
+        fail("scrub mmap")
+    end
+    -- munmap is handed the pages, so the stores are never dead to the compiler.
+    memset(pages, 0, size)
+    if munmap(pages, size) ~= 0 then
+        fail("scrub munmap")
+    end
+end
+
+--- The physical address of the mailbox, from `nupp.mailbox=` on the kernel
+--- command line: one of the two memory profiles the host boots.
+local function mailboxAddress(): integer
+    local file = fopen("/proc/cmdline", "r")
+    if file == nil then
+        fail("open cmdline")
+    end
+    if fgets(args as voidptr, 4096, file as voidptr) == nil then
+        fail("read cmdline")
+    end
+    fclose(file as voidptr)
+    address[0] = 0
+    local token = strtok_r(args as voidptr, " \n", cursor as voidptr)
+    while token ~= nil do
+        if sscanf(token as voidptr, "nupp.mailbox=%lu", address as voidptr) == 1 then
+            break
+        end
+        token = strtok_r(nil, " \n", cursor as voidptr)
+    end
+    local found: integer = address[0]
+    if found ~= 48 * MIB and found ~= 112 * MIB then
+        setErrno(EINVAL)
+        fail("unsupported guest memory profile")
+    end
+
+    return found
+end
+
+--- Mixes the host's 32 bytes at `bytes` into a restored guest's entropy pool
+--- and reseeds its generator, so no two starts of one snapshot share a stream.
+local function reseed(borrows bytes: uint8*): nil
+    seed.bits = 256
+    seed.length = 32
+    @unsafe do
+        for i = 0, 31 do
+            seed.bytes[i] = bytes[i]
+        end
+    end
+    local fd = open("/dev/random", O_RDWR | O_CLOEXEC, 0)
+    if fd < 0 then
+        fail("open random")
+    end
+    if ioctl(fd, RNDADDENTROPY, seed as voidptr) ~= 0 or ioctl(fd, RNDRESEEDCRNG, nil) ~= 0 then
+        fail("reseed restored guest")
+    end
+    explicit_bzero(seed as voidptr, ffi.sizeof(Seed))
+    if close(fd) ~= 0 then
+        fail("close random")
+    end
+end
+
+--- Reads the host's command, a line of at most 15 bytes, one byte at a time so
+--- nothing after it is taken from the console LuaJIT's bridge reads next.
+local function readCommand(): nil
+    local count: integer = 0
+    local last: integer = 0
+    while count < 15 and last ~= 10 do
+        if read(0, at(command as voidptr, count), 1) ~= 1 then
+            break
+        end
+        last = command[count]
+        count = count + 1
+    end
+    command[count] = 0
+end
+
+export function main(): int32
+    if mount("proc", "/proc", "proc", 0, nil) ~= 0 then
+        fail("mount proc")
+    end
+    if mount("devtmpfs", "/dev", "devtmpfs", 0, nil) ~= 0 then
+        fail("mount devtmpfs")
+    end
+    local terminal = open("/dev/ttyS0", O_RDWR, 0)
+    if terminal < 0 then
+        fail("open serial console")
+    end
+    for fd = 0, 2 do
+        if dup2(terminal, fd) < 0 then
+            fail("dup console")
+        end
+    end
+    if terminal > 2 then
+        close(terminal)
+    end
+    if tcgetattr(0, settings as voidptr) ~= 0 then
+        fail("get console attributes")
+    end
+    settings.lflag = settings.lflag & ~(ECHO | ICANON)
+    settings.cc[VMIN] = 1
+    settings.cc[VTIME] = 0
+    if tcsetattr(0, TCSANOW, settings as voidptr) ~= 0 then
+        fail("set console attributes")
+    end
+    local fd = open("/dev/mem", O_RDWR | O_CLOEXEC, 0)
+    if fd < 0 then
+        fail("open physical mailbox")
+    end
+    local memory = mmap(nil, MAILBOX_BYTES, PROT_READ_WRITE, MAP_SHARED, fd, mailboxAddress() as int64)
+    close(fd)
+    if (memory as uint64) == MAP_FAILED then
+        fail("map physical mailbox")
+    end
+    memset(memory, 0, MAILBOX_BYTES)
+    scrubFreePages()
+    dprintf(1, "@@NUPP_SNAPSHOT_READY@@\n")
+    readCommand()
+    if strcmp(command as voidptr, "start\n") ~= 0 then
+        setErrno(EPROTO)
+        fail("snapshot start command")
+    end
+    local header = memory as uint32*
+    local configBytes: integer = 0
+    local appBytes: integer = 0
+    @unsafe do
+        configBytes = header[2]
+        appBytes = header[3]
+        if header[0] ~= START_MAGIC
+            or header[1] ~= START_VERSION
+            or configBytes == 0
+            or configBytes > 65536
+            or appBytes == 0
+            or appBytes > 7 * MIB
+            or header[5] >= 1000000
+        then
+            setErrno(EINVAL)
+            fail("snapshot startup header")
+        end
+        now.seconds = header[4] as int64
+        now.microseconds = header[5] as int64
+    end
+    saveFile("/host/config.json", at(memory, 4096), configBytes)
+    saveFile("/host/app.lua", at(memory, MIB), appBytes)
+    saveFile("/nupp/entropy.bin", at(memory, 512), 32)
+    reseed(at(memory, 512) as uint8*)
+    if __settimeofday_time64(now as voidptr, nil) ~= 0 then
+        fail("restore wall clock")
+    end
+    explicit_bzero(memory, MAILBOX_BYTES)
+    if munmap(memory, MAILBOX_BYTES) ~= 0 then
+        fail("unmap startup mailbox")
+    end
+    setenv("LD_LIBRARY_PATH", "/lib:/nupp", 1)
+    setenv("LUA_PATH", "/nupp/?.lua;;", 1)
+    setenv("LUA_CPATH", "/nupp/?.so;;", 1)
+    dprintf(1, "@@NUPP_BRIDGE_READY@@\n")
+    local child = fork()
+    if child < 0 then
+        fail("fork LuaJIT")
+    end
+    if child == 0 then
+        execl("/nupp/luajit", "/nupp/luajit", "/nupp/bridge.lua", 0LL as voidptr)
+        perror("exec LuaJIT")
+        _exit(127)
+    end
+    while waitpid(child, status as voidptr, 0) < 0 do
+        if errno() ~= EINTR then
+            fail("wait LuaJIT")
+        end
+    end
+    local code: int64 = 128LL
+    if status[0] & 127 == 0 then
+        code = ((status[0] >> 8) & 255) as int64
+    end
+    dprintf(1, "@@NUPP_GUEST_EXIT@@ %lld\n", code)
+    while true do
+        pause()
+    end
+
+    return 0
+end

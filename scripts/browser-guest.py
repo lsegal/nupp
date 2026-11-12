@@ -28,6 +28,20 @@ def cpio(entries):
     return bytes(output)
 
 
+def guest_programs(root, directory):
+    # The guest's own programs are Nupp, compiled for i386 by nupp itself into
+    # static archives the musl gcc wrapper links like any other. Their C
+    # declarations spell musl's types, so nothing in them depends on the libc
+    # the triple names. The archives are compiled before the build key, which
+    # holds their digests: what nupp makes of them is a build input too.
+    archives = {}
+    for name in ('pid1', 'clock', 'ssp'):
+        archives[name] = directory / f'libguest-{name}.a'
+        run(root / 'bin/nupp', 'aot', '--emit', 'static-library', '--triple', 'i686-unknown-linux-gnu',
+            '--output', archives[name], root / 'runtime/luajit/guest' / f'{name}.nupp')
+    return archives
+
+
 def sha(path):
     with path.open('rb') as source:
         return hashlib.file_digest(source, 'sha256').hexdigest()
@@ -36,6 +50,11 @@ def sha(path):
 def build(root, cache, sources):
     if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'amd64'):
         raise RuntimeError('building the guest requires Linux x86_64 with gcc-multilib; use the browser-guest CI artifact on other hosts')
+    with tempfile.TemporaryDirectory() as programs:
+        return assemble(root, cache, sources, guest_programs(root, Path(programs)))
+
+
+def assemble(root, cache, sources, archives):
     from browser_toolchain import lock
     recipe = [root / 'scripts/browser-guest.py', root / 'scripts/browser-toolchain.py', root / 'scripts/toolchain.pins', root / 'scripts/toolchain', root / 'scripts/browser-snapshot.mjs']
     recipe += sorted(path for path in (root / 'runtime/luajit').rglob('*') if path.is_file())
@@ -45,6 +64,7 @@ def build(root, cache, sources):
     identity['inputs'] = {name: record['sha256'] for name, record in sources.items()}
     identity['gcc'] = subprocess.check_output(['gcc', '--version'], text=True)
     identity['binutils'] = subprocess.check_output(['ld', '--version'], text=True)
+    identity['programs'] = {name: sha(path) for name, path in archives.items()}
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     output = cache / 'browser-guest' / key
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -78,8 +98,7 @@ def build(root, cache, sources):
             # musl replaces GCC's link spec, including its -m32 linker selection.
             cc.write_text('#!/bin/sh\nexec gcc -m32 -funwind-tables -fno-omit-frame-pointer -Wl,-m,elf_i386,--eh-frame-hdr -static-libgcc -specs=' + shlex.quote(str(musl / 'lib/musl-gcc.specs')) + ' "$@"\n')
             cc.chmod(0o755)
-            run(cc, '-fPIC', '-fno-stack-protector', '-c', root / 'runtime/luajit/guest-ssp.c', '-o', work / 'guest-ssp.o', env=environment)
-            run('ar', 'rcs', musl / 'lib/libssp_nonshared.a', work / 'guest-ssp.o', env=environment)
+            shutil.copyfile(archives['ssp'], musl / 'lib/libssp_nonshared.a')
             specs = musl / 'lib/musl-gcc.specs'
             specs.write_text(specs.read_text().replace('*libgcc:\n', '*libgcc:\n-lssp_nonshared '))
             probe = work / 'target-probe.c'
@@ -123,8 +142,9 @@ def build(root, cache, sources):
                 (guest / directory).mkdir(parents=True, exist_ok=True)
             shutil.copyfile(musl / 'lib/libc.so', guest / 'lib/ld-musl-i386.so.1')
             shutil.copyfile(trees['luajit'] / 'src/luajit', guest / 'nupp/luajit')
-            run(cc, '-O2', '-Wall', '-Wextra', '-Werror', root / 'runtime/luajit/guest-init.c', '-o', guest / 'init', env=environment)
-            run(cc, '-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', root / 'runtime/luajit/guest-clock.c', '-o', guest / 'nupp/libnupp-browser.so', env=environment)
+            run(cc, '-Wl,--whole-archive', archives['pid1'], '-Wl,--no-whole-archive', '-o', guest / 'init', env=environment)
+            run(cc, '-shared', '-Wl,--whole-archive', archives['clock'], '-Wl,--no-whole-archive',
+                '-o', guest / 'nupp/libnupp-browser.so', env=environment)
             lpeg = Path(sources['lpeg']['sourcePath'])
             run(cc, '-O2', '-shared', '-fPIC', '-I' + str(trees['luajit'] / 'src'),
                 *[lpeg / (unit + '.c') for unit in ('lpvm', 'lpcap', 'lptree', 'lpcode', 'lpprint', 'lpcset')],
