@@ -367,8 +367,11 @@ const FUSION_STANDARD = 1
 
 const FUSION_STRICT = 2
 
---- How far into a target machine its options are searched for.
-const OPTIONS_WINDOW = 4096
+--- How far into a target machine its options are searched for. They are a
+--- member of the `TargetMachine` base class, so where they sit does not depend
+--- on the target; in LLVM 23 `MCOptions` begins about 1400 bytes in. A layout that
+--- moved past the window is refused rather than read further.
+const OPTIONS_WINDOW = 2048
 
 --- Sets a target machine's `Options.AllowFPOpFusion` to `Strict`: no
 --- multiply-add is formed except where an instruction's own `contract` flag
