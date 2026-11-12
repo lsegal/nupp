@@ -113,7 +113,7 @@ game.answer(41) = 42
 
 Use `LD_LIBRARY_PATH` instead of `DYLD_LIBRARY_PATH` on Linux. Static linking
 uses `libnupp.a`, which contains the pinned LuaJIT VM, the Rust host, and the
-exact-feature Rust native provider. Pass the `staticLinkFlags` array from
+native provider. Pass the `staticLinkFlags` array from
 `link.json` to the C linker after the archive; it includes the system libraries
 and frameworks selected by the SDK features and the flag that makes the host
 executable export the provider's symbols (`-rdynamic` on Linux,
