@@ -452,6 +452,54 @@ end
     test.eq(status, 0, ran)
 end
 
+-- Arithmetic mixing a refined integer with a fractional literal, and the
+-- `printf` format each prints with: binary64 beside an `int32`, `uint32` or
+-- `int8`, and beside an `int64` the literal truncated into it.
+local MIXED_EXPRESSIONS = {
+    { "count + 0.5", "%.17g" }, { "count * 1.5", "%.17g" }, { "0.25 - count", "%.17g" },
+    { "count - -0.5", "%.17g" }, { "-0.5 + count", "%.17g" }, { "count / 0.25", "%.17g" },
+    { "count % 2.5", "%.17g" }, { "count ^ 0.5", "%.17g" },
+    { "small * 0.75", "%.17g" }, { "id + 0.5", "%.17g" }, { "id * 1.5", "%.17g" },
+    { "count + 1e300", "%.17g" }, { "count + 2", "%.17g" },
+    { "wide + 2.5", "%lld" }, { "2.5 * wide", "%lld" }, { "wide - 0.5", "%lld" },
+}
+
+-- A fractional literal beside a refined integer lowers as a number, so the
+-- operation gives what LuaJIT gives, and compares as one too.
+function M.refinedIntegersMeetFractionalLiteralsAsLuaJITDoes()
+    requireCodegen()
+    local env = { count = 7, small = -3, id = 4000000000, wide = 10LL }
+    local formats, arguments, expected = {}, {}, {}
+    for _, case in ipairs(MIXED_EXPRESSIONS) do
+        local result = assert(load("return " .. case[1], "=" .. case[1], "t", env))()
+        formats[#formats + 1] = case[2]
+        arguments[#arguments + 1] = ",\n        " .. case[1]
+        expected[#expected + 1] = type(result) == "number" and case[2]:format(result)
+            or (tostring(result):gsub("LL$", ""))
+    end
+    local executable, output = link(([[
+cdef function printf(borrows format: cstring, ...): int32
+
+local function main(): int32
+    local count: int32 = 7
+    local small: int8 = -3
+    local id: uint32 = 4000000000
+    local wide: int64 = 10LL
+    if not (count < 7.5 and 6.5 < count and count ~= 7.25 and small > -3.5) then
+        return 1
+    end
+    printf(
+        "%s\n"%s
+    )
+    return 0
+end
+]]):format(table.concat(formats, " "), table.concat(arguments)))
+    assert(executable ~= nil, output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+    test.eq(ran, table.concat(expected, " "))
+end
+
 -- The operands every bit-operator case reads, as the native program binds them
 -- and as plain LuaJIT does: negative, fractional and out-of-range numbers, an
 -- established `int32`, and 64-bit integers of both signs.
