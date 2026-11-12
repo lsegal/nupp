@@ -28,6 +28,7 @@ cdef function strlen(borrows s: cstring): uint64
 cdef function snprintf(borrows buffer: voidptr, size: uint64, borrows format: cstring, ...): int32
 cdef function __atomic_exchange_8(borrows p: int64*, v: int64, order: int32): int64
 cdef function __atomic_store_8(borrows p: int64*, v: int64, order: int32)
+cdef function nuppNativeAbiVersion(): uint32
 
 const EMBED_ABI_VERSION = 2
 const CONFIG_OPEN_LIBRARIES = 1
@@ -748,6 +749,10 @@ end
 --- when that is free, and answers it, or 0 with the failure reported. The
 --- state is closed on failure when the runtime would have owned it.
 local function newRuntime(state: voidptr, owned: boolean, error: uint64, status: integer, category: integer): uint64
+    -- This call links the selected native provider into every program that
+    -- links the static library, which exports its symbols so LuaJIT's FFI can
+    -- resolve the provider's C ABI by name.
+    nuppNativeAbiVersion()
     local made = calloc(1ULL, ffi.sizeof(Runtime) as uint64)
     if made == nil then
         if owned then

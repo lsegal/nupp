@@ -1866,7 +1866,7 @@ host_string_literal() {
 
 # Writes the generated half of a host program into DIRECTORY: its manifest, its
 # entry, which defines the C `main`, and `nupphost.build`. The features are the
-# host crate's names as `select_host_features` normalized them.
+# host's feature names as `select_host_features` normalized them.
 write_host_program() {
     hp_directory=$1
     hp_features=$2

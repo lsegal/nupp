@@ -159,10 +159,10 @@ claim that every executable byte is Rust. Native builds still retain:
 
 - pinned LuaJIT, its allocator, garbage collector, JIT, stack, and C API;
 - LPeg 1.1 for `lpeg` compatibility and compiler documentation parsing;
-- `native/crates/host/c/lua_shim.c` and `host_shim.c`, which contain the
-  embedding SDK's protected LuaJIT stack, callback, and longjmp boundary while
-  Rust owns every persistent SDK resource. The host executable, its workers,
-  channels and shared bytes are a native Nupp program, `host/program`;
+- the host executable, its workers, channels and shared bytes, and the C
+  embedding SDK (`libnupp`, `host/include/nupp.h`), which are native Nupp
+  programs in `host/program`: the SDK's protected LuaJIT boundary, its names,
+  its host channel and every resource it owns are `host/program/common/nuppembed`;
 - compiled AOT code. The AOT runtime a builder entry calls, through a table the
   provider hands it, is a native Nupp program (`native/aotruntime`) that
   `scripts/toolchain` compiles with the checkout's own compiler and links into
@@ -240,6 +240,10 @@ artifact:
   application archive, embedding SDK, payload loader, and worker core are Rust.
   The C embedding header remains, so existing hosts migrate at the SDK boundary
   rather than by embedding Rust types.
+- The Rust embedding crate, `native/crates/host`, and its C shims were
+  replaced by a native Nupp program, `host/program/common/nuppembed`.
+  `nupp.h`, embedding ABI 2, `libnupp`'s file names and its export list are
+  unchanged, so a host relinks without source changes.
 - SDL GPU, SPIRV-Cross, MSL artifacts, and the SDL provider ABI were removed.
   Native GPU builds accept canonical SPIR-V and execute it through wgpu-native.
 - The Rust GPU crate, its `nuppNativeGpu*` provider exports, the
