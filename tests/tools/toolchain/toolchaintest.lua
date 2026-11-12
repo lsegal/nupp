@@ -897,10 +897,14 @@ end
 function M.macOSLinksDoNotRecordTheBuildDirectory()
     local driver = read(ROOT .. "/scripts/toolchain")
     local _, prefixes = driver:gsub("link%-arg=%-Wl,%-oso_prefix,%$out/target/", "")
-    assert(prefixes == 2, "the provider and embedding links each strip the target directory: " .. prefixes)
+    assert(prefixes == 1, "the provider link strips the target directory: " .. prefixes)
     assert(
         driver:find('"-Wl,-oso_prefix,$nh_out/"', 1, true),
         "the Nupp host's link strips the directory its archive was built in"
+    )
+    assert(
+        driver:find('"-Wl,-oso_prefix,$ne_out/"', 1, true),
+        "the embedding link strips the directory its archive was built in"
     )
     assert(
         driver:find("codesign --force --sign - --identifier nupp-host", 1, true),
