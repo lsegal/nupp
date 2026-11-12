@@ -40,18 +40,20 @@ and a GPU-free program stages no wgpu-native library.
 | paths and files | none: Nupp calls the operating system through FFI | none |
 | UUID | `uuid` | provider archive |
 | URI | `uri` | provider archive |
-| HTTP client | `base`: HTTP/1.1 in Nupp over the network and TLS services | none |
-| TCP, UDP, DNS, and Unix path sockets | `base`: Nupp sockets through FFI | none |
+| HTTP client | `uri`, for the URI handling it parses with: HTTP/1.1 in Nupp over the network and TLS services | none |
+| TCP, UDP, DNS, and Unix path sockets | none: Nupp sockets through FFI | none |
 | TLS over a network stream | none: TLS 1.2/1.3 and its cryptography in Nupp | none |
-| child processes and pipes | `process` | `native-process` |
+| child processes and pipes | none: Nupp spawns, reaps and waits through FFI | none |
 | native GPU compute | none: Nupp over wgpu-native | none: `lib/wgpu_native` beside the program |
 | workers and shared immutable bytes | host-owned | `workers` |
 | `lpeg` | retained LPeg | `lpeg` |
 
 TLS includes the network service, and the compiler's HTTP effect closure also
-selects TLS, the network service and URI handling. The `native-net` and
-`native-tls` host features remain as names that select nothing, so manifests
-and release feature lists naming them keep working. A standalone link may combine the Rust
+selects TLS, the network service and URI handling. Sockets, TLS and processes
+wait on the runtime's wake handle, which is Nupp too, so none of them stages
+the provider. The `native-net`, `native-process` and `native-tls` host
+features remain as names that select nothing, so manifests and release feature
+lists naming them keep working. A standalone link may combine the Rust
 application-host archive with one or more exact-feature provider or AOT
 archives. Shared sidecar builds stage the same provider ABI in a dynamic
 library instead.
@@ -116,11 +118,10 @@ wgpu-native reports finished work only when asked, so its readiness source
 polls the device and sleeps one bounded slice between polls. It is still a
 suspension, so a task deadline reaches the wait and other tasks run meanwhile.
 
-The provider's `nuppNativePoll`, `nuppNativeWait`, `nuppNativeWakeOpen` and
-`nuppNativeWakeClose`, and the per-family poll and wait calls that came before
-them, are superseded. The four stay exported, answering a generation that never
-moves and opening no wake handle, because the pinned stage-zero compiler still
-names them.
+The provider has no readiness calls. Its `nuppNativePoll`, `nuppNativeWait`,
+`nuppNativeWakeOpen` and `nuppNativeWakeClose`, and the per-family poll and
+wait calls that came before them, were removed once stage zero was repinned to
+a compiler whose runtime keeps readiness in Nupp.
 
 ## Native implementations
 

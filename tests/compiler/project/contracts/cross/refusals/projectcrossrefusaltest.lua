@@ -15,9 +15,12 @@ local M = {}
 
 function M.crossTargetBuildRefusesSidecarOnlyProvidersBeforeCargoRuns()
     local dir = tempProject({})
-    local outputs, err = nativeStage.build(dir, "out", {["native.http"] = true}, "x86_64-pc-windows-msvc")
+    -- The client is Nupp; the URI handling its closure carries is what needs
+    -- the sidecar.
+    local outputs, err = nativeStage.build(dir, "out", {["native.http"] = true, ["native.uri"] = true},
+        "x86_64-pc-windows-msvc")
     testAssert.eq(outputs, nil, "a compiler-host HTTP sidecar is not staged")
-    assert(err:find("sidecar-only native feature http", 1, true), err)
+    assert(err:find("sidecar-only native feature uri", 1, true), err)
     remove(dir)
 end
 
