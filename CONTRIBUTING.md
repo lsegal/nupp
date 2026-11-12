@@ -43,7 +43,7 @@ replaced each former Rust crate, the retained third-party boundaries, and the
 release matrix.
 
 LuaJIT and LPeg are upstream C projects rather than part of Nupp. When the
-machine has no new enough LuaJIT, `scripts/toolchain` builds the pinned one
+machine lacks them, `scripts/toolchain` builds the pinned ones
 from its verified sources with the machine's C compiler, which `NUPP_CC` names;
 with it unset, Unix probes `clang`, `cc` and `gcc` in that order, and Windows
 probes the MinGW `gcc` first because LuaJIT's build uses GNU make. That is the
