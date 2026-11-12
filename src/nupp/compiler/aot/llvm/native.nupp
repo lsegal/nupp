@@ -3077,7 +3077,15 @@ end
 --- Declares every C function the modules of a program call.
 local function declareForeign(module: builder.Module, programs: {Program}): nil
     for _, program in ipairs(programs) do
-        for _, callee in pairs(program.callees) do
+        -- In name order: `pairs` order varies between runs, and a declaration is
+        -- module text, so the same program would lower to different IR.
+        local names: {string} = {}
+        for name in pairs(program.callees) do
+            names[#names + 1] = name
+        end
+        table.sort(names)
+        for _, name in ipairs(names) do
+            local callee = program.callees[name] as Callee
             if callee.foreign and callee.atomic == nil then
                 local params: {string} = {}
                 for index, kind in ipairs(callee.params) do
