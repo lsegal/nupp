@@ -174,7 +174,7 @@ function M.unrelatedSourcesStayOutsideTheSimdSurface()
         "src/nupp/text.nupp",
         "src/nupp/runtime/tasks.nupp",
         "src/nupp/compiler/check/callexpr.nupp",
-        "native/crates/native/src/abi.rs",
+        "native/provider/nuppnative/provider.nupp",
         "tests/compiler/syntax/parsertest.lua",
         "bench/utf8simd/results/run.json",
         "bench/base64simd/compare.lua",
@@ -226,7 +226,7 @@ function M.gpuChangeSelectsBothAdapters()
 end
 
 function M.nativeChangeSelectsEveryPlatform()
-    selects("native/nupp-native/src/http.rs", {
+    selects("native/provider/nuppnative/provider.nupp", {
         "fast-checks",
         "linux-integration",
         "macos-integration",

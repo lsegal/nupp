@@ -1,7 +1,7 @@
 @!internal
 
 --[[
-The loader for the versioned Rust-native provider.
+The loader for the versioned native provider.
 ]]
 module nupp.runtime.native
 
@@ -141,7 +141,7 @@ local function library(): any
         if version ~= ABI_VERSION then
             error(
                 (
-                    "nupp: Rust native ABI mismatch: runtime needs %d, provider has %s"
+                    "nupp: native provider ABI mismatch: runtime needs %d, provider has %s"
                 ):format(ABI_VERSION, tostring(version)),
                 3
             )
@@ -178,7 +178,7 @@ end
 --- @raises string when the provider lacks the feature bit
 function native.requireFeature(bit: integer, name: string): nil
     if native.C.nuppNativeFeatures() & bit == 0 then
-        error("nupp: the Rust native provider was built without " .. name, 3)
+        error("nupp: the native provider was built without " .. name, 3)
     end
 end
 

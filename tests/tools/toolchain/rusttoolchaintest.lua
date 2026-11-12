@@ -1,5 +1,6 @@
 -- The Cargo facade is testable without installing Rust: these fake pinned tools
--- record the exact build contract and plant the artifact the driver expects.
+-- record how the driver selected and ran them. `rust-vendor` is what asks for
+-- them here, since the embedding SDK is the only Rust left to build.
 
 local HERE = require("helpers.paths").absoluteTests
 local ROOT = HERE .. "/.."
@@ -20,17 +21,6 @@ end
 
 local function readLines(path)
     return (read(path):gsub("\r\n", "\n"))
-end
-
-local function shellPath(path)
-    if package.config:sub(1, 1) ~= "\\" then
-        return path
-    end
-    local pipe = assert(io.popen("cygpath -u " .. quote(path)))
-    local converted = assert(pipe:read("*l"))
-    assert(pipe:close())
-
-    return converted
 end
 
 local function countOccurrences(text, needle)
@@ -95,17 +85,6 @@ local function fakeCompiler(directory, name, version)
     )
 end
 
-local function artifactNames()
-    if package.config:sub(1, 1) == "\\" then
-        return "nupp_native.dll"
-    end
-    if jit.os == "OSX" then
-        return "libnupp_native.dylib"
-    end
-
-    return "libnupp_native.so"
-end
-
 local function fakeRustTools(directory, version, identity, identityMarker)
     local rustc = executable(
         directory,
@@ -136,28 +115,9 @@ if [ "${1:-}" = --version ]; then
    printf '%%s\n' 'cargo %s (fake)'
    exit 0
 fi
-arguments="$*"
-target=
-package=
-while [ "$#" -gt 0 ]; do
-   case "$1" in
-      --target-dir) shift; target=${1:-} ;;
-      --package) shift; package=${1:-} ;;
-   esac
-   shift
-done
-[ -n "$target" ] || exit 3
-mkdir -p "$target/release"
-case "$package" in
-   nupp-native)
-      artifact=$NUPP_TEST_RUST_LIBRARY
-      printf '%%s\n' built > "$target/release/libnupp_native.a"
-      printf '%%s\n' 'note: native-static-libs: -lfake -lother' >&2
-      ;;
-   *) exit 5 ;;
-esac
-printf '%%s\n' built > "$target/release/$artifact"
-printf '%%s\n' "$arguments" > "$NUPP_TEST_CARGO_RECORD"
+[ "${1:-}" = vendor ] || exit 5
+mkdir -p "${3:?}"
+printf '%%s\n' "$*" > "$NUPP_TEST_CARGO_RECORD"
 printf '%%s\n' "${NUPP_CC:-${CC:-}}" > "$NUPP_TEST_CARGO_CC_RECORD"
 printf '%%s\n' "${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER:-}" > "$NUPP_TEST_CARGO_LINKER_RECORD"
 printf '%%s\n' "${CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER:-}" > "$NUPP_TEST_CARGO_GNULLVM_LINKER_RECORD"
@@ -177,7 +137,6 @@ local function environment(directory, version, identity, identityMarker)
         identity or defaultIdentity,
         identityMarker or "fake-llvm-1"
     )
-    local library = artifactNames()
     assert(os.execute("mkdir -p " .. quote(directory .. "/vendor")) == 0)
     assert(os.execute("mkdir -p " .. quote(directory .. "/rust-sysroot/lib")) == 0)
 
@@ -194,82 +153,13 @@ local function environment(directory, version, identity, identityMarker)
         NUPP_TEST_CARGO_LINKER_RECORD = directory .. "/cargo-linker",
         NUPP_TEST_CARGO_GNULLVM_LINKER_RECORD = directory .. "/cargo-gnullvm-linker",
         NUPP_TEST_RUST_SYSROOT = directory .. "/rust-sysroot",
-        NUPP_TEST_RUST_LIBRARY = library,
         PATH = "$PATH",
-    }, library
+    }
 end
 
-local function answer(output)
-    local last = nil
-    for line in output:gmatch("[^\r\n]+") do
-        if line:match("%S") then
-            last = line
-        end
-    end
-
-    return assert(last, "the driver answered no artifact path")
-end
-
-function M.nativeBuildIsPinnedOfflineAndFeatureSelected()
-    local directory = temporary()
-    local shellDirectory = shellPath(directory)
-    local env, library = environment(directory)
-    env.NUPP_HOST_OFFLINE = "1"
-    local status, output = run(env, "native-rust zeta,alpha,zeta")
-
-    assert(status == 0, output)
-    local arguments = read(env.NUPP_TEST_CARGO_RECORD)
-    assert(arguments:find("--package nupp-native", 1, true), arguments)
-    assert(arguments:find("--locked", 1, true), arguments)
-    assert(arguments:find("--offline", 1, true), arguments)
-    assert(arguments:find("--no-default-features", 1, true), arguments)
-    assert(arguments:find("--features alpha,zeta", 1, true), arguments)
-    assert(arguments:find("source.crates-io.replace-with='nupp-vendored-sources'", 1, true), arguments)
-    assert(
-        arguments:find("source.nupp-vendored-sources.directory='" .. shellDirectory .. "/vendor'", 1, true),
-        arguments
-    )
-    assert(arguments:find(shellDirectory .. "/build/rust/native/", 1, true), arguments)
-    assert(output:find(library, 1, true), output)
-end
-
-function M.offlineRustBuildNamesItsVendorContract()
-    local directory = temporary()
-    local env = environment(directory)
-    env.NUPP_HOST_OFFLINE = "1"
-    env.NUPP_RUST_VENDOR_DIR = nil
-    local status, output = run(env, "native-rust http")
-
-    assert(status ~= 0, output)
-    assert(output:find("offline Rust builds require NUPP_RUST_VENDOR_DIR", 1, true), output)
-    assert(output:find("scripts/toolchain rust-vendor OUTPUT", 1, true), output)
-end
-
-function M.implicitCargoTargetCannotPoisonTheHostArtifactCache()
-    local directory = temporary()
-    local env = environment(directory)
-    env.CARGO_BUILD_TARGET = "wasm32-unknown-unknown"
-    local status, output = run(env, "native-rust http")
-
-    assert(status ~= 0, output)
-    assert(output:find("CARGO_BUILD_TARGET is unsupported", 1, true), output)
-    assert(io.open(env.NUPP_TEST_CARGO_RECORD, "rb") == nil, "Cargo ran with an implicit target")
-end
-
-function M.providerBuildRecordsTheNativeLibrariesItsArchiveNeeds()
-    local directory = temporary()
-    local env = environment(directory)
-    local status, output = run(env, "native-rust")
-
-    assert(status == 0, output)
-    local arguments = read(env.NUPP_TEST_CARGO_RECORD)
-    assert(arguments:find("rustc", 1, true), arguments)
-    assert(arguments:find("--lib", 1, true), arguments)
-    -- The Nupp host links the static archive, so it is told what rustc would
-    -- have linked beside it.
-    assert(arguments:find("--print native-static-libs", 1, true), arguments)
-    local libraries = read(answer(output):match("^(.*)/target/") .. "/native-static-libs")
-    assert(libraries == "-lfake\n-lother\n", libraries)
+-- The `rust-vendor` command for a fresh output directory under `directory`.
+local function vendor(directory)
+    return "rust-vendor " .. quote(directory .. "/vendored")
 end
 
 -- The GPU provider is Nupp over wgpu-native, which no host links, so a host
@@ -287,7 +177,7 @@ end
 function M.anUnpinnedToolchainIsRejected()
     local directory = temporary()
     local env = environment(directory, "1.97.0")
-    local status, output = run(env, "native-rust")
+    local status, output = run(env, vendor(directory))
 
     assert(status ~= 0, output)
     assert(output:find("requires cargo 1.98.0", 1, true), output)
@@ -301,7 +191,7 @@ function M.rustupProxyProgressDoesNotChangeThePinnedVersion()
     local directory = temporary()
     local env = environment(directory)
     env.NUPP_TEST_RUST_TOOL_CHATTER = "1"
-    local status, output = run(env, "native-rust")
+    local status, output = run(env, vendor(directory))
 
     assert(status == 0, output)
     assert(output:find("info: syncing pinned Cargo proxy", 1, true), output)
@@ -354,10 +244,9 @@ esac
     )
     env.NUPP_CARGO = nil
     env.NUPP_RUSTC = nil
-    env.NUPP_TEST_RUST_LIBRARY = "libnupp_native.so"
     env.PATH = proxy .. ":$PATH"
 
-    local status, output = run(env, "native-rust")
+    local status, output = run(env, vendor(directory))
 
     assert(status == 0, output)
     assert(io.open(proxyRecord, "rb") == nil, "an ambient Rust proxy was executed")
@@ -415,7 +304,7 @@ end
 -- is decide the result of an unrelated change, which is why these read
 -- `measurements.yml` rather than the gate.
 function M.gpuConformanceStaysInTheMergeGate()
-    -- No Rust provider is built with or without the GPU any more, so there is
+    -- No provider is built with or without the GPU any more, so there is
     -- nothing to measure; the conformance gate stays where merging depends on it.
     local workflow = read(ROOT .. "/.github/workflows/measurements.yml")
     assert(not workflow:find("gpu-provider", 1, true), "measurements still build a GPU provider")
@@ -451,18 +340,11 @@ function M.nativeRuntimeMeasurementsArePortableAndNonThresholded()
     assert(measure:find("bench/native-runtime/resource.sh", 1, true))
     -- Net and HTTP are Nupp since #142, ask the provider for nothing since #195,
     -- and URI handling is Nupp since #200, so the benchmark stages no provider
-    -- and the measured build is the provider's minimal one; it names only
-    -- features the provider crate still defines.
+    -- and the measured build is the provider's minimal one, `base`, the only
+    -- feature the provider has.
     local features = measure:match("\nfeatures=([%w,%-]+)\n")
     assert(features == "base", "the measured provider build changed its features: " .. tostring(features))
     assert(not measure:find("benchmark_provider", 1, true), "the benchmark stages no provider to measure")
-    local providerFeatures = read(ROOT .. "/native/crates/native/Cargo.toml"):match("\n%[features%]\n(.-)\n%[")
-    for feature in features:gmatch("[^,]+") do
-        assert(
-            providerFeatures:find("\n" .. feature .. " = ", 1, true),
-            "the measured provider build names a feature the provider lacks: " .. feature
-        )
-    end
     assert(measure:find('benchmark.exe', 1, true), "Windows benchmark size does not resolve the executable suffix")
     assert(measure:find("observations, not", 1, true), "hosted-runner timings are not identified as observations")
     assert(peer:find("READY ${httpPort} ${tcpPort}", 1, true), "the peer does not publish one coherent ready event")
@@ -556,93 +438,10 @@ function M.nativeRuntimeMeasurementsArePortableAndNonThresholded()
     assert(peer:find("createTcpServer", 1, true), "the raw slow-writer peer is absent")
 end
 
-function M.featuresAndToolIdentityChangeTheArtifactKey()
-    local directory = temporary()
-    local env = environment(directory)
-    local firstStatus, firstOutput = run(env, "native-rust alpha")
-    assert(firstStatus == 0, firstOutput)
-
-    local secondStatus, secondOutput = run(env, "native-rust beta")
-    assert(secondStatus == 0, secondOutput)
-    assert(answer(firstOutput) ~= answer(secondOutput), "two feature unions shared one artifact")
-
-    local changed = environment(directory, "1.98.0", nil, "fake-llvm-2")
-    local thirdStatus, thirdOutput = run(changed, "native-rust beta")
-    assert(thirdStatus == 0, thirdOutput)
-    assert(answer(secondOutput) ~= answer(thirdOutput), "two rustc identities shared one artifact")
-
-    changed.RUSTFLAGS = "-Cdebuginfo=1"
-    local fourthStatus, fourthOutput = run(changed, "native-rust beta")
-    assert(fourthStatus == 0, fourthOutput)
-    assert(answer(thirdOutput) ~= answer(fourthOutput), "two codegen configurations shared one artifact")
-end
-
--- Rust writes the path of every source a panic can be reported from into the
--- binary, and those sat under the building user's CARGO_HOME and rustup's copy of
--- the standard library, so two users' builds of one tree differed by their home
--- directories. Every crate is remapped, through build.rustflags rather than the
--- final crate's own flags, and what is remapped from stays out of the artifact
--- key: another CARGO_HOME is the same build.
-function M.rustSourcePathsAreRemappedOutOfTheBuildingUsersHome()
-    local directory = temporary()
-    local env = environment(directory)
-    env.CARGO_HOME = directory .. "/first-home/.cargo"
-    local windows = package.config:sub(1, 1) == "\\"
-    for _, command in ipairs({"native-rust alpha"}) do
-        local status, output = run(env, command)
-        assert(status == 0, output)
-        local arguments = read(env.NUPP_TEST_CARGO_RECORD)
-        assert(arguments:find("--config build.rustflags=[", 1, true), command .. ": " .. arguments)
-        assert(arguments:find("=/cargo\"", 1, true), command .. " does not remap CARGO_HOME: " .. arguments)
-        assert(arguments:find("=/vendor\"", 1, true), command .. " does not remap the vendor directory: " .. arguments)
-        assert(
-            arguments:find("/lib/rustlib/src/rust=/rustc/0123abcd\"", 1, true),
-            command .. " does not return the standard library to its release path: " .. arguments
-        )
-        if not windows then
-            assert(
-                arguments:find('"--remap-path-prefix=' .. env.CARGO_HOME .. '=/cargo"', 1, true),
-                command .. " remaps something other than CARGO_HOME: " .. arguments
-            )
-        end
-    end
-
-    local _, first = run(env, "native-rust alpha")
-    env.CARGO_HOME = directory .. "/second-home/.cargo"
-    local status, second = run(env, "native-rust alpha")
-    assert(status == 0, second)
-    assert(answer(first) == answer(second), "another CARGO_HOME was keyed as another build")
-end
-
 function M.legacyProviderUpgradeBridgeIsGone()
     local driver = read(DRIVER)
     assert(not driver:find("provider_sources", 1, true), "the ABI-v1 feature selector remains in the toolchain")
     assert(not driver:match("\n    native%)"), "the ABI-v1 provider command remains in the toolchain")
-end
-
--- With NUPP_CC unset the driver selects its compiler by probing PATH. Cargo
--- does not inherit the driver's private shell variable, so pass the resolved
--- answer explicitly: to the provider's build scripts, and to the embedding
--- crate's C-shim build script.
-function M.rustBuildsUseTheResolvedLuaJitCompiler()
-    local directory = temporary()
-    local env = environment(directory)
-    local probed = package.config:sub(1, 1) == "\\" and "gcc" or "clang"
-    local bin = directory .. "/probed"
-    assert(os.execute("mkdir -p " .. quote(bin)) == 0)
-    fakeCompiler(bin, probed)
-    env.NUPP_CC = nil
-    env.PATH = shellPath(bin) .. ":$PATH"
-    local status, output = run(env, "native-rust")
-
-    assert(status == 0, output)
-    assert(
-        readLines(env.NUPP_TEST_CARGO_CC_RECORD) == probed .. "\n",
-        "the provider build did not receive the compiler selected for LuaJIT"
-    )
-    local driver = read(DRIVER)
-    local forwards = countOccurrences(driver, 'NUPP_CC="$CC"')
-    assert(forwards == 1, "the embedding host build does not forward NUPP_CC")
 end
 
 -- The hosted Windows default is the MSVC Rust toolchain, while LuaJIT and the
@@ -671,11 +470,10 @@ esac
     )
     env.NUPP_CARGO = nil
     env.NUPP_RUSTC = nil
-    env.NUPP_TEST_RUST_LIBRARY = "nupp_native.dll"
     env.CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER = "poison-gnullvm-linker"
     env.PATH = directory .. ":$PATH"
 
-    local status, output = run(env, "native-rust")
+    local status, output = run(env, vendor(directory))
 
     assert(status == 0, output)
     local selected = readLines(rustupRecord)
@@ -718,11 +516,10 @@ esac
     env.NUPP_CARGO = nil
     env.NUPP_RUSTC = nil
     env.NUPP_RUST_WINDOWS_ABI = "gnullvm"
-    env.NUPP_TEST_RUST_LIBRARY = "nupp_native.dll"
     env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "poison-gnu-linker"
     env.PATH = directory .. ":$PATH"
 
-    local status, output = run(env, "native-rust")
+    local status, output = run(env, vendor(directory))
 
     assert(status == 0, output)
     local selected = readLines(rustupRecord)
@@ -743,7 +540,7 @@ printf '%s\n' Linux
 ]])
     env.NUPP_RUST_WINDOWS_ABI = "gnullvm"
     env.PATH = directory .. ":$PATH"
-    local status, output = run(env, "native-rust")
+    local status, output = run(env, vendor(directory))
     assert(status ~= 0, output)
     assert(output:find("NUPP_RUST_WINDOWS_ABI=gnullvm is only supported on Windows", 1, true), output)
 end

@@ -97,10 +97,11 @@ STAGE0_URL='https://github.com/lsegal/nupp/releases/download/${STAGE0_TAG}/nupp-
 # zero they are fetched, verified and cached by digest, never compiled against,
 # so moving them rebuilds nothing native.
 #
-# The code generator is a whole provider (`base` and `codegen`), so a checkout
-# that cannot run Cargo also starts the compiler on it: `native-rust` answers
-# with it when Cargo is missing or NUPP_PREBUILT_PROVIDER=1. A release whose
-# archive predates that carries no `features` file and is refused there.
+# The code generator archive carries a provider too, so a checkout with no
+# compiler yet to build its own starts the compiler on it: `native-provider`
+# answers with it until there is one, or when NUPP_PREBUILT_PROVIDER=1. A
+# release whose archive predates that carries no `features` file and is
+# refused there.
 #
 # The digests are of the archives as published. An empty tag or digest means no
 # release carrying the assets is pinned for that platform yet, and a checkout

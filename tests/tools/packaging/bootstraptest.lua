@@ -149,9 +149,9 @@ end
 -- what it waits for on the way, and a real pair would take a build to produce
 -- and answer the same question.
 --
--- The Rust native provider is planted rather than built for the same reason: the
+-- The native provider is planted rather than built for the same reason: the
 -- launcher stages one before every command that reads a source, and this tree
--- has no `runtime` to build one from. Planted under all three platform names,
+-- has no `native/provider` to build one from. Planted under all three platform names,
 -- because which one is looked for is decided by `uname` and none of them is
 -- ever opened.
 --
@@ -200,12 +200,13 @@ local function plantedTree(stage0Body)
 
     -- Last, because the launcher stages a provider again whenever anything it is
     -- keyed on is newer than the library -- and the pins file above is one of
-    -- those. Staged for real, this tree has no `rust-toolchain.toml` to name a
-    -- toolchain with, so the build these cases are watching never starts. Each
-    -- has a code generator library beside it, or a machine that names a pinned
-    -- LLVM (CI's does) stages the provider again to link one.
+    -- those. Each is marked as the tree's own, since the tree has a compiler to
+    -- have built one with, and has a code generator library beside it, or a
+    -- machine that names a pinned LLVM (CI's does) stages the provider again to
+    -- link one.
     for _, name in ipairs({"libnupp_native_dev.dylib", "libnupp_native_dev.so", "nupp_native_dev.dll",}) do
         plant("build/lib/" .. name, "")
+        plant("build/lib/" .. name .. ".own", "")
         plant("build/lib/" .. name:gsub("nupp_native", "nupp_codegen"), "")
     end
 

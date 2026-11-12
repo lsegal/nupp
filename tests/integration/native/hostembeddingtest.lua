@@ -4,7 +4,7 @@ local test = require("assert")
 
 local HERE = require("helpers.paths").absoluteTests
 local ROOT = HERE .. "/.."
-local FEATURES = "lpeg,native-checksum,native-compression,native-files,native-net,native-panic-probe,native-process,native-time,native-tls,workers"
+local FEATURES = "lpeg,native-checksum,native-compression,native-files,native-net,native-process,native-time,native-tls,workers"
 
 local M = {}
 
@@ -770,26 +770,26 @@ function M.hotReloadAttachesToALoadedComponent()
 end
 
 -- One export, called from C through the static SDK, that crosses into the
--- provider's panic probe. The provider catches the panic at its export and
--- answers a status, the export raises it, and nupp_call reports it: the host
--- lives on to make another call.
-local PANIC_COMPONENT = [[-- NUPP-COMPONENT 1
+-- provider and fails there: releasing a byte handle it never issued. The
+-- provider answers a status with its last error, the export raises it, and
+-- nupp_call reports it: the host lives on to make another call.
+local FAILURE_COMPONENT = [[-- NUPP-COMPONENT 1
 return {
   format = 1,
   hostAbi = 1,
   install = function()
     local ffi = require("ffi")
-    ffi.cdef("int32_t nuppNativePanicProbe(void); const char *nuppNativeLastError(void);")
-    local function panic()
-      local status = ffi.C.nuppNativePanicProbe()
+    ffi.cdef("int32_t nuppNativeBytesRelease(uint64_t handle); const char *nuppNativeLastError(void);")
+    local function fail()
+      local status = ffi.C.nuppNativeBytesRelease(0)
       error(("status %d: %s"):format(status, ffi.string(ffi.C.nuppNativeLastError())))
     end
-    return {exports = {["provider.panic"] = panic, ["provider.after"] = function() return "alive" end}, start = function() end}
+    return {exports = {["provider.fail"] = fail, ["provider.after"] = function() return "alive" end}, start = function() end}
   end,
 }
 ]]
 
-local PANIC_DRIVER = [[
+local FAILURE_DRIVER = [[
 #include "nupp.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -813,7 +813,7 @@ static void print_value(const char *label, const nupp_value *value) {
 int main(int argc, char **argv) {
     nupp_runtime *runtime = NULL;
     nupp_component *component = NULL;
-    nupp_handle *panic = NULL, *after = NULL;
+    nupp_handle *fail = NULL, *after = NULL;
     nupp_error *error = NULL;
     nupp_value result = {0};
     size_t count = 0, length = 0;
@@ -823,21 +823,21 @@ int main(int argc, char **argv) {
     if (argc != 2 || !(bytes = read_all(argv[1], &length))) return 2;
     if (nupp_runtime_new(NULL, &runtime, &error) != NUPP_STATUS_OK) return 1;
     if (nupp_component_load(runtime, bytes, length, argv[1], &component, &error) != NUPP_STATUS_OK) return 1;
-    if (nupp_export_find(runtime, component, "provider.panic", &panic, &error) != NUPP_STATUS_OK) return 1;
+    if (nupp_export_find(runtime, component, "provider.fail", &fail, &error) != NUPP_STATUS_OK) return 1;
     if (nupp_export_find(runtime, component, "provider.after", &after, &error) != NUPP_STATUS_OK) return 1;
-    status = nupp_call(runtime, panic, NULL, 0, &result, 1, &count, &error);
+    status = nupp_call(runtime, fail, NULL, 0, &result, 1, &count, &error);
     if (status == NUPP_STATUS_OK) {
-        print_value("panic", &result);
+        print_value("fail", &result);
         nupp_value_release(runtime, &result, NULL);
     } else {
-        printf("panic status = %d\npanic message = %s\n", (int)status, error ? nupp_error_message(error) : "");
+        printf("fail status = %d\nfail message = %s\n", (int)status, error ? nupp_error_message(error) : "");
         nupp_error_free(error);
     }
     error = NULL;
     if (nupp_call(runtime, after, NULL, 0, &result, 1, &count, &error) != NUPP_STATUS_OK) return 1;
     print_value("after", &result);
     nupp_value_release(runtime, &result, NULL);
-    nupp_handle_release(runtime, panic, NULL);
+    nupp_handle_release(runtime, fail, NULL);
     nupp_handle_release(runtime, after, NULL);
     nupp_component_release(runtime, component, NULL);
     nupp_runtime_shutdown(runtime, NULL);
@@ -846,13 +846,13 @@ int main(int argc, char **argv) {
 }
 ]]
 
-function M.aNativePanicUnderACallAnswersAStatus()
+function M.aProviderFailureUnderACallAnswersAStatus()
     local directory, library = temporary(), sdk()
-    local component = directory .. "/panic.nuppc"
-    write(component, PANIC_COMPONENT)
-    local source = directory .. "/panic.c"
-    write(source, PANIC_DRIVER)
-    local executable = directory .. "/panic"
+    local component = directory .. "/fail.nuppc"
+    write(component, FAILURE_COMPONENT)
+    local source = directory .. "/fail.c"
+    write(source, FAILURE_DRIVER)
+    local executable = directory .. "/fail"
     if jit.os == "Windows" then
         executable = executable .. ".exe"
     end
@@ -871,8 +871,8 @@ function M.aNativePanicUnderACallAnswersAStatus()
     assert(status == 0, output)
     status, output = run(("%s %s"):format(quote(executable), quote(component)))
     assert(status == 0, output)
-    assert(output:find("panic status = 3", 1, true), output)
-    assert(output:find("status 5: native provider panicked: the panic probe tripped", 1, true), output)
+    assert(output:find("fail status = 3", 1, true), output)
+    assert(output:find("status 3: byte handle is stale", 1, true), output)
     assert(output:find("after = alive", 1, true), output)
 end
 

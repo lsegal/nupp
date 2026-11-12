@@ -152,7 +152,7 @@ function M.launcherBuildsTheProviderThroughTheToolchainDriver()
         root .. "/scripts/toolchain",
         [[#!/bin/sh
 case "${1:-}" in
-   native-rust) printf '%s\n' "$*" >> "$NUPP_TEST_RECORD" ;;
+   native-provider) printf '%s\n' "$*" >> "$NUPP_TEST_RECORD" ;;
    stage0) printf '%s\n' "$NUPP_TEST_STAGE0"; exit 0 ;;
 esac
 printf 'built\n' > "$NUPP_TEST_BUILT"
@@ -175,14 +175,14 @@ exit 0
     local asked = read(record)
     -- The code generator is a library of its own, staged beside the provider
     -- where a pinned LLVM is available; the provider is the same either way.
-    local union = "native-rust base"
+    local union = "native-provider base"
     assert(
         asked == union .. "\n",
         "the launcher requested the wrong development providers: " .. asked
     )
     assert(
         read(root .. "/build/lib/libnupp_native_dev.dylib") == "built\n",
-        "the launcher did not install the Rust provider"
+        "the launcher did not install the native provider"
     )
     os.execute("rm -rf " .. quote(root))
 end

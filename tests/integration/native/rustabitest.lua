@@ -54,12 +54,12 @@ function M.theGeneratedHeaderCompiles()
     assert(status == 0, output)
 end
 
---- The provider a C consumer would link, `native-rust` with its base, called
+--- The provider a C consumer would link, `native-provider` with its base, called
 --- through the declarations the generated header makes: everything the
 --- header promises about it holds.
 function M.theGeneratedHeaderDescribesTheProvider()
     local _, text = header()
-    local status, provider = run(("cd %s && ./scripts/toolchain native-rust base"):format(quote(ROOT)))
+    local status, provider = run(("cd %s && ./scripts/toolchain native-provider base"):format(quote(ROOT)))
     assert(status == 0, provider)
     provider = provider:match("([^\r\n]+)%s*$")
 

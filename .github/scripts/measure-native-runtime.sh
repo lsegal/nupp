@@ -43,22 +43,18 @@ rustc=$(rustup which rustc)
 bench/native-runtime/run.sh > "$results/public-boundary.txt"
 bench/native-runtime/resource.sh > "$results/resources.txt"
 
-# Use a fresh task-local target so this is a cold exact-feature provider build
-# even when the compiler and host caches were restored. The second invocation
-# measures the content-addressed warm lookup. These are observations, not
-# acceptance limits. The benchmark itself selects no provider feature since
-# URI handling moved to Nupp (#200), so this is the provider's minimal build.
+# The first invocation builds the provider when the toolchain cache has none
+# for this tree, and the second measures the content-addressed warm lookup.
+# These are observations, not acceptance limits. The benchmark itself selects
+# no provider feature since URI handling moved to Nupp (#200), so this is the
+# provider's minimal build.
 features=base
-exact_root=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nupp-native-exact-$$
-trap 'rm -rf "$exact_root"' EXIT HUP INT TERM
 
 cold_started=$(now_ms)
-provider=$(NUPP_RUST_BUILD_DIR="$exact_root" \
-   ./scripts/toolchain native-rust "$features")
+provider=$(./scripts/toolchain native-provider "$features")
 cold_finished=$(now_ms)
 warm_started=$(now_ms)
-warm_provider=$(NUPP_RUST_BUILD_DIR="$exact_root" \
-   ./scripts/toolchain native-rust "$features")
+warm_provider=$(./scripts/toolchain native-provider "$features")
 warm_finished=$(now_ms)
 [ "$provider" = "$warm_provider" ]
 
