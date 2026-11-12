@@ -20,19 +20,9 @@ file_bytes() {
 }
 
 cd "$root"
-channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-rust_toolchain=$channel
-case "$(uname -s 2>/dev/null || printf unknown)" in
-   MINGW*|MSYS*|CYGWIN*) rust_toolchain=$channel-x86_64-pc-windows-gnu ;;
-esac
-export RUSTUP_TOOLCHAIN=$rust_toolchain RUSTUP_SKIP_UPDATE_CHECK=1
-cargo=$(rustup which cargo)
-rustc=$(rustup which rustc)
 {
    printf 'commit=%s\n' "${GITHUB_SHA:-$(git rev-parse HEAD)}"
    printf 'runner=%s/%s\n' "${RUNNER_OS:-$(uname -s)}" "${RUNNER_ARCH:-$(uname -m)}"
-   "$rustc" --version
-   "$cargo" --version
    printf 'node='
    node --version
 } > "$results/metadata.txt"

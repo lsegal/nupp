@@ -85,7 +85,7 @@
           "platforms": ["windows"],
           "groups": ["windows-preflight"],
           "guarantees": [
-            "the Windows Rust host ABI contract",
+            "the Windows MinGW host ABI contract",
             "a Windows loader failure names its last case"
           ]
         },
@@ -191,16 +191,20 @@
       "selectedBy": "always",
       "steps": [
         {
+          "name": "Refuse Rust and C++ sources",
+          "guarantees": ["no Rust or C++ source, Cargo manifest or Rust toolchain file is reintroduced outside the exempt benchmark controls"]
+        },
+        {
           "name": "Bootstrap the compiler",
-          "guarantees": ["a checkout without Cargo or LLVM bootstraps the compiler from the pinned prebuilt provider"]
+          "guarantees": ["a checkout without Rust, C++ or LLVM bootstraps the compiler from the pinned prebuilt provider"]
         },
         {
           "name": "Link and run a native program",
-          "guarantees": ["a checkout without Cargo or LLVM links and runs a native program with the pinned prebuilt assets"]
+          "guarantees": ["a checkout without Rust, C++ or LLVM links and runs a native program with the pinned prebuilt assets"]
         },
         {
-          "name": "Require that Cargo never ran",
-          "guarantees": ["bootstrapping and linking a native program never invoke Cargo or rustc"]
+          "name": "Require that Rust and C++ never ran",
+          "guarantees": ["bootstrapping and linking a native program never invoke Cargo, rustc or a C++ compiler"]
         }
       ]
     },

@@ -43,8 +43,6 @@ jobs:
   # link jobs link programs for the other platform with it. A kit needs no LLVM.
   kits:
     name: ${{ matrix.name }} link kit
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -84,8 +82,6 @@ jobs:
 
   link:
     name: Link on ${{ matrix.name }} for ${{ matrix.cross }}
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     needs: kits
     runs-on: ${{ matrix.os }}
     # A cold runner builds LLVM first.

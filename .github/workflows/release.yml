@@ -23,14 +23,10 @@ permissions:
 jobs:
   build-luajit-browser-runtime:
     name: LuaJIT browser runtime
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     uses: ./.github/workflows/browser-guest.yml
 
   cold-browser-checkout:
     name: Cold browser checkout
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     needs: build-luajit-browser-runtime
     runs-on: ubuntu-24.04
     # A cold LLVM cache means building LLVM before anything else.
@@ -51,7 +47,7 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: .nupp-cache/toolchain
-          key: browser-guest-${{ runner.os }}-${{ hashFiles('.cargo/config.toml', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'native/crates/**', 'scripts/toolchain', 'scripts/toolchain.pins', 'scripts/browser-*.py', 'scripts/browser-*.mjs', 'runtime/luajit/**', 'src/nupp/runtime/vendor/lunajson/**', 'host/notices/**') }}
+          key: browser-guest-${{ runner.os }}-${{ hashFiles('scripts/toolchain', 'scripts/toolchain.pins', 'scripts/browser-*.py', 'scripts/browser-*.mjs', 'runtime/luajit/**', 'src/nupp/runtime/vendor/lunajson/**', 'host/notices/**') }}
       - name: Install browser engines
         # apt behind this has hung on an unreachable mirror for the whole job
         # timeout; a stalled install fails in minutes instead.
@@ -109,8 +105,6 @@ jobs:
   # link a standalone program for the platform without a C toolchain.
   kits:
     name: ${{ matrix.name }} link kit
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -156,8 +150,6 @@ jobs:
 
   build-unix:
     name: ${{ matrix.name }}
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     needs: kits
     strategy:
       fail-fast: false
@@ -447,8 +439,6 @@ jobs:
 
   build-windows:
     name: Windows x86-64
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     needs: build-unix
     runs-on: windows-2022
     # A cold LLVM cache means building LLVM before anything else.
@@ -466,12 +456,6 @@ jobs:
       # its owner can move; actions/* stay on tags, as GitHub's own.
       - name: Set up the MSVC environment
         uses: step-security/msvc-dev-cmd@22c98154b708dbd743e6f27a933cf6ceba3305c4 # v1.13.1
-
-      - name: Install the ABI-compatible Rust toolchain
-        shell: bash
-        run: |
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal
 
       # The nupp binary links the pinned LLVM (the AOT code generator).
       - name: Fetch or build the pinned LLVM
@@ -587,8 +571,6 @@ jobs:
 
   stage-zero:
     name: Stage-zero compiler
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -678,8 +660,6 @@ jobs:
 
   cross-target:
     name: Stamp every platform on one Linux host
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     needs: catalog
     runs-on: ubuntu-latest
     steps:
