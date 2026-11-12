@@ -1856,7 +1856,7 @@ end
 -- for `codegen`, which no provider carries any more and selects nothing.
 function M.nativeRustWithoutCargoAnswersThePrebuiltProvider()
     local fixture = cargolessFixture("base,uri")
-    for _, features in ipairs({"base,uri", "base,uri,codegen", "base,gpu,uri"}) do
+    for _, features in ipairs({"base,uri", "base,uri,codegen"}) do
         local status, output = run(fixture.environment, "native-rust " .. features, fixture.driver)
         assert(status == 0, "native-rust " .. features .. " needed Cargo:\n" .. output)
         local library = assert(output:match("([^\n]+)%s*$"))
@@ -1871,6 +1871,11 @@ function M.nativeRustWithoutCargoAnswersThePrebuiltProvider()
     local status, output = run(fixture.environment, "native-rust base,panic-probe", fixture.driver)
     assert(status ~= 0, "a feature the prebuilt provider lacks was handed out:\n" .. output)
     assert(output:find("has no panic-probe feature", 1, true), "the refusal does not say why:\n" .. output)
+
+    -- `gpu` went with the stage-zero pin past #14 (#36); no provider has it.
+    status, output = run(fixture.environment, "native-rust base,gpu,uri", fixture.driver)
+    assert(status ~= 0, "the retired gpu feature was handed out:\n" .. output)
+    assert(output:find("has no gpu feature", 1, true), "the refusal does not say why:\n" .. output)
     os.execute("rm -rf " .. quote(fixture.directory))
 end
 

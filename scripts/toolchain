@@ -831,16 +831,15 @@ prebuilt_provider_wanted() {
 }
 
 # Sets PREBUILT_OUT to the prebuilt provider when it carries every feature in
-# the list; `gpu` and `codegen` select nothing and are accepted for the
-# stage-zero compiler that still asks for them. Anything else needs Cargo, and
-# says so.
+# the list; `codegen` selects nothing and is accepted for the stage-zero
+# compiler that still asks for it. Anything else needs Cargo, and says so.
 prebuilt_provider() {
     requested=$(normalize_rust_features "${1:-}")
     build_prebuilt codegen
     provider_dir=$(dirname "$PREBUILT_OUT")
     [ -f "$provider_dir/features" ] \
         || die "the $PREBUILT_TAG prebuilt code generator carries no provider features; it needs Cargo, or a pin past it (scripts/toolchain.pins)"
-    carried=",$(tr -d ' \r\n' < "$provider_dir/features"),gpu,codegen,"
+    carried=",$(tr -d ' \r\n' < "$provider_dir/features"),codegen,"
     for feature in $(printf '%s' "$requested" | tr ',' ' '); do
         case "$carried" in
             *",$feature,"*) ;;
