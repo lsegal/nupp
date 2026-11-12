@@ -1,0 +1,93 @@
+name: scratch issue 7 codegen
+
+on:
+  push:
+    branches: [scratch/issue-7-codegen]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+          - name: Windows x86-64
+            os: windows-2022
+          - name: Linux x86-64
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    env:
+      NUPP_REQUIRE_CODEGEN: '1'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the Windows GNU toolchain
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal
+          echo "NUPP_CC=gcc" >> "$GITHUB_ENV"
+          echo "NUPP_CXX=g++" >> "$GITHUB_ENV"
+          echo "NUPP_TEST_BASH=$(cygpath -w /usr/bin/bash)" >> "$GITHUB_ENV"
+          echo "NUPP_TEST_SH=$(cygpath -w /usr/bin/sh)" >> "$GITHUB_ENV"
+
+      - name: Fetch the pinned LLVM
+        uses: ./.github/actions/pinned-llvm
+
+      - name: Build the compiler and stage the code generator library
+        run: |
+          set -euo pipefail
+          ./bin/nupp --version
+          ls -la build/lib
+
+      - name: The code generator library exports exactly the aliases
+        run: |
+          set -euo pipefail
+          library=$(./scripts/toolchain codegen-library)
+          echo "$library"
+          case "$(uname -s)" in
+            Darwin) nm -gU "$library" | awk '{print $3}' | sort > exported.txt ;;
+            Linux) nm -D --defined-only "$library" | awk '{print $3}' | sort > exported.txt ;;
+            *) objdump -p "$library" | sed -n '/\[Ordinal\/Name Pointer\] Table/,/^$/p' | awk '/nuppcg_/{print $NF}' | sort > exported.txt ;;
+          esac
+          wc -l exported.txt
+          grep -v nuppcg_ exported.txt | head -20 || true
+
+      - name: llvmcontracttest
+        run: ./bin/nupp test --scope=all --jobs=2 --shard=llvmcontracttest
+
+      - name: The host links the code generator in
+        run: |
+          set -euo pipefail
+          host=$(./scripts/toolchain host native-codegen,lpeg)
+          echo "$host"; ls -la "$host"
+          cat > probe.lua <<'EOF'
+          local ffi = require("ffi")
+          ffi.cdef("void nuppcg_LLVMGetVersion(unsigned *, unsigned *, unsigned *);")
+          local v = ffi.new("unsigned[3]")
+          ffi.C.nuppcg_LLVMGetVersion(v, v + 1, v + 2)
+          print("in-process LLVM", v[0], v[1], v[2])
+          EOF
+          stub=$(ls "$host"/nupp-host* "$host"/nupp 2>/dev/null | head -1 || true)
+          [ -n "$stub" ] || stub=$(find "$host" -maxdepth 2 -type f \( -name 'nupp-host' -o -name 'nupp-host.exe' -o -name nupp -o -name nupp.exe \) | head -1)
+          echo "stub: $stub"
+          "$stub" probe.lua
+
+      - name: nativeprogramtest
+        run: ./bin/nupp test --scope=all --jobs=2 --shard=nativeprogramtest
+
+      - name: aotclitest
+        if: always()
+        run: ./bin/nupp test --scope=all --jobs=2 --shard=aotclitest
