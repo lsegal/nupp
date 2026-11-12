@@ -169,15 +169,10 @@ one tree produce byte-identical payloads, which is what the [packaging
 fixpoint](#packaging-fixpoint) below rests on.
 
 The compiler-owned host is reproducible to the same standard across checkouts,
-directories, locales, time zones, umasks and users. Rust records the source
-paths of its dependencies and standard library in panic locations, and those sit
-under the building user's `CARGO_HOME` and rustup directory, so
-`scripts/toolchain` remaps them for every crate it builds: the registry to
-`/cargo`, a vendor directory to `/vendor`, and rustup's copy of the standard
-library back to the `/rustc/<commit>` path the Rust release itself records.
-Where those directories are is therefore not part of the build. An ambient
-`RUSTFLAGS` replaces the remapping, as it replaces any `build.rustflags` in
-Cargo, and is already part of the artifact key.
+directories, locales, time zones, umasks and users. The host, provider and
+embedding library are native Nupp programs, compiled by the checkout's own
+compiler and linked by its code generator, so neither the checkout's location
+nor the building user's home directory is part of the build.
 
 ## Stub requirements
 
@@ -240,18 +235,10 @@ after the output cache and source directory miss. `NUPP_HOST_OFFLINE` accepts
 corresponding false values to allow it. An offline miss names the archive and
 the source-directory setting needed to supply it.
 
-Cargo dependencies use the committed `Cargo.lock` and Cargo checksums rather
-than the archive list above. Provision an offline source tree once, then name it
-for Rust-native builds:
-
-```sh
-./scripts/toolchain rust-vendor /opt/nupp-rust-sources
-NUPP_RUST_VENDOR_DIR=/opt/nupp-rust-sources \
-NUPP_HOST_OFFLINE=1 \
-./scripts/toolchain native-rust uri
-```
-
-An offline Rust build without `NUPP_RUST_VENDOR_DIR` fails before Cargo runs.
+Nothing else is fetched: the native provider, host and embedding library are
+compiled from this tree by its own compiler, so an offline build needs only the
+archives above, the stage-zero compiler and, where it is pinned, the prebuilt
+code generator below.
 
 ### Prebuilt code generator and link kit
 
@@ -277,7 +264,7 @@ cache it by digest. `NUPP_HOST_SOURCE_DIR`, `NUPP_HOST_SOURCE_BASE_URL` and
 code generator library when this tree has not linked one of its own from the
 pinned LLVM; the compiler loads it through LuaJIT's FFI. `NUPP_CODEGEN_LIBRARY`
 names such a library directly. The archive's provider is what a checkout
-without Cargo starts the compiler on. A platform with no pinned assets still
+starts the compiler on before it has built a provider of its own. A platform with no pinned assets still
 needs `scripts/toolchain llvm`.
 
 A released `nupp` carries no separate library: its host links LLVM and lld in
@@ -320,21 +307,18 @@ the same macOS bytes unsigned.
 ## Third-party notices
 
 The compiler-owned stub links LuaJIT, its selected LPeg module, and
-one feature-selected Rust provider archive. A stamped binary or provider is a
+the native provider's archive. A stamped binary or provider is a
 distribution of what it links, so the notices ship in
 [`host/NOTICE.md`](https://github.com/nupp-lang/nupp/blob/main/host/NOTICE.md)
 and `host/notices/`. C-source notices are carried as they arrive in the pinned
-sources, byte for byte. The generated Rust notice covers every third-party
-package in `Cargo.lock`, so one committed notice set is valid for every provider
-feature and target. Hand the directory over with the binary the way a release
-archive carries a README.
+sources, byte for byte. The provider and host are Nupp, so they add no
+third-party notice of their own. Hand the directory over with the binary the
+way a release archive carries a README.
 
 The C sources are fetched at build time rather than committed, so nothing else
 in the tree carries their notices. `scripts/toolchain` compares each committed
 copy against the source it has just verified by digest and fails the build when
-they differ. `scripts/rust-dependency-notices --write` refreshes the Cargo
-aggregate; the test suite refuses a lockfile whose third-party package inventory
-is not represented there. The prebuilt wgpu-native library staged beside GPU
+they differ. The prebuilt wgpu-native library staged beside GPU
 programs carries its own Rust graph, so `scripts/rust-dependency-notices --write
 wgpu-native` generates a second notice from the lock file of the pinned
 `WGPU_VERSION`, and the suite refuses a pin that notice was not generated from.
@@ -470,10 +454,10 @@ A distributed binary is deliberately none of these things.
   Nupp supplies Lunamark's entity encoder and reference-label normalizer from
   its own payload.
   Filesystem and network operations, TLS, clocks, payload trailer verification
-  and child processes come from the feature-selected Rust native archive linked
-  into the host.
+  and child processes are Nupp calling the operating system through FFI, and
+  the native provider linked into the host carries the AOT runtime.
   Each payload selects whatever its own code and bundled dependencies need.
 - **It does not make Nupp a C project either.** The production host and native
-  resource owners are Rust. LuaJIT, LPeg, protected VM shims, and compiled AOT
+  resource owners are Nupp. LuaJIT, LPeg, LLVM and lld, and compiled AOT
   code remain deliberate native boundaries; the complete ownership and support
   matrix is in [Native runtime and support](native-runtime.md).

@@ -44,8 +44,8 @@ the public embedding surface.
 
 The repository carries a C application example in `host/examples/embed.c` and
 its component project in `host/examples/component`. The example calls the
-public C ABI implemented by the Rust-owned SDK; it is not the removed legacy C
-host implementation. Build the component from its project directory:
+public C ABI implemented by the SDK, a native Nupp program; it is not the
+removed legacy C host implementation. Build the component from its project directory:
 
 ```bash
 cd host/examples/component
