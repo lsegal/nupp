@@ -1,0 +1,141 @@
+--[[
+The native provider, `nupp_native`: the library the compiler's runtime and the
+pinned stage-zero compiler load, a Nupp native program built by
+`scripts/toolchain native-rust`. Its ABI is `native.abi.nuppnative`, version 2,
+and grows only by addition.
+
+Every service the provider used to carry is Nupp running on its Lua state now,
+so what is left is the ABI's own version and feature bits, its error slot, its
+byte handles, the machine's parallelism, and the table of the AOT runtime
+(`native/aotruntime`), which is compiled in beside this module.
+
+No export produces a byte handle any more, so every handle is stale. The two
+byte calls stay because the pinned stage-zero compiler names them.
+
+The last error is one slot rather than one per thread: every message is a
+constant, so a reader always sees a whole one, and only the two byte calls ever
+set it.
+]]
+module nuppnative.provider
+
+const {ks_rt_table} = require("ksrt.runtime")
+const {ks_rt_bind} = require("ksrt.api")
+
+cdef function calloc(count: uint64, size: uint64): voidptr?
+cdef function free(borrows p: voidptr)
+cdef function sched_getaffinity(pid: int32, size: uint64, borrows mask: voidptr): int32
+cdef function sysconf(name: int32): int64
+cdef function GetSystemInfo(borrows info: voidptr)
+
+const ABI_VERSION = 2
+-- NUPP_NATIVE_FEATURE_BASE | NUPP_NATIVE_FEATURE_AOT_RUNTIME
+const FEATURES = 4097ULL
+const INVALID_ARGUMENT = 1
+const STALE_HANDLE = 3
+
+local lastError: cstring = "no error"
+
+local function failed(status: int32, message: cstring): int32
+    lastError = message
+    return status
+end
+
+export function nuppNativeAbiVersion(): uint32
+    return ABI_VERSION
+end
+
+export function nuppNativeFeatures(): uint64
+    return FEATURES
+end
+
+--- The AOT runtime's table, which an ahead-of-time compiled Lua module's
+--- registrar is handed, or nil when the runtime finds no Lua API in this
+--- process. Binding only reads the loaded modules' export tables.
+export function nuppAotRuntime(): voidptr?
+    if ks_rt_bind() == 0 then
+        return nil
+    end
+
+    return ks_rt_table as voidptr
+end
+
+--- The message of the last call that failed. A call that succeeds leaves it
+--- as it was, so read it only after a failure.
+export function nuppNativeLastError(): cstring
+    return lastError
+end
+
+--- Copies the bytes behind a handle into caller-owned storage. No handle is
+--- live, so this answers STALE_HANDLE once its outputs are valid.
+export function nuppNativeBytesCopy(
+    handle: uint64,
+    borrows data: uint8*?,
+    capacity: uint64,
+    borrows length: uint64*?
+): int32
+    if length == nil or (capacity ~= 0ULL and data == nil) then
+        return failed(INVALID_ARGUMENT, "byte copy output is null")
+    end
+    return failed(STALE_HANDLE, "byte handle is stale")
+end
+
+export function nuppNativeBytesRelease(handle: uint64): int32
+    return failed(STALE_HANDLE, "byte handle is stale")
+end
+
+-- The CPUs this process may run on, from a 1024-CPU affinity mask: 0 when
+-- the mask cannot be read.
+local function affinity(): int64
+    local mask = calloc(1ULL, 128ULL) as uint64*?
+    if mask == nil then
+        return 0LL
+    end
+    local count: int64 = 0LL
+    if sched_getaffinity(0, 128ULL, mask as voidptr) == 0 then
+        @unsafe do
+            for word = 0, 15 do
+                local bits = mask[word]
+                while bits ~= 0ULL do
+                    bits = bits & (bits - 1ULL)
+                    count = count + 1LL
+                end
+            end
+        end
+    end
+    free(mask as voidptr)
+
+    return count
+end
+
+-- The processors Windows reports: SYSTEM_INFO's dwNumberOfProcessors.
+local function processors(): int64
+    local info = calloc(1ULL, 64ULL)
+    if info == nil then
+        return 0LL
+    end
+    GetSystemInfo(info as voidptr)
+    local count = @unsafe(((info as uint64 + 32ULL) as uint32*)[0] as int64)
+    free(info as voidptr)
+
+    return count
+end
+
+--- How many threads can usefully run at once, always at least one.
+export function nuppNativeAvailableParallelism(): uint64
+    local count: int64 = 0LL
+    if jit.os == "Windows" then
+        count = processors()
+    elseif jit.os == "OSX" then
+        count = sysconf(58)
+    else
+        count = affinity()
+        if count < 1LL then
+            count = sysconf(84)
+        end
+    end
+    if count < 1LL then
+        return 1ULL
+    end
+
+    return count as uint64
+end

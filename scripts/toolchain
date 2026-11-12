@@ -41,8 +41,7 @@ usage: scripts/toolchain COMPONENT...
 Components: luajit luarocks lpeg lpeg-source stage0 migration-stage0 llvm wgpu
             wgpu-static [PLATFORM]
             browser-sources browser-emulator browser-guest
-            native-rust FEATURES
-            aot-runtime
+            native-provider FEATURES
             rust-vendor OUTPUT
             host FEATURES, host-library FEATURES
             kit FEATURES, kit-archive FEATURES OUTPUT
@@ -58,9 +57,9 @@ prints the root the components are installed under without building anything.
 Environment:
   NUPP_CC, NUPP_CXX          the compiler pair. Probed when unset.
   NUPP_CARGO, NUPP_RUSTC     the pinned Rust toolchain. Probed when unset.
-  NUPP_PREBUILT_PROVIDER     1 to take native-rust from the pinned prebuilt
-                             code generator archive, 0 never to. Without Cargo
-                             it is taken whenever one is pinned.
+  NUPP_PREBUILT_PROVIDER     1 to take native-provider from the pinned prebuilt
+                             code generator archive, 0 never to. Without a
+                             built compiler it is taken whenever one is pinned.
   NUPP_RUST_WINDOWS_ABI      GNU (default) or gnullvm for LLVM-MinGW.
   NUPP_TOOLCHAIN_DIR         where to install. Defaults to the repository cache.
   NUPP_RUST_BUILD_DIR        Rust outputs. Defaults to build/rust.
@@ -69,9 +68,6 @@ Environment:
   NUPP_HOST_SOURCE_BASE_URL  a flat mirror to fetch archives from.
   NUPP_HOST_OFFLINE          refuse to reach the network.
   NUPP_LLVM_PREFIX           an existing build of the pinned LLVM to use as is.
-  NUPP_AOT_RUNTIME_ARCHIVE   the AOT runtime archive native-rust links. Built
-                             with this checkout's compiler when unset and one
-                             is built; empty for a provider without it.
 
 `llvm --available` prints the pinned LLVM's prefix if it is already built (or
 named by NUPP_LLVM_PREFIX) and exits 1 otherwise, building nothing.
@@ -774,8 +770,8 @@ prebuilt_codegen_library() {
 }
 
 # The features the archive's provider is built with. They are the ones
-# bin/nupp's own provider asks for, so a checkout that cannot run Cargo starts
-# the compiler on the provider a Cargo build would have given it.
+# bin/nupp's own provider asks for, so a checkout without a compiler yet starts
+# it on the provider its first compiler would have built.
 PREBUILT_PROVIDER_FEATURES=base
 
 # The archive a release publishes as this machine's prebuilt code generator:
@@ -785,14 +781,14 @@ PREBUILT_PROVIDER_FEATURES=base
 codegen_archive() {
     build_llvm
     build_codegen_library
-    build_rust_native "$PREBUILT_PROVIDER_FEATURES"
-    # A checkout that takes this provider has no Cargo to link the runtime in.
-    [ -n "$AOT_RUNTIME_OUT" ] \
-        || die "the code generator archive carries the AOT runtime; build the compiler first (./bin/nupp --version)"
+    # A checkout that takes this provider has no compiler yet to build its own.
+    [ -f "$ROOT/build/nupp/tools/main.lua" ] \
+        || die "the code generator archive carries this checkout's provider; build the compiler first (./bin/nupp --version)"
+    build_native_provider "$PREBUILT_PROVIDER_FEATURES" || die "cannot compile the native provider"
     prebuilt_pins
     [ -n "$prebuilt_library" ] || die "no prebuilt code generator is published for $PREBUILT_TARGET"
     codegen_staging=$(mktemp -d "${TMPDIR:-/tmp}/nupp-codegen.XXXXXX") || die "cannot stage the code generator"
-    cp "$RUST_NATIVE_OUT" "$codegen_staging/$prebuilt_library"
+    cp "$NATIVE_PROVIDER_OUT" "$codegen_staging/$prebuilt_library"
     cp "$CODEGEN_LIBRARY_OUT" "$codegen_staging/$prebuilt_codegen"
     printf '%s\n' "$PREBUILT_PROVIDER_FEATURES" > "$codegen_staging/features"
     deterministic_archive "$codegen_staging" "$1" || { rm -rf "$codegen_staging"; die "cannot archive the code generator"; }
@@ -801,52 +797,33 @@ codegen_archive() {
 
 # --- the prebuilt native provider -------------------------------------------
 
-# The compiler's own native provider, for a checkout that cannot run Cargo:
-# the one in the pinned prebuilt code generator archive, built with
-# PREBUILT_PROVIDER_FEATURES. `native-rust` answers with it when Cargo is not
-# there (NUPP_CARGO naming nothing, or neither `cargo` nor `rustup` on PATH)
-# and a code generator is pinned for this machine, or whenever
-# NUPP_PREBUILT_PROVIDER=1 asks for it. That is how bin/nupp and the stage-zero compiler both start
-# without Cargo: each asks `native-rust` for this provider, and neither knows
-# where the answer came from.
-#
-# Cargo's absence is read from PATH alone. Asking Cargo or rustc anything,
-# the way select_rust_tools does for every Rust build, is what this exists to
-# avoid. The library is the release's, not this tree's, so a checkout whose
-# Rust sources have moved past the pin runs the provider the pin names until
-# the pin moves too.
-prebuilt_provider_wanted() {
-    [ "${NUPP_PREBUILT_PROVIDER:-}" = 1 ] && return 0
-    [ "${NUPP_PREBUILT_PROVIDER:-}" = 0 ] && return 1
-    # Unnamed, Cargo is whatever select_rust_tools would find: rustup's exact
-    # binary when rustup is there, or `cargo` on PATH.
-    if [ -n "${NUPP_CARGO:-}" ]; then
-        command -v "$NUPP_CARGO" >/dev/null 2>&1 && return 1
-    else
-        command -v cargo >/dev/null 2>&1 && return 1
-        command -v rustup >/dev/null 2>&1 && return 1
-    fi
-    prebuilt_pins
-    [ -n "${PREBUILT_TAG:-}" ] && [ -n "$prebuilt_codegen_digest" ]
-}
+# The compiler's own native provider, for a checkout with no compiler yet to
+# build one with: the one in the pinned prebuilt code generator archive, built
+# with PREBUILT_PROVIDER_FEATURES. `native-rust` answers with it until there is
+# a compiler, or whenever NUPP_PREBUILT_PROVIDER=1 asks for it. That is how
+# bin/nupp and the stage-zero compiler both start: each asks `native-rust` for
+# a provider, and neither knows where the answer came from. The library is the
+# release's, not this tree's, so a checkout whose provider sources have moved
+# past the pin runs the provider the pin names until its first compiler builds
+# its own.
 
 # Sets PREBUILT_OUT to the prebuilt provider when it carries every feature in
 # the list; `codegen` selects nothing and is accepted for the stage-zero
-# compiler that still asks for it. Anything else needs Cargo, and says so.
+# compiler that still asks for it.
 prebuilt_provider() {
     requested=$(normalize_rust_features "${1:-}")
     build_prebuilt codegen
     provider_dir=$(dirname "$PREBUILT_OUT")
     [ -f "$provider_dir/features" ] \
-        || die "the $PREBUILT_TAG prebuilt code generator carries no provider features; it needs Cargo, or a pin past it (scripts/toolchain.pins)"
+        || die "the $PREBUILT_TAG prebuilt code generator carries no provider features; pin a later release (scripts/toolchain.pins)"
     carried=",$(tr -d ' \r\n' < "$provider_dir/features"),codegen,"
     for feature in $(printf '%s' "$requested" | tr ',' ' '); do
         case "$carried" in
             *",$feature,"*) ;;
-            *) die "the prebuilt native provider has no $feature feature; building it needs Cargo (NUPP_CARGO)" ;;
+            *) die "the prebuilt native provider has no $feature feature" ;;
         esac
     done
-    note "using the $PREBUILT_TAG prebuilt native provider instead of Cargo"
+    note "using the $PREBUILT_TAG prebuilt native provider"
 }
 
 # --- notices ----------------------------------------------------------------
@@ -887,7 +864,7 @@ verify_embedded_notice() {
 LOCK=""
 HOST_OUT=""
 NATIVE_OUT=""
-RUST_NATIVE_OUT=""
+NATIVE_PROVIDER_OUT=""
 RUST_EMBED_DYNAMIC_OUT=""
 RUST_EMBED_IMPORT_OUT=""
 release_lock() { [ -n "$LOCK" ] && rm -rf "$LOCK"; LOCK=""; return 0; }
@@ -1032,7 +1009,7 @@ normalize_rust_features() {
         | tr '\n' ',' | sed 's/,$//'
 }
 
-rust_library_filename() {
+native_provider_filename() {
     case "$PLATFORM" in
         darwin)  printf '%s\n' libnupp_native.dylib ;;
         windows) printf '%s\n' nupp_native.dll ;;
@@ -1141,89 +1118,54 @@ without_codegen() {
     printf '%s\n' "$1" | tr ',' '\n' | grep -v '^codegen$' | tr '\n' ',' | sed 's/,$//'
 }
 
-build_rust_native() {
-    sorted=$(without_codegen "$(normalize_rust_features "${1:-}")")
-    select_rust_tools
-    rust_environment=$(rust_environment_material)
-    aot_runtime_for_provider
-    rn_runtime=none
-    [ -z "$AOT_RUNTIME_OUT" ] || rn_runtime=$(sha256 "$AOT_RUNTIME_OUT")
-    digest=$({
-        printf '%s|%s|%s|%s|%s|%s\n' \
-            nupp-native "$sorted" "$RUST_TOOL_MATERIAL" "$(rust_sources_digest)" "$KEY" "$rn_runtime"
-        printf '%s\n' "$rust_environment"
-    } | sha256_stdin | cut -c1-16)
-    out="$RUST_BUILD_ROOT/native/$digest"
-    filename=$(rust_library_filename)
-    RUST_NATIVE_OUT="$out/target/release/$filename"
-    RUST_NATIVE_STATIC_OUT="$out/target/release/libnupp_native.a"
-    RUST_NATIVE_LIBS_OUT="$out/native-static-libs"
+# --- the native provider -----------------------------------------------------
 
-    take_lock "rust-native-$digest" "$out/.complete" || return 0
-    [ -f "$out/.complete" ] && [ -f "$RUST_NATIVE_OUT" ] \
-        && [ -f "$RUST_NATIVE_STATIC_OUT" ] \
-        && { release_lock; return 0; }
+# The provider, `nupp_native`, is a Nupp native program (native/provider) with
+# the AOT runtime LLVM-compiled Lua builders call (native/aotruntime) compiled
+# in. This checkout's compiler builds it into the shared library the
+# compiler's runtime loads and the static archive a host links. That compiler
+# runs on a provider too, so the first one a checkout runs is the pinned
+# prebuilt one ("the prebuilt native provider"), and bin/nupp builds its own
+# once there is a compiler to build it with.
 
-    note "building the Rust native provider with $RUSTC"
-    rm -rf "$out"
-    mkdir -p "$out"
-    set -- "$CARGO" rustc \
-        --manifest-path "$ROOT/Cargo.toml" \
-        --package nupp-native \
-        --release \
-        --locked \
-        --no-default-features \
-        --target-dir "$out/target" \
-        --lib
-    if offline; then
-        set -- "$@" --offline
-    fi
-    vendor_arguments=$(rust_vendor_arguments)
-    if [ -n "$vendor_arguments" ]; then
-        while IFS= read -r config; do
-            set -- "$@" --config "$config"
-        done <<EOF
-$vendor_arguments
-EOF
-    fi
-    set -- "$@" --config "$(rust_remap_arguments)"
-    if [ -n "$sorted" ]; then
-        set -- "$@" --features "$sorted"
-    fi
-    # rustc otherwise records the content-addressed target directory as this
-    # dylib's identity. A program linked against the provider would then load
-    # that cache path after the library was staged or packaged elsewhere. The
-    # debug map's object paths carry it too, and ld64 hashes them into
-    # LC_UUID, so they go relative to it.
-    # The Nupp host links the static archive, so it also needs the native
-    # libraries rustc would have linked for it, Rust's own. rustc reports them.
-    set -- "$@" -- --print native-static-libs
-    if [ "$PLATFORM" = darwin ]; then
-        set -- "$@" -C "link-arg=-Wl,-install_name,@rpath/$filename" \
-            -C "link-arg=-Wl,-oso_prefix,$out/target/"
-    fi
-    if ! NUPP_AOT_RUNTIME_ARCHIVE="$AOT_RUNTIME_OUT" CC="$CC" CXX="$CXX" RUSTC="$RUSTC" "$@" 2> "$out/cargo.log"; then
-        cat "$out/cargo.log" >&2
-        die "Cargo could not build nupp-native"
-    fi
-    cat "$out/cargo.log" >&2
-    sed -n 's/^note: native-static-libs: //p' "$out/cargo.log" | tail -n 1 | tr ' ' '\n' \
-        | sed '/^$/d' > "$out/native-static-libs"
-    [ -f "$RUST_NATIVE_OUT" ] \
-        || die "Cargo built nupp-native but did not write $RUST_NATIVE_OUT"
-    [ -f "$RUST_NATIVE_STATIC_OUT" ] \
-        || die "Cargo built nupp-native but did not write $RUST_NATIVE_STATIC_OUT"
-    printf 'done\n' > "$out/.complete"
-    release_lock
+# Checks a provider feature list. Every provider carries `base`, and nothing
+# else is left to select; `codegen` is dropped, because the code generator is
+# a library of its own now but the pinned stage-zero compiler still asks for it.
+provider_features() {
+    for pf_feature in $(without_codegen "$(normalize_rust_features "${1:-}")" | tr ',' ' '); do
+        [ "$pf_feature" = base ] || die "the native provider has no $pf_feature feature"
+    done
 }
 
-# --- the AOT runtime ----------------------------------------------------------
+# Whether `native-rust` answers with the pinned prebuilt provider rather than
+# this checkout's: when NUPP_PREBUILT_PROVIDER=1 asks for it, and otherwise
+# while there is no compiler to build one with.
+prebuilt_provider_wanted() {
+    [ "${NUPP_PREBUILT_PROVIDER:-}" = 1 ] && return 0
+    [ "${NUPP_PREBUILT_PROVIDER:-}" = 0 ] && return 1
+    [ ! -f "$ROOT/build/nupp/tools/main.lua" ]
+}
 
-# The runtime LLVM-compiled Lua builders call is a Nupp native program
-# (native/aotruntime), linked into the provider as a static archive. The
-# compiler that builds it runs on a provider, so the first provider a checkout
-# builds has none: native-rust links the runtime once this checkout has a built
-# compiler, and bin/nupp builds its provider again after its first compiler.
+# Whether a prebuilt provider is pinned for this machine, to fall back on.
+prebuilt_provider_pinned() {
+    prebuilt_pins
+    [ -n "${PREBUILT_TAG:-}" ] && [ -n "$prebuilt_codegen_digest" ]
+}
+
+# The provider's own inputs: its sources and the runtime's, and the parts of
+# the compiler that decide what a native program lowers and links to.
+native_provider_digest() {
+    {
+        (cd "$ROOT" && find native/provider native/aotruntime -type f -name '*.nupp' 2>/dev/null) || true
+        for file in scripts/toolchain src/nupp/compiler/aot/llvm/native.nupp src/nupp/tools/build/program.nupp \
+            src/nupp/tools/build/aotllvm.nupp src/nupp/tools/cli/aot.nupp; do
+            [ -f "$ROOT/$file" ] && printf '%s\n' "$file"
+        done
+    } | LC_ALL=C sort | while IFS= read -r file; do
+        printf '%s ' "$file"
+        sha256 "$ROOT/$file"
+    done | sha256_stdin | cut -c1-16
+}
 
 # What the platform decides for the runtime: size_t's width, and the size of
 # LuaJIT's luaL_Buffer, whose buffer the C library's BUFSIZ sets.
@@ -1256,65 +1198,46 @@ write_aot_runtime_build() {
     } > "$1/ksrt/build.nupp"
 }
 
-# The runtime's own inputs: its sources, and the parts of the compiler that
-# decide what a native program lowers and links to.
-aot_runtime_digest() {
-    {
-        (cd "$ROOT" && find native/aotruntime -type f -name '*.nupp' 2>/dev/null) || true
-        for file in scripts/toolchain src/nupp/compiler/aot/llvm/native.nupp src/nupp/tools/build/program.nupp \
-            src/nupp/tools/build/aotllvm.nupp src/nupp/tools/cli/aot.nupp; do
-            [ -f "$ROOT/$file" ] && printf '%s\n' "$file"
-        done
-    } | LC_ALL=C sort | while IFS= read -r file; do
-        printf '%s ' "$file"
-        sha256 "$ROOT/$file"
-    done | sha256_stdin | cut -c1-16
-}
+# Sets NATIVE_PROVIDER_OUT and NATIVE_PROVIDER_STATIC_OUT to the provider and
+# its static archive, compiling them with this checkout's compiler the first
+# time. Returns 1 when that compiler cannot, for want of a code generator.
+build_native_provider() {
+    provider_features "${1:-}"
+    np_digest=$(printf '%s|%s|%s\n' nupp-native "$(native_provider_digest)" "$KEY" | sha256_stdin | cut -c1-16)
+    np_out="$PREFIX/native-provider/$np_digest"
+    NATIVE_PROVIDER_OUT="$np_out/$(native_provider_filename)"
+    NATIVE_PROVIDER_STATIC_OUT="$np_out/libnupp_native.a"
+    take_lock "native-provider-$np_digest" "$np_out/.complete" || return 0
+    [ -f "$np_out/.complete" ] && [ -f "$NATIVE_PROVIDER_OUT" ] && [ -f "$NATIVE_PROVIDER_STATIC_OUT" ] \
+        && { release_lock; return 0; }
 
-# Sets AOT_RUNTIME_OUT to the runtime archive, compiling it with this checkout's
-# compiler the first time.
-build_aot_runtime() {
-    ar_digest=$(printf '%s|%s|%s\n' nupp-aot-runtime "$(aot_runtime_digest)" "$KEY" | sha256_stdin | cut -c1-16)
-    ar_out="$PREFIX/aot-runtime/$ar_digest"
-    AOT_RUNTIME_OUT="$ar_out/libnupp_aot_runtime.a"
-    take_lock "aot-runtime-$ar_digest" "$ar_out/.complete" || return 0
-    [ -f "$ar_out/.complete" ] && [ -f "$AOT_RUNTIME_OUT" ] && { release_lock; return 0; }
-
-    note "building the AOT runtime"
-    rm -rf "$ar_out"
-    mkdir -p "$ar_out/src/ksrt"
+    note "building the native provider"
+    rm -rf "$np_out"
+    mkdir -p "$np_out/src/ksrt"
     # The compiler resolves a relative include against the manifest's own
     # directory, and on Windows wants a drive-qualified path.
-    printf 'return { include = { ".", "%s", "%s" } }\n' \
+    printf 'return { include = { ".", "%s", "%s", "%s" } }\n' "$(native_path "$ROOT/native/provider")" \
         "$(native_path "$ROOT/native/aotruntime/common")" "$(native_path "$ROOT/native/aotruntime/bound")" \
-        > "$ar_out/src/nupp.lua"
-    printf 'module main\n\nlocal _ = require("ksrt.runtime")\n' > "$ar_out/src/main.nupp"
-    write_aot_runtime_build "$ar_out/src"
+        > "$np_out/src/nupp.lua"
+    printf 'module main\n\nlocal _ = require("nuppnative.provider")\n' > "$np_out/src/main.nupp"
+    write_aot_runtime_build "$np_out/src"
+    printf '%s\n' nuppNativeAbiVersion nuppNativeFeatures nuppNativeLastError nuppNativeBytesCopy \
+        nuppNativeBytesRelease nuppNativeAvailableParallelism nuppAotRuntime > "$np_out/src/exports"
     # The compiler runs on this checkout's provider, which may be the one
-    # being built, so it is started on one without the runtime.
-    if ! NUPP_AOT_RUNTIME_ARCHIVE= "$ROOT/bin/nupp" aot --emit static-library \
-        --output "$(native_path "$AOT_RUNTIME_OUT")" "$(native_path "$ar_out/src/main.nupp")" >&2; then
-        rm -rf "$ar_out"
-        AOT_RUNTIME_OUT=
+    # being replaced, so it is told to run on the one staged rather than
+    # build another.
+    np_main=$(native_path "$np_out/src/main.nupp")
+    if ! NUPP_NATIVE_PROVIDER_BUILD=1 "$ROOT/bin/nupp" aot --emit shared-library \
+            --exports "$(native_path "$np_out/src/exports")" \
+            --output "$(native_path "$NATIVE_PROVIDER_OUT")" "$np_main" >&2 \
+        || ! NUPP_NATIVE_PROVIDER_BUILD=1 "$ROOT/bin/nupp" aot --emit static-library \
+            --output "$(native_path "$NATIVE_PROVIDER_STATIC_OUT")" "$np_main" >&2; then
+        rm -rf "$np_out"
         release_lock
         return 1
     fi
-    printf 'done\n' > "$ar_out/.complete"
+    printf 'done\n' > "$np_out/.complete"
     release_lock
-}
-
-# Sets AOT_RUNTIME_OUT to the archive a provider links: the one
-# NUPP_AOT_RUNTIME_ARCHIVE names, none when it is set empty, and otherwise
-# this checkout's own once it has a built compiler. A compiler that cannot
-# build it, for want of a code generator, leaves the provider without it.
-aot_runtime_for_provider() {
-    AOT_RUNTIME_OUT=
-    if [ "${NUPP_AOT_RUNTIME_ARCHIVE+set}" = set ]; then
-        AOT_RUNTIME_OUT=$NUPP_AOT_RUNTIME_ARCHIVE
-        return 0
-    fi
-    [ -f "$ROOT/build/nupp/tools/main.lua" ] || return 0
-    build_aot_runtime || note "the provider is built without the AOT runtime"
 }
 
 select_host_features() {
@@ -1339,9 +1262,6 @@ select_host_features() {
                 ;;
             native-compression|compression)
                 host_cargo_features="$host_cargo_features,native-compression"
-                ;;
-            native-panic-probe)
-                host_cargo_features="$host_cargo_features,native-panic-probe"
                 ;;
             native-codegen|codegen)
                 if codegen_wanted; then
@@ -1379,11 +1299,10 @@ build_rust_embedding() {
     lpeg_prefix=${3:-}
     select_rust_tools
     rust_environment=$(rust_environment_material)
-    # nupp-native is one of its crates, so libnupp links the provider's AOT
-    # runtime too and exports nuppAotRuntime, as the provider does.
-    aot_runtime_for_provider
-    re_runtime=none
-    [ -z "$AOT_RUNTIME_OUT" ] || re_runtime=$(sha256 "$AOT_RUNTIME_OUT")
+    # libnupp links the provider's static archive, so it exports
+    # nuppAotRuntime and the rest of the provider's ABI, as the provider does.
+    build_native_provider base || die "cannot compile the native provider"
+    re_runtime=$(sha256 "$NATIVE_PROVIDER_STATIC_OUT")
     digest=$({
         printf '%s|%s|%s|%s|%s|%s\n' \
             nupp-native-embedding "$embedding_features" "$RUST_TOOL_MATERIAL" \
@@ -1445,7 +1364,7 @@ EOF
             ;;
     esac
     export_list="$out/nupp.exports"
-    NUPP_AOT_RUNTIME_ARCHIVE="$AOT_RUNTIME_OUT" NUPP_CC="$CC" NUPP_EXPORT_LIST="$export_list" \
+    NUPP_NATIVE_PROVIDER_ARCHIVE="$NATIVE_PROVIDER_STATIC_OUT" NUPP_CC="$CC" NUPP_EXPORT_LIST="$export_list" \
         NUPP_LUAJIT_PREFIX="$luajit_prefix" NUPP_LPEG_PREFIX="$lpeg_prefix" \
         RUSTC="$RUSTC" "$@" >&2
     [ -f "$RUST_EMBED_OUT" ] \
@@ -1904,7 +1823,6 @@ write_host_program() {
         case "$hp_feature" in
             lpeg) hp_lpeg=true; hp_list="$hp_list,lpeg" ;;
             workers) hp_workers=true ;;
-            native-panic-probe) ;;
             *) hp_list="$hp_list,$hp_feature" ;;
         esac
     done
@@ -2034,8 +1952,6 @@ build_nupp_host() {
     nh_features=$1
     nh_lpeg=$2
     nh_luajit=$3
-    nh_provider="base"
-    case ",$nh_features," in *,native-panic-probe,*) nh_provider="$nh_provider,panic-probe" ;; esac
     # The code generator is linked into the stub itself, from the pinned LLVM.
     nh_codegen=""
     case ",$nh_features," in
@@ -2044,9 +1960,8 @@ build_nupp_host() {
             nh_codegen=$(codegen_material)
             ;;
     esac
-    build_rust_native "$nh_provider"
-    nh_provider_archive=$RUST_NATIVE_STATIC_OUT
-    nh_provider_libraries=$RUST_NATIVE_LIBS_OUT
+    build_native_provider base || die "cannot compile the native provider"
+    nh_provider_archive=$NATIVE_PROVIDER_STATIC_OUT
     nh_digest=$(printf '%s|%s|%s|%s|%s|%s' \
         nupp-host "$nh_features" "$(host_program_digest)" "$nh_provider_archive" "$KEY" "$nh_codegen" \
         | sha256_stdin | cut -c1-16)
@@ -2084,7 +1999,6 @@ build_nupp_host() {
         [ -z "$nh_flag" ] || set -- "$@" "$nh_flag"
     done <<EOF
 $(host_system_flags "$nh_features")
-$(cat "$nh_provider_libraries" 2>/dev/null)
 $([ -z "$nh_codegen" ] || { codegen_alias_flags; codegen_libraries host; })
 $(host_stub_export_flags "$nh_out" "$nh_features" "$nh_luajit")
 EOF
@@ -2910,19 +2824,21 @@ case "$1" in
         native_path "$WGPU_STATIC"
         exit 0
         ;;
-    native-rust)
-        if prebuilt_provider_wanted; then
-            prebuilt_provider "${2:-}"
-            native_path "$PREBUILT_OUT"
-            exit 0
+    native-provider|native-rust)
+        # `native-rust` is the name the pinned stage-zero compiler asks by.
+        if ! prebuilt_provider_wanted; then
+            if build_native_provider "${2:-}"; then
+                native_path "$NATIVE_PROVIDER_OUT"
+                exit 0
+            fi
+            [ "${NUPP_PREBUILT_PROVIDER:-}" != 0 ] && prebuilt_provider_pinned \
+                || die "cannot compile the native provider"
+            note "cannot compile the native provider; falling back on the prebuilt one"
         fi
-        build_rust_native "${2:-}"
-        native_path "$RUST_NATIVE_OUT"
-        exit 0
-        ;;
-    aot-runtime)
-        build_aot_runtime || die "cannot compile the AOT runtime"
-        native_path "$AOT_RUNTIME_OUT"
+        prebuilt_provider_pinned \
+            || die "no prebuilt native provider is pinned for $PREBUILT_TARGET, and there is no compiler yet to build one with"
+        prebuilt_provider "${2:-}"
+        native_path "$PREBUILT_OUT"
         exit 0
         ;;
     rust-vendor)
