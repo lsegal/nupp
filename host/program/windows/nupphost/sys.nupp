@@ -31,6 +31,7 @@ cdef function CreateThread(
 ): voidptr?
 cdef function WaitForSingleObject(borrows handle: voidptr, milliseconds: uint32): uint32
 cdef function CloseHandle(borrows handle: voidptr): int32
+cdef function GetCurrentThreadId(): uint32
 cdef function QueryPerformanceCounter(borrows value: int64*): int32
 cdef function QueryPerformanceFrequency(borrows value: int64*): int32
 cdef function Sleep(milliseconds: uint32)
@@ -170,6 +171,12 @@ end
 export function nuppHostSysThreadJoin(borrows thread: voidptr): nil
     WaitForSingleObject(thread, INFINITE)
     CloseHandle(thread)
+end
+
+--- The calling thread's identity, for checking that a caller is the thread
+--- that owns something.
+export function nuppHostSysThreadId(): uint64
+    return GetCurrentThreadId() as uint64
 end
 
 --- Nanoseconds on the performance counter, the clock

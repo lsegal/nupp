@@ -210,19 +210,19 @@ launcher_notice() {
 # library under a later `nupp run` with a narrower union.
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
-        RUST_NATIVE_FILENAME=nupp_native_dev.dll
+        NATIVE_PROVIDER_FILENAME=nupp_native_dev.dll
         CODEGEN_FILENAME=nupp_codegen_dev.dll
         ;;
     Darwin*)
-        RUST_NATIVE_FILENAME=libnupp_native_dev.dylib
+        NATIVE_PROVIDER_FILENAME=libnupp_native_dev.dylib
         CODEGEN_FILENAME=libnupp_codegen_dev.dylib
         ;;
     *)
-        RUST_NATIVE_FILENAME=libnupp_native_dev.so
+        NATIVE_PROVIDER_FILENAME=libnupp_native_dev.so
         CODEGEN_FILENAME=libnupp_codegen_dev.so
         ;;
 esac
-export NUPP_NATIVE_LIBRARY="$LUA_ROOT/build/lib/$RUST_NATIVE_FILENAME"
+export NUPP_NATIVE_LIBRARY="$LUA_ROOT/build/lib/$NATIVE_PROVIDER_FILENAME"
 # The AOT code generator, staged beside the provider where the compiler looks
 # for it (nupp.compiler.aot.llvm.codegen), when the pinned LLVM is built.
 CODEGEN_LIBRARY="$LUA_ROOT/build/lib/$CODEGEN_FILENAME"

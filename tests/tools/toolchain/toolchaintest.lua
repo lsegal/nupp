@@ -880,12 +880,16 @@ end
 -- linked in a second checkout differed from the first in its UUID and nowhere
 -- else.
 function M.macOSLinksDoNotRecordTheBuildDirectory()
+    -- The provider is linked by `nupp aot`, whose own Mach-O link strips the
+    -- project directory it compiled.
     local driver = read(ROOT .. "/scripts/toolchain")
-    local _, prefixes = driver:gsub("link%-arg=%-Wl,%-oso_prefix,%$out/target/", "")
-    assert(prefixes == 1, "the embedding link strips the target directory: " .. prefixes)
     assert(
         driver:find('"-Wl,-oso_prefix,$nh_out/"', 1, true),
         "the Nupp host's link strips the directory its archive was built in"
+    )
+    assert(
+        driver:find('"-Wl,-oso_prefix,$ne_out/"', 1, true),
+        "the embedding link strips the directory its archive was built in"
     )
     assert(
         driver:find("codesign --force --sign - --identifier nupp-host", 1, true),
@@ -946,22 +950,34 @@ function M.windowsHostLinkersCarrySystemImports()
     )
 end
 
--- Cargo derives both the DLL and its import-library descriptor from the Rust
--- library name. Staging the DLL under another basename leaves a successfully
--- linked consumer asking Windows for a file the SDK did not ship.
-function M.windowsEmbeddingArtifactsShareTheCargoBasename()
+-- The import library names the DLL it was linked beside. Staging the DLL under
+-- another basename leaves a successfully linked consumer asking Windows for a
+-- file the SDK did not ship.
+function M.windowsEmbeddingArtifactsShareOneBasename()
     local driver = read(ROOT .. "/scripts/toolchain")
-    local manifest = read(ROOT .. "/native/crates/host/Cargo.toml")
-    assert(manifest:find('name = "nupp"', 1, true), "the host crate does not emit the public embedding basename")
-    assert(driver:find("cargo_dynamic=nupp.dll", 1, true), "the staged Windows DLL does not keep Cargo's basename")
+    assert(driver:find("windows) printf '%s\\n' nupp.dll ;;", 1, true), "the Windows DLL is not named nupp.dll")
     assert(
-        driver:find('RUST_EMBED_IMPORT_OUT="$out/target/release/libnupp.dll.a"', 1, true),
-        "the staged Windows import library describes another DLL basename"
+        driver:find('set -- "$CC" -shared -o "$ne_out/$ne_dynamic"', 1, true)
+            and driver:find('"-Wl,--out-implib,$(native_path "$ne_out/libnupp.dll.a")"', 1, true),
+        "the Windows import library is not written by the link that names the DLL"
     )
     assert(
-        not driver:find("nupp_native_host.dll", 1, true),
-        "the Windows embedding SDK retains its private Cargo basename"
+        driver:find('cp "$embedding/libnupp.dll.a" "$out/libnupp.dll.a"', 1, true),
+        "the staged Windows import library is not the one the DLL link wrote"
     )
+end
+
+-- The embedding SDK is a native Nupp program, compiled the way the host is, and
+-- no Rust crate of its own remains.
+function M.theEmbeddingSdkIsANativeNuppProgram()
+    local driver = read(ROOT .. "/scripts/toolchain")
+    assert(io.open(ROOT .. "/host/program/common/nuppembed/abi.nupp", "rb"), "the embedding ABI is not Nupp source")
+    assert(not io.open(ROOT .. "/native/crates/host/Cargo.toml", "rb"), "the Rust host crate is back")
+    assert(
+        driver:find('"$ROOT/bin/nupp" aot --emit static-library --output "$(native_path "$ne_out/libnuppembed.a")"', 1, true),
+        "the embedding library is not compiled by this tree's compiler"
+    )
+    assert(not driver:find("nupp-native-host", 1, true), "the toolchain still builds the Rust host crate")
 end
 
 -- The same static route carries the macOS trust-store frameworks.
@@ -977,7 +993,6 @@ end
 -- normally so it does not force-load flattened std/import objects; other hosts
 -- retain the authoritative archive directly.
 function M.staticHostsRetainTheRustApplicationArchive()
-    local cargo = read(ROOT .. "/Cargo.toml")
     local driver = read(ROOT .. "/scripts/toolchain")
     local companionCopy = assert(driver:find('cp "$source" "$imports_archive"', 1, true))
     local sanitize = assert(driver:find('"$archive_tool" d "$destination" "@$imports_native"', 1, true))
@@ -1013,16 +1028,6 @@ function M.staticHostsRetainTheRustApplicationArchive()
     assert(
         driver:find('[ "$PLATFORM" != windows ] || [ -f "$out/libnupp-host-imports.a" ]', 1, true),
         "a completed Windows host cache can omit its import companion"
-    )
-
-    local function hasOneCodegenUnit(package)
-        local profile = "%[profile%.release%.package%." .. package:gsub("%-", "%%-") .. "%]"
-        return cargo:match(profile .. "%s+codegen%-units%s*=%s*1")
-    end
-
-    assert(
-        hasOneCodegenUnit("nupp-native-host"),
-        "the ordinary Windows host archive can split name-resolved Rust exports across codegen units"
     )
     local windowsHost = assert(
         driver:find('set -- "$CC" -v -o "$probe.exe" "$probe-aot.o" "$out/libnupp-runtime.a"', 1, true)
@@ -1071,11 +1076,7 @@ end
 function M.gpuIsAPinnedPrebuiltLibraryRatherThanAHostFeature()
     local driver = read(ROOT .. "/scripts/toolchain")
     local pins = read(ROOT .. "/scripts/toolchain.pins")
-    local cargo = read(ROOT .. "/native/crates/host/Cargo.toml")
-    local runtime = read(ROOT .. "/native/crates/host/src/lua.rs")
     assert(not driver:find("native-gpu", 1, true), "the host driver still forwards a GPU feature")
-    assert(not cargo:find("native-gpu", 1, true), "the host crate still has a GPU feature")
-    assert(not runtime:find("native-gpu", 1, true), "the packaged host still advertises a GPU capability")
     assert(driver:find("build_wgpu", 1, true), "the toolchain cannot provision wgpu-native")
     for _, platform in ipairs({
         "LINUX_X86_64",

@@ -4,7 +4,7 @@
 # script on Linux, and a module definition file on Windows -- so a change to what
 # either exports is a change to this file.
 #
-# A section header names the host crate features that bring its symbols in, and
+# A section header names the host features that bring its symbols in, and
 # `always` is every build. A section applies when any feature it names is on.
 # A host built with `native-codegen` also exports the code generator's aliases,
 # which native/codegen/symbols lists with the LLVM and lld names they stand for.

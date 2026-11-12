@@ -1622,22 +1622,18 @@ end
 function M.theNativeHostRaisesTheSameLimits()
     local want = table.concat(jitlimits.FLAGS, ",")
     -- The host executable's state and the embedding SDK's each raise them.
-    local nupp = readText("host/program/common/nupphost/state.nupp")
-    local raised = assert(nupp:match("local function raiseJitLimits%b()(.-)\nend"), "the host raises limits")
-    local flags = {}
-    for flag in raised:gmatch('lua_pushstring%(L, "([^"]+)"%)') do
-        flags[#flags + 1] = flag
+    for _, source in ipairs({
+        "host/program/common/nupphost/state.nupp",
+        "host/program/common/nuppembed/lua.nupp"
+    }) do
+        local raised = assert(readText(source):match("local function raiseJitLimits%b()(.-)\nend"), source)
+        local flags = {}
+        for flag in raised:gmatch('lua_pushstring%(L, "([^"]+)"%)') do
+            flags[#flags + 1] = flag
+        end
+        local got = table.concat(flags, ",")
+        assert(got == want, ("%s and the entry raise the same limits\n  want: %q\n  got:  %q"):format(source, want, got))
     end
-    local got = table.concat(flags, ",")
-    assert(got == want, ("the host and the entry raise the same limits\n  want: %q\n  got:  %q"):format(want, got))
-
-    local list = assert(readText("native/crates/host/c/lua_shim.c"):match("jit_limits%[%] = {(.-)}"))
-    flags = {}
-    for flag in list:gmatch('"([^"]+)"') do
-        flags[#flags + 1] = flag
-    end
-    got = table.concat(flags, ",")
-    assert(got == want, ("the SDK and the entry raise the same limits\n  want: %q\n  got:  %q"):format(want, got))
 end
 
 -- The cli module's header example, checked from a directory outside the repository.
