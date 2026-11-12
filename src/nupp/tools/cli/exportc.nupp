@@ -496,7 +496,10 @@ local function run(options: any): integer
     end
     local cabi = require("nupp.compiler.cinterop.cabi")
     local aggregateDescriptions, functionSignatures = {}, {}
-    local definitions: {{name: string, value: integer}} = {}
+    local definitions: {{
+        name: string,
+        value: integer
+    }} = {}
     local described = {}
 
     local function describe(t: any, selection: string): boolean
@@ -577,10 +580,9 @@ local function run(options: any): integer
         if types[selection] then
             describe(types[selection], selection)
         elseif constants[selection] ~= nil then
-            definitions[#definitions + 1] = {
-                name = selection:match("([^.]+)$") as string,
-                value = constants[selection] as integer
-            }
+            definitions[
+                #definitions + 1
+            ] = {name = selection:match("([^.]+)$") as string, value = constants[selection] as integer}
         elseif functions[selection] then
             functionSignatures[#functionSignatures + 1] = functions[selection]
             for _, description in ipairs(functions[selection].elementStructs or {}) do
