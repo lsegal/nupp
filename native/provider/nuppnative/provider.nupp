@@ -1,8 +1,8 @@
 --[[
 The native provider, `nupp_native`: the library the compiler's runtime and the
 pinned stage-zero compiler load, a Nupp native program built by
-`scripts/toolchain native-rust`. Its ABI is `native.abi.nuppnative`, version 2,
-and grows only by addition.
+`scripts/toolchain native-provider`. Its ABI is `native.abi.nuppnative`,
+version 2, and grows only by addition.
 
 Every service the provider used to carry is Nupp running on its Lua state now,
 so what is left is the ABI's own version and feature bits, its error slot, its
