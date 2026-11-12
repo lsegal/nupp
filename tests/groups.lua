@@ -39,6 +39,7 @@ local groups = {
         "hostembeddingtest",
         "httpnativetest",
         "nativefoundationstest",
+        "nativereadinesstest",
         "netnativetest",
         "nupphosttest",
         "processnativetest",
@@ -225,7 +226,7 @@ simdfleetequivalencetest simdlanetest simdmapinventorytest simdmatrixreporttest 
 simdobligationtest simdpackbudgettest simdprimitivedifferentialtest simdreducerdifferentialtest simdreducertest
 simdruntimeboundarytest simdruntimeidentitytest simdwasmalgorithmdifferentialtest simdwasmbrowsersmoketest simdwasmtimeconformancetest
 hostfacadestest stdlibtest templatetest publicclitest filecomponenttest
-httpnativetest netnativetest tlstest pathtest processnativetest processprovidertest
+httpnativetest netnativetest nativereadinesstest tlstest pathtest processnativetest processprovidertest
 uritest filestest hostchanneltest jsonfacadedefaulttest jsonschematest
 serdecontracttest benchprojectstest benchrunnertest bctest absoluteentrytest
 clitest duplicateclitest coveragereporttest coveragetest clidoctest

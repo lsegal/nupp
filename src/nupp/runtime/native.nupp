@@ -18,8 +18,6 @@ int32_t nuppNativeBytesCopy(
     size_t *outputLength
 );
 int32_t nuppNativeBytesRelease(uint64_t handle);
-int32_t nuppNativePoll(uint64_t *generation);
-int32_t nuppNativeWait(uint64_t generation, uint64_t timeout_ms, uint64_t *output_generation);
 ]]
 
 local native = {}
@@ -39,11 +37,11 @@ native.BUFFER_TOO_SMALL = 6
 --
 -- `ffi.load` unloads its library when the namespace is collected, and closing a
 -- Lua state collects everything in no particular order. A finalizer that calls
--- into the provider -- the wake handle's close, a file or process owner -- can
--- then run after the library is gone and jump into unmapped code. Taking one more
--- reference that nothing ever releases keeps the provider's code there for every
--- finalizer, whatever order the state closes in. Best effort: a platform that
--- cannot be asked keeps the old behaviour.
+-- into the provider -- a handle's release -- can then run after the library is
+-- gone and jump into unmapped code. Taking one more reference that nothing ever
+-- releases keeps the provider's code there for every finalizer, whatever order
+-- the state closes in. Best effort: a platform that cannot be asked keeps the
+-- old behaviour.
 local function pin(loaded: any): any
     local library: any = ffi
     pcall(function(): nil
@@ -107,9 +105,9 @@ end
 
 -- The state's registry, when the debug library is present. A global alone does
 -- not keep the provider loaded: code that puts `_G` back the way it found it
--- drops the library while cached symbols and the wake finalizer still point
+-- drops the library while cached symbols and handle finalizers still point
 -- into it, and LuaJIT finalizes the library before a cdata finalizer collected
--- with it, so that finalizer called into an unloaded DLL. Anchored here, both
+-- with it, so such a finalizer called into an unloaded DLL. Anchored here, both
 -- live until the state closes, which runs cdata finalizers first.
 local registry: any = do
     local debugLibrary: any = rawget(_G, "debug")
@@ -218,30 +216,96 @@ end
 -- Readiness
 ----------------------------------------------------------------------------
 
--- Every native family advances one process-wide generation when something a
--- caller could be waiting for changes, so every native wait sleeps on it: a
--- program waiting on a socket, a file transfer, an HTTP response, a child and
--- GPU work at once wakes for whichever moves first.
+-- Every native family is Nupp running on its Lua state's own thread, so one
+-- generation per state is what every native wait sleeps on: a family advances
+-- it when something a caller could be waiting for changes, and a program
+-- waiting on a socket, an HTTP response and a child at once wakes for
+-- whichever moves first.
 --
 -- One snapshot serves every native readiness check in a pass. The first check
 -- after a sleep takes it, before it looks at anything, and the next sleep
 -- waits from it, so an edge any family reports after the first check of the
 -- pass returns the sleep at once. A snapshot older than that only wakes the
 -- sleep early, which costs one more pass and loses nothing.
-const snapshot = ffi.new("uint64_t[1]")
-const found = ffi.new("uint64_t[1]")
-local snapshotTaken = false
+--
+-- The generation and the wake handle are kept with the state rather than in
+-- this module, so that two copies of the module loaded into one state still
+-- share them.
+
+const windows = ffi.os == "Windows"
+const READINESS_KEY = "__nuppNativeReadiness"
+const WAKE_KEY = "__nuppNativeWake"
+
+-- The names are this module's own, so they cannot collide with a provider that
+-- declares the same functions under their plain names.
+if windows then
+    pcall(
+        ffi.cdef,
+        [[
+    void *nupp_native_create_event(void *, int32_t, int32_t, const uint16_t *) __asm__("CreateEventW");
+    int32_t nupp_native_set_event(void *) __asm__("SetEvent");
+    int32_t nupp_native_close_handle(void *) __asm__("CloseHandle");
+    void nupp_native_sleep(uint32_t) __asm__("Sleep");
+    ]]
+    )
+else
+    pcall(
+        ffi.cdef,
+        [[
+    int nupp_native_pipe(int *) __asm__("pipe");
+    int nupp_native_fcntl(int, int, ...) __asm__("fcntl");
+    intptr_t nupp_native_write(int, const void *, size_t) __asm__("write");
+    int nupp_native_close(int) __asm__("close");
+    int nupp_native_poll(void *, unsigned long, int) __asm__("poll");
+    ]]
+    )
+end
+local C: any = ffi.C
+
+local function readiness(): any
+    local state: any = stateValue(READINESS_KEY)
+    if state == nil then
+        state = {generation = 0, snapshot = 0, taken = false}
+        setStateValue(READINESS_KEY, state)
+    end
+
+    return state
+end
+
+-- Signals an open wake handle: an event set, or a byte down the pipe. A full
+-- pipe is already signalled, so a refused byte loses nothing.
+local function signal(cell: any): nil
+    if windows then
+        C.nupp_native_set_event(ffi.cast("void *", cell.handle))
+    else
+        C.nupp_native_write(cell.write, cell.byte, 1)
+    end
+end
 
 --- Where a native readiness source runs in a pass.
 --- @export
 native.READINESS_PRIORITY = 20
 
+--- Records that something a caller could be waiting for changed, and signals
+--- the wake handle.
+--- @export
+function native.advance(): nil
+    local state = readiness()
+    state.generation = state.generation + 1
+    local cell: any = stateValue(WAKE_KEY)
+    if cell then
+        signal(cell)
+    end
+end
+
 --- Records the readiness generation ahead of a readiness check, unless a check
 --- since the last sleep already did.
 --- @export
 function native.snapshot(): nil
-    if not snapshotTaken and native.C.nuppNativePoll(snapshot) == 0 then
-        snapshotTaken = true
+    local state = readiness()
+    if not state.taken then
+        state.snapshot = state.generation
+        state.taken = true
     end
 end
 
@@ -252,53 +316,91 @@ end
 --- @param waitMs the longest sleep, in milliseconds
 --- @return zero: a sleep settles nothing, the check after it does
 function native.sleep(waitMs: integer): integer
-    if not snapshotTaken then
+    local state = readiness()
+    if not state.taken then
         native.snapshot()
 
         return 0
     end
-    snapshotTaken = false
-    if waitMs > 0 then
-        native.C.nuppNativeWait(snapshot[0], waitMs, found)
+    state.taken = false
+    -- Only this state's thread advances its generation, so nothing can move it
+    -- while that thread sleeps.
+    if waitMs > 0 and state.generation == state.snapshot then
+        if windows then
+            C.nupp_native_sleep(waitMs)
+        else
+            C.nupp_native_poll(nil, 0, waitMs)
+        end
     end
 
     return 0
 end
 
-const WAKE_KEY = "__nuppNativeWake"
+-- Opens the state's wake handle: a manual-reset event on Windows, and the
+-- nonblocking, close-on-exec ends of a pipe elsewhere. Nil when the system
+-- refuses one.
+local function openWake(): any?
+    if windows then
+        local event = C.nupp_native_create_event(nil, 1, 0, nil)
+        if event == nil then
+            return nil
+        end
+        local cell: any = {handle = ffi.cast("uint64_t", ffi.cast("uintptr_t", event))}
+        cell.guard = ffi.gc(ffi.new("uint8_t[1]"), function(_: any): nil
+            C.nupp_native_close_handle(event)
+        end)
+
+        return cell
+    end
+    local ends = ffi.new("int[2]")
+    if C.nupp_native_pipe(ends) ~= 0 then
+        return nil
+    end
+    local read: integer = ends[0]
+    local write: integer = ends[1]
+    local F_GETFL: integer = 3
+    local F_SETFL: integer = 4
+    local F_SETFD: integer = 2
+    local FD_CLOEXEC: integer = 1
+    local O_NONBLOCK: integer = ffi.os == "OSX" and 0x4 or 0x800
+    for _, descriptor in ipairs({read, write}) do
+        local flags = C.nupp_native_fcntl(descriptor, F_GETFL, ffi.new("int", 0))
+        if flags < 0
+            or C.nupp_native_fcntl(descriptor, F_SETFL, ffi.new("int", flags | O_NONBLOCK)) ~= 0
+            or C.nupp_native_fcntl(descriptor, F_SETFD, ffi.new("int", FD_CLOEXEC)) ~= 0
+        then
+            C.nupp_native_close(read)
+            C.nupp_native_close(write)
+
+            return nil
+        end
+    end
+    local cell: any = {handle = ffi.cast("uint64_t", read), write = write, byte = ffi.new("uint8_t[1]", 1)}
+    cell.guard = ffi.gc(ffi.new("uint8_t[1]"), function(_: any): nil
+        C.nupp_native_close(read)
+        C.nupp_native_close(write)
+    end)
+
+    return cell
+end
 
 --- The handle every readiness advance signals, for a source that sleeps on
 --- operating-system handles of its own as well: a manual-reset event on
---- Windows and a nonblocking pipe's read end elsewhere, as a `uint64_t`. One
---- serves the whole Lua state and closes with it. Nil when the provider
---- predates it or cannot open one.
+--- Windows and a nonblocking pipe's read end elsewhere, as a `uint64_t`. Reset
+--- it -- `ResetEvent`, or read the pipe dry -- before `settle`. One serves the
+--- whole Lua state and closes with it. Nil when the system cannot open one.
 --- @export
 function native.wake(): any?
     local cell: any = stateValue(WAKE_KEY)
     if cell == nil then
-        local opened, open = pcall(function(): any
-            ffi.cdef[[
-            int32_t nuppNativeWakeOpen(uint64_t *handle);
-            int32_t nuppNativeWakeClose(uint64_t handle);
-            ]]
-            return native.C.nuppNativeWakeOpen
-        end)
-        local raw = ffi.new("uint64_t[1]")
-        if opened and open(raw) == 0 then
-            local close = native.C.nuppNativeWakeClose
-            cell = ffi.gc(raw, function(value: any): nil
-                close(value[0])
-            end)
-        else
-            cell = false
-        end
+        cell = openWake() or false
         setStateValue(WAKE_KEY, cell)
     end
     if not cell then
         return nil
     end
 
-    return cell[0]
+    return cell.handle
 end
 
 --- Ends a pass the way `sleep` does, for a source sleeping on the `wake` handle
@@ -309,17 +411,15 @@ end
 --- @export
 --- @return whether the caller may sleep
 function native.settle(): boolean
-    if not snapshotTaken then
+    local state = readiness()
+    if not state.taken then
         native.snapshot()
 
         return false
     end
-    snapshotTaken = false
-    if native.C.nuppNativePoll(found) ~= 0 then
-        return false
-    end
+    state.taken = false
 
-    return found[0] == snapshot[0]
+    return state.generation == state.snapshot
 end
 
 --- A native family's readiness pump, as the poll and wait of a suspension

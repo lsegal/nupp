@@ -18,12 +18,12 @@ static PANICKED: &std::ffi::CStr = c"native provider panicked";
 const FEATURE_BASE: u64 = 1 << 0;
 // Bit 1 was UUIDs, bit 2 the GPU provider, bit 4 HTTP, bits 5 to 7 processes,
 // files and the file-transfer lane, bits 8 and 9 the network and TLS families
-// and bit 13 their endpoint calls. Nupp provides all of them now, and bit 11,
-// the code generator, is a library of its own. The bits stay unassigned, so an
-// old caller asking for one reads its absence.
+// bit 13 their endpoint calls and bit 14 the readiness generation. Nupp
+// provides all of them now, and bit 11, the code generator, is a library of its
+// own. The bits stay unassigned, so an old caller asking for one reads its
+// absence.
 const FEATURE_URI: u64 = 1 << 3;
 const FEATURE_AOT_RUNTIME: u64 = 1 << 12;
-const FEATURE_READINESS: u64 = 1 << 14;
 
 fn bytes() -> &'static Mutex<Arena<Box<[u8]>>> {
     static BYTES: OnceLock<Mutex<Arena<Box<[u8]>>>> = OnceLock::new();
@@ -69,7 +69,6 @@ pub extern "C" fn nuppNativeAbiVersion() -> u32 {
 pub extern "C" fn nuppNativeFeatures() -> u64 {
     guard(0, || {
         FEATURE_BASE
-            | FEATURE_READINESS
             | if cfg!(feature = "uri") {
                 FEATURE_URI
             } else {
@@ -171,7 +170,11 @@ pub extern "C" fn nuppNativeAvailableParallelism() -> usize {
 }
 
 #[unsafe(no_mangle)]
-/// Snapshots the process-wide readiness generation.
+/// Answers a readiness generation that never moves.
+///
+/// Readiness is Nupp's now (`nupp.runtime.native`). The pinned stage-zero
+/// compiler's runtime still snapshots through this call, so it stays until the
+/// pin moves past it.
 ///
 /// # Safety
 ///
@@ -185,14 +188,14 @@ pub unsafe extern "C" fn nuppNativePoll(generation: *mut u64) -> i32 {
             );
         }
         // SAFETY: the output was checked above.
-        unsafe { generation.write(nupp_native_runtime::activity::generation()) };
+        unsafe { generation.write(0) };
         Status::Ok.code()
     })
 }
 
 #[unsafe(no_mangle)]
-/// Sleeps until the process-wide readiness generation moves past
-/// `generation`, or `timeout_ms` passes, and writes the generation it found.
+/// Sleeps `timeout_ms` and answers the generation it was given, since nothing
+/// advances it. Kept for the pinned stage-zero compiler, as `nuppNativePoll` is.
 ///
 /// # Safety
 ///
@@ -209,50 +212,25 @@ pub unsafe extern "C" fn nuppNativeWait(
                 "readiness generation output is null",
             );
         }
-        let found = nupp_native_runtime::activity::wait_since(
-            generation,
-            std::time::Duration::from_millis(timeout_ms),
-        );
+        std::thread::sleep(std::time::Duration::from_millis(timeout_ms));
         // SAFETY: the output was checked above.
-        unsafe { output_generation.write(found) };
+        unsafe { output_generation.write(generation) };
         Status::Ok.code()
     })
 }
 
 #[unsafe(no_mangle)]
-/// Opens a waitable handle every advance of the readiness generation signals,
-/// for a caller sleeping on handles of its own as well: a manual-reset event
-/// on Windows, the read end of a nonblocking pipe on POSIX.
-///
-/// # Safety
-///
-/// `handle` must be writable.
-pub unsafe extern "C" fn nuppNativeWakeOpen(handle: *mut u64) -> i32 {
-    boundary(|| {
-        if handle.is_null() {
-            return failed(Status::InvalidArgument, "wake handle output is null");
-        }
-        match nupp_native_runtime::activity::open_wake() {
-            Ok(raw) => {
-                // SAFETY: the output was checked above.
-                unsafe { handle.write(raw) };
-                Status::Ok.code()
-            }
-            Err(error) => failed(Status::Internal, &error.to_string()),
-        }
-    })
+/// Opens no handle: the wake handle is Nupp's now. The pinned stage-zero
+/// compiler's runtime still asks for one, and without it sleeps in bounded
+/// slices, so the export stays until the pin moves past it.
+pub extern "C" fn nuppNativeWakeOpen(_handle: *mut u64) -> i32 {
+    boundary(|| failed(Status::Unavailable, "the provider opens no wake handle"))
 }
 
 #[unsafe(no_mangle)]
-/// Stops signalling and closes a handle `nuppNativeWakeOpen` answered.
-pub extern "C" fn nuppNativeWakeClose(handle: u64) -> i32 {
-    boundary(|| {
-        if nupp_native_runtime::activity::close_wake(handle) {
-            Status::Ok.code()
-        } else {
-            failed(Status::InvalidArgument, "wake handle is not open")
-        }
-    })
+/// Refuses every handle, since `nuppNativeWakeOpen` opens none.
+pub extern "C" fn nuppNativeWakeClose(_handle: u64) -> i32 {
+    boundary(|| failed(Status::InvalidArgument, "wake handle is not open"))
 }
 
 #[cfg(feature = "panic-probe")]
@@ -318,7 +296,6 @@ mod tests {
             ("BASE", FEATURE_BASE),
             ("URI", FEATURE_URI),
             ("AOT_RUNTIME", FEATURE_AOT_RUNTIME),
-            ("READINESS", FEATURE_READINESS),
         ] {
             let define = format!("\nexport const NUPP_NATIVE_FEATURE_{name} = {value}\n");
             assert!(definition.contains(&define), "the definition lacks {}", define.trim());
@@ -360,14 +337,17 @@ mod tests {
     }
 
     #[test]
-    fn one_readiness_generation_answers_poll_and_wait() {
-        let mut seen = 0;
+    fn the_stage_zero_readiness_pair_never_moves() {
+        let mut seen = 1;
         assert_eq!(unsafe { nuppNativePoll(&mut seen) }, 0);
-        nupp_native_runtime::activity::advance();
-        let mut found = seen;
-        assert_eq!(unsafe { nuppNativeWait(seen, 5_000, &mut found) }, 0);
-        assert_ne!(found, seen);
-        assert!(nuppNativeFeatures() & FEATURE_READINESS != 0);
+        assert_eq!(seen, 0);
+        let mut found = 1;
+        assert_eq!(unsafe { nuppNativeWait(seen, 0, &mut found) }, 0);
+        assert_eq!(found, seen);
+        assert!(nuppNativeFeatures() & (1 << 14) == 0, "readiness is Nupp's");
+        let mut handle = 0;
+        assert_eq!(nuppNativeWakeOpen(&mut handle), Status::Unavailable.code());
+        assert_eq!(nuppNativeWakeClose(handle), Status::InvalidArgument.code());
         assert_eq!(
             unsafe { nuppNativePoll(ptr::null_mut()) },
             Status::InvalidArgument.code()

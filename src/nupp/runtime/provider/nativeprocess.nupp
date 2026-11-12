@@ -11,10 +11,10 @@ a write that finds a full pipe reports backpressure, and readiness waits sleep
 in one `WaitForMultipleObjects` or `poll` call.
 
 That one call also holds the runtime's wake handle (see
-[](nupp.runtime.native)), which every native family signals when it advances
-the shared readiness generation. A wait on a child or a pipe therefore parks
-until the child moves, its pipes move, or a socket, file transfer or GPU job
-anywhere in the process does.
+[](nupp.runtime.native)), which a native family signals when it advances the
+state's readiness generation. A wait on a child or a pipe therefore parks until
+the child moves, its pipes move, or another family in the same Lua state
+reports a change.
 
 Reads distinguish pending input from EOF and writes report accepted bytes and a
 closed-pipe flag. One write is in flight on a pipe at a time. A child's exit is

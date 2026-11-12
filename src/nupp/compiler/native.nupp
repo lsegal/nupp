@@ -755,8 +755,8 @@ local FEATURES: {[string]: native.Feature} = {
     ["native.net"] = {
         name = "net",
         -- The public surface, and only that: listening, connecting, and the
-        -- connections either produces. The sockets are Nupp over the FFI; all
-        -- it takes from the provider is the wake handle it sleeps on.
+        -- connections either produces. The sockets are Nupp over the FFI, and
+        -- so is the wake handle they sleep on; nothing reaches the provider.
         module = "nupp.runtime.provider.nativenet",
         runtimeModule = "nupp.runtime.provider.nativenet",
         provider = "nupp_native",
@@ -780,8 +780,8 @@ local FEATURES: {[string]: native.Feature} = {
         module = "nupp.runtime.provider.nativetls",
         runtimeModule = "nupp.runtime.provider.nativetls",
         host = "native-tls",
-        -- Binary through the network provider's wake handle, and so a feature a
-        -- manifest may turn off by name.
+        -- Binary through the network provider, and so a feature a manifest may
+        -- turn off by name.
         binary = true,
         requires = {"runtime.tls_contract", "runtime.tls_types", "native.net", "runtime.suspension"},
     },
@@ -796,8 +796,8 @@ local FEATURES: {[string]: native.Feature} = {
         runtimeModule = "nupp.runtime.provider.nativeprocess",
         provider = "nupp_native",
         providerDriver = "native-rust",
-        -- Nupp spawns and reaps the child itself; all it takes from the provider
-        -- is the wake handle its readiness wait shares, which every build has.
+        -- Nupp spawns and reaps the child itself, and the wake handle its
+        -- readiness wait shares is Nupp's too; nothing reaches the provider.
         providerFeature = "base",
         host = "native-process",
         library = "nupp_native",
