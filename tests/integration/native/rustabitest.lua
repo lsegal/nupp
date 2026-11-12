@@ -54,12 +54,12 @@ function M.theGeneratedHeaderCompiles()
     assert(status == 0, output)
 end
 
---- The provider a C consumer would link, `native-rust` with URIs, called
+--- The provider a C consumer would link, `native-rust` with its base, called
 --- through the declarations the generated header makes: everything the
 --- header promises about it holds.
 function M.theGeneratedHeaderDescribesTheProvider()
     local _, text = header()
-    local status, provider = run(("cd %s && ./scripts/toolchain native-rust base,uri"):format(quote(ROOT)))
+    local status, provider = run(("cd %s && ./scripts/toolchain native-rust base"):format(quote(ROOT)))
     assert(status == 0, provider)
     provider = provider:match("([^\r\n]+)%s*$")
 
@@ -80,33 +80,19 @@ function M.theGeneratedHeaderDescribesTheProvider()
 
     test.eq(native.nuppNativeAbiVersion(), defines.NUPP_NATIVE_ABI_VERSION, "the ABI version")
     local features = native.nuppNativeFeatures()
-    local wanted = defines.NUPP_NATIVE_FEATURE_BASE + defines.NUPP_NATIVE_FEATURE_URI
+    local wanted = defines.NUPP_NATIVE_FEATURE_BASE
     test.eq(tonumber(require("bit").band(features, wanted)), wanted, "the requested feature bits")
     assert(defines.NUPP_NATIVE_FEATURE_READINESS == nil, "readiness is Nupp's, not the provider's")
     for _, name in ipairs({"nuppNativePoll", "nuppNativeWait", "nuppNativeWakeOpen", "nuppNativeWakeClose"}) do
         assert(not text:find(name .. "(", 1, true), name .. " outlived the stage zero that needed it")
     end
 
-    local uri = ffi.new("uint64_t[1]")
-    local spelling = "https://EXAMPLE.com"
-    test.eq(native.nuppNativeUriParse(spelling, #spelling, uri), defines.NUPP_NATIVE_OK, "URI parse")
-    local length = ffi.new("uint64_t[1]")
-    local present = ffi.new("int32_t[1]")
-    test.eq(
-        native.nuppNativeUriPart(uri[0], defines.NUPP_NATIVE_URI_HOST, nil, 0, length, present),
-        defines.NUPP_NATIVE_BUFFER_TOO_SMALL,
-        "a URI part size query"
-    )
-    test.eq(tonumber(length[0]), #"example.com", "the size a query answers")
-    local small = ffi.new("uint8_t[2]")
-    test.eq(
-        native.nuppNativeUriPart(uri[0], defines.NUPP_NATIVE_URI_HOST, small, 2, length, present),
-        defines.NUPP_NATIVE_BUFFER_TOO_SMALL,
-        "a short URI part output"
-    )
-    assert(present[0] ~= 0, "the host is present")
-    test.eq(native.nuppNativeUriRelease(uri[0]), defines.NUPP_NATIVE_OK, "URI release")
-    test.eq(native.nuppNativeUriRelease(uri[0]), defines.NUPP_NATIVE_STALE_HANDLE, "a released URI handle")
+    -- URI parsing is Nupp's (#200), and the pin past it took the exports (#206).
+    assert(defines.NUPP_NATIVE_FEATURE_URI == nil, "URIs are Nupp's, not the provider's")
+    assert(not text:find("nuppNativeUri", 1, true), "the URI exports outlived the stage zero that needed them")
+
+    test.eq(native.nuppNativeBytesRelease(0), defines.NUPP_NATIVE_STALE_HANDLE, "a handle never issued")
+    test.eq(ffi.string(native.nuppNativeLastError()), "byte handle is stale", "the last error")
 end
 
 -- Symbols the pinned bundle names that were deleted before this check existed.

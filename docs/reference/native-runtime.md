@@ -251,8 +251,8 @@ artifact:
 - URI parsing later moved off the provider's `url` crate to Nupp: the URL
   Standard's parser, with UTS #46 tables generated from the Unicode Character
   Database by `scripts/idna-tables`, giving the crate's results and refusal
-  reasons. No program selects the provider's `uri` feature any more; its
-  `nuppNativeUri*` exports stay only until the stage-zero pin moves past them.
+  reasons. The provider's `uri` feature, its `nuppNativeUri*` exports and
+  the `NUPP_NATIVE_FEATURE_URI` bit are gone.
 - Libuv and mbedTLS were removed, and later the Rust `net`, `http` and `tls`
   crates, with Tokio's network lanes, Reqwest and Rustls. Sockets, TLS and HTTP
   are Nupp over FFI; their `nuppNativeNet*`, `nuppNativeTls*` and
