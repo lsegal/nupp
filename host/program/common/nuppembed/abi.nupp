@@ -1,0 +1,2770 @@
+--- The public C embedding ABI that `host/include/nupp.h` declares.
+---
+--- A runtime pointer addresses a runtime this module allocated. Components,
+--- handles and reload sessions are names instead: opaque, never-reused keys
+--- into one process-wide table, so a released name is refused rather than
+--- dereferenced, and one kind cannot be mistaken for another. LuaJIT is only
+--- entered through `nuppembed.lua`, which protects every operation that can
+--- raise.
+---
+--- A runtime and everything it names belong to the thread that made it. A host
+--- callback beneath a call may call back into the runtime that is calling it,
+--- so no function here holds anything across a call into Lua that a nested
+--- call could disturb, and freeing a runtime from beneath a call waits for the
+--- outermost call into its state to return.
+module nuppembed.abi
+
+const lua = require("nuppembed.lua")
+const channel = require("nuppembed.hostchannel")
+const map = require("nupphost.map")
+const sys = require("nupphost.sys")
+
+cdef function calloc(count: uint64, size: uint64): voidptr?
+cdef function malloc(size: uint64): voidptr?
+cdef function free(borrows p: voidptr)
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, count: uint64): voidptr
+cdef function memcmp(borrows left: voidptr, borrows right: voidptr, count: uint64): int32
+cdef function strlen(borrows s: cstring): uint64
+cdef function snprintf(borrows buffer: voidptr, size: uint64, borrows format: cstring, ...): int32
+cdef function __atomic_exchange_8(borrows p: int64*, v: int64, order: int32): int64
+cdef function __atomic_store_8(borrows p: int64*, v: int64, order: int32)
+
+const EMBED_ABI_VERSION = 2
+const CONFIG_OPEN_LIBRARIES = 1
+
+const STATUS_OK = 0
+const STATUS_INVALID_ARGUMENT = 1
+const STATUS_INCOMPATIBLE = 2
+const STATUS_RUNTIME = 3
+const STATUS_BUFFER_TOO_SMALL = 4
+
+const ERROR_CONFIGURATION = 1
+const ERROR_COMPATIBILITY = 2
+const ERROR_COMPONENT = 3
+const ERROR_RUNTIME = 4
+
+const VALUE_NIL = 0
+const VALUE_BOOLEAN = 1
+const VALUE_NUMBER = 2
+const VALUE_STRING = 3
+const VALUE_BYTES = 4
+const VALUE_HANDLE = 5
+
+const RELOAD_NO_CHANGE = 0
+const RELOAD_COMMITTED = 1
+const RELOAD_REJECTED = 2
+const RELOAD_RESTART_REQUIRED = 3
+const RELOAD_PREPARED = 4
+
+const RUNNING = 0
+const SHUTTING_DOWN = 1
+const CLOSED = 2
+
+const NAME_COMPONENT = 1
+const NAME_HANDLE = 2
+const NAME_RELOAD = 3
+
+--- The answers `nuppembed.lua` writes; its `Value`.
+const LUA_NIL = 0
+const LUA_BOOLEAN = 1
+const LUA_NUMBER = 2
+const LUA_BYTES = 4
+const LUA_REFERENCE = 5
+
+--- `nupp_config`.
+cdef struct Config
+    size: uint32
+    abiVersion: uint32
+    flags: uint32
+end
+
+--- `nupp_reload_config`.
+cdef struct ReloadConfig
+    size: uint32
+    flags: uint32
+    compilerPath: uint64
+    root: uint64
+    entry: uint64
+end
+
+--- `nupp_value`.
+cdef struct HostValue
+    kind: uint32
+    boolean: int32
+    number: number
+    data: uint64
+    length: uint64
+    handle: uint64
+end
+
+--- `nuppembed.lua`'s Value.
+cdef struct LuaValue
+    kind: int32
+    boolean: int32
+    number: number
+    data: uint64
+    length: uint64
+    reference: int32
+end
+
+--- `nupp_error`. `message` is always terminated; `length` excludes that byte.
+cdef struct Error
+    status: int32
+    category: int32
+    message: uint64
+    length: uint64
+end
+
+--- One runtime. `state` is the Lua state it owns or attached to, 0 once it has
+--- shut down; `names` heads the list of every name it issued.
+cdef struct Runtime
+    state: uint64
+    owned: int32
+    phase: int32
+    frozen: int32
+    answersHost: int32
+    owner: uint64
+    id: uint64
+    channel: uint64
+    names: uint64
+    deferredState: uint64
+    nextDeferred: uint64
+end
+
+--- One issued name. `live` says the name still holds its references: a runtime
+--- that shut down released them, and a closed session has none. The other
+--- references are a reload session's.
+cdef struct Name
+    key: uint64
+    kind: int32
+    started: int32
+    live: int32
+    reference: int32
+    member: int32
+    prepare: int32
+    apply: int32
+    poll: int32
+    close: int32
+    runtimeId: uint64
+    runtime: uint64
+    message: uint64
+    previous: uint64
+    next: uint64
+end
+
+--- 1 for true, 0 for false.
+local function flag(condition: boolean): int32
+    if condition then
+        return 1
+    end
+
+    return 0
+end
+
+local function flag64(condition: boolean): int64
+    if condition then
+        return 1LL
+    end
+
+    return 0LL
+end
+
+-- The process-wide registry ----------------------------------------------------
+
+--- A spin lock over everything below: names, entry counts and deferred frees.
+--- Each holder only touches these tables, never Lua.
+local lockWord: int64[1]
+local names: uint64 = 0ULL
+local entered: uint64 = 0ULL
+local deferred: uint64 = 0ULL
+local nextKey: uint64 = 1ULL
+local nextRuntime: uint64 = 1ULL
+
+local function lock()
+    while __atomic_exchange_8(lockWord, 1LL, 2) ~= 0LL do
+    end
+    if names == 0ULL then
+        names = map.nuppHostMapNew()
+        entered = map.nuppHostMapNew()
+    end
+end
+
+local function unlock()
+    __atomic_store_8(lockWord, 0LL, 3)
+end
+
+local function nameOf(key: uint64): Name*?
+    if key == 0ULL then
+        return nil
+    end
+    lock()
+    local name = 0ULL
+    if names ~= 0ULL then
+        name = map.nuppHostMapGet(names, key)
+    end
+    unlock()
+    if name == 0ULL then
+        return nil
+    end
+
+    return name as Name*
+end
+
+local function freeName(name: uint64)
+    @unsafe do
+        local message = (name as Name*).message
+        if message ~= 0ULL then
+            free(message as voidptr)
+        end
+    end
+    free(name as voidptr)
+end
+
+--- Unlinks and frees a name, under the lock.
+local function dropNameLocked(name: uint64)
+    local n = name as Name*
+    @unsafe do
+        map.nuppHostMapRemove(names, n.key)
+        if n.previous ~= 0ULL then
+            local previous = n.previous as Name*
+            previous.next = n.next
+        else
+            local runtime = n.runtime as Runtime*
+            runtime.names = n.next
+        end
+        if n.next ~= 0ULL then
+            local next = n.next as Name*
+            next.previous = n.previous
+        end
+    end
+    freeName(name)
+end
+
+local function dropName(name: uint64)
+    lock()
+    dropNameLocked(name)
+    unlock()
+end
+
+--- Writes one word through a C out-pointer.
+local function storeWord(at: uint64, value: uint64)
+    @unsafe do
+        local word = at as uint64*
+        word[0] = value
+    end
+end
+
+local function storeHalf(at: uint64, value: uint32)
+    @unsafe do
+        local half = at as uint32*
+        half[0] = value
+    end
+end
+
+-- Failures ---------------------------------------------------------------------
+
+--- Formatting space for one failure, copied out before anything else runs.
+local text: uint8[1024]
+
+local function beginError(error: uint64)
+    if error ~= 0ULL then
+        @unsafe do
+            storeWord(error, 0ULL)
+        end
+    end
+end
+
+--- Reports a failure through `error`, NUL bytes in the message turned to `?`
+--- so the terminated copy reads whole. Answers the status.
+local function report(error: uint64, status: integer, category: integer, borrows message: voidptr, length: uint64): int32
+    if error ~= 0ULL then
+        local made = calloc(1ULL, ffi.sizeof(Error) as uint64)
+        local copy = malloc(length + 1ULL)
+        if made == nil or copy == nil then
+            if made ~= nil then
+                free(made as voidptr)
+            end
+            if copy ~= nil then
+                free(copy as voidptr)
+            end
+        else
+            @unsafe do
+                local bytes = copy as uint8*
+                if length ~= 0ULL then
+                    memcpy(copy as voidptr, message, length)
+                end
+                for index = 0, (length as integer) - 1 do
+                    if bytes[index] == 0 then
+                        bytes[index] = 63
+                    end
+                end
+                bytes[length as integer] = 0
+                local e = made as Error*
+                e.status = math.i32.wrap(status)
+                e.category = math.i32.wrap(category)
+                e.message = copy as uint64
+                e.length = length
+                storeWord(error, made as uint64)
+            end
+        end
+    end
+
+    return math.i32.wrap(status)
+end
+
+local function refuse(error: uint64, status: integer, category: integer, borrows message: cstring): int32
+    return report(error, status, category, message as voidptr, strlen(message))
+end
+
+local function invalid(error: uint64, category: integer, borrows message: cstring): int32
+    return refuse(error, STATUS_INVALID_ARGUMENT, category, message)
+end
+
+--- Reports what `text` holds.
+local function reportText(error: uint64, status: integer, category: integer): int32
+    return report(error, status, category, text as voidptr, strlen(text as cstring))
+end
+
+--- Reports a failed Lua operation, with the text the operation recorded.
+local function luaFailure(error: uint64, call: uint64, category: integer): int32
+    local length: uint64 = 0ULL
+    local message = 0ULL
+    if call ~= 0ULL then
+        local lengths = calloc(1ULL, 8ULL)
+        if lengths ~= nil then
+            message = lua.nuppEmbedLuaCallError(call, lengths as uint64*)
+            length = @unsafe((lengths as uint64*)[0])
+            free(lengths as voidptr)
+        end
+    end
+    if message == 0ULL then
+        return refuse(error, STATUS_RUNTIME, category, "LuaJIT protected operation failed")
+    end
+
+    return report(error, STATUS_RUNTIME, category, message as voidptr, length)
+end
+
+local function outOfMemory(error: uint64, category: integer): int32
+    return refuse(error, STATUS_RUNTIME, category, "the Nupp embedding library is out of memory")
+end
+
+-- Checked inputs ---------------------------------------------------------------
+
+--- Whether the `length` bytes at `data` are well-formed UTF-8.
+local function wellFormed(data: uint64, length: uint64): boolean
+    local bytes = data as uint8*
+    local at = 0
+    local total = length as integer
+    while at < total do
+        local first = 0
+        @unsafe do
+            first = bytes[at]
+        end
+        local extra = 0
+        local least = 0
+        if first < 128 then
+            extra = 0
+        elseif first >= 194 and first <= 223 then
+            extra = 1
+            least = 128
+        elseif first >= 224 and first <= 239 then
+            extra = 2
+            least = 2048
+        elseif first >= 240 and first <= 244 then
+            extra = 3
+            least = 65536
+        else
+            return false
+        end
+        if at + extra >= total and extra ~= 0 then
+            return false
+        end
+        local point = first
+        if extra == 1 then
+            point = first - 192
+        elseif extra == 2 then
+            point = first - 224
+        elseif extra == 3 then
+            point = first - 240
+        end
+        for offset = 1, extra do
+            local next = 0
+            @unsafe do
+                next = bytes[at + offset]
+            end
+            if next < 128 or next > 191 then
+                return false
+            end
+            point = point * 64 + (next - 128)
+        end
+        if extra ~= 0 and (point < least or point > 1114111 or (point >= 55296 and point <= 57343)) then
+            return false
+        end
+        at = at + extra + 1
+    end
+
+    return true
+end
+
+--- Checks a required name: answers OK, or reports `what` needs a name or is
+--- not UTF-8.
+local function utf8(value: uint64, borrows what: cstring, category: integer, error: uint64): int32
+    if value == 0ULL then
+        snprintf(text, 1024ULL, "%s needs a name", what)
+        return reportText(error, STATUS_INVALID_ARGUMENT, category)
+    end
+    if not wellFormed(value, strlen(value as cstring)) then
+        snprintf(text, 1024ULL, "%s must be UTF-8", what)
+        return reportText(error, STATUS_INVALID_ARGUMENT, category)
+    end
+
+    return STATUS_OK
+end
+
+local function optionalUtf8(value: uint64, borrows what: cstring, category: integer, error: uint64): int32
+    if value == 0ULL then
+        return STATUS_OK
+    end
+
+    return utf8(value, what, category, error)
+end
+
+--- Reads a configuration's flags: `fallback` without one.
+local function configFlags(config: uint64, fallback: integer, error: uint64, borrows flags: int64*): int32
+    @unsafe do
+        flags[0] = fallback as int64
+    end
+    if config == 0ULL then
+        return STATUS_OK
+    end
+    local c = config as Config*
+    @unsafe do
+        if (c.size as integer) < ffi.sizeof(Config) then
+            snprintf(text, 1024ULL, "nupp_config is smaller than embedding ABI %d requires", EMBED_ABI_VERSION as int32)
+            return reportText(error, STATUS_INCOMPATIBLE, ERROR_COMPATIBILITY)
+        end
+        if c.abiVersion ~= (EMBED_ABI_VERSION as uint32) then
+            snprintf(text, 1024ULL, "libnupp embedding ABI %d cannot accept another ABI", EMBED_ABI_VERSION as int32)
+            return reportText(error, STATUS_INCOMPATIBLE, ERROR_COMPATIBILITY)
+        end
+        if (c.flags as integer) & ~CONFIG_OPEN_LIBRARIES ~= 0 then
+            return invalid(error, ERROR_CONFIGURATION, "nupp_config contains unknown flags")
+        end
+        flags[0] = c.flags as int64
+    end
+
+    return STATUS_OK
+end
+
+-- Runtimes ---------------------------------------------------------------------
+
+local function runtimeOf(runtime: uint64): Runtime*
+    return runtime as Runtime*
+end
+
+--- A new call record for one Lua operation, or 0 with the failure reported.
+local function newCall(error: uint64, category: integer): uint64
+    local call = lua.nuppEmbedLuaCall()
+    if call == 0ULL then
+        outOfMemory(error, category)
+    end
+
+    return call
+end
+
+--- Whether the runtime may enter its state: it is running. Reports why not.
+local function usable(runtime: uint64, error: uint64, category: integer): boolean
+    local r = runtimeOf(runtime)
+    @unsafe do
+        if r.phase ~= RUNNING or r.state == 0ULL then
+            refuse(error, STATUS_RUNTIME, category, "the Nupp host has shut down")
+            return false
+        end
+    end
+
+    return true
+end
+
+local function stateOf(runtime: uint64): voidptr
+    return @unsafe(runtimeOf(runtime).state as voidptr)
+end
+
+--- Gives a reference back, quietly.
+local function releaseReference(runtime: uint64, reference: int32): boolean
+    local call = lua.nuppEmbedLuaCall()
+    if call == 0ULL then
+        return false
+    end
+    local ok = lua.nuppEmbedLuaRelease(stateOf(runtime), call, reference) == 0
+    lua.nuppEmbedLuaCallFree(call)
+
+    return ok
+end
+
+--- Releases a reference, reporting a failure.
+local function releaseReported(runtime: uint64, reference: int32, error: uint64, category: integer): int32
+    local call = newCall(error, category)
+    if call == 0ULL then
+        return STATUS_RUNTIME
+    end
+    if lua.nuppEmbedLuaRelease(stateOf(runtime), call, reference) ~= 0 then
+        local status = luaFailure(error, call, category)
+        lua.nuppEmbedLuaCallFree(call)
+        return status
+    end
+    lua.nuppEmbedLuaCallFree(call)
+
+    return STATUS_OK
+end
+
+--- Issues a name for `runtime`. Nil without memory, with nothing issued.
+local function issue(runtime: uint64, kind: integer, reference: int32): Name*?
+    local made = calloc(1ULL, ffi.sizeof(Name) as uint64)
+    if made == nil then
+        return nil
+    end
+    local n = made as Name*
+    lock()
+    @unsafe do
+        n.key = nextKey
+        n.kind = math.i32.wrap(kind)
+        n.live = 1
+        n.reference = reference
+        n.runtimeId = runtimeOf(runtime).id
+        n.runtime = runtime
+        if not map.nuppHostMapPut(names, n.key, made as uint64) then
+            unlock()
+            free(made as voidptr)
+            return nil
+        end
+        -- Wrapping would reissue a released name, which is the one thing a
+        -- name must never do; 2^64 issues do not happen.
+        nextKey = nextKey + 1ULL
+        local r = runtimeOf(runtime)
+        n.next = r.names
+        if r.names ~= 0ULL then
+            local head = r.names as Name*
+            head.previous = made as uint64
+        end
+        r.names = made as uint64
+    end
+    unlock()
+
+    return n
+end
+
+--- Names a rooted value for C. A name that cannot be issued would leave the
+--- registry root with no owner, so the root is released with the refusal.
+local function issueHandle(runtime: uint64, reference: int32, error: uint64, borrows out: uint64*): int32
+    local name = issue(runtime, NAME_HANDLE, reference)
+    if name == nil then
+        releaseReference(runtime, reference)
+        return outOfMemory(error, ERROR_RUNTIME)
+    end
+    @unsafe do
+        out[0] = (name as Name*).key
+    end
+
+    return STATUS_OK
+end
+
+-- Entries ----------------------------------------------------------------------
+
+--- Enters `runtime` for one public call: counts the call against its state so
+--- that freeing the runtime beneath it waits. Answers the state's key, which
+--- `leave` is given back, or a negative status with the failure reported.
+local function enter(runtime: uint64, error: uint64): int64
+    beginError(error)
+    if runtime == 0ULL then
+        invalid(error, ERROR_CONFIGURATION, "this call needs a Nupp runtime")
+        return -(STATUS_INVALID_ARGUMENT as int64)
+    end
+    local r = runtimeOf(runtime)
+    local state = 0ULL
+    @unsafe do
+        if sys.nuppHostSysThreadId() ~= r.owner then
+            refuse(error, STATUS_RUNTIME, ERROR_RUNTIME, "the Nupp host was called from a different thread")
+            return -(STATUS_RUNTIME as int64)
+        end
+        state = r.state
+    end
+    if state ~= 0ULL then
+        lock()
+        map.nuppHostMapPut(entered, state, map.nuppHostMapGet(entered, state) + 1ULL)
+        unlock()
+    end
+
+    return state as int64
+end
+
+local function enteredCount(state: uint64): uint64
+    lock()
+    local count = map.nuppHostMapGet(entered, state)
+    unlock()
+
+    return count
+end
+
+--- `freeRuntime`, which is defined below the entries it frees beneath.
+local freeLater: function(runtime: uint64): nil
+
+--- Leaves the state an entry counted; the last entry to leave frees the
+--- runtimes freed beneath it.
+local function leave(state: int64)
+    if state <= 0LL then
+        return
+    end
+    local key = state as uint64
+    local freed = 0ULL
+    lock()
+    local count = map.nuppHostMapGet(entered, key)
+    if count > 1ULL then
+        map.nuppHostMapPut(entered, key, count - 1ULL)
+        unlock()
+        return
+    end
+    map.nuppHostMapRemove(entered, key)
+    @unsafe do
+        local previous = 0ULL
+        local at = deferred
+        while at ~= 0ULL do
+            local r = runtimeOf(at)
+            local next = r.nextDeferred
+            if r.deferredState == key then
+                if previous == 0ULL then
+                    deferred = next
+                else
+                    local p = runtimeOf(previous)
+                    p.nextDeferred = next
+                end
+                r.nextDeferred = freed
+                freed = at
+            else
+                previous = at
+            end
+            at = next
+        end
+    end
+    unlock()
+    while freed ~= 0ULL do
+        local next = @unsafe(runtimeOf(freed).nextDeferred)
+        freeLater(freed)
+        freed = next
+    end
+end
+
+--- The status an entry's negative answer stands for.
+local function entryStatus(state: int64): int32
+    return math.i32.wrap(-(state as integer))
+end
+
+-- The host channel -------------------------------------------------------------
+
+--- Detaches this runtime's channel from its state, when the runtime answers the
+--- state's host requests and the state is still open.
+local function detachHostChannel(runtime: uint64)
+    local r = runtimeOf(runtime)
+    @unsafe do
+        if r.answersHost == 0 then
+            return
+        end
+        r.answersHost = 0
+        if r.state ~= 0ULL and r.phase == RUNNING and sys.nuppHostSysThreadId() == r.owner then
+            local call = lua.nuppEmbedLuaCall()
+            if call ~= 0ULL then
+                lua.nuppEmbedLuaClearHostChannel(r.state as voidptr, call, r.channel)
+                lua.nuppEmbedLuaCallFree(call)
+            end
+        end
+        channel.nuppEmbedChannelClear(r.channel)
+    end
+end
+
+-- Lua calls --------------------------------------------------------------------
+
+--- Calls the function `callable` roots with `count` LuaValues at `arguments`.
+--- Answers the finished call record, whose values the caller takes with
+--- `nuppEmbedLuaCallValues` and whose answer is how many there are, or 0 with
+--- the failure reported.
+local function callFunction(
+    runtime: uint64,
+    callable: int32,
+    arguments: uint64,
+    count: uint64,
+    error: uint64,
+    category: integer
+): uint64
+    local call = newCall(error, category)
+    if call == 0ULL then
+        return 0ULL
+    end
+    if lua.nuppEmbedLuaCallFunction(stateOf(runtime), call, callable, arguments, count) ~= 0 then
+        local converted = lua.nuppEmbedLuaCallAnswer(call)
+        lua.nuppEmbedLuaFreeValues(stateOf(runtime), lua.nuppEmbedLuaCallValues(call), converted as integer)
+        luaFailure(error, call, category)
+        lua.nuppEmbedLuaCallFree(call)
+        return 0ULL
+    end
+
+    return call
+end
+
+local function luaValueAt(values: uint64, index: integer): LuaValue*
+    return @unsafe((values + (index as uint64) * (ffi.sizeof(LuaValue) as uint64)) as LuaValue*)
+end
+
+local function hostValueAt(values: uint64, index: integer): HostValue*
+    return @unsafe((values + (index as uint64) * (ffi.sizeof(HostValue) as uint64)) as HostValue*)
+end
+
+--- A LuaValue array of `count`, or 0 when `count` is 0 or there is no memory.
+local function luaValues(count: integer): uint64
+    if count == 0 then
+        return 0ULL
+    end
+    local values = calloc(count as uint64, ffi.sizeof(LuaValue) as uint64)
+    if values == nil then
+        return 0ULL
+    end
+
+    return values as uint64
+end
+
+local function kindOf(values: uint64, count: integer, index: integer): integer
+    if index >= count then
+        return -1
+    end
+
+    return @unsafe(luaValueAt(values, index).kind as integer)
+end
+
+-- nupp.h -----------------------------------------------------------------------
+
+export function nupp_config_init(config: uint64): nil
+    if config == 0ULL then
+        return
+    end
+    local c = config as Config*
+    @unsafe do
+        c.size = ffi.sizeof(Config) as uint32
+        c.abiVersion = EMBED_ABI_VERSION as uint32
+        c.flags = CONFIG_OPEN_LIBRARIES as uint32
+    end
+end
+
+--- Sets up a runtime record for `state`, gives it its state's host channel
+--- when that is free, and answers it, or 0 with the failure reported. The
+--- state is closed on failure when the runtime would have owned it.
+local function newRuntime(state: voidptr, owned: boolean, error: uint64, status: integer, category: integer): uint64
+    local made = calloc(1ULL, ffi.sizeof(Runtime) as uint64)
+    if made == nil then
+        if owned then
+            lua.nuppEmbedLuaClose(state)
+        end
+        refuse(error, status, category, "the Nupp embedding library is out of memory")
+        return 0ULL
+    end
+    local runtime = made as uint64
+    local r = runtimeOf(runtime)
+    local box = channel.nuppEmbedChannelNew(runtime)
+    lock()
+    @unsafe do
+        r.id = nextRuntime
+        nextRuntime = nextRuntime + 1ULL
+    end
+    unlock()
+    local call = lua.nuppEmbedLuaCall()
+    @unsafe do
+        r.state = state as uint64
+        r.owned = flag(owned)
+        r.owner = sys.nuppHostSysThreadId()
+        r.channel = box
+    end
+    if box == 0ULL or call == 0ULL then
+        if call ~= 0ULL then
+            lua.nuppEmbedLuaCallFree(call)
+        end
+        channel.nuppEmbedChannelFree(box)
+        free(made as voidptr)
+        if owned then
+            lua.nuppEmbedLuaClose(state)
+        end
+        refuse(error, status, category, "the Nupp embedding library is out of memory")
+        return 0ULL
+    end
+    if lua.nuppEmbedLuaInstallHostChannel(state, call, box, channel.nuppEmbedChannelOpen) ~= 0 then
+        luaFailure(error, call, ERROR_RUNTIME)
+        lua.nuppEmbedLuaCallFree(call)
+        channel.nuppEmbedChannelFree(box)
+        free(made as voidptr)
+        if owned then
+            lua.nuppEmbedLuaClose(state)
+        end
+        return 0ULL
+    end
+    @unsafe do
+        r.answersHost = flag(lua.nuppEmbedLuaCallAnswer(call) ~= 0LL)
+    end
+    lua.nuppEmbedLuaCallFree(call)
+
+    return runtime
+end
+
+--- Readies a state the way every runtime does: its host record and the
+--- features the library was built with. Reports with `status`.
+local function prepareState(state: voidptr, open: boolean, error: uint64, status: integer, category: integer): int32
+    local call = lua.nuppEmbedLuaCall()
+    if call == 0ULL then
+        return refuse(error, status, category, "the Nupp embedding library is out of memory")
+    end
+    local result = lua.nuppEmbedLuaInstallHostRecord(state, call)
+    if result == 0 then
+        result = lua.nuppEmbedLuaAddBuildFeatures(state, call, open)
+    end
+    if result ~= 0 then
+        local length = calloc(1ULL, 8ULL)
+        local message = 0ULL
+        local size = 0ULL
+        if length ~= nil then
+            message = lua.nuppEmbedLuaCallError(call, length as uint64*)
+            size = @unsafe((length as uint64*)[0])
+            free(length as voidptr)
+        end
+        if message == 0ULL then
+            refuse(error, status, category, "LuaJIT protected operation failed")
+        else
+            report(error, status, category, message as voidptr, size)
+        end
+        lua.nuppEmbedLuaCallFree(call)
+        return math.i32.wrap(status)
+    end
+    lua.nuppEmbedLuaCallFree(call)
+
+    return STATUS_OK
+end
+
+--- Runs a state operation that reports with `status` and `category`.
+local function stateStep(call: uint64, result: int32, error: uint64, status: integer, category: integer): boolean
+    if result == 0 then
+        return true
+    end
+    local length = calloc(1ULL, 8ULL)
+    local message = 0ULL
+    local size = 0ULL
+    if length ~= nil then
+        message = lua.nuppEmbedLuaCallError(call, length as uint64*)
+        size = @unsafe((length as uint64*)[0])
+        free(length as voidptr)
+    end
+    if message == 0ULL then
+        refuse(error, status, category, "LuaJIT protected operation failed")
+    else
+        report(error, status, category, message as voidptr, size)
+    end
+
+    return false
+end
+
+export function nupp_runtime_new(config: uint64, out: uint64, error: uint64): int32
+    beginError(error)
+    if out == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "nupp_runtime_new needs somewhere to put the runtime")
+    end
+    @unsafe do
+        storeWord(out, 0ULL)
+    end
+    local flags = calloc(1ULL, 8ULL)
+    if flags == nil then
+        return outOfMemory(error, ERROR_RUNTIME)
+    end
+    local status = configFlags(config, CONFIG_OPEN_LIBRARIES, error, flags as int64*)
+    local open = @unsafe(((flags as int64*)[0] & (CONFIG_OPEN_LIBRARIES as int64)) ~= 0LL)
+    free(flags as voidptr)
+    if status ~= STATUS_OK then
+        return status
+    end
+    local state = lua.nuppEmbedLuaNewState()
+    if state == nil then
+        return refuse(error, STATUS_RUNTIME, ERROR_RUNTIME, "cannot create a LuaJIT state")
+    end
+    if open then
+        local call = lua.nuppEmbedLuaCall()
+        if call == 0ULL then
+            lua.nuppEmbedLuaClose(state as voidptr)
+            return outOfMemory(error, ERROR_RUNTIME)
+        end
+        local ok = stateStep(call, lua.nuppEmbedLuaOpenLibraries(state as voidptr, call), error, STATUS_RUNTIME, ERROR_RUNTIME)
+        lua.nuppEmbedLuaCallFree(call)
+        if not ok then
+            lua.nuppEmbedLuaClose(state as voidptr)
+            return STATUS_RUNTIME
+        end
+    end
+    status = prepareState(state as voidptr, open, error, STATUS_RUNTIME, ERROR_RUNTIME)
+    if status ~= STATUS_OK then
+        lua.nuppEmbedLuaClose(state as voidptr)
+        return status
+    end
+    local runtime = newRuntime(state as voidptr, true, error, STATUS_RUNTIME, ERROR_RUNTIME)
+    if runtime == 0ULL then
+        return STATUS_RUNTIME
+    end
+    @unsafe do
+        storeWord(out, runtime)
+    end
+
+    return STATUS_OK
+end
+
+export function nupp_runtime_attach(state: uint64, config: uint64, out: uint64, error: uint64): int32
+    beginError(error)
+    if out == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "nupp_runtime_attach needs somewhere to put the runtime")
+    end
+    @unsafe do
+        storeWord(out, 0ULL)
+    end
+    if state == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "nupp_runtime_attach needs a Lua state")
+    end
+    local flags = calloc(1ULL, 8ULL)
+    if flags == nil then
+        return outOfMemory(error, ERROR_RUNTIME)
+    end
+    local status = configFlags(config, 0, error, flags as int64*)
+    local open = @unsafe(((flags as int64*)[0] & (CONFIG_OPEN_LIBRARIES as int64)) ~= 0LL)
+    free(flags as voidptr)
+    if status ~= STATUS_OK then
+        return status
+    end
+    local call = lua.nuppEmbedLuaCall()
+    if call == 0ULL then
+        return outOfMemory(error, ERROR_COMPATIBILITY)
+    end
+    local L = state as voidptr
+    -- Checked before opening libraries, which would replace the state's jit
+    -- library with this one and leave nothing of the host's to check.
+    local ok = stateStep(call, lua.nuppEmbedLuaVerify(L, call, open), error, STATUS_INCOMPATIBLE, ERROR_COMPATIBILITY)
+    if ok and open then
+        ok = stateStep(call, lua.nuppEmbedLuaOpenLibraries(L, call), error, STATUS_INCOMPATIBLE, ERROR_COMPATIBILITY)
+            and stateStep(call, lua.nuppEmbedLuaVerify(L, call, false), error, STATUS_INCOMPATIBLE, ERROR_COMPATIBILITY)
+    end
+    lua.nuppEmbedLuaCallFree(call)
+    if not ok then
+        return STATUS_INCOMPATIBLE
+    end
+    status = prepareState(L, open, error, STATUS_INCOMPATIBLE, ERROR_COMPATIBILITY)
+    if status ~= STATUS_OK then
+        return status
+    end
+    local runtime = newRuntime(L, false, error, STATUS_RUNTIME, ERROR_RUNTIME)
+    if runtime == 0ULL then
+        return STATUS_RUNTIME
+    end
+    @unsafe do
+        storeWord(out, runtime)
+    end
+
+    return STATUS_OK
+end
+
+export function nupp_runtime_lua_state(runtime: uint64): uint64
+    if runtime == 0ULL then
+        return 0ULL
+    end
+    local r = runtimeOf(runtime)
+    @unsafe do
+        if sys.nuppHostSysThreadId() ~= r.owner or r.phase ~= RUNNING then
+            return 0ULL
+        end
+        return r.state
+    end
+end
+
+--- Whether providers are frozen: a component has loaded, through this runtime
+--- or any other attached to the same state. Reports a failed query.
+local function frozen(runtime: uint64, error: uint64, borrows answer: int64*): int32
+    local r = runtimeOf(runtime)
+    @unsafe do
+        answer[0] = 0LL
+        if r.frozen ~= 0 then
+            answer[0] = 1LL
+            return STATUS_OK
+        end
+    end
+    local call = newCall(error, ERROR_CONFIGURATION)
+    if call == 0ULL then
+        return STATUS_RUNTIME
+    end
+    if lua.nuppEmbedLuaHostFrozen(stateOf(runtime), call) ~= 0 then
+        local status = luaFailure(error, call, ERROR_CONFIGURATION)
+        lua.nuppEmbedLuaCallFree(call)
+        return status
+    end
+    @unsafe do
+        answer[0] = lua.nuppEmbedLuaCallAnswer(call)
+    end
+    lua.nuppEmbedLuaCallFree(call)
+
+    return STATUS_OK
+end
+
+--- Refuses a declaration once providers have frozen, with `message`.
+local function unfrozen(runtime: uint64, error: uint64, borrows message: cstring): int32
+    if not usable(runtime, error, ERROR_CONFIGURATION) then
+        return STATUS_RUNTIME
+    end
+    local answer = calloc(1ULL, 8ULL)
+    if answer == nil then
+        return outOfMemory(error, ERROR_CONFIGURATION)
+    end
+    local status = frozen(runtime, error, answer as int64*)
+    local isFrozen = @unsafe((answer as int64*)[0] ~= 0LL)
+    free(answer as voidptr)
+    if status ~= STATUS_OK then
+        return status
+    end
+    if isFrozen then
+        return refuse(error, STATUS_RUNTIME, ERROR_CONFIGURATION, message)
+    end
+
+    return STATUS_OK
+end
+
+local function addFeature(runtime: uint64, feature: uint64, error: uint64): int32
+    local status = utf8(feature, "a host feature", ERROR_CONFIGURATION, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    local length = strlen(feature as cstring)
+    -- The generated payload gate reads this table and nothing else, so
+    -- declaring `workers` here would satisfy a component the embedding ABI
+    -- cannot actually run: enablement also installs the adapter modules and the
+    -- worker-host pointer, and this ABI exposes no way to ask for that. Refuse
+    -- the claim rather than let it fail later as a missing
+    -- `nupp.workers.native`.
+    if length == 7ULL and memcmp(feature as voidptr, "workers" as voidptr, 7ULL) == 0 then
+        return invalid(
+            error,
+            ERROR_CONFIGURATION,
+            "the Nupp embedding ABI does not start workers, so a host cannot declare the workers feature"
+        )
+    end
+    status = unfrozen(runtime, error, "Nupp host features freeze when the first component loads")
+    if status ~= STATUS_OK then
+        return status
+    end
+    local call = newCall(error, ERROR_CONFIGURATION)
+    if call == 0ULL then
+        return STATUS_RUNTIME
+    end
+    if lua.nuppEmbedLuaAddFeature(stateOf(runtime), call, feature, length) ~= 0 then
+        status = luaFailure(error, call, ERROR_CONFIGURATION)
+    end
+    lua.nuppEmbedLuaCallFree(call)
+
+    return status
+end
+
+export function nupp_runtime_add_feature(runtime: uint64, feature: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = addFeature(runtime, feature, error)
+    leave(state)
+
+    return status
+end
+
+local function addResource(runtime: uint64, path: uint64, data: uint64, length: uint64, error: uint64): int32
+    local status = utf8(path, "a host resource", ERROR_CONFIGURATION, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    if length ~= 0ULL and data == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "a host resource needs its bytes")
+    end
+    status = unfrozen(runtime, error, "Nupp host resources freeze when the first component loads")
+    if status ~= STATUS_OK then
+        return status
+    end
+    local call = newCall(error, ERROR_CONFIGURATION)
+    if call == 0ULL then
+        return STATUS_RUNTIME
+    end
+    if lua.nuppEmbedLuaAddResource(stateOf(runtime), call, path, data, length) ~= 0 then
+        status = luaFailure(error, call, ERROR_CONFIGURATION)
+    end
+    lua.nuppEmbedLuaCallFree(call)
+
+    return status
+end
+
+export function nupp_runtime_add_resource(runtime: uint64, path: uint64, data: uint64, length: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = addResource(runtime, path, data, length, error)
+    leave(state)
+
+    return status
+end
+
+local function preload(runtime: uint64, module: uint64, opener: uint64, error: uint64): int32
+    local status = utf8(module, "a preloaded module", ERROR_CONFIGURATION, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    if opener == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "a preloaded module needs an opener")
+    end
+    status = unfrozen(runtime, error, "Nupp host modules freeze when the first component loads")
+    if status ~= STATUS_OK then
+        return status
+    end
+    local call = newCall(error, ERROR_CONFIGURATION)
+    if call == 0ULL then
+        return STATUS_RUNTIME
+    end
+    local erased = opener as voidptr
+    local function_ = erased as function(L: voidptr): int32
+    if lua.nuppEmbedLuaPreload(stateOf(runtime), call, module, function_) ~= 0 then
+        status = luaFailure(error, call, ERROR_CONFIGURATION)
+    end
+    lua.nuppEmbedLuaCallFree(call)
+
+    return status
+end
+
+export function nupp_runtime_preload(runtime: uint64, module: uint64, opener: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = preload(runtime, module, opener, error)
+    leave(state)
+
+    return status
+end
+
+local function registerAotBuilders(runtime: uint64, key: uint64, registrar: uint64, error: uint64): int32
+    local status = utf8(key, "registering AOT builders", ERROR_CONFIGURATION, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    if strlen(key as cstring) == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "registering AOT builders needs a key")
+    end
+    if registrar == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "registering AOT builders needs a registrar")
+    end
+    status = unfrozen(runtime, error, "AOT builders must be registered before a component is loaded")
+    if status ~= STATUS_OK then
+        return status
+    end
+    local call = newCall(error, ERROR_CONFIGURATION)
+    if call == 0ULL then
+        return STATUS_RUNTIME
+    end
+    local erased = registrar as voidptr
+    local function_ = erased as function(L: voidptr): int32
+    if lua.nuppEmbedLuaRegisterAotBuilders(stateOf(runtime), call, key, function_) ~= 0 then
+        status = luaFailure(error, call, ERROR_CONFIGURATION)
+    end
+    lua.nuppEmbedLuaCallFree(call)
+
+    return status
+end
+
+export function nupp_runtime_register_aot_builders(runtime: uint64, key: uint64, registrar: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = registerAotBuilders(runtime, key, registrar, error)
+    leave(state)
+
+    return status
+end
+
+-- Components -------------------------------------------------------------------
+
+const EMPTY = ""
+const COMPONENT_MAGIC = "-- NUPP-COMPONENT 1\n"
+const DEFAULT_COMPONENT_NAME = "=component"
+
+local function loadComponent(runtime: uint64, data: uint64, length: uint64, name: uint64, out: uint64, error: uint64): int32
+    if out == 0ULL then
+        return invalid(error, ERROR_COMPONENT, "loading a component needs somewhere to put it")
+    end
+    @unsafe do
+        storeWord(out, 0ULL)
+    end
+    if length ~= 0ULL and data == 0ULL then
+        return invalid(error, ERROR_COMPONENT, "loading a component needs its bytes")
+    end
+    local chunkName = DEFAULT_COMPONENT_NAME as uint64
+    if name ~= 0ULL then
+        local status = utf8(name, "a component", ERROR_COMPONENT, error)
+        if status ~= STATUS_OK then
+            return status
+        end
+        chunkName = name
+    end
+    if length < 20ULL or memcmp(data as voidptr, COMPONENT_MAGIC as voidptr, 20ULL) ~= 0 then
+        return refuse(error, STATUS_RUNTIME, ERROR_COMPONENT, "not a Nupp component artifact (expected component format 1)")
+    end
+    if not usable(runtime, error, ERROR_COMPONENT) then
+        return STATUS_RUNTIME
+    end
+    local call = newCall(error, ERROR_COMPONENT)
+    if call == 0ULL then
+        return STATUS_RUNTIME
+    end
+    if lua.nuppEmbedLuaInstallComponent(stateOf(runtime), call, data, length, chunkName) ~= 0 then
+        local status = luaFailure(error, call, ERROR_COMPONENT)
+        lua.nuppEmbedLuaCallFree(call)
+        return status
+    end
+    local reference = math.i32.wrap(lua.nuppEmbedLuaCallAnswer(call) as integer)
+    lua.nuppEmbedLuaCallFree(call)
+    @unsafe do
+        runtimeOf(runtime).frozen = 1
+    end
+    local issued = issue(runtime, NAME_COMPONENT, reference)
+    if issued == nil then
+        releaseReference(runtime, reference)
+        return outOfMemory(error, ERROR_COMPONENT)
+    end
+    @unsafe do
+        storeWord(out, (issued as Name*).key)
+    end
+
+    return STATUS_OK
+end
+
+export function nupp_component_load(
+    runtime: uint64,
+    data: uint64,
+    length: uint64,
+    name: uint64,
+    out: uint64,
+    error: uint64
+): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = loadComponent(runtime, data, length, name, out, error)
+    leave(state)
+
+    return status
+end
+
+--- The component `key` names for `runtime`, or nil with the refusal reported.
+local function componentFor(runtime: uint64, key: uint64, error: uint64): Name*?
+    if key == 0ULL then
+        invalid(error, ERROR_COMPONENT, "this call needs a component")
+        return nil
+    end
+    local name = nameOf(key)
+    if name == nil or @unsafe((name as Name*).kind ~= NAME_COMPONENT) then
+        invalid(error, ERROR_COMPONENT, "the component has been released or was never issued")
+        return nil
+    end
+    if @unsafe((name as Name*).runtimeId ~= runtimeOf(runtime).id) then
+        invalid(error, ERROR_COMPONENT, "the component belongs to another Nupp runtime")
+        return nil
+    end
+
+    return name
+end
+
+local function startComponent(runtime: uint64, component: uint64, argc: int32, argv: uint64, error: uint64): int32
+    local name = componentFor(runtime, component, error)
+    if name == nil then
+        return STATUS_INVALID_ARGUMENT
+    end
+    if argc < 0 or (argc > 0 and argv == 0ULL) then
+        return invalid(error, ERROR_COMPONENT, "starting a component was given a count without arguments")
+    end
+    for index = 0, (argc as integer) - 1 do
+        local argument = @unsafe(((argv + (index as uint64) * 8ULL) as uint64*)[0])
+        if argument == 0ULL then
+            return invalid(error, ERROR_COMPONENT, "a component argument is null")
+        end
+    end
+    if not usable(runtime, error, ERROR_COMPONENT) then
+        return STATUS_RUNTIME
+    end
+    local n = name as Name*
+    local reference: int32 = 0
+    @unsafe do
+        if n.started ~= 0 then
+            return refuse(error, STATUS_RUNTIME, ERROR_COMPONENT, "the component has already started")
+        end
+        -- Marked before the entry runs, so an entry that reaches back into the
+        -- host cannot start itself a second time; a failed start is undone.
+        n.started = 1
+        reference = n.reference
+    end
+    local call = newCall(error, ERROR_COMPONENT)
+    if call == 0ULL then
+        @unsafe do
+            n.started = 0
+        end
+        return STATUS_RUNTIME
+    end
+    local key = component
+    if lua.nuppEmbedLuaStartComponent(stateOf(runtime), call, reference, argv, argc as uint64) ~= 0 then
+        local status = luaFailure(error, call, ERROR_COMPONENT)
+        lua.nuppEmbedLuaCallFree(call)
+        local still = nameOf(key)
+        if still ~= nil then
+            @unsafe do
+                local held = still as Name*
+                held.started = 0
+            end
+        end
+        return status
+    end
+    lua.nuppEmbedLuaCallFree(call)
+
+    return STATUS_OK
+end
+
+export function nupp_component_start(runtime: uint64, component: uint64, argc: int32, argv: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = startComponent(runtime, component, argc, argv, error)
+    leave(state)
+
+    return status
+end
+
+local function findExport(runtime: uint64, component: uint64, name: uint64, out: uint64, error: uint64): int32
+    local owner = componentFor(runtime, component, error)
+    if owner == nil then
+        return STATUS_INVALID_ARGUMENT
+    end
+    if out == 0ULL then
+        return invalid(error, ERROR_COMPONENT, "finding an export needs somewhere to put it")
+    end
+    @unsafe do
+        storeWord(out, 0ULL)
+    end
+    local status = utf8(name, "finding an export", ERROR_COMPONENT, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    if not usable(runtime, error, ERROR_COMPONENT) then
+        return STATUS_RUNTIME
+    end
+    local call = newCall(error, ERROR_COMPONENT)
+    if call == 0ULL then
+        return STATUS_RUNTIME
+    end
+    local reference = @unsafe((owner as Name*).reference)
+    if lua.nuppEmbedLuaFindExport(stateOf(runtime), call, reference, name) ~= 0 then
+        status = luaFailure(error, call, ERROR_COMPONENT)
+        lua.nuppEmbedLuaCallFree(call)
+        return status
+    end
+    local found = math.i32.wrap(lua.nuppEmbedLuaCallAnswer(call) as integer)
+    lua.nuppEmbedLuaCallFree(call)
+
+    return issueHandle(runtime, found, error, out as uint64*)
+end
+
+export function nupp_export_find(runtime: uint64, component: uint64, name: uint64, out: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = findExport(runtime, component, name, out, error)
+    leave(state)
+
+    return status
+end
+
+export function nupp_component_release(runtime: uint64, component: uint64, error: uint64): int32
+    beginError(error)
+    if component == 0ULL then
+        return STATUS_OK
+    end
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local name = componentFor(runtime, component, error)
+    if name == nil then
+        leave(state)
+        return STATUS_INVALID_ARGUMENT
+    end
+    dropName(name as uint64)
+    leave(state)
+
+    return STATUS_OK
+end
+
+-- Handles and calls ------------------------------------------------------------
+
+--- The handle `key` names for `runtime`, or nil with the refusal reported.
+local function handleFor(runtime: uint64, key: uint64, error: uint64): Name*?
+    if key == 0ULL then
+        invalid(error, ERROR_RUNTIME, "this call needs a managed handle")
+        return nil
+    end
+    local name = nameOf(key)
+    if name == nil or @unsafe((name as Name*).kind ~= NAME_HANDLE) then
+        invalid(error, ERROR_RUNTIME, "the managed handle has been released or was never issued")
+        return nil
+    end
+    if @unsafe((name as Name*).runtimeId ~= runtimeOf(runtime).id) then
+        invalid(error, ERROR_RUNTIME, "the managed handle belongs to another Nupp runtime")
+        return nil
+    end
+
+    return name
+end
+
+--- The reference a live handle holds, or the negated status of the refusal it
+--- reported.
+local function handleReference(runtime: uint64, key: uint64, error: uint64): int64
+    local name = handleFor(runtime, key, error)
+    if name == nil then
+        return -(STATUS_INVALID_ARGUMENT as int64)
+    end
+    @unsafe do
+        if (name as Name*).live == 0 then
+            refuse(error, STATUS_RUNTIME, ERROR_RUNTIME, "the managed handle has been released")
+            return -(STATUS_RUNTIME as int64)
+        end
+        return (name as Name*).reference as int64
+    end
+end
+
+--- Releases a handle's reference and its name. After shutdown there is no
+--- reference left to release, and the name is all that remains, so the caller
+--- still gets to free it.
+local function releaseHandle(runtime: uint64, name: Name*, error: uint64): int32
+    local live = @unsafe(name.live ~= 0)
+    local running = @unsafe(runtimeOf(runtime).phase == RUNNING and runtimeOf(runtime).state ~= 0ULL)
+    if live and running then
+        local status = releaseReported(runtime, @unsafe(name.reference), error, ERROR_RUNTIME)
+        if status ~= STATUS_OK then
+            return status
+        end
+    end
+    dropName(name as uint64)
+
+    return STATUS_OK
+end
+
+--- Releases what LuaValues answered that never reached the caller.
+local function discardAnswers(runtime: uint64, values: uint64, count: integer)
+    lua.nuppEmbedLuaFreeValues(stateOf(runtime), values, count)
+end
+
+local function call(
+    runtime: uint64,
+    callable: uint64,
+    arguments: uint64,
+    argumentCount: uint64,
+    results: uint64,
+    capacity: uint64,
+    resultCount: uint64,
+    error: uint64
+): int32
+    if resultCount ~= 0ULL then
+        @unsafe do
+            storeWord(resultCount, 0ULL)
+        end
+    end
+    if handleFor(runtime, callable, error) == nil then
+        return STATUS_INVALID_ARGUMENT
+    end
+    if (argumentCount ~= 0ULL and arguments == 0ULL) or (capacity ~= 0ULL and results == 0ULL) then
+        return invalid(error, ERROR_RUNTIME, "a call was given a count without values")
+    end
+    local count = argumentCount as integer
+    local passed = luaValues(count)
+    if count ~= 0 and passed == 0ULL then
+        return outOfMemory(error, ERROR_RUNTIME)
+    end
+    for index = 0, count - 1 do
+        local from = hostValueAt(arguments, index)
+        local to = luaValueAt(passed, index)
+        local kind = @unsafe(from.kind as integer)
+        @unsafe do
+            if kind == VALUE_NIL then
+                to.kind = LUA_NIL
+            elseif kind == VALUE_BOOLEAN then
+                to.kind = LUA_BOOLEAN
+                to.boolean = flag(from.boolean ~= 0)
+            elseif kind == VALUE_NUMBER then
+                to.kind = LUA_NUMBER
+                to.number = from.number
+            elseif kind == VALUE_STRING or kind == VALUE_BYTES then
+                if from.length ~= 0ULL and from.data == 0ULL then
+                    free(passed as voidptr)
+                    return invalid(error, ERROR_RUNTIME, "a call was given a string length without its bytes")
+                end
+                to.kind = LUA_BYTES
+                to.data = from.data
+                to.length = from.length
+            elseif kind == VALUE_HANDLE then
+                local reference = handleReference(runtime, from.handle, error)
+                if reference < 0LL then
+                    free(passed as voidptr)
+                    return entryStatus(reference)
+                end
+                to.kind = LUA_REFERENCE
+                to.reference = math.i32.wrap(reference as integer)
+            else
+                free(passed as voidptr)
+                return invalid(error, ERROR_RUNTIME, "a call was given a value of an unknown kind")
+            end
+        end
+    end
+    local target = handleReference(runtime, callable, error)
+    if target < 0LL then
+        if passed ~= 0ULL then
+            free(passed as voidptr)
+        end
+        return entryStatus(target)
+    end
+    if not usable(runtime, error, ERROR_RUNTIME) then
+        if passed ~= 0ULL then
+            free(passed as voidptr)
+        end
+        return STATUS_RUNTIME
+    end
+    local record = callFunction(runtime, math.i32.wrap(target as integer), passed, argumentCount, error, ERROR_RUNTIME)
+    if passed ~= 0ULL then
+        free(passed as voidptr)
+    end
+    if record == 0ULL then
+        return STATUS_RUNTIME
+    end
+    local answered = lua.nuppEmbedLuaCallAnswer(record) as integer
+    local values = lua.nuppEmbedLuaCallValues(record)
+    lua.nuppEmbedLuaCallFree(record)
+    if resultCount ~= 0ULL then
+        @unsafe do
+            storeWord(resultCount, answered as uint64)
+        end
+    end
+    if (answered as uint64) > capacity then
+        discardAnswers(runtime, values, answered)
+        return refuse(error, STATUS_BUFFER_TOO_SMALL, ERROR_RUNTIME, "the result buffer is smaller than the call answered")
+    end
+    -- Every answer is named before any is written, so a refusal leaves the
+    -- caller's buffer untouched and nothing it would have to free.
+    for index = 0, answered - 1 do
+        local value = luaValueAt(values, index)
+        @unsafe do
+            if value.kind == LUA_REFERENCE then
+                local name = issue(runtime, NAME_HANDLE, value.reference)
+                if name == nil then
+                    for earlier = 0, index - 1 do
+                        local named = luaValueAt(values, earlier)
+                        if named.kind == LUA_REFERENCE then
+                            local held = nameOf(named.data)
+                            if held ~= nil then
+                                dropName(held as uint64)
+                            end
+                        end
+                    end
+                    discardAnswers(runtime, values, answered)
+                    return outOfMemory(error, ERROR_RUNTIME)
+                end
+                value.data = (name as Name*).key
+            end
+        end
+    end
+    for index = 0, answered - 1 do
+        local value = luaValueAt(values, index)
+        local result = hostValueAt(results, index)
+        @unsafe do
+            result.kind = VALUE_NIL
+            result.boolean = 0
+            result.number = 0
+            result.data = 0ULL
+            result.length = 0ULL
+            result.handle = 0ULL
+            if value.kind == LUA_BOOLEAN then
+                result.kind = VALUE_BOOLEAN
+                result.boolean = value.boolean
+            elseif value.kind == LUA_NUMBER then
+                result.kind = VALUE_NUMBER
+                result.number = value.number
+            elseif value.kind == LUA_BYTES then
+                result.kind = VALUE_BYTES
+                result.data = value.data
+                result.length = value.length
+            elseif value.kind == LUA_REFERENCE then
+                result.kind = VALUE_HANDLE
+                result.handle = value.data
+            end
+        end
+    end
+    if values ~= 0ULL then
+        free(values as voidptr)
+    end
+
+    return STATUS_OK
+end
+
+export function nupp_call(
+    runtime: uint64,
+    callable: uint64,
+    arguments: uint64,
+    argumentCount: uint64,
+    results: uint64,
+    capacity: uint64,
+    resultCount: uint64,
+    error: uint64
+): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = call(runtime, callable, arguments, argumentCount, results, capacity, resultCount, error)
+    leave(state)
+
+    return status
+end
+
+export function nupp_handle_release(runtime: uint64, handle: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status: int32 = STATUS_INVALID_ARGUMENT
+    local name = handleFor(runtime, handle, error)
+    if name ~= nil then
+        status = releaseHandle(runtime, name as Name*, error)
+    end
+    leave(state)
+
+    return status
+end
+
+export function nupp_value_release(runtime: uint64, value: uint64, error: uint64): int32
+    beginError(error)
+    if value == 0ULL then
+        return STATUS_OK
+    end
+    local v = value as HostValue*
+    @unsafe do
+        if (v.kind == VALUE_STRING or v.kind == VALUE_BYTES) and v.data ~= 0ULL then
+            free(v.data as voidptr)
+        elseif v.kind == VALUE_HANDLE and v.handle ~= 0ULL then
+            local state = enter(runtime, error)
+            if state < 0LL then
+                return entryStatus(state)
+            end
+            local name = handleFor(runtime, v.handle, error)
+            if name == nil then
+                leave(state)
+                return STATUS_INVALID_ARGUMENT
+            end
+            local status = releaseHandle(runtime, name as Name*, error)
+            leave(state)
+            if status ~= STATUS_OK then
+                return status
+            end
+        end
+        v.kind = VALUE_NIL
+        v.boolean = 0
+        v.number = 0
+        v.data = 0ULL
+        v.length = 0ULL
+        v.handle = 0ULL
+    end
+
+    return STATUS_OK
+end
+
+-- Reload -----------------------------------------------------------------------
+
+export function nupp_reload_config_init(config: uint64): nil
+    if config == 0ULL then
+        return
+    end
+    local c = config as ReloadConfig*
+    @unsafe do
+        c.size = ffi.sizeof(ReloadConfig) as uint32
+        c.flags = 0
+        c.compilerPath = 0ULL
+        c.root = 0ULL
+        c.entry = 0ULL
+    end
+end
+
+--- The reload session `key` names, or nil with the refusal reported.
+local function reloadFor(key: uint64, error: uint64): Name*?
+    if key == 0ULL then
+        invalid(error, ERROR_CONFIGURATION, "this call needs a reload session")
+        return nil
+    end
+    local name = nameOf(key)
+    if name == nil or @unsafe((name as Name*).kind ~= NAME_RELOAD) then
+        invalid(error, ERROR_CONFIGURATION, "the reload session has been freed or was never issued")
+        return nil
+    end
+
+    return name
+end
+
+--- Whether `name` is an open session of `runtime`; reports why not.
+local function reloadOpen(runtime: uint64, name: Name*, error: uint64): boolean
+    if not usable(runtime, error, ERROR_RUNTIME) then
+        return false
+    end
+    @unsafe do
+        if name.runtimeId ~= runtimeOf(runtime).id then
+            refuse(error, STATUS_RUNTIME, ERROR_RUNTIME, "the reload session belongs to another Nupp runtime")
+            return false
+        end
+        if name.live == 0 then
+            refuse(error, STATUS_RUNTIME, ERROR_RUNTIME, "the reload session has been closed")
+            return false
+        end
+    end
+
+    return true
+end
+
+--- Retires a session's loader and compiler session: calls its `close` with
+--- `ok` and gives back every reference it holds. The program's values remain;
+--- what stops is reloading them.
+local function closeSession(runtime: uint64, name: Name*, ok: boolean, error: uint64): int32
+    local argument = luaValues(1)
+    local status: int32 = STATUS_OK
+    if argument == 0ULL then
+        status = outOfMemory(error, ERROR_RUNTIME)
+    else
+        @unsafe do
+            local value = argument as LuaValue*
+            value.kind = LUA_BOOLEAN
+            value.boolean = flag(ok)
+        end
+        local record = callFunction(runtime, @unsafe(name.close), argument, 1ULL, error, ERROR_RUNTIME)
+        free(argument as voidptr)
+        if record == 0ULL then
+            status = STATUS_RUNTIME
+        else
+            discardAnswers(runtime, lua.nuppEmbedLuaCallValues(record), lua.nuppEmbedLuaCallAnswer(record) as integer)
+            lua.nuppEmbedLuaCallFree(record)
+        end
+    end
+    @unsafe do
+        local released = releaseReference(runtime, name.reference)
+        released = releaseReference(runtime, name.member) and released
+        released = releaseReference(runtime, name.prepare) and released
+        released = releaseReference(runtime, name.apply) and released
+        released = releaseReference(runtime, name.poll) and released
+        released = releaseReference(runtime, name.close) and released
+        if not released and status == STATUS_OK then
+            status = refuse(error, STATUS_RUNTIME, ERROR_RUNTIME, "cannot release a reload session's references")
+        end
+        name.live = 0
+    end
+
+    return status
+end
+
+--- The names of the fields a session table answers with.
+const MEMBER_NAMES = ffi.new<const voidptr[5]>({"member" as voidptr, "prepare" as voidptr, "apply" as voidptr, "poll" as voidptr, "close" as voidptr})
+
+--- Opens a session through `opener` of `nupp.tools.hostreload` with the
+--- LuaValues `arguments`, and issues its name into `out`.
+local function openSession(
+    runtime: uint64,
+    compiler: uint64,
+    opener: uint64,
+    arguments: uint64,
+    count: uint64,
+    out: uint64,
+    error: uint64
+): int32
+    if not usable(runtime, error, ERROR_COMPONENT) then
+        return STATUS_RUNTIME
+    end
+    local record = newCall(error, ERROR_COMPONENT)
+    if record == 0ULL then
+        return STATUS_RUNTIME
+    end
+    local L = stateOf(runtime)
+    -- Both ways in land here, so the exclusion is stated once. A commit replaces
+    -- functions in this state's slot arrays and nowhere else, while every
+    -- worker runs its own state from the stamped payload it was spawned with.
+    -- Coexisting would mean a session reporting a generation that part of the
+    -- process is not running, so a state with the worker adapter installed --
+    -- by the stamped binary whose state this runtime attached to -- does not
+    -- get a session.
+    if lua.nuppEmbedLuaWorkerHostInstalled(L, record) ~= 0 then
+        local status = luaFailure(error, record, ERROR_COMPONENT)
+        lua.nuppEmbedLuaCallFree(record)
+        return status
+    end
+    if lua.nuppEmbedLuaCallAnswer(record) ~= 0LL then
+        lua.nuppEmbedLuaCallFree(record)
+        return refuse(
+            error,
+            STATUS_RUNTIME,
+            ERROR_COMPONENT,
+            "this Lua state runs native workers: a reload session commits into one state, and worker tasks would keep running the payload they started from"
+        )
+    end
+    if compiler ~= 0ULL and lua.nuppEmbedLuaAddPackagePath(L, record, compiler) ~= 0 then
+        local status = luaFailure(error, record, ERROR_COMPONENT)
+        lua.nuppEmbedLuaCallFree(record)
+        return status
+    end
+    local module = "nupp.tools.hostreload"
+    if lua.nuppEmbedLuaModuleMember(L, record, module as uint64, opener) ~= 0 then
+        local status = luaFailure(error, record, ERROR_COMPONENT)
+        lua.nuppEmbedLuaCallFree(record)
+        return status
+    end
+    local open = math.i32.wrap(lua.nuppEmbedLuaCallAnswer(record) as integer)
+    lua.nuppEmbedLuaCallFree(record)
+    local opened = callFunction(runtime, open, arguments, count, error, ERROR_COMPONENT)
+    releaseReference(runtime, open)
+    if opened == 0ULL then
+        return STATUS_RUNTIME
+    end
+    local answered = lua.nuppEmbedLuaCallAnswer(opened) as integer
+    local values = lua.nuppEmbedLuaCallValues(opened)
+    lua.nuppEmbedLuaCallFree(opened)
+    if kindOf(values, answered, 0) ~= LUA_REFERENCE then
+        local status: int32 = STATUS_RUNTIME
+        if kindOf(values, answered, 1) == LUA_BYTES then
+            local message = luaValueAt(values, 1)
+            status = report(error, STATUS_RUNTIME, ERROR_COMPONENT, @unsafe(message.data as voidptr), @unsafe(message.length))
+        else
+            status = refuse(error, STATUS_RUNTIME, ERROR_COMPONENT, "the Nupp project has no watch build")
+        end
+        discardAnswers(runtime, values, answered)
+        return status
+    end
+    local session = @unsafe(luaValueAt(values, 0).reference)
+    @unsafe do
+        luaValueAt(values, 0).kind = LUA_NIL
+    end
+    discardAnswers(runtime, values, answered)
+    local taken = calloc(5ULL, 4ULL)
+    record = lua.nuppEmbedLuaCall()
+    if taken == nil or record == 0ULL then
+        if taken ~= nil then
+            free(taken as voidptr)
+        end
+        lua.nuppEmbedLuaCallFree(record)
+        releaseReference(runtime, session)
+        return outOfMemory(error, ERROR_COMPONENT)
+    end
+    local members = taken as int32*
+    for index = 0, 4 do
+        local member = @unsafe(MEMBER_NAMES[index] as uint64)
+        if lua.nuppEmbedLuaValueMember(L, record, session, member) ~= 0 then
+            local status = luaFailure(error, record, ERROR_COMPONENT)
+            for earlier = 0, index - 1 do
+                releaseReference(runtime, @unsafe(members[earlier]))
+            end
+            releaseReference(runtime, session)
+            lua.nuppEmbedLuaCallFree(record)
+            free(taken as voidptr)
+            return status
+        end
+        @unsafe do
+            members[index] = math.i32.wrap(lua.nuppEmbedLuaCallAnswer(record) as integer)
+        end
+    end
+    lua.nuppEmbedLuaCallFree(record)
+    local name = issue(runtime, NAME_RELOAD, session)
+    if name == nil then
+        for index = 0, 4 do
+            releaseReference(runtime, @unsafe(members[index]))
+        end
+        releaseReference(runtime, session)
+        free(taken as voidptr)
+        return outOfMemory(error, ERROR_COMPONENT)
+    end
+    @unsafe do
+        local n = name as Name*
+        n.member = members[0]
+        n.prepare = members[1]
+        n.apply = members[2]
+        n.poll = members[3]
+        n.close = members[4]
+        storeWord(out, n.key)
+    end
+    free(taken as voidptr)
+
+    return STATUS_OK
+end
+
+--- Checks a reload configuration; answers OK with `out` cleared.
+local function reloadConfiguration(config: uint64, out: uint64, error: uint64): int32
+    if out == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "opening a reload session needs somewhere to put it")
+    end
+    @unsafe do
+        storeWord(out, 0ULL)
+    end
+    if config == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "opening a reload session needs its configuration")
+    end
+    local c = config as ReloadConfig*
+    @unsafe do
+        if (c.size as integer) < ffi.sizeof(ReloadConfig) then
+            snprintf(
+                text,
+                1024ULL,
+                "nupp_reload_config is smaller than embedding ABI %d requires",
+                EMBED_ABI_VERSION as int32
+            )
+            return reportText(error, STATUS_INCOMPATIBLE, ERROR_COMPATIBILITY)
+        end
+        if c.flags ~= 0 then
+            return invalid(error, ERROR_CONFIGURATION, "nupp_reload_config contains unknown flags")
+        end
+        local status = optionalUtf8(c.compilerPath, "a compiler directory", ERROR_CONFIGURATION, error)
+        if status ~= STATUS_OK then
+            return status
+        end
+        return optionalUtf8(c.root, "a project root", ERROR_CONFIGURATION, error)
+    end
+end
+
+--- Fills a LuaValue with a NUL-terminated name, or nil.
+local function nameValue(value: LuaValue*, data: uint64)
+    @unsafe do
+        if data == 0ULL then
+            value.kind = LUA_NIL
+        else
+            value.kind = LUA_BYTES
+            value.data = data
+            value.length = strlen(data as cstring)
+        end
+    end
+end
+
+local function reloadOpenSession(runtime: uint64, config: uint64, out: uint64, error: uint64): int32
+    local status = reloadConfiguration(config, out, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    local c = config as ReloadConfig*
+    local entry = @unsafe(c.entry)
+    status = utf8(entry, "a reloading entry", ERROR_CONFIGURATION, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    local arguments = luaValues(2)
+    if arguments == 0ULL then
+        return outOfMemory(error, ERROR_COMPONENT)
+    end
+    nameValue(luaValueAt(arguments, 0), entry)
+    nameValue(luaValueAt(arguments, 1), @unsafe(c.root))
+    local opener = "open"
+    status = openSession(runtime, @unsafe(c.compilerPath), opener as uint64, arguments, 2ULL, out, error)
+    free(arguments as voidptr)
+
+    return status
+end
+
+export function nupp_reload_open(runtime: uint64, config: uint64, out: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = reloadOpenSession(runtime, config, out, error)
+    leave(state)
+
+    return status
+end
+
+local function reloadAttachSession(runtime: uint64, config: uint64, out: uint64, error: uint64): int32
+    local status = reloadConfiguration(config, out, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    local c = config as ReloadConfig*
+    local arguments = luaValues(1)
+    if arguments == 0ULL then
+        return outOfMemory(error, ERROR_COMPONENT)
+    end
+    nameValue(luaValueAt(arguments, 0), @unsafe(c.root))
+    local opener = "attach"
+    status = openSession(runtime, @unsafe(c.compilerPath), opener as uint64, arguments, 1ULL, out, error)
+    free(arguments as voidptr)
+
+    return status
+end
+
+--- Attaches to the reload components already loaded in this runtime. `entry`
+--- is not read: the component named its own modules when it installed them.
+export function nupp_reload_attach(runtime: uint64, config: uint64, out: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = reloadAttachSession(runtime, config, out, error)
+    leave(state)
+
+    return status
+end
+
+local function reloadFind(runtime: uint64, reload: uint64, member: uint64, out: uint64, error: uint64): int32
+    local name = reloadFor(reload, error)
+    if name == nil then
+        return STATUS_INVALID_ARGUMENT
+    end
+    if out == 0ULL then
+        return invalid(error, ERROR_RUNTIME, "finding a reloading member needs somewhere to put it")
+    end
+    @unsafe do
+        storeWord(out, 0ULL)
+    end
+    local status = utf8(member, "a reloading member", ERROR_RUNTIME, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    if not reloadOpen(runtime, name as Name*, error) then
+        return STATUS_RUNTIME
+    end
+    local argument = luaValues(1)
+    if argument == 0ULL then
+        return outOfMemory(error, ERROR_RUNTIME)
+    end
+    nameValue(luaValueAt(argument, 0), member)
+    -- A watch build dispatches a named function through a slot, so the handle
+    -- stays the same value across every commit.
+    local record = callFunction(runtime, @unsafe((name as Name*).member), argument, 1ULL, error, ERROR_RUNTIME)
+    free(argument as voidptr)
+    if record == 0ULL then
+        return STATUS_RUNTIME
+    end
+    local answered = lua.nuppEmbedLuaCallAnswer(record) as integer
+    local values = lua.nuppEmbedLuaCallValues(record)
+    lua.nuppEmbedLuaCallFree(record)
+    if kindOf(values, answered, 0) ~= LUA_REFERENCE then
+        discardAnswers(runtime, values, answered)
+        snprintf(text, 1024ULL, "the reloading entry has no callable %s", member as cstring)
+        return reportText(error, STATUS_RUNTIME, ERROR_RUNTIME)
+    end
+    local reference = @unsafe(luaValueAt(values, 0).reference)
+    @unsafe do
+        luaValueAt(values, 0).kind = LUA_NIL
+    end
+    discardAnswers(runtime, values, answered)
+
+    return issueHandle(runtime, reference, error, out as uint64*)
+end
+
+export function nupp_reload_find(runtime: uint64, reload: uint64, name: uint64, out: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = reloadFind(runtime, reload, name, out, error)
+    leave(state)
+
+    return status
+end
+
+const STEP_PREPARE = 1
+const STEP_APPLY = 2
+const STEP_POLL = 3
+
+local function sameText(value: LuaValue*, borrows expected: cstring): boolean
+    local length = strlen(expected)
+    @unsafe do
+        return value.length == length and (length == 0ULL or memcmp(value.data as voidptr, expected as voidptr, length) == 0)
+    end
+end
+
+--- Replaces a session's last diagnostics with the `length` bytes at `data`, NUL
+--- bytes turned to `?`, or with none.
+local function setMessage(name: Name*, data: uint64, length: uint64)
+    @unsafe do
+        if name.message ~= 0ULL then
+            free(name.message as voidptr)
+            name.message = 0ULL
+        end
+        if data == 0ULL and length == 0ULL then
+            return
+        end
+        local copy = malloc(length + 1ULL)
+        if copy == nil then
+            return
+        end
+        if length ~= 0ULL then
+            memcpy(copy as voidptr, data as voidptr, length)
+        end
+        local bytes = copy as uint8*
+        for index = 0, (length as integer) - 1 do
+            if bytes[index] == 0 then
+                bytes[index] = 63
+            end
+        end
+        bytes[length as integer] = 0
+        name.message = copy as uint64
+    end
+end
+
+local function reloadStep(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, step: integer, error: uint64): int32
+    local name = reloadFor(reload, error)
+    if name == nil then
+        return STATUS_INVALID_ARGUMENT
+    end
+    local n = name as Name*
+    setMessage(n, 0ULL, 0ULL)
+    if not reloadOpen(runtime, n, error) then
+        return STATUS_RUNTIME
+    end
+    local target: int32 = 0
+    @unsafe do
+        if step == STEP_PREPARE then
+            target = n.prepare
+        elseif step == STEP_APPLY then
+            target = n.apply
+        else
+            target = n.poll
+        end
+    end
+    local record = callFunction(runtime, target, 0ULL, 0ULL, error, ERROR_RUNTIME)
+    if record == 0ULL then
+        return STATUS_RUNTIME
+    end
+    local answered = lua.nuppEmbedLuaCallAnswer(record) as integer
+    local values = lua.nuppEmbedLuaCallValues(record)
+    lua.nuppEmbedLuaCallFree(record)
+    if kindOf(values, answered, 0) ~= LUA_BYTES then
+        discardAnswers(runtime, values, answered)
+        return refuse(error, STATUS_RUNTIME, ERROR_RUNTIME, "the reload session answered no verdict")
+    end
+    local kind = luaValueAt(values, 0)
+    local answer: integer = -1
+    if sameText(kind, "no-change") then
+        answer = RELOAD_NO_CHANGE
+    elseif sameText(kind, "prepared") then
+        answer = RELOAD_PREPARED
+    elseif sameText(kind, "committed") then
+        answer = RELOAD_COMMITTED
+    elseif sameText(kind, "rejected") then
+        answer = RELOAD_REJECTED
+    elseif sameText(kind, "restart-required") then
+        answer = RELOAD_RESTART_REQUIRED
+    end
+    if answer < 0 then
+        local prefix = "the reload session answered an unknown verdict "
+        local prefixLength = strlen(prefix)
+        local length = @unsafe(kind.length)
+        local joined = malloc(prefixLength + length + 1ULL)
+        local status: int32 = STATUS_RUNTIME
+        if joined == nil then
+            status = outOfMemory(error, ERROR_RUNTIME)
+        else
+            memcpy(joined as voidptr, prefix as voidptr, prefixLength)
+            if length ~= 0ULL then
+                memcpy(@unsafe(((joined as uint64) + prefixLength) as voidptr), @unsafe(kind.data as voidptr), length)
+            end
+            status = report(error, STATUS_RUNTIME, ERROR_RUNTIME, joined as voidptr, prefixLength + length)
+            free(joined as voidptr)
+        end
+        discardAnswers(runtime, values, answered)
+        return status
+    end
+    local generated = 0ULL
+    if kindOf(values, answered, 1) == LUA_NUMBER then
+        local number = @unsafe(luaValueAt(values, 1).number)
+        if number >= 0 then
+            generated = number as uint64
+        end
+    end
+    if kindOf(values, answered, 2) == LUA_BYTES then
+        local message = luaValueAt(values, 2)
+        local data = @unsafe(message.data)
+        if data == 0ULL then
+            data = EMPTY as uint64
+        end
+        setMessage(n, data, @unsafe(message.length))
+    end
+    discardAnswers(runtime, values, answered)
+    @unsafe do
+        if verdict ~= 0ULL then
+            storeHalf(verdict, math.u32.wrap(answer))
+        end
+        if generation ~= 0ULL then
+            storeWord(generation, generated)
+        end
+    end
+
+    return STATUS_OK
+end
+
+--- Clears a step's outputs before any work, like every other output, so a
+--- step that fails leaves no earlier step's verdict for the host to act on.
+local function steppedReload(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, step: integer, error: uint64): int32
+    beginError(error)
+    @unsafe do
+        if verdict ~= 0ULL then
+            storeHalf(verdict, math.u32.wrap(RELOAD_NO_CHANGE))
+        end
+        if generation ~= 0ULL then
+            storeWord(generation, 0ULL)
+        end
+    end
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = reloadStep(runtime, reload, verdict, generation, step, error)
+    leave(state)
+
+    return status
+end
+
+export function nupp_reload_prepare(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, error: uint64): int32
+    return steppedReload(runtime, reload, verdict, generation, STEP_PREPARE, error)
+end
+
+export function nupp_reload_apply(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, error: uint64): int32
+    return steppedReload(runtime, reload, verdict, generation, STEP_APPLY, error)
+end
+
+export function nupp_reload_poll(runtime: uint64, reload: uint64, verdict: uint64, generation: uint64, error: uint64): int32
+    return steppedReload(runtime, reload, verdict, generation, STEP_POLL, error)
+end
+
+--- The diagnostics behind the last poll's verdict, or null when it had none.
+--- The bytes belong to the session and are replaced by the next poll.
+export function nupp_reload_message(reload: uint64): uint64
+    local name = nameOf(reload)
+    if name == nil then
+        return 0ULL
+    end
+    @unsafe do
+        if (name as Name*).kind ~= NAME_RELOAD then
+            return 0ULL
+        end
+        return (name as Name*).message
+    end
+end
+
+local function reloadClose(runtime: uint64, reload: uint64, ok: int32, error: uint64): int32
+    local name = reloadFor(reload, error)
+    if name == nil then
+        return STATUS_INVALID_ARGUMENT
+    end
+    if not reloadOpen(runtime, name as Name*, error) then
+        return STATUS_RUNTIME
+    end
+
+    return closeSession(runtime, name as Name*, ok ~= 0, error)
+end
+
+export function nupp_reload_close(runtime: uint64, reload: uint64, ok: int32, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = reloadClose(runtime, reload, ok, error)
+    leave(state)
+
+    return status
+end
+
+export function nupp_reload_free(reload: uint64): nil
+    local name = nameOf(reload)
+    if name == nil then
+        return
+    end
+    lock()
+    @unsafe do
+        if map.nuppHostMapGet(names, reload) == name as uint64 and (name as Name*).kind == NAME_RELOAD then
+            dropNameLocked(name as uint64)
+        end
+    end
+    unlock()
+end
+
+-- Host requests ----------------------------------------------------------------
+
+--- A kind is two or more dot-separated names of letters, digits, `_` and `-`,
+--- outside the runtime's own `nupp.` names.
+local function checkedKind(kind: uint64, error: uint64): int32
+    local length = strlen(kind as cstring)
+    local bytes = kind as uint8*
+    local wellFormedKind = length ~= 0ULL and length <= 128ULL
+    local dotted = false
+    local previous = 46
+    for index = 0, (length as integer) - 1 do
+        local byte = 0
+        @unsafe do
+            byte = bytes[index]
+        end
+        local letter = (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+        if byte == 46 then
+            dotted = true
+            if previous == 46 then
+                wellFormedKind = false
+            end
+        elseif not letter and byte ~= 95 and byte ~= 45 then
+            wellFormedKind = false
+        end
+        previous = byte
+    end
+    if not dotted or previous == 46 then
+        wellFormedKind = false
+    end
+    if not wellFormedKind then
+        snprintf(text, 1024ULL, "host kind \"%s\" must be dot-separated names", kind as cstring)
+        return reportText(error, STATUS_INVALID_ARGUMENT, ERROR_CONFIGURATION)
+    end
+    if length >= 5ULL and memcmp(kind as voidptr, "nupp." as voidptr, 5ULL) == 0 then
+        snprintf(text, 1024ULL, "host kind %s is reserved for the runtime", kind as cstring)
+        return reportText(error, STATUS_INVALID_ARGUMENT, ERROR_CONFIGURATION)
+    end
+
+    return STATUS_OK
+end
+
+--- The channel answering this runtime's host requests, or 0 with the refusal
+--- reported when another runtime attached to the state answers them.
+local function hostChannelOf(runtime: uint64, error: uint64): uint64
+    local r = runtimeOf(runtime)
+    @unsafe do
+        if r.answersHost == 0 then
+            refuse(
+                error,
+                STATUS_INCOMPATIBLE,
+                ERROR_COMPATIBILITY,
+                "another runtime attached to this Lua state answers its host requests"
+            )
+            return 0ULL
+        end
+        return r.channel
+    end
+end
+
+local function hostRegister(runtime: uint64, kind: uint64, handler: uint64, cancel: uint64, userdata: uint64, error: uint64): int32
+    if kind == 0ULL then
+        return invalid(error, ERROR_CONFIGURATION, "nupp_host_register needs a kind")
+    end
+    local status = checkedKind(kind, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    local box = hostChannelOf(runtime, error)
+    if box == 0ULL then
+        return STATUS_INCOMPATIBLE
+    end
+    if not channel.nuppEmbedChannelRegister(box, kind, strlen(kind as cstring), handler, cancel, userdata) then
+        return outOfMemory(error, ERROR_CONFIGURATION)
+    end
+
+    return STATUS_OK
+end
+
+export function nupp_host_register(
+    runtime: uint64,
+    kind: uint64,
+    handler: uint64,
+    cancel: uint64,
+    userdata: uint64,
+    error: uint64
+): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = hostRegister(runtime, kind, handler, cancel, userdata, error)
+    leave(state)
+
+    return status
+end
+
+--- Checks one answered value against what the channel's value model carries:
+--- no handle, no non-finite number, no text that is not UTF-8, nothing past its
+--- size limit.
+local function checkedAnswer(position: integer, value: HostValue*, error: uint64): int32
+    local problem = ""
+    @unsafe do
+        local kind = value.kind as integer
+        if kind == VALUE_NIL or kind == VALUE_BOOLEAN then
+            return STATUS_OK
+        elseif kind == VALUE_NUMBER then
+            local number = value.number
+            -- Infinity less itself is NaN, as NaN less anything is.
+            if number - number ~= 0 then
+                problem = "is not a finite number"
+            end
+        elseif kind == VALUE_STRING then
+            if value.length > (channel.MAX_STRING_BYTES as uint64) then
+                problem = "is a string longer than 64 KiB; answer bytes"
+            elseif value.length ~= 0ULL and value.data == 0ULL then
+                problem = "has a length but no bytes"
+            elseif not wellFormed(value.data, value.length) then
+                problem = "is a string that is not UTF-8; answer bytes"
+            end
+        elseif kind == VALUE_BYTES then
+            if value.length > (channel.MAX_ANSWER_BYTES as uint64) then
+                problem = "is more than 8 MiB of bytes"
+            elseif value.length ~= 0ULL and value.data == 0ULL then
+                problem = "has a length but no bytes"
+            end
+        elseif kind == VALUE_HANDLE then
+            problem = "is a handle, which a host answer cannot carry"
+        else
+            problem = "has an unknown kind"
+        end
+    end
+    if strlen(problem) == 0ULL then
+        return STATUS_OK
+    end
+    snprintf(text, 1024ULL, "host answer value %d %s", math.i32.wrap(position), problem)
+
+    return reportText(error, STATUS_INVALID_ARGUMENT, ERROR_RUNTIME)
+end
+
+local function answerFailure(request: uint64, outcome: int32, error: uint64): int32
+    if outcome == channel.UNKNOWN then
+        snprintf(text, 1024ULL, "no host request %llu is waiting for an answer", request)
+    else
+        snprintf(text, 1024ULL, "host request %llu was already answered", request)
+    end
+
+    return reportText(error, STATUS_INVALID_ARGUMENT, ERROR_RUNTIME)
+end
+
+local function hostAnswer(runtime: uint64, request: uint64, results: uint64, count: uint64, error: uint64): int32
+    local box = hostChannelOf(runtime, error)
+    if box == 0ULL then
+        return STATUS_INCOMPATIBLE
+    end
+    if count > (channel.MAX_VALUES as uint64) then
+        return invalid(error, ERROR_RUNTIME, "a host answer carries at most 255 values")
+    end
+    if count > 0ULL and results == 0ULL then
+        return invalid(error, ERROR_RUNTIME, "nupp_host_answer was given a count without its values")
+    end
+    for index = 0, (count as integer) - 1 do
+        local status = checkedAnswer(index + 1, hostValueAt(results, index), error)
+        if status ~= STATUS_OK then
+            return status
+        end
+    end
+    local owned = channel.nuppEmbedChannelCopyValues(results, count)
+    if owned == 0ULL then
+        return outOfMemory(error, ERROR_RUNTIME)
+    end
+    local outcome = channel.nuppEmbedChannelAnswer(box, request, owned, count)
+    if outcome ~= channel.ANSWERED then
+        return answerFailure(request, outcome, error)
+    end
+
+    return STATUS_OK
+end
+
+export function nupp_host_answer(runtime: uint64, request: uint64, results: uint64, count: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = hostAnswer(runtime, request, results, count, error)
+    leave(state)
+
+    return status
+end
+
+local function hostPush(runtime: uint64, kind: uint64, values: uint64, count: uint64, error: uint64): int32
+    local box = hostChannelOf(runtime, error)
+    if box == 0ULL then
+        return STATUS_INCOMPATIBLE
+    end
+    if kind == 0ULL then
+        return invalid(error, ERROR_RUNTIME, "nupp_host_push needs a kind")
+    end
+    local status = checkedKind(kind, error)
+    if status ~= STATUS_OK then
+        return status
+    end
+    if count > (channel.MAX_VALUES as uint64) then
+        return invalid(error, ERROR_RUNTIME, "a pushed host message carries at most 255 values")
+    end
+    if count > 0ULL and values == 0ULL then
+        return invalid(error, ERROR_RUNTIME, "nupp_host_push was given a count without its values")
+    end
+    for index = 0, (count as integer) - 1 do
+        local value = hostValueAt(values, index)
+        if @unsafe(value.kind == (VALUE_BYTES as uint32)) then
+            snprintf(
+                text,
+                1024ULL,
+                "pushed value %d is bytes; an inbound message carries scalars and strings",
+                math.i32.wrap(index + 1)
+            )
+            return reportText(error, STATUS_INVALID_ARGUMENT, ERROR_RUNTIME)
+        end
+        status = checkedAnswer(index + 1, value, error)
+        if status ~= STATUS_OK then
+            return status
+        end
+    end
+    local owned = channel.nuppEmbedChannelCopyValues(values, count)
+    if owned == 0ULL or not channel.nuppEmbedChannelPush(box, kind, strlen(kind as cstring), owned, count) then
+        return outOfMemory(error, ERROR_RUNTIME)
+    end
+
+    return STATUS_OK
+end
+
+export function nupp_host_push(runtime: uint64, kind: uint64, values: uint64, count: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = hostPush(runtime, kind, values, count, error)
+    leave(state)
+
+    return status
+end
+
+const DEFAULT_FAILURE = "the host failed the request"
+
+local function hostFail(runtime: uint64, request: uint64, message: uint64, error: uint64): int32
+    local box = hostChannelOf(runtime, error)
+    if box == 0ULL then
+        return STATUS_INCOMPATIBLE
+    end
+    local reason = message
+    if reason == 0ULL then
+        reason = DEFAULT_FAILURE as uint64
+    end
+    local outcome = channel.nuppEmbedChannelFail(box, request, reason, strlen(reason as cstring))
+    if outcome ~= channel.ANSWERED then
+        return answerFailure(request, outcome, error)
+    end
+
+    return STATUS_OK
+end
+
+export function nupp_host_fail(runtime: uint64, request: uint64, message: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status = hostFail(runtime, request, message, error)
+    leave(state)
+
+    return status
+end
+
+-- Polling and shutdown ---------------------------------------------------------
+
+export function nupp_runtime_poll(runtime: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    local status: int32 = STATUS_OK
+    if not usable(runtime, error, ERROR_RUNTIME) then
+        status = STATUS_RUNTIME
+    else
+        local record = newCall(error, ERROR_RUNTIME)
+        if record == 0ULL then
+            status = STATUS_RUNTIME
+        else
+            if lua.nuppEmbedLuaPoll(stateOf(runtime), record) ~= 0 then
+                status = luaFailure(error, record, ERROR_RUNTIME)
+            end
+            lua.nuppEmbedLuaCallFree(record)
+        end
+    end
+    leave(state)
+
+    return status
+end
+
+--- Shuts a runtime down: closes the sessions it left open, gives back every
+--- reference its names hold, and closes its state if it owns one. The names
+--- themselves stay until the runtime is freed, refused as closed. Idempotent;
+--- a failed release leaves the state open, because closing Lua under roots it
+--- could not release is less safe than leaking it.
+local function shutdown(runtime: uint64, error: uint64): int32
+    local r = runtimeOf(runtime)
+    @unsafe do
+        if r.phase == CLOSED then
+            return STATUS_OK
+        end
+    end
+    local status: int32 = STATUS_OK
+    if @unsafe(r.phase == RUNNING) then
+        -- A session the host never closed is closed here, as a failed one: its
+        -- latch lives in the Lua state, which an attached runtime leaves running
+        -- for whatever attaches next.
+        local at = @unsafe(r.names)
+        while at ~= 0ULL do
+            local n = at as Name*
+            local next = @unsafe(n.next)
+            if @unsafe(n.kind == NAME_RELOAD and n.live ~= 0) then
+                closeSession(runtime, n, false, 0ULL)
+            end
+            at = next
+        end
+        @unsafe do
+            r.phase = SHUTTING_DOWN
+        end
+        at = @unsafe(r.names)
+        while at ~= 0ULL do
+            local n = at as Name*
+            @unsafe do
+                if n.live ~= 0 and n.kind ~= NAME_RELOAD then
+                    local call = lua.nuppEmbedLuaCall()
+                    if call == 0ULL then
+                        if status == STATUS_OK then
+                            status = outOfMemory(error, ERROR_RUNTIME)
+                        end
+                    else
+                        if lua.nuppEmbedLuaRelease(r.state as voidptr, call, n.reference) ~= 0 and status == STATUS_OK then
+                            status = luaFailure(error, call, ERROR_RUNTIME)
+                        end
+                        lua.nuppEmbedLuaCallFree(call)
+                    end
+                end
+                n.live = 0
+                at = n.next
+            end
+        end
+        if status ~= STATUS_OK then
+            return status
+        end
+    end
+    @unsafe do
+        if r.owned ~= 0 and r.state ~= 0ULL then
+            lua.nuppEmbedLuaClose(r.state as voidptr)
+        end
+        r.state = 0ULL
+        r.phase = CLOSED
+    end
+
+    return STATUS_OK
+end
+
+export function nupp_runtime_shutdown(runtime: uint64, error: uint64): int32
+    local state = enter(runtime, error)
+    if state < 0LL then
+        return entryStatus(state)
+    end
+    if state ~= 0LL and enteredCount(state as uint64) > 1ULL then
+        leave(state)
+        return refuse(
+            error,
+            STATUS_RUNTIME,
+            ERROR_RUNTIME,
+            "a Nupp runtime cannot shut down while a call into its Lua state is running; shut it down after that call returns"
+        )
+    end
+    detachHostChannel(runtime)
+    local status = shutdown(runtime, error)
+    leave(state)
+
+    return status
+end
+
+--- Frees a runtime: shuts it down when its owner frees it, retires every name
+--- it issued, and frees its channel. Shut down from another thread, its state
+--- is leaked rather than closed under the thread that owns it.
+local function freeRuntime(runtime: uint64)
+    local r = runtimeOf(runtime)
+    detachHostChannel(runtime)
+    local owner = @unsafe(sys.nuppHostSysThreadId() == r.owner)
+    if owner then
+        shutdown(runtime, 0ULL)
+    end
+    lock()
+    @unsafe do
+        while r.names ~= 0ULL do
+            dropNameLocked(r.names)
+        end
+    end
+    unlock()
+    channel.nuppEmbedChannelFree(@unsafe(r.channel))
+    free(runtime as voidptr)
+end
+
+export function nupp_runtime_free(runtime: uint64): nil
+    if runtime == 0ULL then
+        return
+    end
+    freeLater = freeRuntime
+    local r = runtimeOf(runtime)
+    @unsafe do
+        local state = r.state
+        if sys.nuppHostSysThreadId() == r.owner and state ~= 0ULL and enteredCount(state) > 0ULL then
+            -- Freed from beneath a call that is still using it: the last call to
+            -- leave the state frees it.
+            lock()
+            r.deferredState = state
+            r.nextDeferred = deferred
+            deferred = runtime
+            unlock()
+            return
+        end
+    end
+    freeRuntime(runtime)
+end
+
+-- Errors -----------------------------------------------------------------------
+
+export function nupp_error_status(error: uint64): int32
+    if error == 0ULL then
+        return STATUS_OK
+    end
+
+    return @unsafe((error as Error*).status)
+end
+
+export function nupp_error_category(error: uint64): int32
+    if error == 0ULL then
+        return 0
+    end
+
+    return @unsafe((error as Error*).category)
+end
+
+export function nupp_error_message(error: uint64): uint64
+    if error == 0ULL then
+        return EMPTY as uint64
+    end
+
+    return @unsafe((error as Error*).message)
+end
+
+export function nupp_error_message_length(error: uint64): uint64
+    if error == 0ULL then
+        return 0ULL
+    end
+
+    return @unsafe((error as Error*).length)
+end
+
+export function nupp_error_free(error: uint64): nil
+    if error == 0ULL then
+        return
+    end
+    @unsafe do
+        free((error as Error*).message as voidptr)
+    end
+    free(error as voidptr)
+end

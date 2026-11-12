@@ -132,6 +132,23 @@ cdef struct Call
     count: uint64
 end
 
+--- 1 for true, 0 for false.
+local function flag(condition: boolean): int32
+    if condition then
+        return 1
+    end
+
+    return 0
+end
+
+local function flag64(condition: boolean): int64
+    if condition then
+        return 1LL
+    end
+
+    return 0LL
+end
+
 -- Failures ---------------------------------------------------------------------
 
 local function recordOf(call: uint64): Call*
@@ -419,7 +436,7 @@ end
 --- passing a state with no jit library at all only when `allowMissing`.
 export function nuppEmbedLuaVerify(borrows L: voidptr, call: uint64, allowMissing: boolean): int32
     @unsafe do
-        recordOf(call).integer = allowMissing and 1LL or 0LL
+        recordOf(call).integer = flag64(allowMissing)
     end
 
     return protect(L, call as Call*, verifyCompatibility)
@@ -648,7 +665,7 @@ local function installHostChannel(L: voidptr): int32
     @unsafe do
         if lua_type(L, -1) ~= TNIL then
             local present = lua_touserdata(L, -1)
-            call.answer = (present ~= nil and present as uint64 == call.first) and 1LL or 0LL
+            call.answer = flag64((present ~= nil and present as uint64 == call.first))
             return 0
         end
     end
@@ -722,7 +739,7 @@ local function workerHostInstalled(L: voidptr): int32
     lua_pushstring(L, "__nuppWorkerHost")
     lua_rawget(L, GLOBALS)
     @unsafe do
-        call.answer = lua_type(L, -1) == TNIL and 0LL or 1LL
+        call.answer = flag64(not (lua_type(L, -1) == TNIL))
     end
 
     return 0
@@ -736,7 +753,7 @@ local function hostFrozen(L: voidptr): int32
     local call = callOf(L)
     lua_getfield(L, REGISTRY, HOST_FROZEN_KEY)
     @unsafe do
-        call.answer = lua_toboolean(L, -1) ~= 0 and 1LL or 0LL
+        call.answer = flag64(lua_toboolean(L, -1) ~= 0)
     end
 
     return 0
@@ -1070,7 +1087,7 @@ local function pushValue(borrows L: voidptr, borrows value: Value*)
         if kind == VALUE_NIL then
             lua_pushnil(L)
         elseif kind == VALUE_BOOLEAN then
-            lua_pushboolean(L, value.boolean ~= 0 and 1 or 0)
+            lua_pushboolean(L, flag(value.boolean ~= 0))
         elseif kind == VALUE_NUMBER then
             lua_pushnumber(L, value.number)
         elseif kind == VALUE_BYTES then
@@ -1092,7 +1109,7 @@ local function takeValue(borrows L: voidptr, borrows call: Call*, index: int32, 
             value.kind = VALUE_NIL
         elseif kind == TBOOLEAN then
             value.kind = VALUE_BOOLEAN
-            value.boolean = lua_toboolean(L, index) ~= 0 and 1 or 0
+            value.boolean = flag(lua_toboolean(L, index) ~= 0)
         elseif kind == TNUMBER then
             value.kind = VALUE_NUMBER
             value.number = lua_tonumber(L, index)

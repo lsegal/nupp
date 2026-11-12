@@ -154,6 +154,15 @@ const WAITING = 0
 const DONE = 1
 const FAILED = 2
 
+--- 1 for true, 0 for false.
+local function flag(condition: boolean): int32
+    if condition then
+        return 1
+    end
+
+    return 0
+end
+
 local function valueAt(values: uint64, index: integer): HostValue*
     return @unsafe((values + (index as uint64) * (ffi.sizeof(HostValue) as uint64)) as HostValue*)
 end
@@ -207,7 +216,7 @@ export function nuppEmbedChannelCopyValues(values: uint64, count: uint64): uint6
         @unsafe do
             to.kind = from.kind
             if from.kind == VALUE_BOOLEAN then
-                to.boolean = from.boolean ~= 0 and 1 or 0
+                to.boolean = flag(from.boolean ~= 0)
             elseif from.kind == VALUE_NUMBER then
                 to.number = from.number
             elseif from.kind == VALUE_STRING or from.kind == VALUE_BYTES then
@@ -225,7 +234,11 @@ export function nuppEmbedChannelCopyValues(values: uint64, count: uint64): uint6
 end
 
 local function ownedValues(values: uint64): uint64
-    return values == 1ULL and 0ULL or values
+    if values == 1ULL then
+        return 0ULL
+    end
+
+    return values
 end
 
 -- The channel ------------------------------------------------------------------
@@ -415,7 +428,8 @@ local function queueReady(channel: uint64, request: uint64): boolean
     end
     @unsafe do
         local c = channel as Channel*
-        (node as Ready*).request = request
+        local fresh = node as Ready*
+        fresh.request = request
         if c.readyTail == 0ULL then
             c.readyHead = node as uint64
         else
@@ -493,7 +507,9 @@ export function nuppEmbedChannelFail(channel: uint64, request: uint64, message: 
             return ANSWERED
         end
         r.message = copyBytes(message, length)
-        r.messageLength = r.message == 0ULL and 0ULL or length
+        if r.message ~= 0ULL then
+            r.messageLength = length
+        end
         r.state = FAILED
     end
     queueReady(channel, request)
@@ -579,7 +595,7 @@ local function requestId(borrows L: voidptr, index: int32): uint64
 end
 
 local function attached(L: voidptr): int32
-    lua_pushboolean(L, channelOf(L) ~= 0ULL and 1 or 0)
+    lua_pushboolean(L, flag(channelOf(L) ~= 0ULL))
 
     return 1
 end
@@ -628,7 +644,9 @@ local function dispatchValues(borrows L: voidptr, count: integer, hasBytes: bool
                     value.kind = VALUE_STRING
                     if length ~= nil then
                         local text = lua_tolstring(L, index, length as voidptr)
-                        value.data = text == nil and 0ULL or text as uint64
+                        if text ~= nil then
+                            value.data = text as uint64
+                        end
                         value.length = (length as uint64*)[0]
                         free(length as voidptr)
                     end
@@ -745,7 +763,7 @@ local function dispatch(L: voidptr): int32
         local r = entry as Request*
         r.kind = copy
         r.kindLength = length
-        r.post = operation == 1LL and 1 or 0
+        r.post = flag(operation == 1LL)
         if not map.nuppHostMapPut(c.requests, request, entry as uint64) then
             freeRequest(entry as uint64)
             return luaL_error(L, "out of memory dispatching a host request")
