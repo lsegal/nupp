@@ -265,6 +265,90 @@ end
     assert(ran:find("failed with 7 and more", 1, true), ran)
 end
 
+-- An argument in a variadic position passes as C passes it, by its type: a C
+-- integer as an `int`, promoted to one when narrower, a `float` and a number as
+-- a `double`, and an `int64` as itself.
+function M.variadicArgumentsPassAsCPassesThem()
+    requireCodegen()
+    local executable, output = link([[
+cdef function printf(borrows format: cstring, ...): int32
+cdef function calloc(count: uint64, size: uint64): voidptr
+cdef function free(borrows p: voidptr)
+
+cdef struct Small
+    tag: int8
+    count: uint16
+end
+
+local function main(): int32
+    local count: int32 = -7
+    local id: uint32 = 4000000000
+    local ratio: float = math.f32.narrow(0.5)
+    local small = calloc(1, 16) as Small*
+    @unsafe do
+        small.tag = -5
+        small.count = 65535
+        printf(
+            "%d %d %u %d %d %d %g %g %lld\n",
+            count,
+            math.i32.wrap(9),
+            id,
+            small.tag,
+            small.count,
+            true,
+            ratio,
+            count + 0.25,
+            12LL
+        )
+    end
+    free(small)
+    printf("%d\n", (count * 3) as int32)
+    return 0
+end
+]])
+    assert(executable ~= nil, output)
+    assert(not output:find("NUPP2514", 1, true), output)
+    local status, ran = run(quote(executable))
+    test.eq(status, 0, ran)
+    test.eq(ran, "-7 9 4000000000 -5 65535 1 0.5 -6.75 12\n-21")
+end
+
+-- `open` reads its mode after the flags as a variadic `int`, so an `int32` mode
+-- creates the file with the permissions it names: here owner read and write.
+function M.openReadsAnInt32ModeAsAnInt()
+    requireCodegen()
+    local windows = jit.os == "Windows"
+    local flags = windows and 0x301 or jit.os == "OSX" and 0x601 or 0x241
+    local open, close = windows and "_open" or "open", windows and "_close" or "close"
+    local executable, output = link(([[
+cdef function %s(borrows path: cstring, flags: int32, ...): int32
+cdef function %s(fd: int32): int32
+
+local function main(): int32
+    local mode: int32 = 384
+    local fd = %s("mode.txt", %d, mode)
+    if fd < 0 then
+        return 1
+    end
+    %s(fd)
+    return 0
+end
+]]):format(open, close, open, flags, close))
+    assert(executable ~= nil, output)
+    local dir = executable:match("^(.*)/")
+    local status, ran = run(("cd %s && %s"):format(quote(dir), quote(executable)))
+    test.eq(status, 0, ran)
+    if windows then
+        -- The CRT makes the file read-only unless the mode has `_S_IWRITE`.
+        local handle = io.open(dir .. "/mode.txt", "ab")
+        assert(handle ~= nil, "mode.txt was created read-only")
+        handle:close()
+    else
+        local _, listed = run("ls -l " .. quote(dir .. "/mode.txt"))
+        test.eq(listed:sub(1, 10), "-rw-------", listed)
+    end
+end
+
 -- A function-typed field of a `cdef struct` holds a C function pointer: one
 -- written from a program function, from a C function and from a pointer a C
 -- function returns, and each called back through the field.

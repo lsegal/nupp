@@ -88,6 +88,26 @@ fixed-width, and they wrap as LuaJIT's do. `math.floor`, `math.ceil`,
 the signed word back, and an `int64` or `uint64` operand makes the operation
 64-bit.
 
+An argument in a variadic position passes as C passes it, by the type it has. A
+`number` or `integer` is a `double`, and so is a `float`, which C promotes. An
+`int32` or `uint32` passes as a 32-bit `int`, and an `int8`, `uint8`, `int16`,
+`uint16` or `boolean` is promoted to one. An `int64` or `uint64` passes as
+itself. So a value read from an `int32` local or field, returned by
+`math.i32.wrap`, or cast with `as int32` matches `%d`, or the `mode_t` that
+`open` reads after its flags, and a plain number matches `%g`. Arithmetic gives
+a `number` back, so cast its result when C expects an integer. This differs from
+LuaJIT's FFI, which passes every number as a `double`:
+
+```nupp
+cdef function printf(borrows format: cstring, ...): int32
+
+local function main(): int32
+    local count: int32 = 7
+    printf("%d %g %d\n", count, count + 0.5, (count * 2) as int32)
+    return 0
+end
+```
+
 ## Calling into LuaJIT
 
 LuaJIT is just another C library to a native program. Declare the parts of its

@@ -503,11 +503,15 @@ local function run(options: any): integer
         environment.config._target.gpuBindings = policy == "require" or policy == "require-wasm"
     end
     local checked: {any}? = asJson and {} or nil
-    local tree, source = require("nupp.tools.cli.compile").check(path, environment as {[string]: any}, {}, checked)
+    local linked = NATIVE_LINKAGES[options.emit or ""] ~= nil
+    local checkOptions = linked and require("nupp.tools.build.program").checkOptions(environment) or {}
+    local tree, source = require(
+        "nupp.tools.cli.compile"
+    ).check(path, environment as {[string]: any}, checkOptions, checked)
     if tree == nil then
         return checked and report.failure(REPORT_SCHEMA, checked, {file = path}) or 1
     end
-    if NATIVE_LINKAGES[options.emit or ""] ~= nil then
+    if linked then
         return native(tree, path, options, environment, selected as targets.Target, refuse)
     end
 

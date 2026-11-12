@@ -39,6 +39,22 @@ record program.Refusal
     file: string?
 end
 
+--- What a native program's modules are checked with: the project's lint
+--- levels, with `jit-boundary` off, because a native program runs no LuaJIT
+--- trace for an FFI call to stop.
+function program.checkOptions(environment: any?): {[string]: any}
+    local levels: {[string]: string} = {}
+    local config = environment ~= nil and (environment as any).config or nil
+    if config ~= nil and type(config.lints) == "table" then
+        for name, level in pairs(config.lints as {[string]: string}) do
+            levels[name] = level
+        end
+    end
+    levels["jit-boundary"] = "off"
+
+    return {lints = levels}
+end
+
 --- The module `tree` declares itself to be with `module`, if it does.
 local function declaredName(tree: any): string?
     for _, block in ipairs(tree.root.blocks) do
@@ -86,7 +102,7 @@ local function units(tree: any, path: string?, environment: any?, diagnostics: {
                 end
                 local checked = require(
                     "nupp.tools.cli.compile"
-                ).check(found as string, environment as {[string]: any}, {}, diagnostics)
+                ).check(found as string, environment as {[string]: any}, program.checkOptions(environment), diagnostics)
                 if checked == nil then
                     return nil, program.Refusal(message = "module " .. name .. " does not check", file = found)
                 end
@@ -248,7 +264,7 @@ function program.build(root: string, config: Config, target: Target, name: strin
     end
     local tree = require(
         "nupp.tools.cli.compile"
-    ).check(path as string, environment as {[string]: any}, {}, opts.diagnostics)
+    ).check(path as string, environment as {[string]: any}, program.checkOptions(environment), opts.diagnostics)
     if tree == nil then
         return nil, nil, nil
     end

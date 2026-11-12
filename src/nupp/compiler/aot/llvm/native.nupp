@@ -994,11 +994,12 @@ local function call(program: Program, body: Body, node: cst.Call): Value
         local wanted = target.params[index]
         local lowered = expression(program, body, argument, wanted)
         if wanted == nil then
-            -- What LuaJIT passes a variadic parameter: a number, refinements
-            -- included, as a double, a boolean as an int, an `int64` as itself.
-            if lowered.kind.llvm == "i1" then
-                lowered = Value(text = value(body, "zext i1 " .. lowered.text .. " to i32"), kind = I32)
-            elseif isFloat(lowered.kind) or isInteger(lowered.kind) and lowered.kind.llvm ~= "i64" then
+            -- What C passes a variadic parameter: a C integer narrower than an
+            -- `int` promoted to one, a boolean as an int, a `float` as a
+            -- double, and every other value, a number a double, as itself.
+            if lowered.kind.llvm == "i1" or isInteger(lowered.kind) and (WIDTHS[lowered.kind.llvm] as integer) < 32 then
+                lowered = convert(body, lowered, I32, argument)
+            elseif lowered.kind.llvm == "float" then
                 lowered = convert(body, lowered, F64, argument)
             end
         else
