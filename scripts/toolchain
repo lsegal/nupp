@@ -599,6 +599,9 @@ codegen_archive() {
     NUPP_REQUIRE_CODEGEN=1
     export NUPP_REQUIRE_CODEGEN
     build_rust_native "$PREBUILT_PROVIDER_FEATURES"
+    # A checkout that takes this provider has no Cargo to link the runtime in.
+    [ -n "$AOT_RUNTIME_OUT" ] \
+        || die "the code generator archive carries the AOT runtime; build the compiler first (./bin/nupp --version)"
     prebuilt_pins
     [ -n "$prebuilt_library" ] || die "no prebuilt code generator is published for $PREBUILT_TARGET"
     codegen_staging=$(mktemp -d "${TMPDIR:-/tmp}/nupp-codegen.XXXXXX") || die "cannot stage the code generator"
