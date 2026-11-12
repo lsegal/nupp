@@ -2,14 +2,15 @@
 How a Lua-builder entry reaches the Lua C API and the AOT runtime.
 
 The Lua API is called directly: the process that loads the module is the one
-running the VM, and it exports the API. The runtime -- `ks_lua.h`, compiled once
-into the native provider as `ks_rt.c` -- is reached through the table of
-pointers that file ends with, which the registrar fetches and keeps in `@ks_rt`.
+running the VM, and it exports the API. The runtime -- a native Nupp program,
+`native/aotruntime`, linked into the native provider -- is reached through the
+table of pointers it exports, `ks_rt_table`, which the registrar fetches and
+keeps in `@ks_rt`.
 Nothing about the runtime is a symbol, so nothing has to be resolved when the
 module loads, on any platform.
 
 `SLOTS` is that table's order, and it is the ABI: a test holds it to
-`ks_rt.c`. Every argument is a pointer, a `size_t`, a 64-bit integer or a
+`native/aotruntime/common/ksrt/runtime.nupp`. Every argument is a pointer, a `size_t`, a 64-bit integer or a
 double, narrow values widened by the caller, and nothing is passed or
 returned by value.
 ]]
@@ -24,7 +25,7 @@ local runtime = {}
 const runtime.VERSION = 1
 
 --- The bytes generated code sets aside for a value stream's state, at
---- least the runtime's `sizeof(KsLuaBuilder)` (slot 1).
+--- least the runtime's `ffi.sizeof(Builder)` (slot 1).
 const runtime.BUILDER_BYTES = 4096
 
 --- The bytes set aside for a string accumulator: LuaJIT's `luaL_Buffer`

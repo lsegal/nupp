@@ -1,0 +1,120 @@
+--[[
+The versioned Rust-native provider ABI, an internal boundary between the
+compiler's runtime and the provider built from the same checkout. The pinned
+stage-zero compiler also loads it and requires this version exactly, so the ABI
+grows only by addition: see "Provider ABI evolution" in
+docs/reference/native-runtime.md. A call that returns an int32 status returns
+NUPP_NATIVE_INTERNAL for a panic inside it rather than aborting.
+
+This is the ABI's definition. The header a C consumer includes is generated from
+it (`scripts/native-abi-header`, which runs `nupp export-c`), and the provider's
+own tests hold its exports and feature bits to it.
+
+A call that copies bytes into caller-owned storage writes the byte count to its
+length output first, then returns BUFFER_TOO_SMALL when the capacity is short.
+A zero-capacity call therefore asks the size of a nonempty value, and no copied
+output carries a trailing NUL. Every `size_t` of the ABI is a `uint64_t` here,
+the width it has on every platform a provider is built for.
+]]
+module nupp_native
+
+export const NUPP_NATIVE_ABI_VERSION = 2
+
+export const NUPP_NATIVE_OK = 0
+export const NUPP_NATIVE_INVALID_ARGUMENT = 1
+--- A handle table or a provider resource limit is exhausted.
+export const NUPP_NATIVE_CAPACITY = 2
+export const NUPP_NATIVE_STALE_HANDLE = 3
+export const NUPP_NATIVE_CLOSED = 4
+export const NUPP_NATIVE_INTERNAL = 5
+--- An output buffer is too small, and the call's length output holds the byte
+--- count it needs. nuppNativeBytesCopy still returns CAPACITY here, because the
+--- pinned stage-zero compiler reads that code as its size-probe answer.
+export const NUPP_NATIVE_BUFFER_TOO_SMALL = 6
+--- A value does not fit the range its ABI type, or Nupp's exact integers, can
+--- carry.
+export const NUPP_NATIVE_OUT_OF_RANGE = 7
+--- The facility is absent from this machine.
+export const NUPP_NATIVE_UNAVAILABLE = 8
+
+export const NUPP_NATIVE_FEATURE_BASE = 1
+-- Bit 1 was UUIDs, bit 2 the GPU provider, bit 4 HTTP, bits 5 to 7 processes,
+-- files and the file-transfer lane, bits 8 and 9 the network and TLS families
+-- and bit 13 their endpoint calls. Nupp provides all of them now.
+export const NUPP_NATIVE_FEATURE_URI = 8
+--- The code generator. Its exports belong to the compiler, which declares
+--- them itself; this definition does not.
+export const NUPP_NATIVE_FEATURE_CODEGEN = 2048
+--- The AOT runtime, `nuppAotRuntime`: a provider built before its checkout had
+--- a compiler to build the runtime with has none.
+export const NUPP_NATIVE_FEATURE_AOT_RUNTIME = 4096
+--- The process-wide readiness generation, nuppNativePoll and nuppNativeWait.
+export const NUPP_NATIVE_FEATURE_READINESS = 16384
+
+cdef function nuppNativeAbiVersion(): uint32
+cdef function nuppNativeFeatures(): uint64
+--- The message of the last call on this thread that failed. A call that
+--- succeeds leaves it as it was, so read it only after a failure.
+cdef function nuppNativeLastError(): cstring
+
+--- Present when NUPP_NATIVE_FEATURE_AOT_RUNTIME is set: the table an
+--- ahead-of-time compiled Lua module's registrar is handed. Null when the
+--- runtime cannot find the Lua API in this process.
+cdef function nuppAotRuntime(): voidptr?
+
+cdef function nuppNativeBytesCopy(handle: uint64, data: uint8*?, capacity: uint64, length: uint64*?): int32
+cdef function nuppNativeBytesRelease(handle: uint64): int32
+
+cdef function nuppNativeAvailableParallelism(): uint64
+
+--- Test-only: defined only by a provider built with its panic-probe feature,
+--- which no release selects. It panics inside the export boundary, so it
+--- returns NUPP_NATIVE_INTERNAL with the panic as the last error.
+cdef function nuppNativePanicProbe(): int32
+
+--- Present when NUPP_NATIVE_FEATURE_READINESS is set. One process-wide
+--- generation that every family advances when something a caller could be
+--- waiting for changes. A caller waiting on any mix of them sleeps here once;
+--- the families Nupp provides through the FFI sleep on their own handles and
+--- the wake handle below instead.
+---
+--- Poll the generation first, then check the resources you are waiting for
+--- with their non-blocking calls, and wait from the generation you polled:
+--- any change after the poll returns the wait at once, so no edge is lost. A
+--- wake says only that something changed; check again after every wait.
+cdef function nuppNativePoll(generation: uint64*?): int32
+cdef function nuppNativeWait(generation: uint64, timeoutMs: uint64, outputGeneration: uint64*?): int32
+
+--- Present when NUPP_NATIVE_FEATURE_READINESS is set, for a caller that has to
+--- sleep on handles of its own as well as the generation. Open answers a
+--- waitable handle every advance of the generation signals: a manual-reset
+--- event HANDLE on Windows, and on POSIX the nonblocking read end of a pipe
+--- that receives a byte. Reset it (ResetEvent, or read the pipe dry), poll the
+--- generation, check, and then wait on it with the other handles. Close stops
+--- signalling the handle and closes it.
+cdef function nuppNativeWakeOpen(handle: uint64*?): int32
+cdef function nuppNativeWakeClose(handle: uint64): int32
+
+--- Present when NUPP_NATIVE_FEATURE_URI is set. URI values are immutable
+--- generational handles. Text and components are copied into caller-owned
+--- storage; `kind` is one of the NUPP_NATIVE_URI_* parts.
+export const NUPP_NATIVE_URI_TEXT = 0
+export const NUPP_NATIVE_URI_SCHEME = 1
+export const NUPP_NATIVE_URI_AUTHORITY = 2
+export const NUPP_NATIVE_URI_USERNAME = 3
+export const NUPP_NATIVE_URI_PASSWORD = 4
+export const NUPP_NATIVE_URI_HOST = 5
+export const NUPP_NATIVE_URI_PATH = 6
+export const NUPP_NATIVE_URI_QUERY = 7
+export const NUPP_NATIVE_URI_FRAGMENT = 8
+cdef function nuppNativeUriParse(data: uint8*?, length: uint64, output: uint64*?): int32
+cdef function nuppNativeUriRelease(uri: uint64): int32
+cdef function nuppNativeUriPart(
+    uri: uint64,
+    kind: uint32,
+    output: uint8*?,
+    capacity: uint64,
+    length: uint64*?,
+    present: int32*?
+): int32
+cdef function nuppNativeUriPort(uri: uint64, port: int32*?): int32

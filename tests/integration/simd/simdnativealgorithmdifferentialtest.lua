@@ -43,10 +43,11 @@ local function projectFiles(name)
         paths[#paths + 1] = ROOT .. "/src/nupp/codec/json/internal/decoder/fused.nupp"
         paths[#paths + 1] = ROOT .. "/tests/stdlib/serde/json/jsonfuseddifferentialtest.lua"
         -- The fused decoder builds its values through the native value-stream
-        -- builder, which the provider compiles from C rather than from source
-        -- the compiler fingerprint covers.
-        paths[#paths + 1] = ROOT .. "/native/crates/native/c/ks_lua.h"
-        paths[#paths + 1] = ROOT .. "/native/crates/native/c/ks_rt.c"
+        -- builder, which the provider links as a Nupp program the compiler
+        -- fingerprint does not cover.
+        for _, part in ipairs({"common/ksrt/builder.nupp", "common/ksrt/values.nupp", "bound/ksrt/api.nupp"}) do
+            paths[#paths + 1] = ROOT .. "/native/aotruntime/" .. part
+        end
     end
     table.sort(paths)
 
@@ -188,8 +189,8 @@ function M.fusedJsonKeyCoversTheNativeBuilder()
     for _, path in ipairs(projectFiles("fused-json")) do
         covered[path:sub(#ROOT + 2)] = true
     end
-    test(covered["native/crates/native/c/ks_lua.h"], "the fused-json key omits ks_lua.h")
-    test(covered["native/crates/native/c/ks_rt.c"], "the fused-json key omits ks_rt.c")
+    test(covered["native/aotruntime/common/ksrt/builder.nupp"], "the fused-json key omits the builder")
+    test(covered["native/aotruntime/common/ksrt/values.nupp"], "the fused-json key omits the runtime's values")
 end
 
 return M

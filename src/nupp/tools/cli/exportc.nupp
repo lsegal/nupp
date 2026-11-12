@@ -394,6 +394,8 @@ local function run(options: any): integer
     local checker = require("nupp.compiler.check")
     local allDiagnostics: {any} = {}
     local types, functions, sites = {}, {}, {}
+    -- Selection -> the integer an exported `const` is, which the header defines.
+    local constants: {[string]: integer} = {}
     -- Selection -> why that `@aot(export)` function has no C signature.
     local unexportable: {[string]: string} = {}
     local unexportableFiles: {[string]: string} = {}
@@ -441,6 +443,19 @@ local function run(options: any): integer
                     local qualified = (moduleName and moduleName .. "." or "") .. name
                     types[qualified], sites[qualified] = t, exports.typeDefs[name]
                 end
+                for name, t in pairs(exports and exports.values or {}) do
+                    local value: any = t
+                    while value ~= nil and value.tag == "const" do
+                        value = value.inner
+                    end
+                    if value ~= nil
+                        and value.tag == "literal"
+                        and type(value.constant) == "number"
+                        and math.floor(value.constant) == value.constant
+                    then
+                        constants[(moduleName and moduleName .. "." or "") .. name] = value.constant
+                    end
+                end
                 local context = {moduleName = moduleName, path = path, exports = {}}
                 walk(result.root, collectCdefFunction, context)
                 -- An export's prototype is what lowering made of it, so a file
@@ -481,6 +496,7 @@ local function run(options: any): integer
     end
     local cabi = require("nupp.compiler.cinterop.cabi")
     local aggregateDescriptions, functionSignatures = {}, {}
+    local definitions: {{name: string, value: integer}} = {}
     local described = {}
 
     local function describe(t: any, selection: string): boolean
@@ -560,6 +576,11 @@ local function run(options: any): integer
     for _, selection in ipairs(selections) do
         if types[selection] then
             describe(types[selection], selection)
+        elseif constants[selection] ~= nil then
+            definitions[#definitions + 1] = {
+                name = selection:match("([^.]+)$") as string,
+                value = constants[selection] as integer
+            }
         elseif functions[selection] then
             functionSignatures[#functionSignatures + 1] = functions[selection]
             for _, description in ipairs(functions[selection].elementStructs or {}) do
@@ -602,7 +623,7 @@ local function run(options: any): integer
 
     local text = nil
     if not failed then
-        local rendered, why = cabi.header(aggregateDescriptions, functionSignatures, output)
+        local rendered, why = cabi.header(aggregateDescriptions, functionSignatures, output, definitions)
         if not rendered then
             allDiagnostics[
                 #allDiagnostics + 1
@@ -640,7 +661,7 @@ local function run(options: any): integer
     return failed and 1 or 0
 end
 
---- Export canonical C declarations for Nupp structs and C functions.
+--- Export canonical C declarations for Nupp structs, constants and C functions.
 ---
 --- Examples:
 ---

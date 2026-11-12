@@ -357,12 +357,14 @@ end
 --- The linkage each native-program `--emit` asks for.
 const NATIVE_LINKAGES: {
     [string]: string
-} = {executable = "executable", ["static-library"] = "static", ["shared-library"] = "shared",}
+} = {executable = "executable", ["static-library"] = "static", ["shared-library"] = "shared", ["llvm-library"] = "ir",}
 
 --- Links the checked `tree`, with the modules it requires, as a native
 --- program: an executable whose `main` is its own, or a static or shared
 --- library, which needs none, writing it to `--output`. `--archive` links
---- more static archives in, and `--exports` names what it exports.
+--- more static archives in, and `--exports` names what it exports. A library's
+--- LLVM IR is written instead of anything linked, and to standard output
+--- without `--output`.
 local function native(
     tree: any,
     path: string,
@@ -373,10 +375,13 @@ local function native(
 ): integer
     local emit = options.emit as string
     local output = options.output as string?
-    if output == nil then
+    local linkage = NATIVE_LINKAGES[emit] or "executable"
+    if output == nil and linkage ~= "ir" then
         return usageError("--emit " .. emit .. " needs --output PATH")
     end
-    local linkage = NATIVE_LINKAGES[emit] or "executable"
+    if linkage == "ir" and (options.exports ~= nil or #(options.archive as {string}) > 0) then
+        return usageError("--emit llvm-library links nothing, so it takes no --exports or --archive")
+    end
     local exports: {string}? = nil
     if options.exports ~= nil then
         if linkage == "static" then
@@ -409,6 +414,16 @@ local function native(
             problem.line == nil and report.UNKNOWN_NAME or report.TOOL_FAILED,
             programs.describe(refusal as any, path)
         )
+    end
+    if linkage == "ir" then
+        if output == nil then
+            io.write(ir as string)
+            return 0
+        end
+        if not require("nupp.compiler.fs").writeFile(output as string, ir as string) then
+            return refuse(report.TOOL_FAILED, "cannot write " .. tostring(output))
+        end
+        return 0
     end
     local aotllvm = require("nupp.tools.build.aotllvm")
     local linked, linkErr = require(
@@ -691,6 +706,8 @@ end
 --- `--emit static-library` and `--emit shared-library` build it as a library,
 --- which needs no `main`; `--archive` links static archives in and `--exports`
 --- names every symbol the executable or shared library exports.
+--- `--emit llvm-library` writes the LLVM IR such a library is compiled from,
+--- for `--triple`, to `--output` or standard output, and links nothing.
 ---
 --- Examples:
 ---
@@ -702,14 +719,27 @@ end
 ---     nupp aot --format json src/kernel.nupp
 ---     nupp aot --emit executable --output build/host src/host.nupp
 ---     nupp aot --emit shared-library --exports nupp.exports --output build/libhost.so src/host.nupp
+---     nupp aot --emit llvm-library --triple i686-unknown-linux-gnu src/runtime.nupp
 @cli("aot")
 @derive(cliModule.command)
 local record Aot
     --- Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or a native
-    --- program linked as an executable, static-library or shared-library.
+    --- program linked as an executable, static-library or shared-library, or
+    --- a native library's LLVM IR (llvm-library).
     @cli(
         value = "ARTIFACT",
-        choices = {"ir", "llvm", "spirv", "wgsl", "asm", "binding", "executable", "static-library", "shared-library"}
+        choices = {
+            "ir",
+            "llvm",
+            "spirv",
+            "wgsl",
+            "asm",
+            "binding",
+            "executable",
+            "static-library",
+            "shared-library",
+            "llvm-library"
+        }
     )
     emit: string?
 

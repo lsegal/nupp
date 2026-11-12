@@ -2203,7 +2203,8 @@ Options:
 ```
 
 The command writes one target-specific header from selected exported structs,
-`cdef` functions and `@aot(export)` functions. It includes transitive layout
+integer constants, `cdef` functions and `@aot(export)` functions. A constant
+becomes a `#define`. It includes transitive layout
 dependencies, stable C names, layout assertions, and the typed declarations used
 by native wrappers.
 See [c-interop.md](../learn/runtime/c-interop/index.md#export-ordinary-structs-to-c) for

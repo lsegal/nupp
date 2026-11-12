@@ -29,5 +29,3 @@ nupp-native-runtime = { path = "../runtime" }
 nupp-native-codegen = { path = "../codegen", optional = true }
 url = { version = "2.5.7", optional = true }
 
-[build-dependencies]
-cc = "1"

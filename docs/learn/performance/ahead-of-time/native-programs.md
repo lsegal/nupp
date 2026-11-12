@@ -43,8 +43,11 @@ relink while the program is unchanged; see
 ## The shape of a program
 
 The top level holds only `cdef function` and `cdef struct` declarations,
-`const` literals, [module state](#module-state), [C arrays](#c-arrays), the
-[modules it requires](#programs-that-span-modules) and plain functions. Every
+`type` aliases, `const` literals, [module state](#module-state),
+[C arrays](#c-arrays), the [modules it requires](#programs-that-span-modules)
+and plain functions. A type alias, such as `type Size = uint64`, names a C type
+for the checker and lowers to nothing, so a module a build generates per target
+can choose one and every module requiring it uses the choice. Every
 function becomes a C function, so
 each parameter and result needs a written C type: `number`, `integer`, `float`,
 `boolean`, the fixed-width integers, `cstring`, `voidptr` and typed pointers
@@ -432,6 +435,11 @@ each platform's linker in its own form: a version script on Linux, an
 exported-symbols list on macOS, and a module definition file on Windows.
 Without one, a shared library exports everything it defines, and an executable
 what a standalone host does.
+
+`--emit llvm-library` lowers the program as a library and writes the LLVM IR
+instead of linking it, to `--output` or standard output, for the triple
+`--triple` names. That is the form a library is carried in when something else
+compiles it, as the browser guest's AOT runtime is.
 
 ## Exported data
 

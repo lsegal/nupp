@@ -2791,20 +2791,37 @@ return {rows = rows}
     assert(not library:find("ks_dll_main", 1, true), "the entry point is not exported")
 end
 
---- The runtime reaches the Lua API through pointers, one per function
---- `ks_lua.h` declares; a declaration without its pointer would be an import,
---- which a provider loaded by a host that does not export Lua cannot resolve.
-function M.theRuntimeRedirectsEveryLuaFunction()
-    local header = assert(read(HERE .. "/../native/crates/native/c/ks_lua.h"))
-    local runtime = assert(read(HERE .. "/../native/crates/native/c/ks_rt.c"))
-    local redirected = {}
-    for name in runtime:gmatch("#define (luaL?_[%w_]+) %(%*ks_lua_ptr_") do
-        redirected[name] = true
+--- The runtime reaches the Lua API through pointers it binds, one per function
+--- the browser guest's runtime calls directly; a declaration in the provider's
+--- runtime would be an import, which a provider loaded by a host that does not
+--- export Lua cannot resolve. Both variants hand the rest of the runtime the
+--- same functions.
+function M.theRuntimeBindsEveryLuaFunction()
+    local root = HERE .. "/../native/aotruntime/"
+    local bound = assert(read(root .. "bound/ksrt/api.nupp"))
+    local direct = assert(read(root .. "direct/ksrt/api.nupp"))
+    local declared, looked = {}, {}
+    for name in direct:gmatch("\ncdef function (luaL?_[%w_]+)%(") do
+        declared[#declared + 1] = name
     end
-    for name in header:gmatch("\nextern [^;(]-(luaL?_[%w_]+)%(") do
-        assert(redirected[name], "ks_rt.c does not redirect " .. name)
+    for name in bound:gmatch('lookup%(module, "(luaL?_[%w_]+)"%)') do
+        looked[#looked + 1] = name
     end
-    assert(redirected.luaL_addvalue, "nor the runtime's own luaL_addvalue")
+    assert(#declared > 0, "the guest's runtime declares the Lua API")
+    test.eq(table.concat(looked, " "), table.concat(declared, " "), "the provider binds what the guest declares")
+    assert(not bound:find("\ncdef function lua", 1, true), "the provider's runtime imports no Lua API")
+    local function exports(text)
+        local names = {}
+        for name in text:gmatch("\nexport function (ks%u[%w]*)%(") do
+            names[#names + 1] = name
+        end
+        return table.concat(names, " ")
+    end
+    test.eq(exports(bound), exports(direct), "both runtimes export the same API")
+    for _, file in ipairs({"values", "builder", "runtime"}) do
+        local source = assert(read(root .. "common/ksrt/" .. file .. ".nupp"))
+        assert(not source:find("\ncdef function lua", 1, true), file .. " calls the Lua API only through ksrt.api")
+    end
 end
 
 function M.aDeclaredMinimumCarriesOnlyItsSelectedTier()
@@ -4404,57 +4421,84 @@ function M.luaBuilderRegistrationReturnsOrdinaryTables()
 end
 
 --- The LLVM lowering calls the AOT runtime by slot, so its slot list and
---- message ids are an ABI with `ks_rt.c`: the same names in the same order.
+--- message ids are an ABI with the runtime (`native/aotruntime`): the same
+--- names in the same order.
 function M.theAotRuntimeTableMatchesItsLowering()
     local runtime = require("nupp.compiler.aot.llvm.lua.runtime")
-    local source = assert(read(HERE .. "/../native/crates/native/c/ks_rt.c"))
-    local slots = assert(source:match("const void %*const ks_rt_table%[%] = {(.-)\n};"), "ks_rt_table")
-    local names = {}
-    for name in slots:gmatch("%(const void %*%)ks_rt_([%w_]+),") do
-        names[#names + 1] = name
+    local root = HERE .. "/../native/aotruntime/common/ksrt/"
+    local source = assert(read(root .. "runtime.nupp"))
+    local slots = assert(source:match("export const ks_rt_table = ffi%.new<const voidptr%[%d+%]>%({(.-)\n}%)"), "ks_rt_table")
+    local names, header = {}, 0
+    for entry in slots:gmatch("[^\n]+") do
+        local name = entry:match("^%s*ks_rt_([%w_]+) as voidptr,?$")
+        if name ~= nil then
+            names[#names + 1] = name
+        elseif entry:match("as voidptr,?$") then
+            assert(#names == 0, "a layout word follows a slot: " .. entry)
+            header = header + 1
+        end
     end
     local expected = {}
     for position, slot in ipairs(runtime.SLOTS) do
         expected[position] = slot.name
     end
     test.eq(table.concat(names, " "), table.concat(expected, " "), "runtime slots follow ks_rt_table")
-    local header = select(2, slots:gsub("%(const void %*%)%(uintptr_t%)", ""))
     test.eq(header, runtime.HEADER, "the leading words are the version and block sizes")
-    assert(slots:find("KS_RT_ABI_VERSION", 1, true), "slot 0 is the ABI version")
-    assert(source:find("#define KS_RT_ABI_VERSION " .. tostring(runtime.VERSION) .. "u", 1, true), "ABI version")
+    assert(slots:find("^%s*ABI_VERSION as voidptr,"), "slot 0 is the ABI version")
+    assert(source:find("\nconst ABI_VERSION = " .. tostring(runtime.VERSION) .. "\n", 1, true), "ABI version")
 
-    local messages = assert(source:match("ks_rt_messages%[%] = {(.-)\n};"), "ks_rt_messages")
+    local values = assert(read(root .. "values.nupp"))
+    local messages = assert(values:match("\nlocal function message%(id: uint64%): cstring\n(.-)\nend\n"), "message")
     local texts = {}
-    for text in messages:gmatch('"([^"]*)"') do
-        texts[#texts + 1] = text
+    for id, text in messages:gmatch('id == (%d+)ULL then\n%s*return "([^"]*)"') do
+        texts[tonumber(id)] = text
     end
     local wanted = {
         stack = "AOT builder Lua stack exhausted",
         byteWrite = "AOT byte scratch write is out of bounds",
         substring = "AOT string.sub bounds must be integers",
+        noContainer = "AOT value stream has no current container",
     }
     for key, text in pairs(wanted) do
-        test.eq(texts[runtime.MESSAGE[key] + 1], text, "message id " .. key)
+        test.eq(texts[runtime.MESSAGE[key]], text, "message id " .. key)
     end
 end
 
---- The browser guest links `runtime-i686.ll`, which is `ks_rt.c` compiled by
---- `scripts/guest-runtime` and committed. It went stale once: the runtime's
---- builder checks changed and the guest kept the old ones. The file records a
---- digest of the sources it was compiled from, and a source that changed
---- without the file being regenerated fails here.
+--- The browser guest links `runtime-i686.ll`, which is the runtime
+--- (`native/aotruntime`) compiled by `scripts/guest-runtime` and committed. It
+--- went stale once: the runtime's builder checks changed and the guest kept
+--- the old ones. The file records a digest of the sources it was compiled
+--- from, and a source that changed without the file being regenerated fails
+--- here.
 function M.theGuestRuntimeIrIsCompiledFromTheCurrentSources()
     local hash = require("nupp.compiler.hash")
-    local c = HERE .. "/../native/crates/native/c/"
+    local fs = require("nupp.compiler.fs")
+    local root = HERE .. "/.."
 
     -- A Windows checkout may carry CRLF line endings; the digest is of the text.
     local function text(path)
-        return (assert(read(path)):gsub("\r\n", "\n"))
+        return (assert(read(path)):gsub("\r", ""))
     end
 
-    local digest = hash.sha256(text(c .. "ks_rt.c") .. text(c .. "ks_lua.h"))
+    -- In the order the script reads them: sorted by path from the root.
+    local inputs = {}
+    for _, part in ipairs({"common", "direct"}) do
+        local directory = "native/aotruntime/" .. part
+        for _, path in ipairs(fs.listFiles(root .. "/" .. directory)) do
+            local below = path:gsub("\\", "/"):match("/" .. directory .. "/(.+%.nupp)$")
+            if below ~= nil then
+                inputs[#inputs + 1] = directory .. "/" .. below
+            end
+        end
+    end
+    table.sort(inputs)
+    local sources = {}
+    for index, input in ipairs(inputs) do
+        sources[index] = text(root .. "/" .. input)
+    end
+    local digest = hash.sha256(table.concat(sources))
     local ir = assert(read(HERE .. "/../src/nupp/compiler/aot/llvm/lua/runtime-i686.ll"))
-    local recorded = ir:match("\n; Inputs: ks_rt%.c ks_lua%.h, sha256 (%x+)%.\n")
+    local recorded = ir:match("\n; Inputs: native/aotruntime common and direct, sha256 (%x+)%.\n")
     assert(recorded, "runtime-i686.ll records the digest of its inputs")
     test.eq(recorded, digest, "runtime-i686.ll is stale: rerun scripts/guest-runtime")
 end

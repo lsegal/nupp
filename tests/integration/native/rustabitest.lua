@@ -1,5 +1,6 @@
 local HERE = require("helpers.paths").tests
 local ROOT = HERE .. "/.."
+local test = require("assert")
 
 local M = {}
 
@@ -14,12 +15,108 @@ local function read(path)
     return text
 end
 
-function M.publicHeaderLinksAndRunsAgainstTheSelectedCdylib()
-    local pipe = assert(io.popen("'" .. ROOT:gsub("'", "'\\''") .. "/scripts/test-rust-abi' 2>&1; echo __exit__:$?"))
+local function run(command)
+    local pipe = assert(io.popen(command .. " 2>&1; echo __exit__:$?"))
     local output = pipe:read("*a")
     pipe:close()
     local status = tonumber(output:match("__exit__:(%d+)%s*$"))
+    return status, (output:gsub("__exit__:%d+%s*$", ""))
+end
+
+local function temporary()
+    local path = os.tmpname()
+    os.remove(path)
+    assert(os.execute("mkdir -p " .. quote(path)) == 0)
+    return path
+end
+
+local DEFINITION = ROOT .. "/native/abi/nupp_native.nupp"
+
+--- The header `scripts/native-abi-header` generates from the definition.
+local function header()
+    local directory = temporary()
+    local path = directory .. "/nupp_native.h"
+    local status, output = run(("%s/scripts/native-abi-header %s"):format(quote(ROOT), quote(path)))
     assert(status == 0, output)
+    return path, read(path)
+end
+
+--- What a C compiler makes of the header: it compiles on its own, warnings as
+--- errors, as C11 and as C++.
+function M.theGeneratedHeaderCompiles()
+    local path = header()
+    local cc = os.getenv("NUPP_CC") or os.getenv("CC") or "cc"
+    local source = path:gsub("%.h$", ".c")
+    local file = assert(io.open(source, "wb"))
+    file:write('#include "nupp_native.h"\nint main(void) { return NUPP_NATIVE_OK; }\n')
+    file:close()
+    local status, output = run(("%s -std=c11 -Wall -Wextra -Werror -fsyntax-only %s"):format(cc, quote(source)))
+    assert(status == 0, output)
+end
+
+--- The provider a C consumer would link, `native-rust` with URIs, called
+--- through the declarations the generated header makes: everything the
+--- header promises about it holds.
+function M.theGeneratedHeaderDescribesTheProvider()
+    local _, text = header()
+    local status, provider = run(("cd %s && ./scripts/toolchain native-rust base,uri"):format(quote(ROOT)))
+    assert(status == 0, provider)
+    provider = provider:match("([^\r\n]+)%s*$")
+
+    -- The declarations, with the preprocessor's lines and the layout checks left
+    -- to the compiler test above.
+    local declarations, defines = {}, {}
+    for line in text:gmatch("[^\n]+") do
+        local name, value = line:match("^#define (NUPP_NATIVE_[%u%d_]+) (%d+)U?L?L?$")
+        if name ~= nil then
+            defines[name] = tonumber(value)
+        elseif not line:match("^%s*#") and not line:match("_STATIC_ASSERT") and line ~= "extern \"C\" {" and line ~= "}" then
+            declarations[#declarations + 1] = line
+        end
+    end
+    local ffi = require("ffi")
+    ffi.cdef(table.concat(declarations, "\n"))
+    local native = ffi.load(provider)
+
+    test.eq(native.nuppNativeAbiVersion(), defines.NUPP_NATIVE_ABI_VERSION, "the ABI version")
+    local features = native.nuppNativeFeatures()
+    local wanted = defines.NUPP_NATIVE_FEATURE_BASE + defines.NUPP_NATIVE_FEATURE_URI
+    test.eq(tonumber(require("bit").band(features, wanted)), wanted, "the requested feature bits")
+    assert(
+        require("bit").band(features, defines.NUPP_NATIVE_FEATURE_READINESS) ~= 0,
+        "the readiness feature bit is absent"
+    )
+
+    -- The readiness pair rejects a NULL output, and a wait that nothing wakes
+    -- answers at its timeout with the generation it was given.
+    test.eq(native.nuppNativePoll(nil), defines.NUPP_NATIVE_INVALID_ARGUMENT, "a NULL poll output")
+    test.eq(native.nuppNativeWait(0, 0, nil), defines.NUPP_NATIVE_INVALID_ARGUMENT, "a NULL wait output")
+    local generation = ffi.new("uint64_t[1]")
+    local found = ffi.new("uint64_t[1]")
+    test.eq(native.nuppNativePoll(generation), defines.NUPP_NATIVE_OK, "readiness poll")
+    test.eq(native.nuppNativeWait(generation[0], 10, found), defines.NUPP_NATIVE_OK, "readiness wait")
+    assert(found[0] == generation[0], "an idle readiness wait moved the generation")
+
+    local uri = ffi.new("uint64_t[1]")
+    local spelling = "https://EXAMPLE.com"
+    test.eq(native.nuppNativeUriParse(spelling, #spelling, uri), defines.NUPP_NATIVE_OK, "URI parse")
+    local length = ffi.new("uint64_t[1]")
+    local present = ffi.new("int32_t[1]")
+    test.eq(
+        native.nuppNativeUriPart(uri[0], defines.NUPP_NATIVE_URI_HOST, nil, 0, length, present),
+        defines.NUPP_NATIVE_BUFFER_TOO_SMALL,
+        "a URI part size query"
+    )
+    test.eq(tonumber(length[0]), #"example.com", "the size a query answers")
+    local small = ffi.new("uint8_t[2]")
+    test.eq(
+        native.nuppNativeUriPart(uri[0], defines.NUPP_NATIVE_URI_HOST, small, 2, length, present),
+        defines.NUPP_NATIVE_BUFFER_TOO_SMALL,
+        "a short URI part output"
+    )
+    assert(present[0] ~= 0, "the host is present")
+    test.eq(native.nuppNativeUriRelease(uri[0]), defines.NUPP_NATIVE_OK, "URI release")
+    test.eq(native.nuppNativeUriRelease(uri[0]), defines.NUPP_NATIVE_STALE_HANDLE, "a released URI handle")
 end
 
 -- Symbols the pinned bundle names that were deleted before this check existed.
@@ -38,17 +135,20 @@ function M.theProviderKeepsWhatThePinnedStageZeroNames()
     pipe:close()
     assert(path, "no stage-zero compiler; run scripts/toolchain stage0")
     local bundle = read(assert(path:match("^(.*)[/\\][^/\\]+$")) .. "/verified.lua")
-    local header = read(ROOT .. "/native/include/nupp_native.h")
+    local definition = read(DEFINITION)
 
     local required = assert(bundle:match("\nconst ABI_VERSION = (%d+)\n"), "the bundle checks no ABI version")
-    local provided = assert(header:match("#define NUPP_NATIVE_ABI_VERSION (%d+)u"), "the header has no ABI version")
+    local provided = assert(
+        definition:match("\nexport const NUPP_NATIVE_ABI_VERSION = (%d+)\n"),
+        "the definition has no ABI version"
+    )
     assert(
         required == provided,
-        ("the pinned stage zero needs ABI %s and the header says %s"):format(required, provided)
+        ("the pinned stage zero needs ABI %s and the definition says %s"):format(required, provided)
     )
 
     local declared = {}
-    for name in header:gmatch("NUPP_NATIVE_EXPORT[^;(]-([%w_]+)%s*%(") do
+    for name in definition:gmatch("\ncdef function ([%w_]+)%(") do
         declared[name] = true
     end
     local missing, seen = {}, {}
@@ -64,7 +164,7 @@ function M.theProviderKeepsWhatThePinnedStageZeroNames()
     assert(next(seen), "the bundle names no provider symbol, so this check reads the wrong text")
     assert(
         #missing == 0,
-        "the pinned stage zero names provider symbols the header lost: " .. table.concat(missing, ", ")
+        "the pinned stage zero names provider symbols the definition lost: " .. table.concat(missing, ", ")
     )
 end
 

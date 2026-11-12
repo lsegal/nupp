@@ -115,7 +115,7 @@ local function apiInteger(ctx: context.Context, value: string, minimum: string, 
     return integer
 end
 
---- `ks_lua_count`: a table capacity.
+--- The runtime's `luaCount`: a table capacity.
 function values.count(ctx: context.Context, node: scalarIR.Expr, what: string): string
     local value = values.operand(ctx, node, "f64")
 
@@ -124,7 +124,7 @@ function values.count(ctx: context.Context, node: scalarIR.Expr, what: string): 
     end)
 end
 
---- `ks_lua_index`: an array index.
+--- The runtime's `luaIndex`: an array index.
 function values.index(ctx: context.Context, node: scalarIR.Expr, source: scalarIR.Source?): string
     local value = values.operand(ctx, node, "f64")
 
@@ -341,7 +341,7 @@ end
 
 --- The value stream's depth, its current frame's kind and count, or its
 --- state (kind, and 0x100 once the container holds anything), read from
---- the state block as `ks_lua_builder_query` reads them: a hot tape walk
+--- the state block as the runtime's `builderQuery` reads them: a hot tape walk
 --- asks after every value, and a call for three loads showed.
 local function builderQuery(ctx: context.Context, node: scalarIR.Expr): (string, string)
     local query = node as scalarIR.LuaBuilderQuery
