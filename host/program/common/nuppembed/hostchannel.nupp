@@ -1,0 +1,977 @@
+--- `os.host` requests to an embedding application: the registrations, which
+--- requests are outstanding, every answer from `nupp_host_answer` until it has
+--- been copied into Lua values, and `nupp.host.native`, the Lua module the
+--- runtime preloads to reach them.
+---
+--- An answer is only ever queued here, never delivered from inside the call
+--- that gave it, so a handler that answers at once and one that answers from
+--- its own loop reach Lua the same way: through the next poll.
+---
+--- Handlers run from a Lua C function rather than through the FFI, so a handler
+--- may call back into the runtime that called it. Every Lua operation here runs
+--- in such a function, beneath a protected frame, and a handler's arguments are
+--- borrowed for the length of its call: a string's bytes belong to the Lua
+--- string on this frame's stack, and a byte value's to the span the caller
+--- holds, which outlives the call.
+module nuppembed.hostchannel
+
+const map = require("nupphost.map")
+const sys = require("nupphost.sys")
+
+cdef function calloc(count: uint64, size: uint64): voidptr?
+cdef function malloc(size: uint64): voidptr?
+cdef function free(borrows p: voidptr)
+cdef function memcpy(borrows destination: voidptr, borrows source: voidptr, count: uint64): voidptr
+cdef function memcmp(borrows left: voidptr, borrows right: voidptr, count: uint64): int32
+
+cdef function lua_gettop(borrows L: voidptr): int32
+cdef function lua_settop(borrows L: voidptr, index: int32)
+cdef function lua_type(borrows L: voidptr, index: int32): int32
+cdef function lua_toboolean(borrows L: voidptr, index: int32): int32
+cdef function lua_tonumber(borrows L: voidptr, index: int32): number
+cdef function lua_tolstring(borrows L: voidptr, index: int32, borrows length: voidptr?): voidptr?
+cdef function lua_touserdata(borrows L: voidptr, index: int32): voidptr?
+cdef function lua_rawget(borrows L: voidptr, index: int32)
+cdef function lua_rawgeti(borrows L: voidptr, index: int32, n: int32)
+cdef function lua_rawseti(borrows L: voidptr, index: int32, n: int32)
+cdef function lua_setfield(borrows L: voidptr, index: int32, borrows k: cstring)
+cdef function lua_pushstring(borrows L: voidptr, borrows s: cstring)
+cdef function lua_pushlstring(borrows L: voidptr, borrows s: voidptr, length: uint64)
+cdef function lua_pushinteger(borrows L: voidptr, n: int64)
+cdef function lua_pushnumber(borrows L: voidptr, n: number)
+cdef function lua_pushboolean(borrows L: voidptr, b: int32)
+cdef function lua_pushnil(borrows L: voidptr)
+cdef function lua_pushcclosure(borrows L: voidptr, f: function(L: voidptr): int32, n: int32)
+cdef function lua_pushfstring(borrows L: voidptr, borrows format: cstring, ...): voidptr?
+cdef function lua_createtable(borrows L: voidptr, narr: int32, nrec: int32)
+cdef function lua_checkstack(borrows L: voidptr, extra: int32): int32
+cdef function luaL_error(borrows L: voidptr, borrows format: cstring, ...): int32
+cdef function luaL_argerror(borrows L: voidptr, index: int32, borrows message: cstring): int32
+cdef function luaL_checknumber(borrows L: voidptr, index: int32): number
+cdef function luaL_checkinteger(borrows L: voidptr, index: int32): int64
+cdef function luaL_checklstring(borrows L: voidptr, index: int32, borrows length: voidptr?): voidptr
+cdef function luaL_checktype(borrows L: voidptr, index: int32, kind: int32)
+
+const GLOBALS = -10002
+
+const TNIL = 0
+const TBOOLEAN = 1
+const TLIGHTUSERDATA = 2
+const TNUMBER = 3
+const TSTRING = 4
+const TTABLE = 5
+
+--- The most values one request or answer carries.
+export const MAX_VALUES = 255
+
+--- The longest string value, which the browser carries inside a text envelope.
+export const MAX_STRING_BYTES = 65536
+
+--- How many pushed messages wait for a poll before the oldest is dropped.
+export const MAX_PUSHES = 4096
+
+--- The largest byte value an application may answer with.
+export const MAX_ANSWER_BYTES = 8388608
+
+export const VALUE_NIL = 0
+
+export const VALUE_BOOLEAN = 1
+export const VALUE_NUMBER = 2
+export const VALUE_STRING = 3
+export const VALUE_BYTES = 4
+export const VALUE_HANDLE = 5
+
+--- What answering a request reports.
+export const ANSWERED = 0
+
+export const UNKNOWN = 1
+export const ALREADY_ANSWERED = 2
+
+--- `nupp_value` in host/include/nupp.h.
+export cdef struct HostValue
+    kind: uint32
+    boolean: int32
+    number: number
+    data: uint64
+    length: uint64
+    handle: uint64
+end
+
+--- One kind's handler. `handler` and `cancel` are C function pointers, the
+--- latter 0 when the kind has none.
+cdef struct Registration
+    kind: uint64
+    kindLength: uint64
+    handler: uint64
+    cancel: uint64
+    userdata: uint64
+    next: uint64
+end
+
+--- One outstanding request. `values` holds an answer's `count` values, their
+--- bytes owned here; `message` a failure's text.
+cdef struct Request
+    kind: uint64
+    kindLength: uint64
+    post: int32
+    cancelled: int32
+    state: int32
+    values: uint64
+    count: uint64
+    message: uint64
+    messageLength: uint64
+end
+
+--- One inbound message the application pushed, waiting for a poll.
+cdef struct Push
+    kind: uint64
+    kindLength: uint64
+    values: uint64
+    count: uint64
+    next: uint64
+end
+
+cdef struct Ready
+    request: uint64
+    next: uint64
+end
+
+--- One runtime's registered kinds and outstanding requests.
+cdef struct Channel
+    runtime: uint64
+    handlers: uint64
+    requests: uint64
+    readyHead: uint64
+    readyTail: uint64
+    pushHead: uint64
+    pushTail: uint64
+    pushCount: int64
+    popped: uint64
+    dropped: uint64
+end
+
+const WAITING = 0
+const DONE = 1
+const FAILED = 2
+
+local function valueAt(values: uint64, index: integer): HostValue*
+    return @unsafe((values + (index as uint64) * (ffi.sizeof(HostValue) as uint64)) as HostValue*)
+end
+
+--- A copy of the `length` bytes at `data`, terminated, or 0 without memory.
+local function copyBytes(data: uint64, length: uint64): uint64
+    local copy = malloc(length + 1ULL)
+    if copy == nil then
+        return 0ULL
+    end
+    if length ~= 0ULL then
+        memcpy(copy as voidptr, data as voidptr, length)
+    end
+    @unsafe do
+        (copy as uint8*)[length as integer] = 0
+    end
+
+    return copy as uint64
+end
+
+--- Frees `count` values and the bytes they own.
+export function nuppEmbedChannelFreeValues(values: uint64, count: uint64): nil
+    if values == 0ULL then
+        return
+    end
+    for index = 0, (count as integer) - 1 do
+        local value = valueAt(values, index)
+        @unsafe do
+            if value.data ~= 0ULL then
+                free(value.data as voidptr)
+            end
+        end
+    end
+    free(values as voidptr)
+end
+
+--- An owned copy of `count` values: scalars as they are, strings and bytes
+--- copied. The caller has already checked them. 0 without memory, and 1 for
+--- an empty list, which owns nothing.
+export function nuppEmbedChannelCopyValues(values: uint64, count: uint64): uint64
+    if count == 0ULL then
+        return 1ULL
+    end
+    local copy = calloc(count, ffi.sizeof(HostValue) as uint64)
+    if copy == nil then
+        return 0ULL
+    end
+    for index = 0, (count as integer) - 1 do
+        local from = valueAt(values, index)
+        local to = valueAt(copy as uint64, index)
+        @unsafe do
+            to.kind = from.kind
+            if from.kind == VALUE_BOOLEAN then
+                to.boolean = from.boolean ~= 0 and 1 or 0
+            elseif from.kind == VALUE_NUMBER then
+                to.number = from.number
+            elseif from.kind == VALUE_STRING or from.kind == VALUE_BYTES then
+                to.length = from.length
+                to.data = copyBytes(from.data, from.length)
+                if to.data == 0ULL then
+                    nuppEmbedChannelFreeValues(copy as uint64, count)
+                    return 0ULL
+                end
+            end
+        end
+    end
+
+    return copy as uint64
+end
+
+local function ownedValues(values: uint64): uint64
+    return values == 1ULL and 0ULL or values
+end
+
+-- The channel ------------------------------------------------------------------
+
+--- A new channel whose handlers are given `runtime`, or 0 without memory.
+export function nuppEmbedChannelNew(runtime: uint64): uint64
+    local channel = calloc(1ULL, ffi.sizeof(Channel) as uint64)
+    if channel == nil then
+        return 0ULL
+    end
+    local requests = map.nuppHostMapNew()
+    if requests == 0ULL then
+        free(channel as voidptr)
+        return 0ULL
+    end
+    @unsafe do
+        local c = channel as Channel*
+        c.runtime = runtime
+        c.requests = requests
+    end
+
+    return channel as uint64
+end
+
+local function freeRequest(request: uint64)
+    @unsafe do
+        local r = request as Request*
+        free(r.kind as voidptr)
+        nuppEmbedChannelFreeValues(r.values, r.count)
+        if r.message ~= 0ULL then
+            free(r.message as voidptr)
+        end
+    end
+    free(request as voidptr)
+end
+
+local function freePush(push: uint64)
+    if push == 0ULL then
+        return
+    end
+    @unsafe do
+        local p = push as Push*
+        free(p.kind as voidptr)
+        nuppEmbedChannelFreeValues(p.values, p.count)
+    end
+    free(push as voidptr)
+end
+
+--- Forgets every outstanding request and waiting message, for a runtime
+--- shutting down.
+export function nuppEmbedChannelClear(channel: uint64): nil
+    local c = channel as Channel*
+    local key: uint64[1]
+    @unsafe do
+        while map.nuppHostMapCount(c.requests) > 0LL do
+            freeRequest(map.nuppHostMapTakeAny(c.requests, key))
+        end
+        local ready = c.readyHead
+        while ready ~= 0ULL do
+            local next = (ready as Ready*).next
+            free(ready as voidptr)
+            ready = next
+        end
+        c.readyHead = 0ULL
+        c.readyTail = 0ULL
+        local push = c.pushHead
+        while push ~= 0ULL do
+            local next = (push as Push*).next
+            freePush(push)
+            push = next
+        end
+        c.pushHead = 0ULL
+        c.pushTail = 0ULL
+        c.pushCount = 0LL
+        freePush(c.popped)
+        c.popped = 0ULL
+    end
+end
+
+export function nuppEmbedChannelFree(channel: uint64): nil
+    if channel == 0ULL then
+        return
+    end
+    nuppEmbedChannelClear(channel)
+    @unsafe do
+        local c = channel as Channel*
+        local registration = c.handlers
+        while registration ~= 0ULL do
+            local next = (registration as Registration*).next
+            free((registration as Registration*).kind as voidptr)
+            free(registration as voidptr)
+            registration = next
+        end
+        map.nuppHostMapFree(c.requests)
+    end
+    free(channel as voidptr)
+end
+
+local function sameKind(kind: uint64, kindLength: uint64, data: uint64, length: uint64): boolean
+    if kindLength ~= length then
+        return false
+    end
+
+    return length == 0ULL or memcmp(kind as voidptr, data as voidptr, length) == 0
+end
+
+local function registrationOf(channel: uint64, kind: uint64, length: uint64): uint64
+    @unsafe do
+        local registration = (channel as Channel*).handlers
+        while registration ~= 0ULL do
+            local r = registration as Registration*
+            if sameKind(r.kind, r.kindLength, kind, length) then
+                return registration
+            end
+            registration = r.next
+        end
+    end
+
+    return 0ULL
+end
+
+--- Registers, replaces, or with a 0 handler removes, the handler for the
+--- `length` bytes of `kind`. False without memory.
+export function nuppEmbedChannelRegister(
+    channel: uint64,
+    kind: uint64,
+    length: uint64,
+    handler: uint64,
+    cancel: uint64,
+    userdata: uint64
+): boolean
+    local c = channel as Channel*
+    local found = registrationOf(channel, kind, length)
+    @unsafe do
+        if handler == 0ULL then
+            if found == 0ULL then
+                return true
+            end
+            local previous: uint64 = 0ULL
+            local at = c.handlers
+            while at ~= found do
+                previous = at
+                at = (at as Registration*).next
+            end
+            if previous == 0ULL then
+                c.handlers = (found as Registration*).next
+            else
+                local p = previous as Registration*
+                p.next = (found as Registration*).next
+            end
+            free((found as Registration*).kind as voidptr)
+            free(found as voidptr)
+            return true
+        end
+        if found == 0ULL then
+            local added = calloc(1ULL, ffi.sizeof(Registration) as uint64)
+            if added == nil then
+                return false
+            end
+            local copy = copyBytes(kind, length)
+            if copy == 0ULL then
+                free(added as voidptr)
+                return false
+            end
+            local r = added as Registration*
+            r.kind = copy
+            r.kindLength = length
+            r.next = c.handlers
+            c.handlers = added as uint64
+            found = added as uint64
+        end
+        local r = found as Registration*
+        r.handler = handler
+        r.cancel = cancel
+        r.userdata = userdata
+    end
+
+    return true
+end
+
+local function queueReady(channel: uint64, request: uint64): boolean
+    local node = calloc(1ULL, ffi.sizeof(Ready) as uint64)
+    if node == nil then
+        return false
+    end
+    @unsafe do
+        local c = channel as Channel*
+        (node as Ready*).request = request
+        if c.readyTail == 0ULL then
+            c.readyHead = node as uint64
+        else
+            local tail = c.readyTail as Ready*
+            tail.next = node as uint64
+        end
+        c.readyTail = node as uint64
+    end
+
+    return true
+end
+
+--- Stores a request's answer, taking `values`, an owned copy from
+--- `nuppEmbedChannelCopyValues`, whatever it reports.
+export function nuppEmbedChannelAnswer(channel: uint64, request: uint64, values: uint64, count: uint64): int32
+    local c = channel as Channel*
+    local entry = 0ULL
+    @unsafe do
+        entry = map.nuppHostMapGet(c.requests, request)
+    end
+    if entry == 0ULL then
+        nuppEmbedChannelFreeValues(ownedValues(values), count)
+        return UNKNOWN
+    end
+    local r = entry as Request*
+    @unsafe do
+        if r.state ~= WAITING then
+            nuppEmbedChannelFreeValues(ownedValues(values), count)
+            return ALREADY_ANSWERED
+        end
+        if r.post ~= 0 then
+            -- Nobody waits on a post: its answer is the application's to drop.
+            map.nuppHostMapRemove(c.requests, request)
+            freeRequest(entry)
+            nuppEmbedChannelFreeValues(ownedValues(values), count)
+            return ANSWERED
+        end
+        r.values = ownedValues(values)
+        r.count = count
+        r.state = DONE
+    end
+    queueReady(channel, request)
+
+    return ANSWERED
+end
+
+--- Stores a request's failure, with the `length` bytes of `message`.
+export function nuppEmbedChannelFail(channel: uint64, request: uint64, message: uint64, length: uint64): int32
+    local c = channel as Channel*
+    local entry = 0ULL
+    @unsafe do
+        entry = map.nuppHostMapGet(c.requests, request)
+    end
+    if entry == 0ULL then
+        return UNKNOWN
+    end
+    local r = entry as Request*
+    @unsafe do
+        if r.state ~= WAITING then
+            return ALREADY_ANSWERED
+        end
+        if r.post ~= 0 then
+            local prefix = "nupp: host "
+            sys.nuppHostSysWriteError(prefix as voidptr, 11ULL)
+            sys.nuppHostSysWriteError(r.kind as voidptr, r.kindLength)
+            local middle = ": post failed: "
+            sys.nuppHostSysWriteError(middle as voidptr, 15ULL)
+            if length ~= 0ULL then
+                sys.nuppHostSysWriteError(message as voidptr, length)
+            end
+            local ending = "\n"
+            sys.nuppHostSysWriteError(ending as voidptr, 1ULL)
+            map.nuppHostMapRemove(c.requests, request)
+            freeRequest(entry)
+            return ANSWERED
+        end
+        r.message = copyBytes(message, length)
+        r.messageLength = r.message == 0ULL and 0ULL or length
+        r.state = FAILED
+    end
+    queueReady(channel, request)
+
+    return ANSWERED
+end
+
+--- Queues an inbound message for the next poll, taking `values`, and dropping
+--- the oldest past the bound. False without memory.
+export function nuppEmbedChannelPush(channel: uint64, kind: uint64, length: uint64, values: uint64, count: uint64): boolean
+    local push = calloc(1ULL, ffi.sizeof(Push) as uint64)
+    local copy = copyBytes(kind, length)
+    if push == nil or copy == 0ULL then
+        if push ~= nil then
+            free(push as voidptr)
+        end
+        if copy ~= 0ULL then
+            free(copy as voidptr)
+        end
+        nuppEmbedChannelFreeValues(ownedValues(values), count)
+        return false
+    end
+    @unsafe do
+        local p = push as Push*
+        p.kind = copy
+        p.kindLength = length
+        p.values = ownedValues(values)
+        p.count = count
+        local c = channel as Channel*
+        if c.pushTail == 0ULL then
+            c.pushHead = push as uint64
+        else
+            local tail = c.pushTail as Push*
+            tail.next = push as uint64
+        end
+        c.pushTail = push as uint64
+        c.pushCount = c.pushCount + 1LL
+        while c.pushCount > (MAX_PUSHES as int64) do
+            local oldest = c.pushHead
+            c.pushHead = (oldest as Push*).next
+            freePush(oldest)
+            c.pushCount = c.pushCount - 1LL
+            c.dropped = c.dropped + 1ULL
+        end
+    end
+
+    return true
+end
+
+-- nupp.host.native -------------------------------------------------------------
+
+local function channelOf(borrows L: voidptr): uint64
+    lua_pushstring(L, "__nuppHostChannel")
+    lua_rawget(L, GLOBALS)
+    local channel = 0ULL
+    if lua_type(L, -1) == TLIGHTUSERDATA then
+        local pointer = lua_touserdata(L, -1)
+        if pointer ~= nil then
+            channel = pointer as uint64
+        end
+    end
+    lua_settop(L, -2)
+
+    return channel
+end
+
+local function requiredChannel(borrows L: voidptr): uint64
+    local channel = channelOf(L)
+    if channel == 0ULL then
+        luaL_error(L, "no embedding application is attached to this runtime")
+    end
+
+    return channel
+end
+
+local function requestId(borrows L: voidptr, index: int32): uint64
+    local value = luaL_checknumber(L, index)
+    if value < 1 or value > 9007199254740991 or math.floor(value) ~= value then
+        luaL_argerror(L, index, "a request id must be a positive integer")
+    end
+
+    return value as uint64
+end
+
+local function attached(L: voidptr): int32
+    lua_pushboolean(L, channelOf(L) ~= 0ULL and 1 or 0)
+
+    return 1
+end
+
+--- The values of one dispatch, which a handler may outlive only by copying.
+local function dispatchValues(borrows L: voidptr, count: integer, hasBytes: boolean): uint64
+    if count == 0 then
+        return 0ULL
+    end
+    local values = calloc(count as uint64, ffi.sizeof(HostValue) as uint64)
+    if values == nil then
+        luaL_error(L, "out of memory dispatching a host request")
+        return 0ULL
+    end
+    for position = 1, count do
+        local index = math.i32.wrap(5 + position)
+        local value = valueAt(values as uint64, position - 1)
+        local bytes = false
+        if hasBytes then
+            lua_rawgeti(L, 5, math.i32.wrap(position))
+            if lua_type(L, -1) == TTABLE then
+                lua_rawgeti(L, -1, 1)
+                lua_rawgeti(L, -2, 2)
+                @unsafe do
+                    value.kind = VALUE_BYTES
+                    value.data = lua_tonumber(L, -2) as uint64
+                    value.length = lua_tonumber(L, -1) as uint64
+                end
+                lua_settop(L, -4)
+                bytes = true
+            else
+                lua_settop(L, -2)
+            end
+        end
+        if not bytes then
+            local kind = lua_type(L, index)
+            @unsafe do
+                if kind == TBOOLEAN then
+                    value.kind = VALUE_BOOLEAN
+                    value.boolean = lua_toboolean(L, index)
+                elseif kind == TNUMBER then
+                    value.kind = VALUE_NUMBER
+                    value.number = lua_tonumber(L, index)
+                elseif kind == TSTRING then
+                    local length = calloc(1ULL, 8ULL)
+                    value.kind = VALUE_STRING
+                    if length ~= nil then
+                        local text = lua_tolstring(L, index, length as voidptr)
+                        value.data = text == nil and 0ULL or text as uint64
+                        value.length = (length as uint64*)[0]
+                        free(length as voidptr)
+                    end
+                end
+            end
+        end
+    end
+
+    return values as uint64
+end
+
+local function callHandler(
+    handler: uint64,
+    runtime: uint64,
+    request: uint64,
+    borrows kind: cstring,
+    values: uint64,
+    count: uint64,
+    userdata: uint64
+)
+    local erased = handler as voidptr
+    local call = erased as function(
+        runtime: voidptr?,
+        request: uint64,
+        kind: cstring,
+        arguments: voidptr?,
+        count: uint64,
+        userdata: voidptr?
+    )
+    call(runtime as voidptr, request, kind, values as voidptr, count, userdata as voidptr)
+end
+
+--- dispatch(operation, request, kind, count, bytes, ...) calls the kind's
+--- handler. `bytes[i]` is `{address, length}` for a byte argument at position
+--- i. Answers true, or false and a reason when no handler answers the kind.
+local function dispatch(L: voidptr): int32
+    local channel = requiredChannel(L)
+    local operation = luaL_checkinteger(L, 1)
+    local request = requestId(L, 2)
+    local kindLength = calloc(1ULL, 8ULL)
+    if kindLength == nil then
+        return luaL_error(L, "out of memory dispatching a host request")
+    end
+    local kind = luaL_checklstring(L, 3, kindLength as voidptr)
+    local length = @unsafe((kindLength as uint64*)[0])
+    free(kindLength as voidptr)
+    local count = luaL_checkinteger(L, 4)
+    local hasBytes = lua_type(L, 5) == TTABLE
+    if count < 0LL or count > (MAX_VALUES as int64) or (lua_gettop(L) as int64) < 5LL + count then
+        return luaL_error(L, "a host request has no valid value count")
+    end
+    local registration = registrationOf(channel, kind as uint64, length)
+    local handler = 0ULL
+    if registration ~= 0ULL then
+        @unsafe do
+            handler = (registration as Registration*).handler
+        end
+    end
+    if handler == 0ULL then
+        lua_pushboolean(L, 0)
+        lua_pushfstring(L, "no host answers %s", kind as cstring)
+        return 2
+    end
+    -- Every value is checked before anything is allocated, so a refusal leaks
+    -- nothing.
+    for position = 1, count as integer do
+        local type = lua_type(L, math.i32.wrap(5 + position))
+        local bytes = false
+        if hasBytes then
+            lua_rawgeti(L, 5, math.i32.wrap(position))
+            bytes = lua_type(L, -1) == TTABLE
+            lua_settop(L, -2)
+        end
+        if not bytes and type ~= TNIL and type ~= TBOOLEAN and type ~= TNUMBER and type ~= TSTRING then
+            return luaL_error(L, "host request %s value %d cannot cross", kind as cstring, math.i32.wrap(position))
+        end
+    end
+    local c = channel as Channel*
+    local runtime = 0ULL
+    local userdata = 0ULL
+    @unsafe do
+        runtime = c.runtime
+        userdata = (registration as Registration*).userdata
+    end
+    -- A send has no answer, so nothing records it; its handler sees request 0.
+    if operation == 2LL then
+        local values = dispatchValues(L, count as integer, hasBytes)
+        callHandler(handler, runtime, 0ULL, kind as cstring, values, count as uint64, userdata)
+        if values ~= 0ULL then
+            free(values as voidptr)
+        end
+        lua_pushboolean(L, 1)
+        return 1
+    end
+    local known = false
+    @unsafe do
+        known = map.nuppHostMapHas(c.requests, request)
+    end
+    if known then
+        return luaL_error(L, "host request %d was dispatched twice", request as int32)
+    end
+    local entry = calloc(1ULL, ffi.sizeof(Request) as uint64)
+    local copy = copyBytes(kind as uint64, length)
+    if entry == nil or copy == 0ULL then
+        if entry ~= nil then
+            free(entry as voidptr)
+        end
+        if copy ~= 0ULL then
+            free(copy as voidptr)
+        end
+        return luaL_error(L, "out of memory dispatching a host request")
+    end
+    @unsafe do
+        local r = entry as Request*
+        r.kind = copy
+        r.kindLength = length
+        r.post = operation == 1LL and 1 or 0
+        if not map.nuppHostMapPut(c.requests, request, entry as uint64) then
+            freeRequest(entry as uint64)
+            return luaL_error(L, "out of memory dispatching a host request")
+        end
+    end
+    local values = dispatchValues(L, count as integer, hasBytes)
+    callHandler(handler, runtime, request, kind as cstring, values, count as uint64, userdata)
+    if values ~= 0ULL then
+        free(values as voidptr)
+    end
+    lua_pushboolean(L, 1)
+
+    return 1
+end
+
+local function forget(channel: uint64, request: uint64)
+    @unsafe do
+        local entry = map.nuppHostMapRemove((channel as Channel*).requests, request)
+        if entry ~= 0ULL then
+            freeRequest(entry)
+        end
+    end
+end
+
+local function pushHostValue(borrows L: voidptr, borrows value: HostValue*)
+    @unsafe do
+        local kind = value.kind
+        if kind == VALUE_BOOLEAN then
+            lua_pushboolean(L, value.boolean)
+        elseif kind == VALUE_NUMBER then
+            lua_pushnumber(L, value.number)
+        elseif kind == VALUE_STRING or kind == VALUE_BYTES then
+            lua_pushlstring(L, value.data as voidptr, value.length)
+        else
+            lua_pushnil(L)
+        end
+    end
+end
+
+--- Kind letters for `take`, one per answered value.
+local kinds: uint8[256]
+
+--- take(request) answers nothing while the host has not answered; false and
+--- the host's message when it failed; or true, a kind letter per value ("n",
+--- "b", "d", "s" for text, "y" for bytes) and the values themselves.
+local function take(L: voidptr): int32
+    local channel = requiredChannel(L)
+    local request = requestId(L, 1)
+    local entry = 0ULL
+    @unsafe do
+        entry = map.nuppHostMapGet((channel as Channel*).requests, request)
+    end
+    if entry == 0ULL then
+        return 0
+    end
+    local r = entry as Request*
+    local state = 0
+    local count = 0ULL
+    @unsafe do
+        state = r.state
+        count = r.count
+    end
+    if state == WAITING then
+        return 0
+    end
+    if state == FAILED then
+        lua_pushboolean(L, 0)
+        @unsafe do
+            if r.message == 0ULL then
+                lua_pushstring(L, "")
+            else
+                lua_pushlstring(L, r.message as voidptr, r.messageLength)
+            end
+        end
+        forget(channel, request)
+        return 2
+    end
+    if count > (MAX_VALUES as uint64) or lua_checkstack(L, math.i32.wrap((count as integer) + 4)) == 0 then
+        forget(channel, request)
+        return luaL_error(L, "a host answer has too many values")
+    end
+    lua_pushboolean(L, 1)
+    @unsafe do
+        for index = 0, (count as integer) - 1 do
+            local kind = valueAt(r.values, index).kind
+            local letter = 110
+            if kind == VALUE_BOOLEAN then
+                letter = 98
+            elseif kind == VALUE_NUMBER then
+                letter = 100
+            elseif kind == VALUE_STRING then
+                letter = 115
+            elseif kind == VALUE_BYTES then
+                letter = 121
+            end
+            kinds[index] = letter
+        end
+        lua_pushlstring(L, kinds as voidptr, count)
+        for index = 0, (count as integer) - 1 do
+            pushHostValue(L, valueAt(r.values, index))
+        end
+    end
+    forget(channel, request)
+
+    return math.i32.wrap((count as integer) + 2)
+end
+
+--- ready() answers the ids of the requests answered since it was last asked.
+local function ready(L: voidptr): int32
+    local channel = requiredChannel(L)
+    lua_createtable(L, 0, 0)
+    local index = 0
+    @unsafe do
+        local c = channel as Channel*
+        while c.readyHead ~= 0ULL do
+            local node = c.readyHead
+            c.readyHead = (node as Ready*).next
+            if c.readyHead == 0ULL then
+                c.readyTail = 0ULL
+            end
+            local request = (node as Ready*).request
+            free(node as voidptr)
+            index = index + 1
+            lua_pushnumber(L, request as number)
+            lua_rawseti(L, -2, math.i32.wrap(index))
+        end
+    end
+
+    return 1
+end
+
+--- cancel(request) marks a request abandoned and tells its kind's host.
+local function cancel(L: voidptr): int32
+    local channel = requiredChannel(L)
+    local request = requestId(L, 1)
+    local c = channel as Channel*
+    @unsafe do
+        local entry = map.nuppHostMapGet(c.requests, request)
+        if entry == 0ULL then
+            return 0
+        end
+        local r = entry as Request*
+        if r.cancelled ~= 0 then
+            return 0
+        end
+        r.cancelled = 1
+        if r.state ~= WAITING then
+            return 0
+        end
+        local registration = registrationOf(channel, r.kind, r.kindLength)
+        if registration == 0ULL then
+            return 0
+        end
+        local callback = (registration as Registration*).cancel
+        if callback == 0ULL then
+            return 0
+        end
+        local erased = callback as voidptr
+        local call = erased as function(runtime: voidptr?, request: uint64, userdata: voidptr?)
+        call(c.runtime as voidptr, request, (registration as Registration*).userdata as voidptr)
+    end
+
+    return 0
+end
+
+--- drain(list) moves every pushed message into list, in push order and flat:
+--- each message is its kind, its value count and its values. Answers how many
+--- slots it wrote, so one call and no table per message carries a frame's
+--- input, however many messages it holds.
+local function drain(L: voidptr): int32
+    local channel = requiredChannel(L)
+    luaL_checktype(L, 1, TTABLE)
+    local slot = 0
+    local c = channel as Channel*
+    @unsafe do
+        while c.pushHead ~= 0ULL do
+            local push = c.pushHead
+            c.pushHead = (push as Push*).next
+            if c.pushHead == 0ULL then
+                c.pushTail = 0ULL
+            end
+            c.pushCount = c.pushCount - 1LL
+            -- Kept until the next message is taken, as the bytes it lends.
+            freePush(c.popped)
+            c.popped = push
+            local p = push as Push*
+            if p.count > (MAX_VALUES as uint64) then
+                return luaL_error(L, "a pushed host message has too many values")
+            end
+            lua_pushlstring(L, p.kind as voidptr, p.kindLength)
+            slot = slot + 1
+            lua_rawseti(L, 1, math.i32.wrap(slot))
+            lua_pushinteger(L, p.count as int64)
+            slot = slot + 1
+            lua_rawseti(L, 1, math.i32.wrap(slot))
+            for index = 0, (p.count as integer) - 1 do
+                local value = valueAt(p.values, index)
+                if value.kind == VALUE_BYTES then
+                    lua_pushnil(L)
+                else
+                    pushHostValue(L, value)
+                end
+                slot = slot + 1
+                lua_rawseti(L, 1, math.i32.wrap(slot))
+            end
+        end
+        freePush(c.popped)
+        c.popped = 0ULL
+    end
+    lua_pushinteger(L, slot as int64)
+
+    return 1
+end
+
+local function field(borrows L: voidptr, borrows name: cstring, f: function(L: voidptr): int32)
+    lua_pushcclosure(L, f, 0)
+    lua_setfield(L, -2, name)
+end
+
+--- The `nupp.host.native` module.
+export function nuppEmbedChannelOpen(L: voidptr): int32
+    lua_createtable(L, 0, 6)
+    field(L, "attached", attached)
+    field(L, "dispatch", dispatch)
+    field(L, "take", take)
+    field(L, "ready", ready)
+    field(L, "cancel", cancel)
+    field(L, "drain", drain)
+
+    return 1
+end
