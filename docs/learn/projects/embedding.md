@@ -44,8 +44,8 @@ the public embedding surface.
 
 The repository carries a C application example in `host/examples/embed.c` and
 its component project in `host/examples/component`. The example calls the
-public C ABI implemented by the Rust-owned SDK; it is not the removed legacy C
-host implementation. Build the component from its project directory:
+public C ABI implemented by the SDK, a native Nupp program; it is not the
+removed legacy C host implementation. Build the component from its project directory:
 
 ```bash
 cd host/examples/component
@@ -87,7 +87,8 @@ modules reached by a component are compiled into the component with their
 runtime dependency closure, including target-bound builtin implementations;
 the embedding host does not need a Nupp module tree on its Lua search path.
 
-Build the Rust-owned `libnupp` SDK from the repository root:
+Build the `libnupp` SDK from the repository root. It is a native Nupp program,
+`host/program/common/nuppembed`, compiled by the checkout's own compiler:
 
 ```bash
 SDK=$(./scripts/toolchain host-library \
@@ -112,8 +113,8 @@ game.answer(41) = 42
 ```
 
 Use `LD_LIBRARY_PATH` instead of `DYLD_LIBRARY_PATH` on Linux. Static linking
-uses `libnupp.a`, which contains the pinned LuaJIT VM, the Rust host, and the
-exact-feature Rust native provider. Pass the `staticLinkFlags` array from
+uses `libnupp.a`, which contains the pinned LuaJIT VM, the Nupp embedding library,
+and the exact-feature native provider. Pass the `staticLinkFlags` array from
 `link.json` to the C linker after the archive; it includes the system libraries
 and frameworks selected by the SDK features and the flag that makes the host
 executable export the provider's symbols (`-rdynamic` on Linux,

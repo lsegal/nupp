@@ -227,13 +227,13 @@ steps on the calling Lua thread behind a bounded lane. Processes, sockets, TLS
 and HTTP call the operating system through FFI as well, with TLS and its
 cryptography and the HTTP/1.1 client written in Nupp, and so is the wake
 handle their waits share; none of them stages `build/lib/nupp_native`. URI
-uses Rust's `url` parser, so HTTP, which parses its URLs with it, carries
-the provider for that alone. Built-in message digests are
+parsing is Nupp as well, so HTTP stages nothing for it. Built-in message digests are
 written in Nupp and stage no native artifact. The build binds builtin services
 to the selected target implementation; package descriptors do not replace them.
-The Rust facilities share the versioned `build/lib/nupp_native` sidecar.
+The native provider, itself a native Nupp program, is the versioned
+`build/lib/nupp_native` sidecar.
 Generated or external C interop builds its own declared native dependencies;
-there is no unversioned compatibility provider beside the Rust provider.
+there is no unversioned compatibility provider beside it.
 Each provider is built with the union of its selected features. Pure facilities
 such as buffers, checksums and `math` emit
 their Lua adapters but stage no native artifact. At `-O1` and above the build
