@@ -9,20 +9,16 @@ use std::ffi::c_char;
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
-#[cfg(feature = "uri")]
-mod uri;
-
 /// What `nuppNativeLastError` answers if reading the last error panics.
 static PANICKED: &std::ffi::CStr = c"native provider panicked";
 
 const FEATURE_BASE: u64 = 1 << 0;
-// Bit 1 was UUIDs, bit 2 the GPU provider, bit 4 HTTP, bits 5 to 7 processes,
-// files and the file-transfer lane, bits 8 and 9 the network and TLS families
-// bit 13 their endpoint calls and bit 14 the readiness generation. Nupp
-// provides all of them now, and bit 11, the code generator, is a library of its
-// own. The bits stay unassigned, so an old caller asking for one reads its
-// absence.
-const FEATURE_URI: u64 = 1 << 3;
+// Bit 1 was UUIDs, bit 2 the GPU provider, bit 3 URIs, bit 4 HTTP, bits 5 to 7
+// processes, files and the file-transfer lane, bits 8 and 9 the network and TLS
+// families bit 13 their endpoint calls and bit 14 the readiness generation.
+// Nupp provides all of them now, and bit 11, the code generator, is a library
+// of its own. The bits stay unassigned, so an old caller asking for one reads
+// its absence.
 const FEATURE_AOT_RUNTIME: u64 = 1 << 12;
 
 fn bytes() -> &'static Mutex<Arena<Box<[u8]>>> {
@@ -47,19 +43,6 @@ pub(crate) fn failed(status: Status, message: &str) -> i32 {
     status.code()
 }
 
-#[cfg(feature = "uri")]
-pub(crate) fn input<'a>(data: *const u8, length: usize) -> Result<&'a [u8], i32> {
-    if length == 0 {
-        return Ok(&[]);
-    }
-    if data.is_null() {
-        return Err(failed(Status::InvalidArgument, "input pointer is null"));
-    }
-    // SAFETY: the versioned ABI requires `data` to remain readable for
-    // `length` bytes for the duration of this call.
-    Ok(unsafe { std::slice::from_raw_parts(data, length) })
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn nuppNativeAbiVersion() -> u32 {
     guard(0, || ABI_VERSION)
@@ -69,11 +52,6 @@ pub extern "C" fn nuppNativeAbiVersion() -> u32 {
 pub extern "C" fn nuppNativeFeatures() -> u64 {
     guard(0, || {
         FEATURE_BASE
-            | if cfg!(feature = "uri") {
-                FEATURE_URI
-            } else {
-                0
-            }
             | if cfg!(nupp_aot_runtime) {
                 FEATURE_AOT_RUNTIME
             } else {
@@ -230,7 +208,6 @@ mod tests {
         let definition = std::fs::read_to_string(root.join("../../abi/nuppnative.nupp")).unwrap();
         for (name, value) in [
             ("BASE", FEATURE_BASE),
-            ("URI", FEATURE_URI),
             ("AOT_RUNTIME", FEATURE_AOT_RUNTIME),
         ] {
             let define = format!("\nexport const NUPP_NATIVE_FEATURE_{name} = {value}\n");

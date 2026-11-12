@@ -775,9 +775,8 @@ prebuilt_codegen_library() {
 
 # The features the archive's provider is built with. They are the ones
 # bin/nupp's own provider asks for, so a checkout that cannot run Cargo starts
-# the compiler on the provider a Cargo build would have given it. `uri` is
-# there for the pinned stage-zero compiler only (bin/nupp says why).
-PREBUILT_PROVIDER_FEATURES=base,uri
+# the compiler on the provider a Cargo build would have given it.
+PREBUILT_PROVIDER_FEATURES=base
 
 # The archive a release publishes as this machine's prebuilt code generator:
 # the code generator library, linked from the pinned LLVM (built first if it
