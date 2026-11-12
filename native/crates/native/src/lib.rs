@@ -9,8 +9,6 @@ use std::ffi::c_char;
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
-#[cfg(feature = "codegen")]
-mod codegen;
 #[cfg(feature = "uri")]
 mod uri;
 
@@ -20,10 +18,10 @@ static PANICKED: &std::ffi::CStr = c"native provider panicked";
 const FEATURE_BASE: u64 = 1 << 0;
 // Bit 1 was UUIDs, bit 2 the GPU provider, bit 4 HTTP, bits 5 to 7 processes,
 // files and the file-transfer lane, bits 8 and 9 the network and TLS families
-// and bit 13 their endpoint calls. Nupp provides all of them now. The bits stay
-// unassigned, so an old caller asking for one reads its absence.
+// and bit 13 their endpoint calls. Nupp provides all of them now, and bit 11,
+// the code generator, is a library of its own. The bits stay unassigned, so an
+// old caller asking for one reads its absence.
 const FEATURE_URI: u64 = 1 << 3;
-const FEATURE_CODEGEN: u64 = 1 << 11;
 const FEATURE_AOT_RUNTIME: u64 = 1 << 12;
 const FEATURE_READINESS: u64 = 1 << 14;
 
@@ -33,7 +31,7 @@ fn bytes() -> &'static Mutex<Arena<Box<[u8]>>> {
 }
 
 /// Keeps provider-produced bytes behind a handle the caller copies out of.
-#[cfg(any(feature = "codegen", test))]
+#[cfg(test)]
 pub(crate) fn store_bytes(value: Vec<u8>) -> Result<u64, i32> {
     match bytes().lock() {
         Ok(mut arena) => arena
@@ -49,7 +47,7 @@ pub(crate) fn failed(status: Status, message: &str) -> i32 {
     status.code()
 }
 
-#[cfg(any(feature = "codegen", feature = "uri"))]
+#[cfg(feature = "uri")]
 pub(crate) fn input<'a>(data: *const u8, length: usize) -> Result<&'a [u8], i32> {
     if length == 0 {
         return Ok(&[]);
@@ -74,11 +72,6 @@ pub extern "C" fn nuppNativeFeatures() -> u64 {
             | FEATURE_READINESS
             | if cfg!(feature = "uri") {
                 FEATURE_URI
-            } else {
-                0
-            }
-            | if cfg!(feature = "codegen") {
-                FEATURE_CODEGEN
             } else {
                 0
             }
@@ -324,22 +317,20 @@ mod tests {
         for (name, value) in [
             ("BASE", FEATURE_BASE),
             ("URI", FEATURE_URI),
-            ("CODEGEN", FEATURE_CODEGEN),
             ("AOT_RUNTIME", FEATURE_AOT_RUNTIME),
             ("READINESS", FEATURE_READINESS),
         ] {
             let define = format!("\nexport const NUPP_NATIVE_FEATURE_{name} = {value}\n");
             assert!(definition.contains(&define), "the definition lacks {}", define.trim());
         }
-        // The code generator's exports belong to the compiler, which declares
-        // them itself; everything else this crate exports is the definition's.
+        // Everything this crate exports is the definition's.
         let mut exported = std::collections::BTreeSet::new();
         for entry in std::fs::read_dir(root.join("src")).unwrap() {
             let source = std::fs::read_to_string(entry.unwrap().path()).unwrap();
             exported.extend(
                 declared(&source, "extern \"C\" fn ")
                     .into_iter()
-                    .filter(|name| name.starts_with("nupp") && !name.starts_with("nuppCodegen")),
+                    .filter(|name| name.starts_with("nupp")),
             );
         }
         let mut declarations = declared(&definition, "\ncdef function ");

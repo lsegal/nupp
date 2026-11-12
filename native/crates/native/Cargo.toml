@@ -20,12 +20,9 @@ gpu = ["base"]
 uri = ["base", "dep:url"]
 # A test-only export that panics inside the boundary: nuppNativePanicProbe.
 panic-probe = ["base"]
-# The AOT code generator: LLVM and lld, linked in (NUPP_LLVM_PREFIX).
-codegen = ["base", "dep:nupp-native-codegen", "nupp-native-codegen/llvm"]
 
 [dependencies]
 nupp-native-abi = { path = "../abi" }
 nupp-native-runtime = { path = "../runtime" }
-nupp-native-codegen = { path = "../codegen", optional = true }
 url = { version = "2.5.7", optional = true }
 

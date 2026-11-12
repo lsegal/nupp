@@ -211,15 +211,21 @@ launcher_notice() {
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
         RUST_NATIVE_FILENAME=nupp_native_dev.dll
+        CODEGEN_FILENAME=nupp_codegen_dev.dll
         ;;
     Darwin*)
         RUST_NATIVE_FILENAME=libnupp_native_dev.dylib
+        CODEGEN_FILENAME=libnupp_codegen_dev.dylib
         ;;
     *)
         RUST_NATIVE_FILENAME=libnupp_native_dev.so
+        CODEGEN_FILENAME=libnupp_codegen_dev.so
         ;;
 esac
 export NUPP_NATIVE_LIBRARY="$LUA_ROOT/build/lib/$RUST_NATIVE_FILENAME"
+# The AOT code generator, staged beside the provider where the compiler looks
+# for it (nupp.compiler.aot.llvm.codegen), when the pinned LLVM is built.
+CODEGEN_LIBRARY="$LUA_ROOT/build/lib/$CODEGEN_FILENAME"
 
 # This makes the Rust provider a prerequisite for building Nupp itself, rather
 # than only for a target that asked for a native facility. Stage 0 reaches it
@@ -243,30 +249,53 @@ aot_runtime_expected() {
     [ -f "$BUILT" ] && [ "${NUPP_AOT_RUNTIME_ARCHIVE+set}" != set ]
 }
 
+# Copies a built library beside its destination and renames it onto it, never
+# writing in place. A rename within one directory is atomic, so a command
+# loading the library while this runs sees the old file or the new one. Writing
+# over it directly leaves a window in which the file is neither: half a shared
+# library, which the loader does not report as a bad file -- on macOS the kernel
+# refuses the image and kills the process outright, some way from the cause.
+install_library() {
+    staged="$2.$$"
+    if ! cp "$1" "$staged"; then
+        rm -f "$staged"
+        echo "nupp: could not stage $3" >&2
+        return 1
+    fi
+    if mv -f "$staged" "$2"; then
+        return 0
+    fi
+    rm -f "$staged"
+    echo "nupp: could not install $3" >&2
+    return 1
+}
+
+# The code generator library beside the provider, linked from the pinned LLVM
+# only when it is already built (or named by NUPP_LLVM_PREFIX): building LLVM
+# takes minutes to an hour, and nothing but AOT compilation needs it. A tree
+# without it still builds and runs the compiler; `@aot` then says what is
+# missing, or takes the pinned prebuilt code generator.
+stage_codegen() {
+    rm -f "$NUPP_NATIVE_LIBRARY.codegen"
+    if ! llvm_is_available; then
+        rm -f "$CODEGEN_LIBRARY"
+        return 0
+    fi
+    codegen=$("$ROOT/scripts/toolchain" codegen-library) || return 1
+    install_library "$codegen" "$CODEGEN_LIBRARY" "the code generator library"
+}
+
 build_native() {
     # These are optional stdlib facilities a program run by this launcher may
     # select; unlike a packaged build, `nupp run` loads this one development
     # provider rather than staging a target-specific union beside the program.
     #
-    # The AOT code generator joins the union only when the pinned LLVM is
-    # already built (or named by NUPP_LLVM_PREFIX): building LLVM takes minutes
-    # to an hour, and nothing but AOT compilation needs it. A tree without it
-    # still builds and runs the compiler; `@aot` then says what is missing.
-    #
     # A machine without Cargo gets the pinned prebuilt provider from the same
-    # request, code generator included, without Cargo or rustc being asked
-    # anything (`scripts/toolchain`, "the prebuilt native provider").
-    features=base,uri
-    if llvm_is_available; then
-        features=$features,codegen
-    fi
-    built=$("$ROOT/scripts/toolchain" native-rust "$features") || return 1
+    # request, without Cargo or rustc being asked anything (`scripts/toolchain`,
+    # "the prebuilt native provider").
+    built=$("$ROOT/scripts/toolchain" native-rust base,uri) || return 1
     mkdir -p "$ROOT/build/lib"
-    if llvm_is_available; then
-        : > "$NUPP_NATIVE_LIBRARY.codegen"
-    else
-        rm -f "$NUPP_NATIVE_LIBRARY.codegen"
-    fi
+    stage_codegen || return 1
     # The AOT runtime is a Nupp program, so a provider built before there was a
     # compiler to build it has none; `native_is_current` asks for another once
     # there is one.
@@ -275,24 +304,7 @@ build_native() {
     else
         rm -f "$NUPP_NATIVE_LIBRARY.aotruntime"
     fi
-    # Copied beside the destination and renamed onto it, never written in place.
-    # A rename within one directory is atomic, so a command loading the library
-    # while this runs sees the old file or the new one. Writing over it directly
-    # leaves a window in which the file is neither: half a shared library, which
-    # the loader does not report as a bad file -- on macOS the kernel refuses the
-    # image and kills the process outright, some way from the cause.
-    staged="$NUPP_NATIVE_LIBRARY.$$"
-    if ! cp "$built" "$staged"; then
-        rm -f "$staged"
-        echo "nupp: could not stage the Rust native provider" >&2
-        return 1
-    fi
-    if mv -f "$staged" "$NUPP_NATIVE_LIBRARY"; then
-        return 0
-    fi
-    rm -f "$staged"
-    echo "nupp: could not install the Rust native provider" >&2
-    return 1
+    install_library "$built" "$NUPP_NATIVE_LIBRARY" "the Rust native provider"
 }
 
 . "$ROOT/scripts/luajit.sh"
@@ -573,8 +585,13 @@ native_is_current() {
     [ ! "$ROOT/scripts/toolchain.pins" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
     [ ! "$ROOT/rust-toolchain.toml" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
     [ ! "$ROOT/.cargo/config.toml" -nt "$NUPP_NATIVE_LIBRARY" ] || return 1
-    # A provider built before the pinned LLVM existed lacks the code generator.
-    [ -f "$NUPP_NATIVE_LIBRARY.codegen" ] || ! llvm_is_available || return 1
+    # A tree staged before the pinned LLVM existed lacks the code generator,
+    # and one staged before the code generator's exports moved is stale.
+    if [ -f "$CODEGEN_LIBRARY" ]; then
+        [ ! "$ROOT/native/codegen/symbols" -nt "$CODEGEN_LIBRARY" ] || return 1
+    else
+        ! llvm_is_available || return 1
+    fi
     [ -f "$NUPP_NATIVE_LIBRARY.aotruntime" ] || ! aot_runtime_expected
 }
 

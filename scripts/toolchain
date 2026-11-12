@@ -46,6 +46,7 @@ Components: luajit luarocks lpeg lpeg-source stage0 migration-stage0 llvm wgpu
             rust-vendor OUTPUT
             host FEATURES, host-library FEATURES
             kit FEATURES, kit-archive FEATURES OUTPUT
+            codegen-library
             prebuilt-codegen [PLATFORM], prebuilt-kit [PLATFORM]
             codegen-archive OUTPUT
             archive DIRECTORY OUTPUT
@@ -58,8 +59,8 @@ Environment:
   NUPP_CC, NUPP_CXX          the compiler pair. Probed when unset.
   NUPP_CARGO, NUPP_RUSTC     the pinned Rust toolchain. Probed when unset.
   NUPP_PREBUILT_PROVIDER     1 to take native-rust from the pinned prebuilt
-                             code generator, 0 never to. Without Cargo it is
-                             taken whenever one is pinned.
+                             code generator archive, 0 never to. Without Cargo
+                             it is taken whenever one is pinned.
   NUPP_RUST_WINDOWS_ABI      GNU (default) or gnullvm for LLVM-MinGW.
   NUPP_TOOLCHAIN_DIR         where to install. Defaults to the repository cache.
   NUPP_RUST_BUILD_DIR        Rust outputs. Defaults to build/rust.
@@ -501,6 +502,175 @@ stage0() {
     native_path "$stage0_runtime_file"
 }
 
+# --- the code generator -----------------------------------------------------
+
+# The code generator is LLVM and lld, linked statically and reached by the
+# compiler through LuaJIT's FFI (src/nupp/compiler/aot/llvm/codegen.nupp). It
+# is linked into one of two places: a shared library of its own, which a
+# checkout stages beside its native provider and a release publishes as the
+# prebuilt code generator, or a Nupp host built with `native-codegen`. Either
+# way the only names exported are the `nuppcg_*` aliases native/codegen/symbols
+# lists, each for an LLVM or lld name that stays local: a process that loads
+# another LLVM, as Mesa's llvmpipe Vulkan driver does, must never have its
+# calls bound to this one.
+
+# LLVM's component libraries the code generator links.
+CODEGEN_COMPONENTS="passes irreader object option lto bitwriter bitreader profiledata
+    debuginfodwarf textapi objcarcopts cgdata dtlto debuginfocodeview debuginfomsf
+    debuginfopdb libdriver windowsdriver windowsmanifest aarch64codegen
+    aarch64asmparser aarch64disassembler x86codegen x86asmparser x86disassembler
+    webassemblycodegen webassemblyasmparser webassemblydisassembler mcdisassembler"
+
+codegen_library_filename() {
+    case "$PLATFORM" in
+        darwin)  printf '%s\n' libnupp_codegen.dylib ;;
+        windows) printf '%s\n' nupp_codegen.dll ;;
+        *)       printf '%s\n' libnupp_codegen.so ;;
+    esac
+}
+
+# `ALIAS TARGET`, one export per line, for this platform.
+codegen_symbols() {
+    while IFS= read -r cs_line; do
+        cs_line=$(printf '%s' "$cs_line" | tr -d '\r')
+        case "$cs_line" in
+            ''|'#'*) continue ;;
+        esac
+        # shellcheck disable=SC2086 # split into the line's fields
+        set -- $cs_line
+        case "${3:-}" in
+            '') ;;
+            darwin) [ "$PLATFORM" = darwin ] || continue ;;
+            '!darwin') [ "$PLATFORM" != darwin ] || continue ;;
+            *) die "native/codegen/symbols names an unknown platform: $3" ;;
+        esac
+        printf '%s %s\n' "$1" "$2"
+    done < "$ROOT/native/codegen/symbols"
+}
+
+# What exports each alias for its target and pulls the target out of LLVM's
+# archives, one argument per line. Windows gives the aliases in a module
+# definition file instead (codegen_definitions), and needs only the pull.
+codegen_alias_flags() {
+    codegen_symbols | while read -r ca_alias ca_target; do
+        case "$PLATFORM" in
+            darwin) printf '%s\n' "-Wl,-u,_$ca_target" "-Wl,-alias,_$ca_target,_$ca_alias" ;;
+            windows) printf '%s\n' "-Wl,--undefined=$ca_target" ;;
+            *) printf '%s\n' "-Wl,--undefined=$ca_target" "-Wl,--defsym=$ca_alias=$ca_target" ;;
+        esac
+    done
+}
+
+# The aliases as module-definition exports, for a Windows link.
+codegen_definitions() {
+    codegen_symbols | while read -r cd_alias cd_target; do
+        printf '    %s=%s\n' "$cd_alias" "$cd_target"
+    done
+}
+
+# The static LLVM and lld libraries, then what they need from the system, one
+# argument per line. NUPP_LLVM_LIBS (with NUPP_LLVM_SYSTEM_LIBS) lists them for
+# a cross-built tree whose llvm-config cannot run here. `library` links the C++
+# runtime statically, so the code generator library depends on nothing a
+# machine might lack; `host` links it the way the host's other C++ does.
+codegen_libraries() {
+    cl_mode=$1
+    build_llvm
+    printf '%s\n' "-L$(native_path "$LLVM_OUT/lib")"
+    # lld's libraries before LLVM's: they depend on it, not the reverse.
+    for cl_library in lldMinGW lldCOFF lldELF lldMachO lldWasm lldCommon; do
+        printf '%s\n' "-l$cl_library"
+    done
+    if [ -n "${NUPP_LLVM_LIBS:-}" ]; then
+        cl_libraries=$NUPP_LLVM_LIBS
+        cl_system=${NUPP_LLVM_SYSTEM_LIBS:-}
+    else
+        cl_config="$LLVM_OUT/bin/llvm-config"
+        # shellcheck disable=SC2086 # one argument per component
+        cl_libraries=$("$cl_config" --link-static --libs $CODEGEN_COMPONENTS) \
+            || die "llvm-config could not list LLVM's libraries"
+        cl_system=$("$cl_config" --link-static --system-libs) \
+            || die "llvm-config could not list LLVM's system libraries"
+    fi
+    for cl_library in $cl_libraries $cl_system; do
+        cl_name=${cl_library#-l}
+        cl_name=${cl_name%.lib}
+        [ -n "$cl_name" ] && printf '%s\n' "-l$cl_name"
+    done
+    case "$PLATFORM:$cl_mode" in
+        darwin:*) printf '%s\n' -lc++ ;;
+        *:library) printf '%s\n' -static-libstdc++ -static-libgcc -lpthread ;;
+        windows:host) printf '%s\n' -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic ;;
+        *:host) printf '%s\n' -lstdc++ ;;
+    esac
+}
+
+# What the code generator is built from, for the key of anything it is linked
+# into. Builds or finds the pinned LLVM.
+codegen_material() {
+    build_llvm
+    printf 'llvm %s %s %s symbols %s\n' "$LLVM_VERSION" "$LLVM_SHA256" "$LLVM_OUT" \
+        "$(sha256 "$ROOT/native/codegen/symbols")"
+}
+
+macos_deployment_floor() {
+    case "$(uname -m 2>/dev/null)" in
+        x86_64) printf '%s\n' 10.14 ;;
+        *) printf '%s\n' 11.0 ;;
+    esac
+}
+
+# The code generator library for this machine, linked from the pinned LLVM.
+# Sets CODEGEN_LIBRARY_OUT.
+CODEGEN_LIBRARY_OUT=""
+build_codegen_library() {
+    build_llvm
+    cg_material=$(codegen_material)
+    cg_digest=$(printf '%s|%s|%s' nupp-codegen "$cg_material" "$KEY" | sha256_stdin | cut -c1-16)
+    cg_out="$PREFIX/codegen/$cg_digest"
+    cg_filename=$(codegen_library_filename)
+    CODEGEN_LIBRARY_OUT="$cg_out/$cg_filename"
+    take_lock "codegen-$cg_digest" "$cg_out/.complete" || return 0
+    [ -f "$cg_out/.complete" ] && [ -f "$CODEGEN_LIBRARY_OUT" ] && { release_lock; return 0; }
+    note "linking the code generator library"
+    rm -rf "$cg_out"
+    mkdir -p "$cg_out"
+    set -- "$CXX" -shared -o "$CODEGEN_LIBRARY_OUT"
+    case "$PLATFORM" in
+        darwin)
+            codegen_symbols | sed 's/ .*//; s/^/_/' > "$cg_out/exports"
+            set -- "$@" -Wl,-x "-Wl,-exported_symbols_list,$cg_out/exports" \
+                "-Wl,-install_name,@rpath/$cg_filename" "-mmacosx-version-min=$(macos_deployment_floor)"
+            ;;
+        windows)
+            {
+                printf 'EXPORTS\n'
+                codegen_definitions
+            } > "$cg_out/exports.def"
+            set -- "$@" "$(native_path "$cg_out/exports.def")"
+            ;;
+        *)
+            {
+                printf '{\n  global:\n'
+                codegen_symbols | sed 's/^\([^ ]*\) .*$/    \1;/'
+                printf '  local: *;\n};\n'
+            } > "$cg_out/exports.map"
+            # -Bsymbolic binds the library's references to its own LLVM even
+            # where a name happens to be visible from another.
+            set -- "$@" "-Wl,--version-script=$cg_out/exports.map" -Wl,-Bsymbolic -Wl,--gc-sections
+            ;;
+    esac
+    while IFS= read -r cg_flag; do
+        [ -z "$cg_flag" ] || set -- "$@" "$cg_flag"
+    done <<EOF
+$(codegen_alias_flags)
+$(codegen_libraries library)
+EOF
+    "$@" >&2 || die "cannot link the code generator library"
+    printf 'done\n' > "$cg_out/.complete"
+    release_lock
+}
+
 # --- the prebuilt code generator and link kit -------------------------------
 
 # What a clean checkout links a native program with before it has built LLVM:
@@ -509,23 +679,31 @@ stage0() {
 # fetched, not built, so they are cached by their own digest rather than under
 # the compiler-pair key, and a checkout that builds its own LLVM never asks.
 #
-# The code generator is the release's native provider built with `codegen`:
-# one shared library, loaded beside this tree's own provider only for the
-# `nuppCodegen*` entry points. The kit is the same archive `kit-archive`
-# writes, so a release publishes one file for both a catalog and a checkout.
+# The code generator archive carries two shared libraries: the code generator
+# library (`codegen-library`), which the compiler loads for LLVM and lld, and
+# the release's native provider, which a checkout without Cargo starts the
+# compiler on (the prebuilt native provider, below). The kit is the same
+# archive `kit-archive` writes, so a release publishes one file for both a
+# catalog and a checkout.
 
-# The pin suffix and archive member for a platform's prebuilt assets, which is
-# this machine's own unless one is named. Sets PREBUILT_TARGET and the two
-# digests, which are empty for a platform nothing is pinned for.
+# The pin suffix and archive members for a platform's prebuilt assets, which
+# is this machine's own unless one is named. Sets PREBUILT_TARGET, the provider
+# and code generator library names, and the two digests, which are empty for a
+# platform nothing is pinned for.
 prebuilt_pins() {
     PREBUILT_TARGET=${1:-$(kit_target)}
     case "$PREBUILT_TARGET" in
-        x86_64-unknown-linux-gnu) prebuilt_suffix=LINUX_X86_64; prebuilt_library=libnupp_native.so ;;
-        aarch64-apple-darwin)     prebuilt_suffix=MACOS_AARCH64; prebuilt_library=libnupp_native.dylib ;;
+        x86_64-unknown-linux-gnu)
+            prebuilt_suffix=LINUX_X86_64; prebuilt_library=libnupp_native.so
+            prebuilt_codegen=libnupp_codegen.so ;;
+        aarch64-apple-darwin)
+            prebuilt_suffix=MACOS_AARCH64; prebuilt_library=libnupp_native.dylib
+            prebuilt_codegen=libnupp_codegen.dylib ;;
         x86_64-pc-windows-msvc|x86_64-pc-windows-gnu)
             PREBUILT_TARGET=x86_64-pc-windows-msvc
-            prebuilt_suffix=WINDOWS_X86_64; prebuilt_library=nupp_native.dll ;;
-        *) prebuilt_suffix=""; prebuilt_library="" ;;
+            prebuilt_suffix=WINDOWS_X86_64; prebuilt_library=nupp_native.dll
+            prebuilt_codegen=nupp_codegen.dll ;;
+        *) prebuilt_suffix=""; prebuilt_library=""; prebuilt_codegen="" ;;
     esac
     prebuilt_codegen_digest=""
     prebuilt_kit_digest=""
@@ -536,7 +714,7 @@ prebuilt_pins() {
 }
 
 # One verified, unpacked prebuilt asset: `codegen` or `kit`. Sets PREBUILT_OUT
-# to the provider library or the kit directory. A platform with no pin, or a
+# to the code generator archive's provider library or the kit directory. A platform with no pin, or a
 # pin with no tag, is refused with what is missing rather than fetched.
 PREBUILT_OUT=""
 build_prebuilt() {
@@ -585,19 +763,28 @@ build_prebuilt() {
     release_lock
 }
 
-# The features the prebuilt code generator is built with. They are the ones
+# The code generator library in the unpacked code generator archive, after
+# `build_prebuilt codegen`. Sets PREBUILT_OUT to it. An archive from before the
+# code generator was a library of its own carries none, and is refused by name.
+prebuilt_codegen_library() {
+    pcl_dir=$(dirname "$PREBUILT_OUT")
+    [ -f "$pcl_dir/$prebuilt_codegen" ] \
+        || die "the $PREBUILT_TAG prebuilt code generator for $PREBUILT_TARGET has no $prebuilt_codegen; it predates the code generator library, so pin a later release (scripts/toolchain.pins)"
+    PREBUILT_OUT="$pcl_dir/$prebuilt_codegen"
+}
+
+# The features the archive's provider is built with. They are the ones
 # bin/nupp's own provider asks for, so a checkout that cannot run Cargo starts
-# the compiler on the same library it links native programs with.
-PREBUILT_PROVIDER_FEATURES=base,codegen,uri
+# the compiler on the provider a Cargo build would have given it.
+PREBUILT_PROVIDER_FEATURES=base,uri
 
 # The archive a release publishes as this machine's prebuilt code generator:
-# the provider built with PREBUILT_PROVIDER_FEATURES, which
-# NUPP_REQUIRE_CODEGEN makes sure really has the code generator in it. The
-# feature list travels beside the library, so a checkout can tell an archive
-# that carries them from an older one built with `codegen` alone.
+# the code generator library, linked from the pinned LLVM (built first if it
+# must be), and the provider built with PREBUILT_PROVIDER_FEATURES. The feature
+# list travels beside the provider, so a checkout can tell what it carries.
 codegen_archive() {
-    NUPP_REQUIRE_CODEGEN=1
-    export NUPP_REQUIRE_CODEGEN
+    build_llvm
+    build_codegen_library
     build_rust_native "$PREBUILT_PROVIDER_FEATURES"
     # A checkout that takes this provider has no Cargo to link the runtime in.
     [ -n "$AOT_RUNTIME_OUT" ] \
@@ -606,6 +793,7 @@ codegen_archive() {
     [ -n "$prebuilt_library" ] || die "no prebuilt code generator is published for $PREBUILT_TARGET"
     codegen_staging=$(mktemp -d "${TMPDIR:-/tmp}/nupp-codegen.XXXXXX") || die "cannot stage the code generator"
     cp "$RUST_NATIVE_OUT" "$codegen_staging/$prebuilt_library"
+    cp "$CODEGEN_LIBRARY_OUT" "$codegen_staging/$prebuilt_codegen"
     printf '%s\n' "$PREBUILT_PROVIDER_FEATURES" > "$codegen_staging/features"
     deterministic_archive "$codegen_staging" "$1" || { rm -rf "$codegen_staging"; die "cannot archive the code generator"; }
     rm -rf "$codegen_staging"
@@ -614,7 +802,7 @@ codegen_archive() {
 # --- the prebuilt native provider -------------------------------------------
 
 # The compiler's own native provider, for a checkout that cannot run Cargo:
-# the pinned prebuilt code generator, which is a whole provider built with
+# the one in the pinned prebuilt code generator archive, built with
 # PREBUILT_PROVIDER_FEATURES. `native-rust` answers with it when Cargo is not
 # there (NUPP_CARGO naming nothing, or neither `cargo` nor `rustup` on PATH)
 # and a code generator is pinned for this machine, or whenever
@@ -643,15 +831,16 @@ prebuilt_provider_wanted() {
 }
 
 # Sets PREBUILT_OUT to the prebuilt provider when it carries every feature in
-# the list; `gpu` selects nothing and is accepted for the stage-zero compiler
-# that still asks for it. Anything else needs Cargo, and says so.
+# the list; `gpu` and `codegen` select nothing and are accepted for the
+# stage-zero compiler that still asks for them. Anything else needs Cargo, and
+# says so.
 prebuilt_provider() {
     requested=$(normalize_rust_features "${1:-}")
     build_prebuilt codegen
     provider_dir=$(dirname "$PREBUILT_OUT")
     [ -f "$provider_dir/features" ] \
         || die "the $PREBUILT_TAG prebuilt code generator carries no provider features; it needs Cargo, or a pin past it (scripts/toolchain.pins)"
-    carried=",$(tr -d ' \r\n' < "$provider_dir/features"),gpu,"
+    carried=",$(tr -d ' \r\n' < "$provider_dir/features"),gpu,codegen,"
     for feature in $(printf '%s' "$requested" | tr ',' ' '); do
         case "$carried" in
             *",$feature,"*) ;;
@@ -934,14 +1123,11 @@ provision_rust_vendor() {
 # Rust entry points are content-addressed under the checkout's build/rust tree.
 # They always build the locked workspace with default features disabled so the
 # compiler-selected feature union is the dependency union.
-# A feature list naming the code generator needs the pinned LLVM: it is built
-# (or found) first, handed to cargo, and folded into the artifact's key, since
-# the LLVM pin is deliberately not part of the ordinary native key.
-# Whether a feature list's code generator is built in: when the pinned LLVM is
-# already built, or when NUPP_REQUIRE_CODEGEN=1 asks for it (a release, which
-# builds LLVM if it must). Otherwise the build goes ahead without it, the way
-# bin/nupp's own provider does, so a checkout or CI shard that never compiles
-# AOT code never waits an hour for LLVM. `@aot` then says what is missing.
+# Whether a host's code generator is built in: when the pinned LLVM is already
+# built, or when NUPP_REQUIRE_CODEGEN=1 asks for it (a release, which builds
+# LLVM if it must). Otherwise the build goes ahead without it, the way
+# bin/nupp's own does, so a checkout or CI shard that never compiles AOT code
+# never waits an hour for LLVM. `@aot` then says what is missing.
 codegen_wanted() {
     [ "${NUPP_REQUIRE_CODEGEN:-}" = 1 ] && return 0
     (build_llvm available) >/dev/null 2>&1 && return 0
@@ -949,44 +1135,23 @@ codegen_wanted() {
     return 1
 }
 
-# The Rust feature list without `codegen` when codegen_wanted declines it.
-optional_codegen() {
-    case ",$1," in
-        *,codegen,*)
-            if codegen_wanted; then
-                printf '%s\n' "$1"
-            else
-                printf '%s\n' "$1" | tr ',' '\n' | grep -v '^codegen$' | tr '\n' ',' | sed 's/,$//'
-            fi
-            ;;
-        *) printf '%s\n' "$1" ;;
-    esac
-}
-
-llvm_for_features() {
-    RUST_LLVM_MATERIAL=
-    case ",$1," in
-        *,codegen,*|*,native-codegen,*)
-            build_llvm
-            NUPP_LLVM_PREFIX=$LLVM_OUT
-            export NUPP_LLVM_PREFIX
-            RUST_LLVM_MATERIAL="llvm $LLVM_VERSION $LLVM_SHA256 $LLVM_OUT"
-            ;;
-    esac
+# A provider feature list without `codegen`. The code generator is a library of
+# its own now (codegen-library), but the pinned stage-zero compiler still asks
+# the provider for it, and is answered with the provider it can have.
+without_codegen() {
+    printf '%s\n' "$1" | tr ',' '\n' | grep -v '^codegen$' | tr '\n' ',' | sed 's/,$//'
 }
 
 build_rust_native() {
-    sorted=$(optional_codegen "$(normalize_rust_features "${1:-}")")
+    sorted=$(without_codegen "$(normalize_rust_features "${1:-}")")
     select_rust_tools
-    llvm_for_features "$sorted"
     rust_environment=$(rust_environment_material)
     aot_runtime_for_provider
     rn_runtime=none
     [ -z "$AOT_RUNTIME_OUT" ] || rn_runtime=$(sha256 "$AOT_RUNTIME_OUT")
     digest=$({
-        printf '%s|%s|%s|%s|%s|%s|%s\n' \
-            nupp-native "$sorted" "$RUST_TOOL_MATERIAL" "$(rust_sources_digest)" "$KEY" "$RUST_LLVM_MATERIAL" \
-            "$rn_runtime"
+        printf '%s|%s|%s|%s|%s|%s\n' \
+            nupp-native "$sorted" "$RUST_TOOL_MATERIAL" "$(rust_sources_digest)" "$KEY" "$rn_runtime"
         printf '%s\n' "$rust_environment"
     } | sha256_stdin | cut -c1-16)
     out="$RUST_BUILD_ROOT/native/$digest"
@@ -1032,8 +1197,7 @@ EOF
     # debug map's object paths carry it too, and ld64 hashes them into
     # LC_UUID, so they go relative to it.
     # The Nupp host links the static archive, so it also needs the native
-    # libraries rustc would have linked for it: libstdc++ and LLVM's system
-    # libraries under the code generator, and Rust's own. rustc reports them.
+    # libraries rustc would have linked for it, Rust's own. rustc reports them.
     set -- "$@" -- --print native-static-libs
     if [ "$PLATFORM" = darwin ]; then
         set -- "$@" -C "link-arg=-Wl,-install_name,@rpath/$filename" \
@@ -1789,9 +1953,10 @@ merge_static_archives() {
 }
 
 # The symbols the stub executable exports by name, one per line: the LuaJIT C
-# API, the native provider and the code generator, which LuaJIT's FFI resolves
-# in its own process. That is host/include/nupp.exports for this feature list,
-# less the embedding API, which only the embedding SDK defines.
+# API and the native provider, which LuaJIT's FFI resolves in its own process.
+# That is host/include/nupp.exports for this feature list, less the embedding
+# API, which only the embedding SDK defines. The code generator's aliases are
+# added by host_stub_export_flags, from native/codegen/symbols.
 host_stub_exports() {
     hx_features=$1
     hx_luajit=$2
@@ -1828,9 +1993,14 @@ host_stub_export_flags() {
     he_out=$1
     he_features=$2
     he_luajit=$3
+    he_codegen=false
+    case ",$he_features," in *,native-codegen,*) he_codegen=true ;; esac
     case "$PLATFORM" in
         darwin)
-            host_stub_exports "$he_features" "$he_luajit" | sed 's/^/_/' > "$he_out/nupp-host.exports"
+            {
+                host_stub_exports "$he_features" "$he_luajit"
+                [ "$he_codegen" = false ] || codegen_symbols | sed 's/ .*//'
+            } | sed 's/^/_/' > "$he_out/nupp-host.exports"
             # macOS also drops local symbols; Linux keeps them, because a
             # crashed worker's core dump is read back through them.
             printf '%s\n' -Wl,-x "-Wl,-exported_symbols_list,$he_out/nupp-host.exports"
@@ -1839,6 +2009,7 @@ host_stub_export_flags() {
             {
                 printf 'EXPORTS\n'
                 host_stub_exports "$he_features" "$he_luajit" | sed 's/^/    /'
+                [ "$he_codegen" = false ] || codegen_definitions
             } > "$he_out/nupp-host.def"
             native_path "$he_out/nupp-host.def"
             ;;
@@ -1860,13 +2031,20 @@ build_nupp_host() {
     nh_lpeg=$2
     nh_luajit=$3
     nh_provider="base"
-    case ",$nh_features," in *,native-codegen,*) nh_provider="$nh_provider,codegen" ;; esac
     case ",$nh_features," in *,native-panic-probe,*) nh_provider="$nh_provider,panic-probe" ;; esac
+    # The code generator is linked into the stub itself, from the pinned LLVM.
+    nh_codegen=""
+    case ",$nh_features," in
+        *,native-codegen,*)
+            build_llvm
+            nh_codegen=$(codegen_material)
+            ;;
+    esac
     build_rust_native "$nh_provider"
     nh_provider_archive=$RUST_NATIVE_STATIC_OUT
     nh_provider_libraries=$RUST_NATIVE_LIBS_OUT
-    nh_digest=$(printf '%s|%s|%s|%s|%s' \
-        nupp-host "$nh_features" "$(host_program_digest)" "$nh_provider_archive" "$KEY" \
+    nh_digest=$(printf '%s|%s|%s|%s|%s|%s' \
+        nupp-host "$nh_features" "$(host_program_digest)" "$nh_provider_archive" "$KEY" "$nh_codegen" \
         | sha256_stdin | cut -c1-16)
     nh_out="$PREFIX/nupp-host/$nh_digest"
     NUPP_HOST_OUT=$nh_out
@@ -1903,6 +2081,7 @@ build_nupp_host() {
     done <<EOF
 $(host_system_flags "$nh_features")
 $(cat "$nh_provider_libraries" 2>/dev/null)
+$([ -z "$nh_codegen" ] || { codegen_alias_flags; codegen_libraries host; })
 $(host_stub_export_flags "$nh_out" "$nh_features" "$nh_luajit")
 EOF
     "$@" >&2 || die "cannot link the Nupp host"
@@ -1922,6 +2101,15 @@ build_host() {
     select_host_features "$features"
     selected_cargo_features=$host_cargo_features
     selected_lpeg_prefix=$host_lpeg_prefix
+    # The embedding SDK carries no code generator: a program embedding the
+    # compiler finds the code generator library the way a checkout does.
+    case "$kind:,$selected_cargo_features," in
+        library:*,native-codegen,*)
+            note "the embedding library is built without the code generator"
+            selected_cargo_features=$(printf '%s\n' "$selected_cargo_features" | tr ',' '\n' \
+                | grep -v '^native-codegen$' | tr '\n' ',' | sed 's/,$//')
+            ;;
+    esac
     digest=$(printf '%s|%s|%s|%s' \
         "$kind" "$selected_cargo_features" "$(embedding_headers_digest)" "$(rust_sources_digest)" \
         | sha256_stdin | cut -c1-16)
@@ -2745,6 +2933,12 @@ case "$1" in
         native_path "$output"
         exit 0
         ;;
+    codegen-library)
+        build_llvm
+        build_codegen_library
+        native_path "$CODEGEN_LIBRARY_OUT"
+        exit 0
+        ;;
     prebuilt-codegen|prebuilt-kit)
         # A provider driver hands over a feature list, which a prebuilt asset
         # has no use for; a platform is named by its target key.
@@ -2752,6 +2946,7 @@ case "$1" in
             *-*) build_prebuilt "${1#prebuilt-}" "$2" ;;
             *)   build_prebuilt "${1#prebuilt-}" ;;
         esac
+        [ "$1" = prebuilt-kit ] || prebuilt_codegen_library
         native_path "$PREBUILT_OUT"
         exit 0
         ;;
