@@ -1,6 +1,5 @@
-//! Versioned primitives shared by the Rust host and native providers.
-
-#![forbid(unsafe_op_in_unsafe_fn)]
+//! Versioned primitives behind every provider export: status codes, the
+//! thread's last error, the panic boundary and generational handles.
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -10,8 +9,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub const ABI_VERSION: u32 = 2;
 
+/// The status codes `native/abi/nuppnative.nupp` declares. No export answers
+/// OUT_OF_RANGE or UNAVAILABLE any more, but the codes stay assigned.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(dead_code, reason = "the ABI keeps every declared status code")]
 pub enum Status {
     Ok = 0,
     InvalidArgument = 1,
@@ -105,22 +107,22 @@ pub fn boundary(body: impl FnOnce() -> i32) -> i32 {
 pub struct Handle(u64);
 
 impl Handle {
-    pub const INVALID: Self = Self(0);
-
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
+    #[cfg_attr(
+        not(feature = "uri"),
+        allow(dead_code, reason = "only URIs store handles")
+    )]
     pub const fn raw(self) -> u64 {
         self.0
     }
 
-    pub const fn is_valid(self) -> bool {
-        let index = (self.0 & u32::MAX as u64) as u32;
-        let generation = (self.0 >> 32) as u32;
-        index != 0 && generation != 0
-    }
-
+    #[cfg_attr(
+        not(feature = "uri"),
+        allow(dead_code, reason = "only URIs store handles")
+    )]
     fn new(index: usize, generation: u32) -> Self {
         debug_assert!(index < u32::MAX as usize);
         Self((u64::from(generation) << 32) | (index as u64 + 1))
@@ -146,7 +148,6 @@ struct Slot<T> {
 pub struct Arena<T> {
     slots: Vec<Slot<T>>,
     free: Vec<usize>,
-    len: usize,
 }
 
 impl<T> Arena<T> {
@@ -154,18 +155,13 @@ impl<T> Arena<T> {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
-            len: 0,
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
+    #[cfg_attr(
+        not(feature = "uri"),
+        allow(dead_code, reason = "only URIs store handles")
+    )]
     pub fn insert(&mut self, value: T) -> Result<Handle, Status> {
         let index = if let Some(index) = self.free.pop() {
             index
@@ -182,7 +178,6 @@ impl<T> Arena<T> {
         let slot = &mut self.slots[index];
         debug_assert!(slot.value.is_none());
         slot.value = Some(value);
-        self.len += 1;
         Ok(Handle::new(index, slot.generation))
     }
 
@@ -193,15 +188,6 @@ impl<T> Arena<T> {
             return Err(Status::StaleHandle);
         }
         slot.value.as_ref().ok_or(Status::StaleHandle)
-    }
-
-    pub fn get_mut(&mut self, handle: Handle) -> Result<&mut T, Status> {
-        let (index, generation) = handle.parts().ok_or(Status::StaleHandle)?;
-        let slot = self.slots.get_mut(index).ok_or(Status::StaleHandle)?;
-        if slot.generation != generation {
-            return Err(Status::StaleHandle);
-        }
-        slot.value.as_mut().ok_or(Status::StaleHandle)
     }
 
     pub fn remove(&mut self, handle: Handle) -> Result<T, Status> {
@@ -215,7 +201,6 @@ impl<T> Arena<T> {
             slot.generation += 1;
             self.free.push(index);
         }
-        self.len -= 1;
         Ok(value)
     }
 }
@@ -244,7 +229,7 @@ mod tests {
     #[test]
     fn zero_and_double_release_are_stale() {
         let mut arena = Arena::new();
-        assert_eq!(arena.get(Handle::INVALID), Err(Status::StaleHandle));
+        assert_eq!(arena.get(Handle::from_raw(0)), Err(Status::StaleHandle));
         let handle = arena.insert(42).unwrap();
         assert_eq!(arena.remove(handle), Ok(42));
         assert_eq!(arena.remove(handle), Err(Status::StaleHandle));

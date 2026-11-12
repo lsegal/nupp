@@ -2,9 +2,9 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use nupp_native_abi::{
-    ABI_VERSION, Arena, Handle, Status, boundary, guard, last_error_ptr, set_last_error,
-};
+mod abi;
+
+use abi::{ABI_VERSION, Arena, Handle, Status, boundary, guard, last_error_ptr, set_last_error};
 use std::ffi::c_char;
 use std::ptr;
 use std::sync::{Mutex, OnceLock};

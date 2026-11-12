@@ -22,7 +22,6 @@ uri = ["base", "dep:url"]
 panic-probe = ["base"]
 
 [dependencies]
-nupp-native-abi = { path = "../abi" }
 nupp-native-runtime = { path = "../runtime" }
 url = { version = "2.5.7", optional = true }
 
