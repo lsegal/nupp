@@ -118,7 +118,7 @@
         "operation": "append a host-only parameter descriptor so the canonical guest payload has the wrong extent",
         "implemented": true,
         "historicalCommit": "2066cc4d",
-        "validator": "tests/integration/simd/wasmtime-host/src/lib.rs",
+        "validator": "tests/integration/simd/wasmtime-host.lua",
         "killMarker": "SIMD_EQUIVALENCE_KILL:wasm-stack-transport:bridge-bounds-failure"
       }
     },
@@ -134,7 +134,7 @@
         "operation": "narrow a host-only 64-bit span descriptor while the canonical guest keeps its 64-bit payload",
         "implemented": true,
         "historicalCommit": "4e990f18",
-        "validator": "tests/integration/simd/wasmtime-host/src/lib.rs",
+        "validator": "tests/integration/simd/wasmtime-host.lua",
         "killMarker": "SIMD_EQUIVALENCE_KILL:wasm-wide-transport:wide-value-mismatch"
       }
     },

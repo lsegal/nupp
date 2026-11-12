@@ -5,6 +5,8 @@
 -- into guest memory through the module's own allocator, and writable spans
 -- copied back out once the kernel returns.
 local ffi = require("ffi")
+-- Held before a browser bundle replaces io in the same Lua state.
+local fileOpen = io.open
 local M = {}
 
 local TRANSFER_LIMIT = 2 * 1024 * 1024
@@ -236,7 +238,7 @@ local function i32Type(api)
 end
 
 local function readFile(path)
-    local handle, problem = io.open(path, "rb")
+    local handle, problem = fileOpen(path, "rb")
     if not handle then
         return nil, problem
     end

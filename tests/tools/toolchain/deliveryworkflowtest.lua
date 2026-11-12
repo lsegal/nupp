@@ -293,7 +293,17 @@ function M.ciProvisionsNoRust()
     for path in listing:lines() do
         if path ~= ".github/scripts/check-no-rust-or-cpp.sh" then
             local text = read(ROOT .. "/" .. path)
-            for _, needle in ipairs({"rustup", "cargo build", "cargo test", "rust-toolchain", "build/rust", "native-rust"}) do
+            for _, needle in ipairs({
+                "rustup toolchain",
+                "rustup target",
+                "rustup which",
+                "cargo build",
+                "cargo test",
+                "cargo vendor",
+                "rust-toolchain",
+                "build/rust",
+                "native-rust",
+            }) do
                 assert(not text:find(needle, 1, true), path .. " still names " .. needle)
             end
             assert(not text:find("Turned off: builds Rust", 1, true), path .. " still turns a job off for building Rust")

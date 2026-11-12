@@ -4,13 +4,6 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$root"
-channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-rust_toolchain=$channel-x86_64-pc-windows-gnu
-export RUSTUP_TOOLCHAIN=$rust_toolchain RUSTUP_SKIP_UPDATE_CHECK=1
-RUSTC=$(rustup which rustc)
-RUSTDOC=$(rustup which rustdoc)
-export RUSTC RUSTDOC
-
 export WGPU_BACKEND=dx12
 export NUPP_REQUIRE_GPU=1
 export NUPP_EXPECT_GPU_BACKEND=dx12

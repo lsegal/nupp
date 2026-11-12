@@ -1,5 +1,5 @@
 -- Execute a generated browser bundle in the host LuaJIT while routing its
--- independent Wasm kernels through the Rust Wasmtime test host.
+-- independent Wasm kernels through Wasmtime's C API (wasmtime-host.lua).
 local ffi = require("ffi")
 -- The browser bundle installs its own io surface in this Lua state.
 -- Keep the host operation for reading artifacts after guest execution.
@@ -82,39 +82,12 @@ local function loadApplication()
     return assert(loadstring(application, "@" .. path)), bridged
 end
 
-ffi.cdef[[
-typedef struct nupp_wasmtime_host nupp_wasmtime_host;
-typedef struct {
-    const char *name;
-    size_t offset;
-    size_t bytes;
-} nupp_wasmtime_host_field;
-typedef struct {
-    uint8_t *data;
-    size_t bytes;
-    size_t stride;
-    size_t count;
-    uint8_t writable;
-    const nupp_wasmtime_host_field *fields;
-    size_t fields_len;
-} nupp_wasmtime_host_span;
-uint32_t nupp_wasmtime_host_abi(void);
-nupp_wasmtime_host *nupp_wasmtime_host_open(const char *manifest_path, const char *module_root);
-int32_t nupp_wasmtime_host_call(nupp_wasmtime_host *host, const char *unit, const char *symbol,
-    uint8_t *arguments, size_t arguments_len, uint8_t *results, size_t results_len,
-    nupp_wasmtime_host_span *spans, size_t spans_len);
-const char *nupp_wasmtime_host_error(nupp_wasmtime_host *host);
-void nupp_wasmtime_host_close(nupp_wasmtime_host *host);
-]]
-
-local hostLibrary = ffi.load(library)
-assert(hostLibrary.nupp_wasmtime_host_abi() == 1, "unsupported Wasmtime host ABI")
+local wasmtimeHost = assert(loadfile(nativeRoot .. "/tests/integration/simd/wasmtime-host.lua"))()
 local hostManifest = os.getenv("NUPP_SIMD_HOST_MANIFEST")
 if hostManifest == nil or hostManifest == "" then
     hostManifest = project .. "/dist/aot/units.json"
 end
-local host = hostLibrary.nupp_wasmtime_host_open(hostManifest, project .. "/dist/aot")
-assert(host ~= nil, ffi.string(hostLibrary.nupp_wasmtime_host_error(nil)))
+local host = assert(wasmtimeHost.open(library, hostManifest, project .. "/dist/aot", decode))
 
 local scalarTypes = {
     bool = "bool",
@@ -149,32 +122,20 @@ local function kernel(unit, symbol, descriptor)
         local values = {...}
         local arguments = ffi.new("uint64_t[?]", math.max(1, #params + countCount))
         local returned = ffi.new("uint64_t[?]", math.max(1, #results))
-        local spanCount = 0
-        for _, param in ipairs(params) do
-            if param.kind == "read_span" or param.kind == "write_span" then
-                spanCount = spanCount + 1
-            end
-        end
-        local spans = ffi.new("nupp_wasmtime_host_span[?]", math.max(1, spanCount))
-        local spanFields = {}
-        local nextSpan, countIndex = 0, #params + 1
+        local spans = {}
+        local countIndex = #params + 1
         for index, param in ipairs(params) do
             if param.kind == "read_span" or param.kind == "write_span" then
                 local count = values[countIndex]
                 assert(type(count) == "number" and count >= 0 and count % 1 == 0, "invalid Wasm span count")
                 local layout = param.layout
-                local stride
+                local stride, fields
                 if layout then
                     stride = layout.size
-                    local fields = ffi.new("nupp_wasmtime_host_field[?]", math.max(1, #layout.fields))
+                    fields = {}
                     for position, field in ipairs(layout.fields) do
-                        fields[position - 1].name = field.name
-                        fields[position - 1].offset = field.offset
-                        fields[position - 1].bytes = field.size
+                        fields[position] = {name = field.name, offset = field.offset, bytes = field.size}
                     end
-                    spanFields[#spanFields + 1] = fields
-                    spans[nextSpan].fields = fields
-                    spans[nextSpan].fields_len = #layout.fields
                 else
                     local ctype = scalarTypes[param.type]
                     if param.sourceType == "uint8"
@@ -186,12 +147,14 @@ local function kernel(unit, symbol, descriptor)
                     end
                     stride = ffi.sizeof(assert(ctype, "unknown Wasm span type"))
                 end
-                spans[nextSpan].data = ffi.cast("uint8_t *", values[index])
-                spans[nextSpan].bytes = count * stride
-                spans[nextSpan].stride = stride
-                spans[nextSpan].count = count
-                spans[nextSpan].writable = param.kind == "write_span" and 1 or 0
-                nextSpan = nextSpan + 1
+                spans[#spans + 1] = {
+                    data = ffi.cast("uint8_t *", values[index]),
+                    bytes = count * stride,
+                    stride = stride,
+                    count = count,
+                    writable = param.kind == "write_span",
+                    fields = fields,
+                }
                 ffi.cast("uint32_t *", arguments + countIndex - 1)[0] = count
                 if descriptor.independentCounts then
                     countIndex = countIndex + 1
@@ -203,18 +166,7 @@ local function kernel(unit, symbol, descriptor)
                 )[0] = values[index]
             end
         end
-        local ok = hostLibrary.nupp_wasmtime_host_call(
-            host,
-            unit,
-            symbol,
-            ffi.cast("uint8_t *", arguments),
-            (#params + countCount) * 8,
-            ffi.cast("uint8_t *", returned),
-            #results * 8,
-            spans,
-            spanCount
-        )
-        assert(ok == 1, ffi.string(hostLibrary.nupp_wasmtime_host_error(host)))
+        assert(host:call(unit, symbol, arguments, (#params + countCount) * 8, returned, #results * 8, spans))
         local key = unit .. "\0" .. symbol
         callCounts[key] = (callCounts[key] or 0) + 1
         local valuesOut = {}
@@ -244,7 +196,7 @@ _G.__nuppBrowser = {
 }
 _G.__nuppWasmBeforeRun = function()
     -- The application has now loaded bindings and verified its LuaJIT runtime
-    -- contract. Interpret the oracle that observes Rust-host span writes.
+    -- contract. Interpret the oracle that observes host span writes.
     jit.off()
 end
 
@@ -335,7 +287,7 @@ local ok, answer = xpcall(
     debug.traceback
 )
 
-hostLibrary.nupp_wasmtime_host_close(host)
+host:close()
 _G.__nuppBrowser = nil
 if not ok then
     error(answer, 0)
