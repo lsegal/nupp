@@ -1,9 +1,8 @@
 #!/bin/sh
-# Refreshes or verifies a committed notice for all locked Cargo packages.
-#
-# `nupp` (the default) covers this workspace's Cargo.lock. `wgpu-native` covers
-# the lock file of the wgpu-native release pinned as WGPU_VERSION, whose
-# prebuilt library statically carries that graph beside GPU programs.
+# Refreshes or verifies the committed notice for the locked Cargo packages of
+# the wgpu-native release pinned as WGPU_VERSION, whose prebuilt library
+# statically carries that graph beside GPU programs. Nothing in this tree is
+# Rust; this is the one Rust graph anything here distributes.
 
 set -eu
 
@@ -13,7 +12,7 @@ CARGO=${CARGO:-cargo}
 EXPECTED_CARGO_ABOUT='cargo-about 0.9.2'
 
 usage() {
-    printf '%s\n' 'usage: scripts/rust-dependency-notices --write|--check [nupp|wgpu-native]' >&2
+    printf '%s\n' 'usage: scripts/rust-dependency-notices --write|--check [wgpu-native]' >&2
     exit 2
 }
 
@@ -23,12 +22,8 @@ case "${1:-}" in
     *) usage ;;
 esac
 
-target=${2:-nupp}
+target=${2:-wgpu-native}
 case "$target" in
-    nupp)
-        notice=Rust-dependencies.html
-        command='scripts/rust-dependency-notices --write'
-        ;;
     wgpu-native)
         notice=wgpu-native-Rust-dependencies.html
         command='scripts/rust-dependency-notices --write wgpu-native'
@@ -50,30 +45,24 @@ report=$temporary/report.html
 inventory=$temporary/inventory.html
 generated=$temporary/generated.html
 
-if [ "$target" = nupp ]; then
-    manifest=$ROOT/Cargo.toml
-    config=$ROOT/about.toml
-    template=$ROOT/scripts/rust-dependency-notices.hbs
-else
-    # The release is a prebuilt library, so its lock file is only in the source
-    # archive of the same tag. The notice names that tag, and the test suite
-    # holds it to the pin, so a bump without a refresh fails there.
-    version=$(sed -n 's/^WGPU_VERSION=//p' "$ROOT/scripts/toolchain.pins")
-    [ -n "$version" ] || {
-        printf '%s\n' 'rust-dependency-notices: scripts/toolchain.pins has no WGPU_VERSION' >&2
-        exit 1
-    }
-    curl -fsSL "https://github.com/gfx-rs/wgpu-native/archive/refs/tags/$version.tar.gz" \
-        -o "$temporary/wgpu-native.tar.gz"
-    mkdir "$temporary/wgpu-native"
-    tar -xzf "$temporary/wgpu-native.tar.gz" -C "$temporary/wgpu-native" --strip-components=1
-    manifest=$temporary/wgpu-native/Cargo.toml
-    config=$ROOT/scripts/rust-dependency-notices-wgpu-native.toml
-    "$CARGO" fetch --manifest-path "$manifest" --locked >/dev/null
-    template=$temporary/template.hbs
-    sed "s/@@WGPU_VERSION@@/$version/g" \
-        "$ROOT/scripts/rust-dependency-notices-wgpu-native.hbs" > "$template"
-fi
+# The release is a prebuilt library, so its lock file is only in the source
+# archive of the same tag. The notice names that tag, and the test suite
+# holds it to the pin, so a bump without a refresh fails there.
+version=$(sed -n 's/^WGPU_VERSION=//p' "$ROOT/scripts/toolchain.pins")
+[ -n "$version" ] || {
+    printf '%s\n' 'rust-dependency-notices: scripts/toolchain.pins has no WGPU_VERSION' >&2
+    exit 1
+}
+curl -fsSL "https://github.com/gfx-rs/wgpu-native/archive/refs/tags/$version.tar.gz" \
+    -o "$temporary/wgpu-native.tar.gz"
+mkdir "$temporary/wgpu-native"
+tar -xzf "$temporary/wgpu-native.tar.gz" -C "$temporary/wgpu-native" --strip-components=1
+manifest=$temporary/wgpu-native/Cargo.toml
+config=$ROOT/scripts/rust-dependency-notices-wgpu-native.toml
+"$CARGO" fetch --manifest-path "$manifest" --locked >/dev/null
+template=$temporary/template.hbs
+sed "s/@@WGPU_VERSION@@/$version/g" \
+    "$ROOT/scripts/rust-dependency-notices-wgpu-native.hbs" > "$template"
 
 "$CARGO_ABOUT" generate \
     --manifest-path "$manifest" \

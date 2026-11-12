@@ -1,6 +1,5 @@
-# cargo-about's policy for wgpu-native's lock file. It is wgpu's graph rather
-# than Nupp's, so it accepts what that release ships rather than widening the
-# policy in about.toml.
+# cargo-about's policy for wgpu-native's lock file: wgpu's own graph, the one Rust
+# graph anything here distributes. It accepts what that release ships.
 accepted = [
     "Apache-2.0",
     "BSD-2-Clause",

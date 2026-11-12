@@ -22,7 +22,7 @@ local groups = {
     -- instead of arriving twenty minutes later as unrun shards.
     [
         "windows-preflight"
-    ] = {"netnativetest", "runnertest", "rusttoolchaintest", "soatest", "toolchaintest", "worktreetest",},
+    ] = {"deliveryworkflowtest", "netnativetest", "runnertest", "soatest", "toolchaintest", "worktreetest",},
 
     -- Fixtures whose inputs come from outside the repository. Kept nameable
     -- because a configured corpus used to be absent and silently skipped.
@@ -242,7 +242,7 @@ for name in (
     [[
 hostbinarytest hostembeddingtest nupphosttest spitest bootstraptest bundletest
 compilerpacktest releasetest rocktest spipackagetest worktreetest
-rusttoolchaintest toolchaintest
+deliveryworkflowtest toolchaintest
 ]]
 ):gmatch("%S+") do
     scopes[name] = "delivery"
@@ -473,9 +473,6 @@ local repositoryInputs = {
     "native",
     "runtime",
     "host",
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain.toml",
     "bench/serde-spike/contracts",
     "editors/playground/src/examples",
 }

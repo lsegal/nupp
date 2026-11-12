@@ -26,10 +26,10 @@ function M.standaloneBinaryReachesTheFilesystemThroughItsOwnFfi()
         [
             "src/main.nupp"
         ] = [[
-assert(os.stat("Cargo.toml") == "file")
-local file = assert(io.open("Cargo.toml", "rb"))
+assert(os.stat("nupp.lua") == "file")
+local file = assert(io.open("nupp.lua", "rb"))
 local contents = assert(file:read("*a"))
-assert(contents:find("[workspace]", 1, true))
+assert(contents:find("return", 1, true))
 print("native-files-ok")
 ]],
     })
