@@ -76,20 +76,6 @@ cdef function nuppNativeAvailableParallelism(): uint64
 --- returns NUPP_NATIVE_INTERNAL with the panic as the last error.
 cdef function nuppNativePanicProbe(): int32
 
---- Deprecated: readiness is Nupp's own (`nupp.runtime.native`), and nothing
---- advances this generation any more. Poll answers 0, and Wait sleeps its
---- timeout and answers the generation it was given. WakeOpen opens no handle
---- and answers NUPP_NATIVE_UNAVAILABLE, and WakeClose refuses every handle.
---- They stay only because the pinned stage-zero compiler's runtime still names
---- them, and go once the pin moves past it.
-cdef function nuppNativePoll(generation: uint64*?): int32
-
-cdef function nuppNativeWait(generation: uint64, timeoutMs: uint64, outputGeneration: uint64*?): int32
-
-cdef function nuppNativeWakeOpen(handle: uint64*?): int32
-
-cdef function nuppNativeWakeClose(handle: uint64): int32
-
 --- Present when NUPP_NATIVE_FEATURE_URI is set. URI values are immutable
 --- generational handles. Text and components are copied into caller-owned
 --- storage; `kind` is one of the NUPP_NATIVE_URI_* parts.

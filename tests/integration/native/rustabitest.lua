@@ -83,16 +83,9 @@ function M.theGeneratedHeaderDescribesTheProvider()
     local wanted = defines.NUPP_NATIVE_FEATURE_BASE + defines.NUPP_NATIVE_FEATURE_URI
     test.eq(tonumber(require("bit").band(features, wanted)), wanted, "the requested feature bits")
     assert(defines.NUPP_NATIVE_FEATURE_READINESS == nil, "readiness is Nupp's, not the provider's")
-
-    -- The readiness pair kept for the pinned stage zero rejects a NULL output,
-    -- and a wait answers at its timeout with the generation it was given.
-    test.eq(native.nuppNativePoll(nil), defines.NUPP_NATIVE_INVALID_ARGUMENT, "a NULL poll output")
-    test.eq(native.nuppNativeWait(0, 0, nil), defines.NUPP_NATIVE_INVALID_ARGUMENT, "a NULL wait output")
-    local generation = ffi.new("uint64_t[1]")
-    local found = ffi.new("uint64_t[1]")
-    test.eq(native.nuppNativePoll(generation), defines.NUPP_NATIVE_OK, "readiness poll")
-    test.eq(native.nuppNativeWait(generation[0], 10, found), defines.NUPP_NATIVE_OK, "readiness wait")
-    assert(found[0] == generation[0], "an idle readiness wait moved the generation")
+    for _, name in ipairs({"nuppNativePoll", "nuppNativeWait", "nuppNativeWakeOpen", "nuppNativeWakeClose"}) do
+        assert(not text:find(name .. "(", 1, true), name .. " outlived the stage zero that needed it")
+    end
 
     local uri = ffi.new("uint64_t[1]")
     local spelling = "https://EXAMPLE.com"
