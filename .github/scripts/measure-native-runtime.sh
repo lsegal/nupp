@@ -46,8 +46,9 @@ bench/native-runtime/resource.sh > "$results/resources.txt"
 # Use a fresh task-local target so this is a cold exact-feature provider build
 # even when the compiler and host caches were restored. The second invocation
 # measures the content-addressed warm lookup. These are observations, not
-# acceptance limits.
-features=uri
+# acceptance limits. The benchmark itself selects no provider feature since
+# URI handling moved to Nupp (#200), so this is the provider's minimal build.
+features=base
 exact_root=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nupp-native-exact-$$
 trap 'rm -rf "$exact_root"' EXIT HUP INT TERM
 
@@ -71,13 +72,6 @@ if [ -f "$benchmark.exe" ]; then
    benchmark=$benchmark.exe
 fi
 [ -f "$benchmark" ]
-benchmark_provider=bench/native-runtime/build/lib/nupp_native
-if [ ! -f "$benchmark_provider" ]; then
-   benchmark_provider=$(find bench/native-runtime/build/lib -maxdepth 1 -type f \
-      \( -name 'nupp_native.dll' -o -name 'libnupp_native.so' \
-         -o -name 'libnupp_native.dylib' \) -print | head -n 1)
-fi
-[ -n "$benchmark_provider" ]
 
 {
    printf 'features=%s\n' "$features"
@@ -86,7 +80,6 @@ fi
    printf 'provider_dynamic_bytes=%s\n' "$(file_bytes "$provider")"
    printf 'provider_static_bytes=%s\n' "$(file_bytes "$provider_static")"
    printf 'benchmark_binary_bytes=%s\n' "$(file_bytes "$benchmark")"
-   printf 'benchmark_provider_bytes=%s\n' "$(file_bytes "$benchmark_provider")"
 } > "$results/exact-feature-build.txt"
 
 printf 'native runtime measurements written to %s\n' "$results"

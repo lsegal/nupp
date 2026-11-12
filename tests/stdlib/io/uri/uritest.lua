@@ -645,6 +645,114 @@ function M.portableParserRefusesInternationalHosts()
     test.eq(assert(native.parse("foo://\195\177.test/")).host, "%C3%B1.test")
 end
 
+-- UTS #46 as the `url` crate the native provider used to parse with applied it:
+-- every row was recorded from url 2.5.8 (idna 1.1, Unicode 17). They cover the
+-- mapping, NFC, Punycode both ways, the joiner contexts, the bidi rule, the
+-- deny list and the empty host an ignored code point leaves behind.
+local IDNA_ROWS = {
+    {"https://caf\195\169.example/", "https://xn--caf-dma.example/"},
+    {"https://CAF\195\137.Example/a", "https://xn--caf-dma.example/a"},
+    {"https://%C3%A9.example/", "https://xn--9ca.example/"},
+    {"https://XN--CAF-DMA.example/", "https://xn--caf-dma.example/"},
+    {"https://www.xn--caf-dma.example/", "https://www.xn--caf-dma.example/"},
+    {"http://fa\195\159.de/", "http://xn--fa-hia.de/"},
+    {"http://\206\163\206\159\206\166\206\159\206\163.gr/", "http://xn--0xaakcn.gr/"},
+    {"http://\239\189\129\239\189\130\239\189\131\239\188\142\239\189\131\239\189\143\239\189\141/", "http://abc.com/"},
+    {"http://\228\190\139\227\129\136\227\128\130\227\131\134\227\130\185\227\131\136/", "http://xn--r8jz45g.xn--zckzah/"},
+    {"http://B\195\188cher.example/", "http://xn--bcher-kva.example/"},
+    {"http://a.b\226\128\140c/", false, "invalid international domain name"},
+    {"http://\216\168\226\128\140\216\168.com/", "http://xn--ngba799q.com/"},
+    {"http://\224\164\149\224\165\141\226\128\140\224\164\183.com/", "http://xn--11b2ezcs70k.com/"},
+    {"http://a\226\128\141b/", false, "invalid international domain name"},
+    {"http://xn--a.com/", false, "invalid international domain name"},
+    {"http://xn--ls8h-.com/", false, "invalid international domain name"},
+    {"http://xn--CAF-DMA.example/", "http://xn--caf-dma.example/"},
+    {"http://xn--cafe-yvc.example/", false, "invalid international domain name"},
+    {"http://e01.example/", "http://e01.example/"},
+    {"http://\204\129a.example/", false, "invalid international domain name"},
+    {"http://\215\144\215\145.\215\153\215\169\215\168\215\144\215\156/", "http://xn--4dbc.xn--4dbrk0ce/"},
+    {"http://\215\1441.com/", "http://xn--1-zhc.com/"},
+    {"http://1\215\144.com/", false, "invalid international domain name"},
+    {"http://\215\144a.com/", false, "invalid international domain name"},
+    {"http://a.\215\144\215\145/", "http://a.xn--4dbc/"},
+    {"http://\217\161\217\162.com/", false, "invalid international domain name"},
+    {"http://\217\163a/", false, "invalid international domain name"},
+    {"http://%C2%AD/", false, "empty host"},
+    {"http://a%C2%ADb/", "http://ab/"},
+    {"http://exa mple.com/", false, "invalid international domain name"},
+    {"http://exa%25mple.com/", false, "invalid international domain name"},
+    {"http://ex%FFample.com/", false, "invalid international domain name"},
+    {"http://\226\145\160.com/", "http://1.com/"},
+    {"http://\226\146\136.com/", false, "invalid international domain name"},
+    {"http://\240\159\152\128.com/", "http://xn--e28h.com/"},
+    {"http://\239\172\129.com/", "http://fi.com/"},
+    {"http://x.\234\147\184.y/", "http://x.xn--8m8a.y/"},
+}
+
+function M.nativeParserMapsHostsAsTheUrlCrateDid()
+    ready()
+    local native = require("nupp.runtime.provider.nativeuri")
+    for _, row in ipairs(IDNA_ROWS) do
+        local parts, reason = native.parse(row[1])
+        if row[2] == false then
+            test.eq(parts, nil, ("%q is refused"):format(row[1]))
+            test.eq(reason, row[3], ("%q explains its refusal"):format(row[1]))
+        else
+            assert(parts, ("%q: %s"):format(row[1], tostring(reason)))
+            test.eq(parts.text, row[2], ("%q"):format(row[1]))
+        end
+    end
+end
+
+-- URI handling is Nupp, so a program that uses only it stages no Rust provider.
+function M.uriHandlingStagesNoProvider()
+    ready()
+    local native = require("nupp.compiler.native")
+    for _, feature in ipairs(native.features(native.expand({["native.uri"] = true}))) do
+        test.eq(feature.provider, nil, feature.name .. " selects no provider")
+    end
+    local staged, problem = nativeStage.build(root, "plain", {["native.uri"] = true})
+    assert(staged, problem)
+    for path in pairs(staged) do
+        assert(not path:find("nupp_native", 1, true), "a provider sidecar was staged: " .. path)
+    end
+end
+
+-- The rows the provider's Rust tests held it to, now that the parser is Nupp.
+function M.nativeParserKeepsTheProviderRows()
+    ready()
+    local native = require("nupp.runtime.provider.nativeuri")
+    local parts = assert(native.parse("https://user:pass@EXAMPLE.com:443/a/../b?q=1#top"))
+    test.eq(parts.text, "https://user:pass@example.com/b?q=1#top")
+    test.eq(parts.authority, "user:pass@example.com")
+    test.eq(parts.username, "user")
+    test.eq(parts.password, "pass")
+    test.eq(parts.host, "example.com")
+    test.eq(parts.port, nil)
+    test.eq(parts.path, "/b")
+    test.eq(parts.query, "q=1")
+    test.eq(parts.fragment, "top")
+    local opaque = assert(native.parse("mailto:someone@example.com"))
+    test.eq(opaque.authority, nil)
+    test.eq(opaque.path, "someone@example.com")
+    local file = assert(native.parse("file:///tmp/x"))
+    test.eq(file.authority, "")
+    test.eq(file.host, nil)
+    test.eq(assert(native.parse("http://example.com:8080/")).port, 8080)
+    for text, reason in pairs({
+        [""] = "relative URL without a base",
+        ["http://["] = "invalid IPv6 address",
+        ["http:"] = "empty host",
+        ["http://example.com:99999/"] = "invalid port number",
+        ["http://999.1.1.1/"] = "invalid IPv4 address",
+        ["file://h:8080/x"] = "invalid international domain name",
+    }) do
+        local value, why = native.parse(text)
+        test.eq(value, nil, ("%q is refused"):format(text))
+        test.eq(why, reason, ("%q explains its refusal"):format(text))
+    end
+end
+
 -- A page host with its own `URL` is asked, and its canonical text is read back,
 -- so the host's IDNA mapping reaches the components.
 function M.browserHostUrlIsReadBack()

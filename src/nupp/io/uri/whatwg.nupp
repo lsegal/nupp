@@ -3,23 +3,24 @@
 The WHATWG URL Standard's basic URL parser, for hosts without a URL parser of
 their own.
 
-Every provider behind [](io) returns the result the URL Standard
-defines, because that is what both transports send: the native HTTP client is
-built on the `url` crate and the browser on Fetch. This module is the reading
-used where neither a native library nor a host `URL` is available, and the one
-the public `resolve` uses on every host to find the text a reference names
+Every provider behind [](io) returns the result the URL Standard defines,
+because that is what both transports send. This module is the native
+provider's parser, the reading used where a page host offers no `URL`, and the
+one the public `resolve` uses on every host to find the text a reference names
 before the provider normalizes it.
 
 It follows the standard's state machine byte by byte. Bytes above 127 are only
 ever percent-encoded, which is UTF-8 percent-encoding for the valid UTF-8 the
-entry insists on. The one thing it does not carry is UTS #46: a special-scheme
-host that is not plain ASCII, or that holds an `xn--` label, is refused with a
-reason rather than mapped, because mapping it needs the IDNA tables a host URL
-parser has. `trustHosts` lifts that refusal for text whose host a real parser
-will read afterwards: the host is then kept as written.
+entry insists on. UTS #46 is the caller's to supply: the native provider passes
+[](nupp.io.uri.idna), whose tables the portable runtime does not carry. Without
+it a special-scheme host that is not plain ASCII, or that holds an `xn--`
+label, is refused with a reason rather than mapped. `trustHosts` lifts that
+refusal for text whose host a real parser will read afterwards: the host is
+then kept as written.
 
-The percent-encode sets are the ones the `url` crate the native provider uses
-implements, so that the two agree byte for byte.
+The percent-encode sets are the ones the `url` crate implements, which the
+native provider was built on before this parser replaced it, so that the two
+agree byte for byte.
 ]]
 module nupp.io.uri.whatwg
 
@@ -395,7 +396,10 @@ local function forbiddenHost(byte: integer): boolean
         or byte == 124
 end
 
-local function parseHost(input: string, opaque: boolean, trustHosts: boolean): (string?, string?)
+--- A domain-to-ASCII converter: the ASCII host, or nil and the reason.
+local type ToAscii = function(string): (string?, string?)
+
+local function parseHost(input: string, opaque: boolean, trustHosts: boolean, toAscii: ToAscii?): (string?, string?)
     if input:sub(1, 1) == "[" then
         if input:sub(-1) ~= "]" then
             return nil, "invalid IPv6 address"
@@ -411,6 +415,19 @@ local function parseHost(input: string, opaque: boolean, trustHosts: boolean): (
         return encodeText(input, C0_SET), nil
     end
     local domain = percentDecode(input)
+    if toAscii ~= nil then
+        -- In the url crate's order: UTS #46 first, whose deny list refuses the
+        -- forbidden domain code points, then the empty and IPv4 checks.
+        local ascii, reason = toAscii(domain)
+        if ascii == nil then
+            return nil, reason
+        elseif ascii == "" then
+            return nil, "empty host"
+        elseif endsInANumber(ascii) then
+            return ipv4(ascii)
+        end
+        return ascii, nil
+    end
     local international = domain:find("[\128-\255]") ~= nil
     if not international then
         domain = domain:lower()
@@ -620,9 +637,17 @@ end
 --- @param base the URL a relative input is resolved against, when there is one
 --- @param trustHosts whether a host that needs IDNA is kept as written rather
 ---     than refused, for text a host URL parser reads afterwards
+--- @param toAscii the domain-to-ASCII step a special-scheme host goes through,
+---     when the caller carries one; without it a host that needs IDNA is
+---     refused or trusted as above
 --- @return the URL's components, or nil when the text is not a URL
 --- @return the reason, when it is not
-export function parse(text: string, base: contracts.UriParts?, trustHosts: boolean?): (contracts.UriParts?, string?)
+export function parse(
+    text: string,
+    base: contracts.UriParts?,
+    trustHosts: boolean?,
+    toAscii: ToAscii?
+): (contracts.UriParts?, string?)
     local refused = refusal(text)
     if refused ~= nil then
         return nil, refused
@@ -810,7 +835,7 @@ export function parse(text: string, base: contracts.UriParts?, trustHosts: boole
                 if collected == "" then
                     return nil, "empty host"
                 end
-                local host, reason = parseHost(collected, not special, trusted)
+                local host, reason = parseHost(collected, not special, trusted, toAscii)
                 if host == nil then
                     return nil, reason
                 end
@@ -823,7 +848,7 @@ export function parse(text: string, base: contracts.UriParts?, trustHosts: boole
                 if special and collected == "" then
                     return nil, "empty host"
                 end
-                local host, reason = parseHost(collected, not special, trusted)
+                local host, reason = parseHost(collected, not special, trusted, toAscii)
                 if host == nil then
                     return nil, reason
                 end
@@ -919,7 +944,7 @@ export function parse(text: string, base: contracts.UriParts?, trustHosts: boole
                     url.host = ""
                     state = PATH_START
                 else
-                    local host, reason = parseHost(collected, not special, trusted)
+                    local host, reason = parseHost(collected, not special, trusted, toAscii)
                     if host == nil then
                         return nil, reason
                     elseif host == "localhost" then

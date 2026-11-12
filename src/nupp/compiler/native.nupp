@@ -662,18 +662,14 @@ local FEATURES: {[string]: native.Feature} = {
         requires = {"runtime.pathtext", "runtime.path_provider"},
     },
     ["runtime.pathtext"] = {name = "pathtext", runtimeModule = "nupp.io.path.pathtext", portableRuntime = true,},
-    [
-        "native.uri"
-    ] = {
+    ["native.uri"] = {
         name = "uri",
         modules = {"nupp.runtime.provider.nativeuri"},
         runtimeModule = "nupp.runtime.provider.nativeuri",
-        provider = "nupp_native",
-        providerDriver = "native-rust",
-        providerFeature = "uri",
-        library = "nupp_native",
+        -- The URL Standard's parser and UTS #46 are Nupp; nothing here reaches
+        -- the Rust provider. Still a feature a manifest may turn off by name.
         binary = true,
-        requires = {"runtime.uri", "runtime.native"},
+        requires = {"runtime.uri", "runtime.uri_idna"},
     },
     [
         "runtime.uri"
@@ -700,6 +696,17 @@ local FEATURES: {[string]: native.Feature} = {
         requires = {"runtime.uri_whatwg"}
     },
     ["runtime.uri_whatwg"] = {name = "uri_whatwg", runtimeModule = "nupp.io.uri.whatwg", portableRuntime = true},
+    [
+        "runtime.uri_idna"
+    ] = {
+        name = "uri_idna",
+        runtimeModule = "nupp.io.uri.idna",
+        portableRuntime = true,
+        requires = {"runtime.uri_idnatables"}
+    },
+    [
+        "runtime.uri_idnatables"
+    ] = {name = "uri_idnatables", runtimeModule = "nupp.io.uri.idnatables", portableRuntime = true},
     ["native.uuid"] = {name = "uuid", modules = {"nupp.runtime.provider.nativeuuid"},},
     ["native.files"] = {
         name = "files",
@@ -848,8 +855,6 @@ local FEATURES: {[string]: native.Feature} = {
         name = "http",
         module = "nupp.runtime.provider.nativehttp",
         runtimeModule = "nupp.runtime.provider.nativehttp",
-        -- The client is Nupp; only the URI handling it requires reaches the
-        -- Rust provider.
         binary = true,
         -- A request that races its upload against the response head performs one
         -- through `coroutine`, so the task runtime travels with the client.
