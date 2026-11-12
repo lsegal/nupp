@@ -2,13 +2,14 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use nupp_native_abi::{
-    ABI_VERSION, Arena, Handle, Status, boundary, guard, last_error_ptr, set_last_error,
-};
+use abi::{ABI_VERSION, Arena, Handle, Status, boundary, guard, last_error_ptr, set_last_error};
 use std::ffi::c_char;
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
+// Without the uri exports, nothing inserts a handle or answers BUFFER_TOO_SMALL.
+#[cfg_attr(not(feature = "uri"), allow(dead_code))]
+mod abi;
 #[cfg(feature = "uri")]
 mod uri;
 

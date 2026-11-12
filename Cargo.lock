@@ -159,14 +159,9 @@ dependencies = [
 name = "nupp-native"
 version = "0.1.0"
 dependencies = [
- "nupp-native-abi",
  "nupp-native-runtime",
  "url",
 ]
-
-[[package]]
-name = "nupp-native-abi"
-version = "0.1.0"
 
 [[package]]
 name = "nupp-native-host"

@@ -1,6 +1,6 @@
-//! Versioned primitives shared by the Rust host and native providers.
-
-#![forbid(unsafe_op_in_unsafe_fn)]
+//! The export boundary: status codes, the thread's last error, the panic
+//! guard every export runs inside, and generation-checked handles. The codes
+//! and the version are the definition's (`native/abi/nuppnative.nupp`).
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -8,28 +8,23 @@ use std::ffi::{CStr, CString, c_char};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-pub const ABI_VERSION: u32 = 2;
+pub(crate) const ABI_VERSION: u32 = 2;
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Status {
+pub(crate) enum Status {
     Ok = 0,
     InvalidArgument = 1,
     /// A handle table or a provider resource limit is exhausted.
     Capacity = 2,
     StaleHandle = 3,
-    Closed = 4,
     Internal = 5,
     /// An output buffer is too small; the call reports the size it needs.
     BufferTooSmall = 6,
-    /// A value does not fit the range its ABI type or the caller can carry.
-    OutOfRange = 7,
-    /// The facility is absent from this machine, such as a GPU adapter.
-    Unavailable = 8,
 }
 
 impl Status {
-    pub const fn code(self) -> i32 {
+    pub(crate) const fn code(self) -> i32 {
         self as i32
     }
 }
@@ -38,7 +33,7 @@ thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(c"no error".to_owned());
 }
 
-pub fn set_last_error(message: impl fmt::Display) {
+pub(crate) fn set_last_error(message: impl fmt::Display) {
     let mut bytes = message.to_string().into_bytes();
     for byte in &mut bytes {
         if *byte == 0 {
@@ -49,11 +44,11 @@ pub fn set_last_error(message: impl fmt::Display) {
     LAST_ERROR.with(|slot| *slot.borrow_mut() = value);
 }
 
-pub fn with_last_error<T>(read: impl FnOnce(&CStr) -> T) -> T {
+pub(crate) fn with_last_error<T>(read: impl FnOnce(&CStr) -> T) -> T {
     LAST_ERROR.with(|slot| read(slot.borrow().as_c_str()))
 }
 
-pub fn last_error_ptr() -> *const c_char {
+pub(crate) fn last_error_ptr() -> *const c_char {
     with_last_error(CStr::as_ptr)
 }
 
@@ -75,7 +70,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 /// aborting the process; an unwind that escaped an `extern "C"` function
 /// would still abort, which is what keeps it from ever crossing LuaJIT's
 /// frames. The panic's text becomes the thread's last error.
-pub fn guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
+pub(crate) fn guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
     match catch_unwind(AssertUnwindSafe(body)) {
         Ok(value) => value,
         Err(payload) => {
@@ -96,29 +91,21 @@ pub fn guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
 }
 
 /// Runs one status-returning export's body, answering INTERNAL if it panics.
-pub fn boundary(body: impl FnOnce() -> i32) -> i32 {
+pub(crate) fn boundary(body: impl FnOnce() -> i32) -> i32 {
     guard(Status::Internal.code(), body)
 }
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Handle(u64);
+pub(crate) struct Handle(u64);
 
 impl Handle {
-    pub const INVALID: Self = Self(0);
-
-    pub const fn from_raw(raw: u64) -> Self {
+    pub(crate) const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
-    pub const fn raw(self) -> u64 {
+    pub(crate) const fn raw(self) -> u64 {
         self.0
-    }
-
-    pub const fn is_valid(self) -> bool {
-        let index = (self.0 & u32::MAX as u64) as u32;
-        let generation = (self.0 >> 32) as u32;
-        index != 0 && generation != 0
     }
 
     fn new(index: usize, generation: u32) -> Self {
@@ -143,30 +130,20 @@ struct Slot<T> {
 }
 
 /// An arena whose public identities cannot alias a reused slot.
-pub struct Arena<T> {
+pub(crate) struct Arena<T> {
     slots: Vec<Slot<T>>,
     free: Vec<usize>,
-    len: usize,
 }
 
 impl<T> Arena<T> {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
-            len: 0,
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn insert(&mut self, value: T) -> Result<Handle, Status> {
+    pub(crate) fn insert(&mut self, value: T) -> Result<Handle, Status> {
         let index = if let Some(index) = self.free.pop() {
             index
         } else {
@@ -182,11 +159,10 @@ impl<T> Arena<T> {
         let slot = &mut self.slots[index];
         debug_assert!(slot.value.is_none());
         slot.value = Some(value);
-        self.len += 1;
         Ok(Handle::new(index, slot.generation))
     }
 
-    pub fn get(&self, handle: Handle) -> Result<&T, Status> {
+    pub(crate) fn get(&self, handle: Handle) -> Result<&T, Status> {
         let (index, generation) = handle.parts().ok_or(Status::StaleHandle)?;
         let slot = self.slots.get(index).ok_or(Status::StaleHandle)?;
         if slot.generation != generation {
@@ -195,16 +171,7 @@ impl<T> Arena<T> {
         slot.value.as_ref().ok_or(Status::StaleHandle)
     }
 
-    pub fn get_mut(&mut self, handle: Handle) -> Result<&mut T, Status> {
-        let (index, generation) = handle.parts().ok_or(Status::StaleHandle)?;
-        let slot = self.slots.get_mut(index).ok_or(Status::StaleHandle)?;
-        if slot.generation != generation {
-            return Err(Status::StaleHandle);
-        }
-        slot.value.as_mut().ok_or(Status::StaleHandle)
-    }
-
-    pub fn remove(&mut self, handle: Handle) -> Result<T, Status> {
+    pub(crate) fn remove(&mut self, handle: Handle) -> Result<T, Status> {
         let (index, generation) = handle.parts().ok_or(Status::StaleHandle)?;
         let slot = self.slots.get_mut(index).ok_or(Status::StaleHandle)?;
         if slot.generation != generation {
@@ -215,14 +182,7 @@ impl<T> Arena<T> {
             slot.generation += 1;
             self.free.push(index);
         }
-        self.len -= 1;
         Ok(value)
-    }
-}
-
-impl<T> Default for Arena<T> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -244,7 +204,7 @@ mod tests {
     #[test]
     fn zero_and_double_release_are_stale() {
         let mut arena = Arena::new();
-        assert_eq!(arena.get(Handle::INVALID), Err(Status::StaleHandle));
+        assert_eq!(arena.get(Handle::from_raw(0)), Err(Status::StaleHandle));
         let handle = arena.insert(42).unwrap();
         assert_eq!(arena.remove(handle), Ok(42));
         assert_eq!(arena.remove(handle), Err(Status::StaleHandle));
@@ -262,7 +222,10 @@ mod tests {
         });
         assert_eq!(guard(7, || -> u32 { panic!("{}", 1) }), 7);
         with_last_error(|value| assert_eq!(value.to_bytes(), b"native provider panicked: 1"));
-        assert_eq!(boundary(|| Status::Closed.code()), Status::Closed.code());
+        assert_eq!(
+            boundary(|| Status::StaleHandle.code()),
+            Status::StaleHandle.code()
+        );
     }
 
     #[test]
@@ -285,5 +248,24 @@ mod tests {
     fn error_text_replaces_interior_nuls() {
         set_last_error("bad\0message");
         with_last_error(|value| assert_eq!(value.to_bytes(), b"bad?message"));
+    }
+
+    /// The codes and version here are the definition's.
+    #[test]
+    fn statuses_match_the_definition() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let definition = std::fs::read_to_string(root.join("../../abi/nuppnative.nupp")).unwrap();
+        for (name, value) in [
+            ("ABI_VERSION", ABI_VERSION as i32),
+            ("OK", Status::Ok.code()),
+            ("INVALID_ARGUMENT", Status::InvalidArgument.code()),
+            ("CAPACITY", Status::Capacity.code()),
+            ("STALE_HANDLE", Status::StaleHandle.code()),
+            ("INTERNAL", Status::Internal.code()),
+            ("BUFFER_TOO_SMALL", Status::BufferTooSmall.code()),
+        ] {
+            let define = format!("\nexport const NUPP_NATIVE_{name} = {value}\n");
+            assert!(definition.contains(&define), "the definition lacks {}", define.trim());
+        }
     }
 }
