@@ -142,10 +142,9 @@ fn luajit_version_symbol(prefix: &Path) -> String {
 ///
 /// rustc already exports a cdylib's Rust symbols; the list adds LuaJIT's C API,
 /// which rustc cannot see, and names everything else so that a symbol missing
-/// from the build is a link error rather than an absent export. On macOS the
-/// executable exports exactly the list too. Linux cannot take a second version
-/// script beside rustc's, so `scripts/toolchain` links `libnupp.so` itself from
-/// the static archive with the list this writes.
+/// from the build is a link error rather than an absent export. Linux cannot
+/// take a second version script beside rustc's, so `scripts/toolchain` links
+/// `libnupp.so` itself from the static archive with the list this writes.
 fn export_list(repository: &Path, prefix: &Path, target: &str) {
     let symbols = exported_symbols(repository, prefix);
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets it"));
@@ -158,7 +157,6 @@ fn export_list(repository: &Path, prefix: &Path, target: &str) {
         write(&list, &names.join("\n"));
         let argument = format!("-Wl,-exported_symbols_list,{}", list.display());
         println!("cargo:rustc-cdylib-link-arg={argument}");
-        println!("cargo:rustc-link-arg-bins={argument}");
     } else if target.contains("windows") {
         // rustc's own module definition file already exports the Rust half,
         // so this one names only what it cannot.
