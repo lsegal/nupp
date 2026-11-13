@@ -389,6 +389,28 @@ local function applyTestColor(args: {string}): integer?
     return nil
 end
 
+--- How `test` runs its build: in a child compiler, so this process holds nothing of it
+--- while it waits on the tests. Absent where no compiler command can be started, as in
+--- the stage-zero fallback, whose root has no launcher, and then the build runs here.
+--- The child is given the colour this run asked for, since its build output is this
+--- command's output.
+local function childBuild(args: {string}): any
+    local root = os.getenv("NUPP_COMPILER_ROOT")
+    local launched: any = io.cli.args[0]
+    local executable = root and root .. "/bin/nupp" or (type(launched) == "string" and launched or nil)
+    if executable == nil or root ~= nil and not require("nupp.compiler.fs").exists(executable) then
+        return nil
+    end
+    local colour: {string} = {}
+    for _, argument in ipairs(args) do
+        if argument == "--color" or argument == "--no-color" or argument:match("^%-%-color=") then
+            colour[#colour + 1] = argument
+        end
+    end
+
+    return require("nupp.tools.build.project").childTestBuild({executable, "test", "--internal-build"}, colour)
+end
+
 local function runCoverage(options: any): integer
     local fs = require("nupp.compiler.fs")
     local outDir = options.coverageOut or "build/reports/coverage"
@@ -414,7 +436,8 @@ local function runCoverage(options: any): integer
     local testCode = project.test(".", options.arguments, {
         coverage = true,
         outDir = buildDir,
-        env = {NUPP_COVERAGE = "1", NUPP_COVERAGE_BUILD = buildDir, NUPP_COVERAGE_FILE = raw}
+        env = {NUPP_COVERAGE = "1", NUPP_COVERAGE_BUILD = buildDir, NUPP_COVERAGE_FILE = raw},
+        build = childBuild(options.arguments)
     })
     local report = require("nupp.tools.coverage")
     local model = report.collect(buildDir .. "/.nupp-state.json", raw)
@@ -483,6 +506,16 @@ local record Test
                 runnerArguments[#runnerArguments + 1] = self.arguments[index]
             end
             return require("nupp.tools.cli.testrunner").run(runnerArguments)
+        elseif self.arguments[1] == "--internal-build" then
+            local colour: {string} = {}
+            for index = 3, #self.arguments do
+                colour[#colour + 1] = self.arguments[index]
+            end
+            local colorCode = applyTestColor(colour)
+            if colorCode ~= nil then
+                return colorCode
+            end
+            return require("nupp.tools.build.project").serveTestBuild(tostring(self.arguments[2]))
         end
         if self.coverageOut ~= nil and not self.coverage then
             return usageError("--coverage-out requires --coverage")
@@ -501,7 +534,8 @@ local record Test
         if asksForJson(self.arguments) then
             local diagnostics: {any} = {}
             local code, stopped = require("nupp.tools.build.project").test(".", self.arguments, {
-                diagnostics = diagnostics
+                diagnostics = diagnostics,
+                build = childBuild(self.arguments)
             })
             if stopped ~= nil then
                 return preRunnerFailure(stopped as string, diagnostics)
@@ -510,7 +544,7 @@ local record Test
             return code
         end
 
-        return (require("nupp.tools.build.project").test(".", self.arguments))
+        return (require("nupp.tools.build.project").test(".", self.arguments, {build = childBuild(self.arguments)}))
     end
 end
 

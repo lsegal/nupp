@@ -21,3 +21,7 @@
   bit. Under a MinGW LuaJIT built against `msvcrt.dll`, `0.3 ^ 3` was
   `0.026999999999999996` compiled and `0.027` in Lua. A native build on
   Windows also no longer crashes now and then while it sets up LLVM.
+- `nupp test` builds the code under test in a child process, so it no longer
+  holds the build's memory while the tests run. For this repository's own
+  suite the command used to stay at 6 to 7 GB resident for the whole run; it
+  now stays around 20 MB, leaving that memory to the test workers.
