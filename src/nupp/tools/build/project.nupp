@@ -110,7 +110,12 @@ type project.TestOptions = {
 
     --- Where a `--json` run gathers why it stopped before the test command ran,
     --- instead of stderr.
-    diagnostics: {any}?
+    diagnostics: {any}?,
+
+    --- Runs the build under test instead of `project.build` in this process. The
+    --- command hands in `project.childTestBuild`, so that what the build leaves
+    --- reachable is gone before the test command starts.
+    build: (function(string, project.BuildOptions): integer)?
 }
 
 --- What `clean` was asked for.
@@ -1471,7 +1476,8 @@ function project.test(root: string?, args: {string}?, opts: project.TestOptions?
     end
     local test = manifest.testConfig(config)
     local produced: {[string]: any} = {}
-    if project.build(root, {
+    local build = asked.build or project.build
+    if build(root, {
         target = test.build,
         testBuild = true,
         outDir = asked.outDir,
@@ -1534,6 +1540,102 @@ function project.test(root: string?, args: {string}?, opts: project.TestOptions?
     end
 
     return process.run(argv, {cwd = root, env = env, replaceShell = true})
+end
+
+--- The build `test` asks for, run by another compiler process.
+---
+--- `test` builds and then waits on the test command for as long as that runs. A build
+--- done in its own process leaves the compiled program reachable from module state,
+--- several gigabytes for this repository's runner, and a collection gives little of it
+--- back. The process then holds all of it while it does nothing but wait, beside the
+--- workers that need the memory. Built in a child, that memory goes when the child exits,
+--- and only what `test` reads back crosses over: the status, the artifact, and any
+--- gathered diagnostics. The child prints its own progress and diagnostics otherwise.
+---
+--- `command` is the compiler invocation up to the request file, and `trailing`
+--- follows it.
+function project.childTestBuild(
+    command: {string},
+    trailing: {string}?
+): function(string, project.BuildOptions): integer
+    return function(root: string, opts: project.BuildOptions): integer
+        local json = require("serde.json")
+        local request = process.tmpname()
+        local written, problem = writeFile(request, json.encodevalue({
+            root = root,
+            target = opts.target,
+            outDir = opts.outDir,
+            coverage = opts.coverage,
+            gather = opts.diagnostics ~= nil,
+        }))
+        if not written then
+            say(opts, "NUPP0004", "nupp: cannot hand the test build to a child: " .. tostring(problem) .. "\n")
+            return 1
+        end
+        local argv: {string} = {}
+        for _, item in ipairs(command) do
+            argv[#argv + 1] = item
+        end
+        argv[#argv + 1] = request
+        for _, item in ipairs(trailing or {}) do
+            argv[#argv + 1] = item
+        end
+        local code = process.run(process.isolatedArguments(argv))
+        local text = readFile(request)
+        os.remove(request)
+        local result: any = text and json.decodevalue(text, json.NULL) or nil
+        if type(result) ~= "table" or result.code == nil then
+            -- The child never answered: it could not start, or it died before the
+            -- build finished. Either way nothing was built that can be tested.
+            if code == 0 then
+                say(opts, "NUPP0004", "nupp: the test build ended without a result\n")
+            end
+            return code ~= 0 and code or 1
+        end
+        if opts.produced ~= nil and type(result.artifact) == "string" then
+            opts.produced.artifact = result.artifact
+        end
+        if opts.diagnostics ~= nil and type(result.diagnostics) == "table" then
+            for _, diagnostic in ipairs(result.diagnostics) do
+                opts.diagnostics[#opts.diagnostics + 1] = diagnostic
+            end
+        end
+
+        return tonumber(result.code) or 1
+    end
+end
+
+--- The child's half of `childTestBuild`: builds what the request file asks for, then
+--- writes the outcome back to the same file.
+function project.serveTestBuild(request: string): integer
+    local json = require("serde.json")
+    local text, problem = readFile(request)
+    local asked: any = text and json.decodevalue(text, json.NULL) or nil
+    if type(asked) ~= "table" or type(asked.root) ~= "string" then
+        io.stderr:write("nupp: cannot read the test build request: " .. tostring(problem or request) .. "\n")
+        return 1
+    end
+    local produced: {[string]: any} = {}
+    local diagnostics: {any}? = asked.gather == true and {} or nil
+    local code = project.build(asked.root, {
+        target = type(asked.target) == "string" and asked.target or nil,
+        testBuild = true,
+        outDir = type(asked.outDir) == "string" and asked.outDir or nil,
+        coverage = asked.coverage == true and true or nil,
+        produced = produced,
+        diagnostics = diagnostics,
+    })
+    local written, writeProblem = writeFile(request, json.encodevalue({
+        code = code,
+        artifact = produced.artifact,
+        diagnostics = json.asarray(diagnostics or {}),
+    }))
+    if not written then
+        io.stderr:write("nupp: cannot answer the test build request: " .. tostring(writeProblem) .. "\n")
+        return 1
+    end
+
+    return code
 end
 
 --- Runs `tasks.<name>` from the manifest: builds `tasks.<name>.build` first if it names
