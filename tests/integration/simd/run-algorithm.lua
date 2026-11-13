@@ -101,7 +101,11 @@ for _, unit in ipairs(units.units) do
     end
 end
 assert(actual > 0, "algorithm emitted no compiled units")
-local path = "build/?.lua;build/?/init.lua;" .. root .. "/build/?.lua;" .. root .. "/build/?/init.lua;;"
+-- The compiler target's build carries only the compiler's own closure. The
+-- fused-json differential also loads `nupp.codec.json.aot`, which only the test
+-- runner's build (every source under `src/`) carries.
+local path = "build/?.lua;build/?/init.lua;" .. root .. "/build/?.lua;" .. root .. "/build/?/init.lua;" .. root
+    .. "/build/test-runner/?.lua;" .. root .. "/build/test-runner/?/init.lua;;"
 local output = runner.command(
     "cd " .. q(project) .. " && LUA_PATH=" .. q(path) .. " luajit -joff " .. q(selected.script),
     directory .. "/execution.log"
