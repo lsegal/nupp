@@ -16,6 +16,13 @@ from `msvcrt.dll` (the C runtime the Rust `windows-gnu` host itself uses) and,
 for the C99 math it lacks, from the Universal C Runtime's math API set; the
 two `kernel32.dll` functions the entry point calls, and `___chkstk_ms`, the
 stack probe a large frame calls, which MinGW's libgcc would otherwise supply.
+
+`pow` is the exception: the binding defines it. The LuaJIT a Windows build of
+Nupp carries is built with MinGW, whose C runtime replaces `msvcrt.dll`'s `pow`
+with its own -- repeated squaring for an integer exponent, x87 `exp2l` and
+`log2l` otherwise -- and that is what Lua's `^` answers with. The correctly
+rounded `pow` of `msvcrt.dll` differs from it in the last bit for exponents as
+plain as `0.3 ^ 3`, so AOT code calls MinGW's, transcribed here.
 ]]
 module nupp.compiler.aot.llvm.coff
 
@@ -50,7 +57,6 @@ const CRT: {
     "memmove",
     "memset",
     "modf",
-    "pow",
     "sin",
     "sinh",
     "sqrt",
@@ -110,6 +116,222 @@ coff.CRT = CRT
 coff.UCRT = UCRT
 coff.KERNEL32 = KERNEL32
 
+--- The x87 halves of MinGW-w64's `pow` (`math/x86/pow.def.h`): `fsqrt` for an
+--- exponent of one half, and `exp2l(y * log2l(|x|))`, rounded to a double,
+--- for the rest. Run in this process's own x87 control word, as MinGW's are.
+--- Leaf functions that keep their scratch in the caller's home area.
+const X87: {
+    string
+} = {
+    ".globl nupp_mingw_sqrt",
+    "nupp_mingw_sqrt:",
+    "    movsd %xmm0, 8(%rsp)",
+    "    fldl 8(%rsp)",
+    "    fsqrt",
+    "    fstpl 8(%rsp)",
+    "    movsd 8(%rsp), %xmm0",
+    "    retq",
+    ".globl nupp_mingw_exp2log2",
+    "nupp_mingw_exp2log2:",
+    "    movsd %xmm0, 8(%rsp)",
+    "    movsd %xmm1, 16(%rsp)",
+    -- log2l: fyl2xp1 on x - 1 near one, fyl2x elsewhere.
+    "    fld1",
+    "    fldl 16(%rsp)",
+    "    fld %st(0)",
+    "    fsub %st(2), %st",
+    "    fld %st(0)",
+    "    fabs",
+    "    fcompl nupp_mingw_log2_limit(%rip)",
+    "    fnstsw %ax",
+    "    andb $0x45, %ah",
+    "    jz .Lnupp_log2_far",
+    "    fstp %st(1)",
+    "    fyl2xp1",
+    "    jmp .Lnupp_log2_done",
+    ".Lnupp_log2_far:",
+    "    fstp %st(0)",
+    "    fyl2x",
+    ".Lnupp_log2_done:",
+    "    fmull 8(%rsp)",
+    -- exp2l: 2^fraction by f2xm1, scaled by the truncated integer part.
+    "    fld %st(0)",
+    "    fnstcw 28(%rsp)",
+    "    movzwl 28(%rsp), %eax",
+    "    orb $12, %ah",
+    "    movw %ax, 24(%rsp)",
+    "    fldcw 24(%rsp)",
+    "    frndint",
+    "    fldcw 28(%rsp)",
+    -- st(1) = st(1) - st(0), the fraction; spelled as bytes because the
+    -- AT&T mnemonic for it is the one assemblers disagree over.
+    "    .byte 0xdc, 0xe9",
+    "    fxch %st(1)",
+    "    f2xm1",
+    "    fld1",
+    "    faddp %st, %st(1)",
+    "    fscale",
+    "    fstp %st(1)",
+    "    fstpl 8(%rsp)",
+    "    movsd 8(%rsp), %xmm0",
+    "    retq",
+    ".section .rdata,\\22dr\\22",
+    ".p2align 3",
+    "nupp_mingw_log2_limit:",
+    "    .double 0.29",
+    ".text",
+}
+
+--- MinGW-w64's `pow` and its `__powi` (`math/powi.def.h`), case for case:
+--- `edges` is a zero or infinite `x`, `powi` an exponent that fits an `int`.
+const POW = [[
+declare double @nupp_mingw_sqrt(double)
+declare double @nupp_mingw_exp2log2(double, double)
+declare double @llvm.fabs.f64(double)
+declare double @llvm.trunc.f64(double)
+
+define dso_local double @pow(double %x, double %y) {
+entry:
+  %xbits = bitcast double %x to i64
+  %xneg = icmp slt i64 %xbits, 0
+  %ybits = bitcast double %y to i64
+  %yneg = icmp slt i64 %ybits, 0
+  %ax = call double @llvm.fabs.f64(double %x)
+  %ay = call double @llvm.fabs.f64(double %y)
+  %yzero = fcmp oeq double %y, 0.0
+  %xone = fcmp oeq double %x, 1.0
+  %unit = or i1 %yzero, %xone
+  br i1 %unit, label %one, label %xnans
+one:
+  ret double 1.0
+xnans:
+  %xnan = fcmp uno double %x, 0.0
+  br i1 %xnan, label %retx, label %ynans
+retx:
+  ret double %x
+ynans:
+  %ynan = fcmp uno double %y, 0.0
+  br i1 %ynan, label %rety, label %classify
+rety:
+  ret double %y
+classify:
+  %ytrunc = call double @llvm.trunc.f64(double %y)
+  %yfrac = fcmp one double %ytrunc, %y
+  %yhalf = fmul double %y, 0.5
+  %htrunc = call double @llvm.trunc.f64(double %yhalf)
+  %yodd = fcmp one double %htrunc, %yhalf
+  %xzero = fcmp oeq double %x, 0.0
+  %xinf = fcmp oeq double %ax, 0x7FF0000000000000
+  %edge = or i1 %xzero, %xinf
+  br i1 %edge, label %edges, label %yinfs
+edges:
+  %yint = xor i1 %yfrac, true
+  %oddint = and i1 %yint, %yodd
+  %negative = and i1 %xneg, %oddint
+  %differ = xor i1 %xzero, %yneg
+  %large = xor i1 %differ, true
+  %magnitude = select i1 %large, double 0x7FF0000000000000, double 0.0
+  %negated = fneg double %magnitude
+  %edged = select i1 %negative, double %negated, double %magnitude
+  ret double %edged
+yinfs:
+  %yinf = fcmp oeq double %ay, 0x7FF0000000000000
+  br i1 %yinf, label %yinfinite, label %finite
+yinfinite:
+  %axone = fcmp oeq double %ax, 1.0
+  %axbig = fcmp ogt double %ax, 1.0
+  %grows = xor i1 %axbig, %yneg
+  %limit = select i1 %grows, double 0x7FF0000000000000, double 0.0
+  %limited = select i1 %axone, double 1.0, double %limit
+  ret double %limited
+finite:
+  br i1 %yfrac, label %fraction, label %integer
+fraction:
+  br i1 %xneg, label %invalid, label %half
+invalid:
+  ret double 0xFFF8000000000000
+half:
+  %ishalf = fcmp oeq double %y, 0.5
+  br i1 %ishalf, label %root, label %general
+root:
+  %rooted = call double @nupp_mingw_sqrt(double %x)
+  ret double %rooted
+integer:
+  %below = fcmp ole double %y, 2147483647.0
+  %above = fcmp oge double %y, -2147483648.0
+  %fits = and i1 %below, %above
+  br i1 %fits, label %powi, label %general
+powi:
+  %n = fptosi double %y to i32
+  %squared = call double @nupp_mingw_powi(double %x, i32 %n)
+  ret double %squared
+general:
+  %raised = call double @nupp_mingw_exp2log2(double %y, double %ax)
+  %flip = and i1 %xneg, %yodd
+  %flipped = fneg double %raised
+  %signed = select i1 %flip, double %flipped, double %raised
+  ret double %signed
+}
+
+define internal double @nupp_mingw_powi(double %x, i32 %n) {
+entry:
+  %d = call double @llvm.fabs.f64(double %x)
+  %reciprocal = icmp slt i32 %n, 0
+  %negn = sub i32 0, %n
+  %m = select i1 %reciprocal, i32 %negn, i32 %n
+  %single = icmp eq i32 %m, 1
+  br i1 %single, label %finish, label %iterate
+iterate:
+  %r = call double @nupp_mingw_powi_iter(double %d, i32 %m)
+  %rinf = fcmp oeq double %r, 0x7FF0000000000000
+  %dbig = fcmp ogt double %d, 1.0
+  %overflow = and i1 %rinf, %dbig
+  %redo = and i1 %overflow, %reciprocal
+  br i1 %redo, label %upfront, label %finish
+upfront:
+  %inverse = fdiv double 1.0, %d
+  %again = call double @nupp_mingw_powi_iter(double %inverse, i32 %m)
+  br label %signed
+finish:
+  %rr = phi double [ %d, %entry ], [ %r, %iterate ]
+  %inverted = fdiv double 1.0, %rr
+  %rf = select i1 %reciprocal, double %inverted, double %rr
+  br label %signed
+signed:
+  %result = phi double [ %again, %upfront ], [ %rf, %finish ]
+  %odd = trunc i32 %n to i1
+  %xbits = bitcast double %x to i64
+  %xneg = icmp slt i64 %xbits, 0
+  %flip = and i1 %xneg, %odd
+  %negated = fneg double %result
+  %final = select i1 %flip, double %negated, double %result
+  ret double %final
+}
+
+define internal double @nupp_mingw_powi_iter(double %base, i32 %m) {
+entry:
+  %low = and i32 %m, 1
+  %isodd = icmp ne i32 %low, 0
+  %start = select i1 %isodd, double %base, double 1.0
+  %u0 = lshr i32 %m, 1
+  br label %loop
+loop:
+  %d = phi double [ %base, %entry ], [ %d2, %loop ]
+  %r = phi double [ %start, %entry ], [ %r2, %loop ]
+  %u = phi i32 [ %u0, %entry ], [ %u2, %loop ]
+  %d2 = fmul double %d, %d
+  %bit = and i32 %u, 1
+  %take = icmp ne i32 %bit, 0
+  %product = fmul double %r, %d2
+  %r2 = select i1 %take, double %product, double %r
+  %u2 = lshr i32 %u, 1
+  %more = icmp ne i32 %u2, 0
+  br i1 %more, label %loop, label %done
+done:
+  ret double %r2
+}
+]]
+
 local function cString(name: string): string
     return ("private unnamed_addr constant [%d x i8] c\"%s\\00\""):format(#name + 1, name)
 end
@@ -142,6 +364,9 @@ function coff.binding(triple: string, names: {string}): string
         "module asm \"    popq %rcx\"",
         "module asm \"    retq\"",
     }
+    for _, line in ipairs(X87) do
+        lines[#lines + 1] = "module asm \"" .. line .. "\""
+    end
     for _, name in ipairs(names) do
         lines[#lines + 1] = "module asm \".globl " .. name .. "\""
         lines[#lines + 1] = "module asm \"" .. name .. ":\""
@@ -193,6 +418,8 @@ function coff.binding(triple: string, names: {string}): string
     lines[#lines + 1] = "done:"
     lines[#lines + 1] = "  ret i32 1"
     lines[#lines + 1] = "}"
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = POW
 
     return table.concat(lines, "\n") .. "\n"
 end
