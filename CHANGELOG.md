@@ -16,3 +16,7 @@
   unchanged, so an embedding host relinks without source changes. See
   [Native runtime and support](https://nupp.dev/reference/native-runtime/)
   for which Nupp module replaced each crate.
+- On Windows, `@aot` code computes `^` as the LuaJIT that Nupp builds there
+  does, so compiled and interpreted results agree to the last bit: `0.3 ^ 3`
+  was `0.026999999999999996` compiled and `0.027` in Lua. A native build on
+  Windows also no longer crashes now and then while it sets up LLVM.
