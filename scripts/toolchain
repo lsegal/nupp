@@ -38,7 +38,7 @@ usage: scripts/toolchain COMPONENT...
        scripts/toolchain --all
        scripts/toolchain --prefix
 
-Components: luajit luarocks lpeg lpeg-source stage0 migration-stage0 llvm wgpu
+Components: luajit luarocks lpeg lpeg-source stage0 llvm wgpu
             wgpu-static [PLATFORM]
             browser-sources browser-emulator browser-guest
             native-provider FEATURES
@@ -2739,9 +2739,6 @@ for component in "$@"; do
         lpeg-source) lpeg_tree=$(lpeg_source); native_path "$lpeg_tree" ;;
         llvm)     build_llvm;     native_path "$LLVM_OUT" ;;
         stage0)   stage0 ;;
-        migration-stage0)
-            . "$ROOT/scripts/migration-toolchain.pins"
-            stage0 ;;
         *) note "unknown component $component"; usage ;;
     esac
 done

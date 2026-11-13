@@ -43,7 +43,10 @@ proof. The same checks apply to the optional baseline.
 
 The runner also executes the repository's JSON differential corpus against
 the compiled decoder before timing it, including malformed UTF-8 and exact
-first-error positions across vector boundaries.
+first-error positions across vector boundaries. That corpus loads
+`nupp.codec.json.aot`, which the compiler's own build does not carry, so it
+reads it from the test runner's build. Any `bin/nupp test` run, or
+`bin/nupp build --target testRunner`, writes `build/test-runner`.
 
 ## Protocol
 
