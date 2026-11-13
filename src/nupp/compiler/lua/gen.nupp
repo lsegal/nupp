@@ -10638,7 +10638,9 @@ export function generate(
     if coverageOn and coverageName then
         -- The recorder is self-contained so an instrumented application does not need
         -- the compiler installed at runtime. Its plain table is intentionally public: a
-        -- custom runner may flush it just as this repository's runner does.
+        -- custom runner may flush it just as this repository's runner does. Each load
+        -- then rebinds the file's two recorders, the `_G` keys its probes call, to
+        -- whichever table is current.
         code = (
             "local %s=_G.__nuppCoverage;if not %s then %s={hits={}};"
             .. "function %s.hit(p,i)local f=%s.hits[p]or{};%s.hits[p]=f;"
@@ -10647,8 +10649,6 @@ export function generate(
             .. "f[k]=(f[k]or 0)+1;return v end;_G.__nuppCoverage=%s end;"
             .. "_G[%q]=function(i)return %s.hit(%q,i)end;_G[%q]=function(i,v)return %s.branch(%q,i,v)end; "
         ):format(
-            coverageName,
-            coverageName,
             coverageName,
             coverageName,
             coverageName,
