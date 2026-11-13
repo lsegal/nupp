@@ -373,6 +373,41 @@ const FUSION_STRICT = 2
 --- moved past the window is refused rather than read further.
 const OPTIONS_WINDOW = 2048
 
+local regionDeclared = false
+
+--- How much of the window from `base` is mapped. A target machine is smaller
+--- than the window, and the Windows heap can place one at the very end of a
+--- region, where reading the whole window runs into an unmapped page (#219);
+--- `VirtualQuery` says where the region holding the machine ends, and the
+--- machine itself always lies inside it.
+local function mappedWindow(base: any): integer
+    if not windows then
+        return OPTIONS_WINDOW
+    end
+    if not regionDeclared then
+        regionDeclared = true
+        ffi.cdef[[
+typedef struct {
+    void *base;
+    void *allocationBase;
+    uint32_t allocationProtect;
+    uint16_t partition;
+    size_t size;
+    uint32_t state, protect, type;
+} nuppcg_MemoryRegion;
+size_t nuppcg_VirtualQuery(const void *address, nuppcg_MemoryRegion *region, size_t length) __asm__("VirtualQuery");
+]]
+    end
+    local region: any = ffi.new("nuppcg_MemoryRegion")
+    if ffi.C.nuppcg_VirtualQuery(base, region, ffi.sizeof(region)) == 0 then
+        return OPTIONS_WINDOW
+    end
+    local start: any = ffi.cast("uint8_t *", region.base)
+    local left = tonumber(start + region.size - base) as integer
+
+    return math.min(OPTIONS_WINDOW, left)
+end
+
 --- Sets a target machine's `Options.AllowFPOpFusion` to `Strict`: no
 --- multiply-add is formed except where an instruction's own `contract` flag
 --- allows it, which Nupp emits only inside `@relax("fp-contract")` functions.
@@ -391,14 +426,15 @@ const OPTIONS_WINDOW = 2048
 --- @return nil, or why the field could not be found
 local function strictFusion(C: any, machine: any): string?
     local base: any = ffi.cast("uint8_t *", machine)
-    local before: any = ffi.new("uint8_t[?]", OPTIONS_WINDOW)
-    ffi.copy(before, base, OPTIONS_WINDOW)
+    local window = mappedWindow(base)
+    local before: any = ffi.new("uint8_t[?]", window)
+    ffi.copy(before, base, window)
     C.nuppcg_LLVMSetTargetMachineAsmVerbosity(machine, 0)
-    local quiet: any = ffi.new("uint8_t[?]", OPTIONS_WINDOW)
-    ffi.copy(quiet, base, OPTIONS_WINDOW)
+    local quiet: any = ffi.new("uint8_t[?]", window)
+    ffi.copy(quiet, base, window)
     C.nuppcg_LLVMSetTargetMachineAsmVerbosity(machine, 1)
     local changed: integer? = nil
-    for offset = 0, OPTIONS_WINDOW - 1 do
+    for offset = 0, window - 1 do
         if base[offset] ~= quiet[offset] then
             local flipped = (tonumber(base[offset]) as integer) ~ (tonumber(quiet[offset]) as integer)
             if changed ~= nil or flipped ~= 8 then
