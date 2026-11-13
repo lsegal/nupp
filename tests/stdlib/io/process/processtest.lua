@@ -1661,6 +1661,15 @@ function M.luaGcRetainsTheChildWhileAStreamIsReachable()
 
     local ok, reason = pcall(function()
         readWhileReachable()
+        -- A compiled trace keeps every closure it calls as a constant. The read's
+        -- per-call wait callbacks capture the stream and child state, so a trace
+        -- recorded during the read keeps the child reachable until it is flushed.
+        -- Which loops get hot enough to record depends on hot counters hashed by
+        -- bytecode address, which made this case depend on unrelated code layout.
+        local jit = rawget(_G, "jit")
+        if jit ~= nil then
+            jit.flush()
+        end
         for _ = 1, 4 do
             collectgarbage("collect")
         end
