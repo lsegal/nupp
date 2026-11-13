@@ -6,6 +6,7 @@ local read = fixture.read
 local exists = fixture.exists
 local tempProject = fixture.tempProject
 local remove = fixture.remove
+local json = fixture.json
 
 local M = {}
 
@@ -99,6 +100,103 @@ return {
     testAssert.eq(ran.argv[3], "--internal-runner", "the default test command is Nupp's bundled runner")
     testAssert.eq(ran.options.cwd, dir, "the default runner starts in the project")
     assert(exists(dir .. "/out/main.lua"), "the default test command builds first")
+    remove(dir)
+end
+
+-- `nupp test` builds in a child so that it holds nothing of the build while it waits
+-- on the tests; the build a caller hands in is the one that runs, with the options
+-- `project.build` would have had, and its artifact is what the command runs.
+function M.testRunsTheBuildTheCallerHandsIn()
+    local dir = tempProject({
+        ["nupp.lua"] = [[
+return {
+   include = {"src"},
+   build = {kind = "bundle", outDir = "build", output = "build/test.lua", entries = {"main"}},
+   test = {argv = {"luajit", "build/test.lua"}},
+}
+]],
+        ["src/main.nupp"] = "return true\n",
+        ["elsewhere.lua"] = [[
+local f = assert(io.open("test-ran", "wb"))
+f:write("yes")
+f:close()
+]],
+    })
+    local asked
+    local code = project.test(dir, {}, {
+        build = function(root, opts)
+            asked = {root = root, testBuild = opts.testBuild, target = opts.target}
+            opts.produced.artifact = "elsewhere.lua"
+            return 0
+        end,
+        outDir = "elsewhere",
+    })
+    testAssert.eq(code, 0)
+    testAssert.eq(asked.root, dir)
+    testAssert.eq(asked.testBuild, true, "the handed-in build is a test build")
+    testAssert.eq(read(dir .. "/test-ran"), "yes", "the command runs the artifact the handed-in build made")
+    assert(not exists(dir .. "/build/test.lua"), "nothing was built in this process")
+    local stopped
+    code, stopped = project.test(dir, {}, {build = function() return 1 end})
+    testAssert.eq(code, 1)
+    testAssert.eq(stopped, "build")
+    remove(dir)
+end
+
+-- What crosses back from the child is its status, the artifact and the gathered
+-- diagnostics, through the request file named after the command it was given.
+function M.childTestBuildReadsOnlyTheOutcomeTheChildWrote()
+    local dir = tempProject({
+        ["child.lua"] = [[
+local request = assert(io.open(arg[1], "rb")):read("*a")
+assert(request:find('"target":"runner"', 1, true), request)
+assert(request:find('"gather":true', 1, true), request)
+assert(arg[2] == "--color=never", tostring(arg[2]))
+local f = assert(io.open(arg[1], "wb"))
+f:write('{"code":0,"artifact":"build/runner","diagnostics":[{"code":"NUPP9999","msg":"kept"}]}')
+f:close()
+]],
+        ["silent.lua"] = "os.exit(0)\n",
+    })
+    local produced, diagnostics = {}, {}
+    local build = project.childTestBuild({"luajit", dir .. "/child.lua"}, {"--color=never"})
+    testAssert.eq(build(".", {target = "runner", produced = produced, diagnostics = diagnostics}), 0)
+    testAssert.eq(produced.artifact, "build/runner")
+    testAssert.eq(#diagnostics, 1)
+    testAssert.eq(diagnostics[1].msg, "kept")
+
+    -- A child that exits without answering built nothing that can be tested.
+    diagnostics = {}
+    testAssert.eq(project.childTestBuild({"luajit", dir .. "/silent.lua"})(".", {diagnostics = diagnostics}), 1)
+    testAssert.eq(#diagnostics, 1, "the missing result is reported")
+    remove(dir)
+end
+
+function M.serveTestBuildAnswersInTheRequestFile()
+    local dir = tempProject({
+        ["nupp.lua"] = [[
+return {
+   include = {"src"},
+   build = {kind = "bundle", outDir = "build", output = "build/test.lua", entries = {"main"}},
+}
+]],
+        ["src/main.nupp"] = "return true\n",
+    })
+    local request = os.tmpname()
+    fixture.write(request, json.encode({root = dir, gather = true}))
+    testAssert.eq(project.serveTestBuild(request), 0)
+    local answer = json.decode(read(request))
+    testAssert.eq(answer.code, 0)
+    assert(tostring(answer.artifact):match("build/test%.lua$"), tostring(answer.artifact))
+    assert(exists(dir .. "/build/test.lua"), "the child built the target")
+
+    fixture.write(dir .. "/src/main.nupp", 'local x: integer = "text"\nreturn x\n')
+    fixture.write(request, json.encode({root = dir, gather = true}))
+    testAssert.eq(project.serveTestBuild(request), 1)
+    answer = json.decode(read(request))
+    testAssert.eq(answer.code, 1)
+    assert(#answer.diagnostics > 0, "a failed build hands back what it gathered")
+    os.remove(request)
     remove(dir)
 end
 
