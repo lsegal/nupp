@@ -2735,15 +2735,26 @@ export function generate(
     -- Coverage
     ---------------------------------------------------------------------
 
-    local function coverageRuntime()
-        -- Named through `_G` at the call sites, though the prologue still declares
-        -- a local to build it with. A local the sites referred to would be an
-        -- upvalue in every instrumented closure, and a function already holding
-        -- the sixty LuaJIT allows cannot take one more -- which is how asking for
-        -- coverage over this compiler stopped it generating anything at all.
+    -- The `_G` key the prologue binds this file's `kind` recorder under ("hit" or
+    -- "branch"). The path is in the key, so a probe passes only its site.
+    local function coverageKey(kind: string): string
+        return ("__nuppCoverage.%s %s"):format(kind, coveragePath)
+    end
+
+    -- What a probe calls. Named through `_G` at the call sites, though the
+    -- prologue still declares a local to build it with. A local the sites referred
+    -- to would be an upvalue in every instrumented closure, and a function already
+    -- holding the sixty LuaJIT allows cannot take one more -- which is how asking
+    -- for coverage over this compiler stopped it generating anything at all.
+    --
+    -- The recorder is one constant-key index away, so a probe is four bytecodes
+    -- rather than the six `_G.__nuppCoverage.hit("path", id)` took. Every
+    -- statement carries one, and at six this compiler's own `emit` grew past the
+    -- jump LuaJIT can patch an early return across (NUPP3005).
+    local function coverageProbe(kind: string): string
         coverageName = coverageName or reservedName("__nuppCoverage")
 
-        return "_G.__nuppCoverage"
+        return ("_G[%q]"):format(coverageKey(kind))
     end
 
     local function coverageSite(kind, node)
@@ -2770,7 +2781,7 @@ export function generate(
             return
         end
         local id = coverageSite(kind, node)
-        e(("%s.hit(%q,%d);"):format(coverageRuntime(), coveragePath, id), sourceLine(node))
+        e(("%s(%d);"):format(coverageProbe("hit"), id), sourceLine(node))
     end
 
     local function coverageStatement(node)
@@ -3842,7 +3853,7 @@ export function generate(
             first = false
             if coverageOn then
                 local branch = coverageSite("branch", arm)
-                e(("%s.branch(%q,%d,"):format(coverageRuntime(), coveragePath, branch), sourceLine(arm))
+                e(("%s(%d,"):format(coverageProbe("branch"), branch), sourceLine(arm))
             end
             if arm.patternKind == "static" then
                 for index, value in ipairs(arm.values or {}) do
@@ -4170,7 +4181,7 @@ export function generate(
         e(";if ")
         local branch = coverageOn and coverageSite("branch", node) or nil
         if branch then
-            e(("%s.branch(%q,%d,"):format(coverageRuntime(), coveragePath, branch))
+            e(("%s(%d,"):format(coverageProbe("branch"), branch))
         end
         e("not " .. temps[1])
         if branch then
@@ -6468,7 +6479,7 @@ export function generate(
                 end
                 e("if ")
                 if coverageOn then
-                    e(("%s.branch(%q,%d,"):format(coverageRuntime(), coveragePath, coverageSite("branch", clause.cond)))
+                    e(("%s(%d,"):format(coverageProbe("branch"), coverageSite("branch", clause.cond)))
                 end
                 if binding then
                     e(binding .. "~=nil")
@@ -6555,7 +6566,7 @@ export function generate(
             local branch = coverageSite("branch", x.cond)
             for _, child in ipairs(x) do
                 if child == x.cond then
-                    e(("%s.branch(%q,%d,"):format(coverageRuntime(), coveragePath, branch), sourceLine(child))
+                    e(("%s(%d,"):format(coverageProbe("branch"), branch), sourceLine(child))
                     emit(child)
                     e(")")
                 else
@@ -10627,13 +10638,16 @@ export function generate(
     if coverageOn and coverageName then
         -- The recorder is self-contained so an instrumented application does not need
         -- the compiler installed at runtime. Its plain table is intentionally public: a
-        -- custom runner may flush it just as this repository's runner does.
+        -- custom runner may flush it just as this repository's runner does. Each load
+        -- then rebinds the file's two recorders, the `_G` keys its probes call, to
+        -- whichever table is current.
         code = (
             "local %s=_G.__nuppCoverage;if not %s then %s={hits={}};"
             .. "function %s.hit(p,i)local f=%s.hits[p]or{};%s.hits[p]=f;"
             .. "local k=tostring(i);f[k]=(f[k]or 0)+1 end;function %s.branch(p,i,v)local f=%s.hits[p]"
             .. "or{};%s.hits[p]=f;local k=tostring(i)..(v and ':true'or ':false');"
-            .. "f[k]=(f[k]or 0)+1;return v end;_G.__nuppCoverage=%s end; "
+            .. "f[k]=(f[k]or 0)+1;return v end;_G.__nuppCoverage=%s end;"
+            .. "_G[%q]=function(i)return %s.hit(%q,i)end;_G[%q]=function(i,v)return %s.branch(%q,i,v)end; "
         ):format(
             coverageName,
             coverageName,
@@ -10645,8 +10659,12 @@ export function generate(
             coverageName,
             coverageName,
             coverageName,
+            coverageKey("hit"),
             coverageName,
-            coverageName
+            coveragePath,
+            coverageKey("branch"),
+            coverageName,
+            coveragePath
         ) .. code
     end
     if hotState then

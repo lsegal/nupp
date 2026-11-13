@@ -667,6 +667,40 @@ function M.coverageModeCountsANamedVarargFunction()
     end)
 end
 
+-- A probe sits on every statement, so its own size multiplies the function's. An
+-- early return before the first nested closure is patched with a jump to the end,
+-- and LuaJIT cannot patch one longer than 32767 bytecodes. Each statement here is
+-- one bytecode: probes of six, as `_G.__nuppCoverage.hit("path", id)` was, put
+-- the end out of reach (NUPP3005), and the compiler's own `emit` did the same.
+function M.coverageProbesStayCheapEnoughForLongFunctions()
+    local statements = 5500
+    local lines = {
+        "local function long(n: integer, skip: boolean): integer",
+        "   if skip then return 0 end",
+    }
+    for _ = 1, statements do
+        lines[#lines + 1] = "   n = n + 1"
+    end
+    lines[#lines + 1] = "   local function inner(): integer return n end"
+    lines[#lines + 1] = "   return inner()"
+    lines[#lines + 1] = "end"
+    lines[#lines + 1] = "return long(0, false)"
+    local code, metadata = generateCoverage(table.concat(lines, "\n"))
+    withFreshCoverage(function()
+        local chunk, err = loadstring(code, "@coverage_long")
+        assert(chunk, "instrumented long function does not load: " .. tostring(err))
+        testAssert.eq(chunk(), statements, "instrumented program result")
+        local hits = assert(_G.__nuppCoverage and _G.__nuppCoverage.hits["coverage-test.nupp"])
+        local reached = 0
+        for _, site in ipairs(metadata.sites) do
+            if site.kind == "statement" and (hits[tostring(site.id)] or 0) > 0 then
+                reached = reached + 1
+            end
+        end
+        assert(reached >= statements, "every executed statement is recorded")
+    end)
+end
+
 function M.erasure()
     testAssert.eq(run("local x: number = 21\nreturn x * 2"), 42)
     testAssert.eq(run("local record P\n   x: number\nend\nlocal p = { x = 7 } as P\nreturn p.x"), 7)
