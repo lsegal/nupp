@@ -1601,7 +1601,7 @@ function project.childTestBuild(
             end
         end
 
-        return tonumber(result.code) or 1
+        return result.code == 0 and 0 or 1
     end
 end
 
