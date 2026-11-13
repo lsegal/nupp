@@ -622,6 +622,11 @@ do
     for _, f in ipairs({"absf", "floorf", "ceilf", "sqrtf", "negf", "degf", "radf", "halff"}) do
         for _, a in ipairs(V) do cases[#cases + 1] = {"binary64", f, {a, n = 1}} end
     end
+    -- `^` past the boundary operands: fractional exponents, integers beyond an
+    -- int, and bases near one, which reach every path of a C runtime's pow.
+    local B = {2, -2, 3, 0.3, -0.3, 1.0000001, 0.9999999, 1.5, -1.5, 10, 1e-5, 1e17, 1e300, 4.9e-324}
+    local P = {0.5, 1.5, -2.5, 1/3, 0.1, 7, -7, 31, 2^31, 2^31 + 1, -2^31, -2^31 - 1, 1e10, 2^53 + 2}
+    for _, a in ipairs(B) do for _, b in ipairs(P) do cases[#cases + 1] = {"binary64", "powf", {a, b, n = 2}} end end
     groups.binary64 = cases
 end
 
