@@ -95,29 +95,38 @@ end
 function M.concurrentSleepsShareOneSourceAndFireInDeadlineOrder()
     local order = {}
     local started = os.monotonic()
+
+    -- Every deadline is measured from one reading. Measured from each child's own
+    -- start, a loaded runner that paused for 20 milliseconds between the first and
+    -- the last child really did give the 60 an earlier deadline than the 40. The
+    -- floor keeps a child that starts after its deadline parked on the source, so
+    -- the source still decides the order rather than whoever ran first.
+    local function sleepUntil(offset)
+        time.sleep(math.max(1, started + offset - os.monotonic()))
+    end
+
     tasks.gather({
         function()
-            time.sleep(60)
-            order[#order + 1] = 60
+            sleepUntil(150)
+            order[#order + 1] = 150
         end,
         function()
-            time.sleep(20)
-            order[#order + 1] = 20
+            sleepUntil(50)
+            order[#order + 1] = 50
         end,
         function()
-            time.sleep(40)
-            order[#order + 1] = 40
+            sleepUntil(100)
+            order[#order + 1] = 100
         end,
     })
     local elapsed = os.monotonic() - started
 
-    assert(elapsed >= 60, "the longest sleep did not finish")
-    -- Serialized, this would be 120. The margin is wide because the point is that
-    -- one source drove all three, not what the scheduler's overhead was.
-    assert(elapsed < 110, "the sleeps serialized: " .. tostring(elapsed))
-    testAssert.eq(order[1], 20, "the soonest deadline did not fire first")
-    testAssert.eq(order[2], 40, "the middle deadline did not fire second")
-    testAssert.eq(order[3], 60, "the latest deadline did not fire last")
+    assert(elapsed >= 150, "the longest sleep did not finish")
+    -- Serialized, the first child would hold the others until its own deadline,
+    -- and they would then fire in the order they started: 150, 50, 100.
+    testAssert.eq(order[1], 50, "the soonest deadline did not fire first")
+    testAssert.eq(order[2], 100, "the middle deadline did not fire second")
+    testAssert.eq(order[3], 150, "the latest deadline did not fire last")
 end
 
 function M.anAbandonedWaitTakesItsTimerWithIt()
