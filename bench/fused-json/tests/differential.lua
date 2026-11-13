@@ -9,6 +9,17 @@ proveNative(module, function()
 end)
 package.loaded["nupp.codec.json.internal.decoder.fused"] = fused
 package.loaded["nupp.codec.json.aot"] = nil
+-- The corpus loads the codec over the compiled decoder above. The compiler's
+-- build does not carry the codec; the test runner's build does.
+if not package.searchpath("nupp.codec.json.aot", package.path) then
+    error(
+        "the fused JSON differential needs nupp.codec.json.aot, which this"
+            .. " LUA_PATH does not reach; build the test runner with"
+            .. " `bin/nupp build --target testRunner` and put build/test-runner on"
+            .. " LUA_PATH:\n" .. package.path,
+        0
+    )
+end
 local suite = dofile("../../tests/stdlib/serde/json/jsonfuseddifferentialtest.lua")
 local names = {}
 for name in pairs(suite) do
