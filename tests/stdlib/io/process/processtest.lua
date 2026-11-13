@@ -1413,7 +1413,7 @@ end
 -- Waitable sources registered ahead of the process, as earlier suites leave them in a
 -- shared process: a timer that has slept once, a worker pool. None of them is what a
 -- task scope's child waits on, so none of them should take the driver's sleeps.
-local function withUnrelatedSources(body)
+local function registerUnrelatedSources()
     local registered = {}
     for index = 1, 4 do
         registered[index] = suspension.source(
@@ -1430,12 +1430,13 @@ local function withUnrelatedSources(body)
             end
         )
     end
-    local ok, problem = pcall(body)
+
+    return registered
+end
+
+local function releaseAll(registered)
     for index = 1, #registered do
         registered[index]:release()
-    end
-    if not ok then
-        error(problem, 0)
     end
 end
 
@@ -1452,18 +1453,18 @@ function M.aWaitInsideATaskScopeSleepsInThePlatformRatherThanSpinning()
         return 0
     end
 
-    withUnrelatedSources(function()
-        local child = spawnOn(backend, {args = {"quiet"}})
-        local scope = tasks.scope()
-        local waited = scope:spawn(function()
-            return child:wait()
-        end)
-        local exit = waited:await()
-        scope:close()
-        testAssert.eq(exit.exitcode, 0, "the child's exit")
-        assert(sleeps > 0, "the driver slept in the platform between quiet passes")
-        child:_drop()
+    local unrelated = registerUnrelatedSources()
+    local child = spawnOn(backend, {args = {"quiet"}})
+    local scope = tasks.scope()
+    local waited = scope:spawn(function()
+        return child:wait()
     end)
+    local exit = waited:await()
+    scope:close()
+    releaseAll(unrelated)
+    testAssert.eq(exit.exitcode, 0, "the child's exit")
+    assert(sleeps > 0, "the driver slept in the platform between quiet passes")
+    child:_drop()
 end
 
 function M.aReadInsideATaskScopeKeepsTheChunkThatWokeIt()
@@ -1517,18 +1518,18 @@ function M.drainingInsideATaskScopeSleepsInThePlatformRatherThanSpinning()
         return 0
     end
 
-    withUnrelatedSources(function()
-        local child = spawnOn(backend, {args = {"slow"}})
-        local scope = tasks.scope()
-        local drained = scope:spawn(function()
-            return assert(child:communicate())
-        end)
-        local result = drained:await()
-        scope:close()
-        child:_drop()
-        testAssert.eq(result.output, "onetwo", "everything arrived")
-        assert(sleeps > 0, "the driver slept in the platform between quiet passes")
+    local unrelated = registerUnrelatedSources()
+    local child = spawnOn(backend, {args = {"slow"}})
+    local scope = tasks.scope()
+    local drained = scope:spawn(function()
+        return assert(child:communicate())
     end)
+    local result = drained:await()
+    scope:close()
+    releaseAll(unrelated)
+    child:_drop()
+    testAssert.eq(result.output, "onetwo", "everything arrived")
+    assert(sleeps > 0, "the driver slept in the platform between quiet passes")
 end
 
 function M.popenUsesOneImplementationForLuaAndArgumentVectorCalls()
