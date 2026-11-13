@@ -1836,27 +1836,29 @@ esac
 end
 
 -- Before a checkout has a compiler to build its own provider with, the one it
--- runs on is the pinned prebuilt one. bin/nupp asks `native-provider` for it,
--- and stage zero asks `native-rust`, the name it knows, for `codegen`, which no
--- provider carries any more and selects nothing.
+-- runs on is the pinned prebuilt one. bin/nupp and stage zero both ask
+-- `native-provider` for it.
 function M.aCheckoutWithoutACompilerRunsOnThePrebuiltProvider()
     local fixture = compilerlessFixture("base")
-    for _, command in ipairs({"native-provider base", "native-rust base,codegen"}) do
-        local status, output = run(fixture.environment, command, fixture.driver)
-        assert(status == 0, command .. " was refused:\n" .. output)
-        local library = assert(output:match("([^\n]+)%s*$"))
-        assert(
-            library:find("/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so", 1, true),
-            command .. " did not answer the prebuilt provider:\n" .. output
-        )
-        assert(output:find("prebuilt native provider", 1, true), "the choice is not said:\n" .. output)
-    end
+    local status, output = run(fixture.environment, "native-provider base", fixture.driver)
+    assert(status == 0, "native-provider base was refused:\n" .. output)
+    local library = assert(output:match("([^\n]+)%s*$"))
+    assert(
+        library:find("/prebuilt/codegen/" .. fixture.digests.codegen .. "/libnupp_native.so", 1, true),
+        "native-provider base did not answer the prebuilt provider:\n" .. output
+    )
+    assert(output:find("prebuilt native provider", 1, true), "the choice is not said:\n" .. output)
     assert(select(2, served(fixture):gsub("\n", "")) == 1, "the prebuilt provider was not fetched once")
 
+    -- `native-rust` was the name stage zero asked by until the pin past #215
+    -- (#221); nothing asks by it now.
+    status, output = run(fixture.environment, "native-rust base", fixture.driver)
+    assert(status ~= 0, "the retired native-rust name was answered:\n" .. output)
+
     -- `gpu` went with the stage-zero pin past #14 (#36), `uri` with the pin
-    -- past #200 (#206), and the panic probe with the Rust provider (#209); no
-    -- provider has any of them.
-    for _, retired in ipairs({"gpu", "uri", "panic-probe"}) do
+    -- past #200 (#206), the panic probe with the Rust provider (#209), and
+    -- `codegen` with the pin past #215 (#221); no provider has any of them.
+    for _, retired in ipairs({"gpu", "uri", "panic-probe", "codegen"}) do
         local status, output = run(fixture.environment, "native-provider base," .. retired, fixture.driver)
         assert(status ~= 0, "the retired " .. retired .. " feature was handed out:\n" .. output)
         assert(output:find("has no " .. retired .. " feature", 1, true), "the refusal does not say why:\n" .. output)
