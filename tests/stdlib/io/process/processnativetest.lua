@@ -163,7 +163,7 @@ local text = assert(io.open(found, "rb")):read("*a"):gsub('os%%.getenv%%("NUPP_N
 end)
 package.preload["nupp.runtime.native"] = assert(loadstring(text, "@nupp.runtime.native"))
 assert(loadfile(%q))()
-held = assert(require("io").popen({%q, "-c", "echo $$ > '%s'; exec sleep 30"}, {
+held = assert(require("nupp.runtime.standardio").popen({%q, "-c", "echo $$ > '%s'; exec sleep 30"}, {
     stdin = "pipe", stdout = "pipe", stderr = "pipe",
 }))
 while not io.open(%q, "rb") do
