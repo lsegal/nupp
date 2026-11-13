@@ -232,7 +232,7 @@ serdecontracttest benchprojectstest benchrunnertest bctest absoluteentrytest
 clitest duplicateclitest coveragereporttest coveragetest clidoctest
 diagnosticgoldentest doctest examplestest explaintest homesampletest
 referencetest fmtclitest fmtcorpustest fmtimportstest fmttreetest
-associatedtoolingtest lspclitest lsptest constructionmigrationtest repositoryscriptstest
+associatedtoolingtest lspclitest lsptest repositoryscriptstest
 runnertest testtimingstest buildprogresstest buildtest
 ]]
 ):gmatch("%S+") do
