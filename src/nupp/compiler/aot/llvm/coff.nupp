@@ -120,9 +120,7 @@ coff.KERNEL32 = KERNEL32
 --- exponent of one half, and `exp2l(y * log2l(|x|))`, rounded to a double,
 --- for the rest. Run in this process's own x87 control word, as MinGW's are.
 --- Leaf functions that keep their scratch in the caller's home area.
-const X87: {
-    string
-} = {
+const X87: {string} = {
     ".globl nupp_mingw_sqrt",
     "nupp_mingw_sqrt:",
     "    movsd %xmm0, 8(%rsp)",
