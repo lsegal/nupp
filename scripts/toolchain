@@ -795,15 +795,14 @@ codegen_archive() {
 # its own.
 
 # Sets PREBUILT_OUT to the prebuilt provider when it carries every feature in
-# the list; `codegen` selects nothing and is accepted for the stage-zero
-# compiler that still asks for it.
+# the list.
 prebuilt_provider() {
     requested=$(normalize_features "${1:-}")
     build_prebuilt codegen
     provider_dir=$(dirname "$PREBUILT_OUT")
     [ -f "$provider_dir/features" ] \
         || die "the $PREBUILT_TAG prebuilt code generator carries no provider features; pin a later release (scripts/toolchain.pins)"
-    carried=",$(tr -d ' \r\n' < "$provider_dir/features"),codegen,"
+    carried=",$(tr -d ' \r\n' < "$provider_dir/features"),"
     for feature in $(printf '%s' "$requested" | tr ',' ' '); do
         case "$carried" in
             *",$feature,"*) ;;
@@ -933,13 +932,6 @@ codegen_wanted() {
     return 1
 }
 
-# A provider feature list without `codegen`. The code generator is a library of
-# its own now (codegen-library), but the pinned stage-zero compiler still asks
-# the provider for it, and is answered with the provider it can have.
-without_codegen() {
-    printf '%s\n' "$1" | tr ',' '\n' | grep -v '^codegen$' | tr '\n' ',' | sed 's/,$//'
-}
-
 # --- the native provider -----------------------------------------------------
 
 # The provider, `nupp_native`, is a Nupp native program (native/provider) with
@@ -951,10 +943,9 @@ without_codegen() {
 # once there is a compiler to build it with.
 
 # Checks a provider feature list. Every provider carries `base`, and nothing
-# else is left to select; `codegen` is dropped, because the code generator is
-# a library of its own now but the pinned stage-zero compiler still asks for it.
+# else is left to select.
 provider_features() {
-    for pf_feature in $(without_codegen "$(normalize_features "${1:-}")" | tr ',' ' '); do
+    for pf_feature in $(normalize_features "${1:-}" | tr ',' ' '); do
         [ "$pf_feature" = base ] || die "the native provider has no $pf_feature feature"
     done
 }
@@ -2636,8 +2627,7 @@ case "$1" in
         native_path "$WGPU_STATIC"
         exit 0
         ;;
-    native-provider|native-rust)
-        # `native-rust` is the name the pinned stage-zero compiler asks by.
+    native-provider)
         if ! prebuilt_provider_wanted; then
             if build_native_provider "${2:-}"; then
                 native_path "$NATIVE_PROVIDER_OUT"
