@@ -674,7 +674,10 @@ end
 -- the end out of reach (NUPP3005), and the compiler's own `emit` did the same.
 function M.coverageProbesStayCheapEnoughForLongFunctions()
     local statements = 5500
-    local lines = {"local function long(n: integer, skip: boolean): integer", "   if skip then return 0 end"}
+    local lines = {
+        "local function long(n: integer, skip: boolean): integer",
+        "   if skip then return 0 end",
+    }
     for _ = 1, statements do
         lines[#lines + 1] = "   n = n + 1"
     end

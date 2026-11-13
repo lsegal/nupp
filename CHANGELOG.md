@@ -25,3 +25,7 @@
   holds the build's memory while the tests run. For this repository's own
   suite the command used to stay at 6 to 7 GB resident for the whole run; it
   now stays around 20 MB, leaving that memory to the test workers.
+- `nupp test --coverage` probes are smaller: four bytecodes per statement or
+  branch instead of six. A long function that LuaJIT refused once instrumented,
+  with NUPP3005 "function too long for return fixup", now loads, which is what
+  stopped coverage runs over this repository from running any tests.
