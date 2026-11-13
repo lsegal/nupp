@@ -129,6 +129,10 @@ local sourceSequence: integer = 0
 local sourcesVersion: integer = 0
 local turnGeneration: integer = 0
 
+-- The contexts of the parks outstanding right now, whoever is answering them. Weak, so
+-- a coroutine abandoned mid-park takes its context with it.
+local parkedContexts: {[any]: boolean} = setmetatable({}, {__mode = "k"})
+
 local function sourceBefore(left: any, right: any): boolean
     if left.order ~= right.order then
         return left.order < right.order
@@ -271,6 +275,13 @@ end
 -- no reason to stop. What is a reason is having nothing to drive at all: with no pump
 -- registered and no synchronous resumption, nothing in this process can complete the
 -- wait, and saying so beats hanging.
+--
+-- What to sleep in, nearest first: the sources this wait uses; else the sources some
+-- other outstanding park uses, which is where a driver's wait ends up, since the
+-- frame it parks for uses none and its children's parks hold the sources that matter;
+-- else every source with a wait. Skipping the middle step let a source registered
+-- long ago by an unrelated library, a timer or a worker pool, take every slice ahead
+-- of the child the scope was actually waiting on.
 local function waitCandidates(waiting: any): {any}
     local associated = waiting.context and waiting.context._associated
     local preferred = {}
@@ -280,6 +291,25 @@ local function waitCandidates(waiting: any): {any}
             if associated[source] and not source._released and source.wait ~= nil then
                 preferred[#preferred + 1] = source.wait
             end
+        end
+    end
+    if #preferred > 0 then
+        return preferred
+    end
+
+    local used = {}
+    for context in pairs(parkedContexts) do
+        local others = context._associated
+        if others ~= nil then
+            for source in pairs(others) do
+                used[source] = true
+            end
+        end
+    end
+    for index = 1, #sources do
+        local source = sources[index]
+        if used[source] and not source._released and source.wait ~= nil then
+            preferred[#preferred + 1] = source.wait
         end
     end
     if #preferred > 0 then
@@ -565,11 +595,13 @@ function suspension.suspend<T>(
     -- refused while compiling (NUPP2702); the ones reached through an unknown C API are
     -- not, so the failure is caught here and told what it was doing.
     local ok, err
+    parkedContexts[context] = true
     if handler then
         ok, err = pcall(handler.park, handler, waiting as suspension.Waiting, cancel as function(): nil)
     else
         ok, err = pcall(blockingPark, waiting)
     end
+    parkedContexts[context] = nil
     -- The acknowledgement. Reaching here is what "this park finished" means, whether it
     -- resumed, was cancelled, or failed; until then the ticket stays registered so a
     -- releasing extent can see it is still outstanding.

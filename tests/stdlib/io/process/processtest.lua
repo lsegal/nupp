@@ -1410,6 +1410,36 @@ function M.plainLuaInputsAreValidatedBeforeTheyReachTheProvider()
     child:_drop()
 end
 
+-- Waitable sources registered ahead of the process, as earlier suites leave them in a
+-- shared process: a timer that has slept once, a worker pool. None of them is what a
+-- task scope's child waits on, so none of them should take the driver's sleeps.
+local function registerUnrelatedSources()
+    local registered = {}
+    for index = 1, 4 do
+        registered[index] = suspension.source(
+            "unrelated" .. index,
+            index,
+            function()
+                return 0
+            end,
+            function()
+                return 0
+            end,
+            function()
+                return true
+            end
+        )
+    end
+
+    return registered
+end
+
+local function releaseAll(registered)
+    for index = 1, #registered do
+        registered[index]:release()
+    end
+end
+
 function M.aWaitInsideATaskScopeSleepsInThePlatformRatherThanSpinning()
     -- A task scope with no host beneath it drives its family through the built-in
     -- driver, which sleeps in a source's wait between quiet passes. A process wait
@@ -1423,6 +1453,7 @@ function M.aWaitInsideATaskScopeSleepsInThePlatformRatherThanSpinning()
         return 0
     end
 
+    local unrelated = registerUnrelatedSources()
     local child = spawnOn(backend, {args = {"quiet"}})
     local scope = tasks.scope()
     local waited = scope:spawn(function()
@@ -1430,6 +1461,7 @@ function M.aWaitInsideATaskScopeSleepsInThePlatformRatherThanSpinning()
     end)
     local exit = waited:await()
     scope:close()
+    releaseAll(unrelated)
     testAssert.eq(exit.exitcode, 0, "the child's exit")
     assert(sleeps > 0, "the driver slept in the platform between quiet passes")
     child:_drop()
@@ -1486,6 +1518,7 @@ function M.drainingInsideATaskScopeSleepsInThePlatformRatherThanSpinning()
         return 0
     end
 
+    local unrelated = registerUnrelatedSources()
     local child = spawnOn(backend, {args = {"slow"}})
     local scope = tasks.scope()
     local drained = scope:spawn(function()
@@ -1493,6 +1526,7 @@ function M.drainingInsideATaskScopeSleepsInThePlatformRatherThanSpinning()
     end)
     local result = drained:await()
     scope:close()
+    releaseAll(unrelated)
     child:_drop()
     testAssert.eq(result.output, "onetwo", "everything arrived")
     assert(sleeps > 0, "the driver slept in the platform between quiet passes")
