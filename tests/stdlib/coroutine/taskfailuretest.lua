@@ -79,9 +79,14 @@ end
 
 function M.runRetainsCleanupFailureAfterADeadline()
     local cleanup = {}
+    local entered = false
     local problem = raises(function()
-        tasks.run(nil, 5, function(scope)
+        -- A child the deadline cancels before it has started is dropped, with no
+        -- cleanup to run, so the deadline has to outlast the time it takes to start
+        -- one even on a loaded runner. Five milliseconds did not.
+        tasks.run(nil, 250, function(scope)
             scope:spawn(function()
+                entered = true
                 local ok = pcall(time.sleep, 5000)
                 if not ok then
                     error(cleanup, 0)
@@ -90,6 +95,7 @@ function M.runRetainsCleanupFailureAfterADeadline()
             time.sleep(5000)
         end)
     end)
+    assert(entered, "the child never started before the deadline passed")
     assert(tasks.iscancelled(problem.primary), "the deadline stays primary")
     testAssert.eq(problem.suppressed[1], cleanup, "cleanup survives deadline cancellation")
 end
