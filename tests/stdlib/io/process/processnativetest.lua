@@ -169,6 +169,7 @@ held = assert(require("nupp.runtime.standardio").popen({%q, "-c", "echo $$ > '%s
 while not io.open(%q, "rb") do
 end
 io.stdout:write("started\n")
+io.stdout:flush()
 ]]):format(package.path, "%q", providerPath, bootstrapFile, SHELL, pidFile, pidFile)
     )
     file:close()
