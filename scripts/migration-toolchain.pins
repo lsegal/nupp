@@ -1,3 +1,7 @@
 # Retain the parser for Tecs until its construction migration is complete.
 STAGE0_TAG=v0.0.15-callable.3
 STAGE0_SHA256=2e6746dd7249055fdf3cb8578045a9f5f8f305608c12aa9930cf76fccbd01fa1
+# This release predates the repository's own stage-zero releases and is
+# published only upstream; without its own URL the main pin's would send the
+# fetch to a release that does not exist.
+STAGE0_URL='https://github.com/nupp-lang/nupp/releases/download/${STAGE0_TAG}/nupp-stage0-${STAGE0_TAG}.lua.gz'
