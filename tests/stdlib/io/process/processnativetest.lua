@@ -143,8 +143,8 @@ end
 -- own finalizer has killed and reaped it by the time the Process's teardown asks
 -- whether it has exited, and teardown used to wait on an answer that never came.
 -- Nothing is collected mid-close, so that wait grew until the machine ran out of
--- memory (#218). The child here runs under a memory cap so a regression fails
--- with a message rather than taking the host down with it.
+-- memory (#218). The script runs under a memory cap and a deadline, so a
+-- regression fails here rather than hanging the suite or taking the host down.
 function M.aChildLeftOpenWhenTheStateClosesDoesNotHoldTheExit()
     ready()
     local pidFile = root .. "/left-open.pid"
@@ -173,13 +173,18 @@ io.stdout:write("started\n")
     )
     file:close()
 
-    local started = os.time()
-    local pipe = assert(io.popen(("(ulimit -v 1000000 2>/dev/null; luajit '%s') 2>&1"):format(script)))
-    local output = pipe:read("*a")
-    pipe:close()
+    local closing = assert(
+        startProcess({
+            args = shell(("ulimit -v 1000000 2>/dev/null; exec luajit '%s'"):format(script)),
+            stderr = "stdout",
+            timeoutms = 30000,
+        })
+    )
+    local result = assert(closing:communicate())
+    closing:_drop()
 
-    test.eq(output, "started\n", "the script started its child and closed without complaint")
-    assert(os.time() - started < 20, "closing the state took " .. (os.time() - started) .. "s")
+    test.eq((result.output:gsub("\r\n", "\n")), "started\n", "the script started its child and closed without complaint")
+    assert(result:succeeded(), "closing the script's state did not end it within the deadline")
     local pid = assert(io.open(pidFile, "rb")):read("*l")
     assert(tonumber(pid), "the child wrote its pid: " .. tostring(pid))
     assert(
