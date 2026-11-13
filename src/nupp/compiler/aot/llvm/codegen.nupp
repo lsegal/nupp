@@ -401,7 +401,7 @@ int nuppcg_close(int fd) __asm__("close");
     local page = tonumber(C.nuppcg_getpagesize()) as integer
     local byte: any = ffi.new("uint8_t[1]")
     local into = tonumber(ffi.cast("uintptr_t", base) % page) as integer
-    local readable = OPTIONS_WINDOW
+    local readable: integer = OPTIONS_WINDOW
     for offset = page - into, OPTIONS_WINDOW - 1, page do
         if C.nuppcg_write(fds[1], base + offset, 1) ~= 1 then
             readable = offset
