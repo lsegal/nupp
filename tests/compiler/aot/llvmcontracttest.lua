@@ -173,6 +173,27 @@ attributes #0 = { nounwind }
 
 -- Where the host carries LLVM, a real compile verifies clean on every target:
 -- the optimizer must not fuse the multiply and add on its own.
+-- A target machine the heap placed at the end of its region is searched only
+-- up to that end: reading the whole window there faulted (#219).
+function M.theOptionsSearchStopsWhereTheMappingDoes()
+    local ffi = require("ffi")
+    if ffi.os ~= "Windows" then
+        assert(codegen.mappedWindow(ffi.new("uint8_t[1]")) == 2048)
+        return
+    end
+    pcall(ffi.cdef, [[
+void *llvmcontract_VirtualAlloc(void *address, size_t size, uint32_t type, uint32_t protect) __asm__("VirtualAlloc");
+int llvmcontract_VirtualFree(void *address, size_t size, uint32_t type) __asm__("VirtualFree");
+]])
+    -- One committed page, with only reserved address space after it.
+    local page = ffi.cast("uint8_t *", ffi.C.llvmcontract_VirtualAlloc(nil, 4096, 0x3000, 4))
+    assert(page ~= nil, "VirtualAlloc failed")
+    local whole, last = codegen.mappedWindow(page), codegen.mappedWindow(page + 4096 - 100)
+    ffi.C.llvmcontract_VirtualFree(page, 0, 0x8000)
+    assert(whole == 2048, "a machine with room after it is searched across the whole window, not " .. whole)
+    assert(last == 100, "a machine 100 bytes from the end of its region is searched over 100 bytes, not " .. last)
+end
+
 function M.compiledKernelsVerifyCleanWhereLlvmIsLinked()
     if not codegen.available() then
         return

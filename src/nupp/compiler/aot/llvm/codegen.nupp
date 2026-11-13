@@ -380,7 +380,7 @@ local regionDeclared = false
 --- region, where reading the whole window runs into an unmapped page (#219);
 --- `VirtualQuery` says where the region holding the machine ends, and the
 --- machine itself always lies inside it.
-local function mappedWindow(base: any): integer
+function codegen.mappedWindow(base: any): integer
     if not windows then
         return OPTIONS_WINDOW
     end
@@ -426,7 +426,7 @@ end
 --- @return nil, or why the field could not be found
 local function strictFusion(C: any, machine: any): string?
     local base: any = ffi.cast("uint8_t *", machine)
-    local window = mappedWindow(base)
+    local window = codegen.mappedWindow(base)
     local before: any = ffi.new("uint8_t[?]", window)
     ffi.copy(before, base, window)
     C.nuppcg_LLVMSetTargetMachineAsmVerbosity(machine, 0)
