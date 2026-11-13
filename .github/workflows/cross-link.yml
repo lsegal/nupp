@@ -69,6 +69,14 @@ jobs:
           restore-keys: |
             nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
 
+      # The kit carries the native provider, a Nupp program this checkout's
+      # compiler builds, so there has to be one first.
+      - name: Build the compiler
+        shell: bash
+        run: |
+          ./scripts/toolchain --all
+          ./bin/nupp --version
+
       - name: Build the link kit archive
         shell: bash
         run: ./scripts/toolchain kit-archive "" "$RUNNER_TEMP/kit-${{ matrix.platform }}.tar.gz"
