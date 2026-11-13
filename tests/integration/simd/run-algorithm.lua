@@ -104,8 +104,17 @@ assert(actual > 0, "algorithm emitted no compiled units")
 -- The compiler target's build carries only the compiler's own closure. The
 -- fused-json differential also loads `nupp.codec.json.aot`, which only the test
 -- runner's build (every source under `src/`) carries.
-local path = "build/?.lua;build/?/init.lua;" .. root .. "/build/?.lua;" .. root .. "/build/?/init.lua;" .. root
-    .. "/build/test-runner/?.lua;" .. root .. "/build/test-runner/?/init.lua;;"
+--
+-- On Windows the command reaches Git Bash, and every `X:/` in its text becomes
+-- `/x/`, a path the native LuaJIT cannot open. Backslashes pass unchanged.
+local sep = package.config:sub(1, 1)
+local build = (root .. "/build"):gsub("/", sep)
+local path = "build/?.lua;build/?/init.lua;" .. table.concat({
+    build .. sep .. "?.lua",
+    build .. sep .. "?" .. sep .. "init.lua",
+    build .. sep .. "test-runner" .. sep .. "?.lua",
+    build .. sep .. "test-runner" .. sep .. "?" .. sep .. "init.lua",
+}, ";") .. ";;"
 local output = runner.command(
     "cd " .. q(project) .. " && LUA_PATH=" .. q(path) .. " luajit -joff " .. q(selected.script),
     directory .. "/execution.log"
