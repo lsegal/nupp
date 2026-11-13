@@ -17,12 +17,13 @@ for the C99 math it lacks, from the Universal C Runtime's math API set; the
 two `kernel32.dll` functions the entry point calls, and `___chkstk_ms`, the
 stack probe a large frame calls, which MinGW's libgcc would otherwise supply.
 
-`pow` is the exception: the binding defines it. The LuaJIT a Windows build of
-Nupp carries is built with MinGW, whose C runtime replaces `msvcrt.dll`'s `pow`
-with its own -- repeated squaring for an integer exponent, x87 `exp2l` and
-`log2l` otherwise -- and that is what Lua's `^` answers with. The correctly
-rounded `pow` of `msvcrt.dll` differs from it in the last bit for exponents as
-plain as `0.3 ^ 3`, so AOT code calls MinGW's, transcribed here.
+`pow` is the exception: the binding defines it, as whichever `pow` the VM's
+own `^` calls. The C runtimes disagree in the last bit for exponents as plain
+as `0.3 ^ 3`: the Universal C Runtime's and `msvcrt.dll`'s round correctly,
+while MinGW-w64's, which a LuaJIT built against `msvcrt.dll` links in
+statically, squares repeatedly for an integer exponent. So the entry point
+looks `pow` up in the VM module's imports and binds to that; a VM that
+imports none carries MinGW's, and gets the transcription of it here.
 ]]
 module nupp.compiler.aot.llvm.coff
 
@@ -180,15 +181,118 @@ const X87: {string} = {
     ".text",
 }
 
---- MinGW-w64's `pow` and its `__powi` (`math/powi.def.h`), case for case:
---- `edges` is a zero or infinite `x`, `powi` an exponent that fits an `int`.
+--- `pow`: the one the VM imports, which `ks_imported` finds when the library
+--- loads, else MinGW-w64's `pow` and its `__powi` (`math/powi.def.h`), case
+--- for case: `edges` is a zero or infinite `x`, `powi` an exponent that fits
+--- an `int`.
 const POW = [[
 declare double @nupp_mingw_sqrt(double)
 declare double @nupp_mingw_exp2log2(double, double)
 declare double @llvm.fabs.f64(double)
 declare double @llvm.trunc.f64(double)
 
+@ks_pow_name = private unnamed_addr constant [4 x i8] c"pow\00"
+@ks_pow_slot = internal global ptr null
+
 define dso_local double @pow(double %x, double %y) {
+entry:
+  %bound = load ptr, ptr @ks_pow_slot
+  %imported = icmp ne ptr %bound, null
+  br i1 %imported, label %vm, label %own
+vm:
+  %theirs = tail call double %bound(double %x, double %y)
+  ret double %theirs
+own:
+  %ours = tail call double @nupp_mingw_pow(double %x, double %y)
+  ret double %ours
+}
+
+; The address a module's import table binds `wanted` to, or null when the
+; module imports no function of that name.
+define internal ptr @ks_imported(ptr %base, ptr %wanted) {
+entry:
+  %lfanew.at = getelementptr i8, ptr %base, i64 60
+  %lfanew = load i32, ptr %lfanew.at, align 1
+  %lfanew64 = sext i32 %lfanew to i64
+  %nt = getelementptr i8, ptr %base, i64 %lfanew64
+  %directory.at = getelementptr i8, ptr %nt, i64 144
+  %directory = load i32, ptr %directory.at, align 1
+  %empty = icmp eq i32 %directory, 0
+  br i1 %empty, label %missing, label %descriptors
+descriptors:
+  %directory64 = zext i32 %directory to i64
+  %first = getelementptr i8, ptr %base, i64 %directory64
+  br label %descriptor
+descriptor:
+  %d = phi ptr [ %first, %descriptors ], [ %following, %nextdescriptor ]
+  %library.at = getelementptr i8, ptr %d, i64 12
+  %library = load i32, ptr %library.at, align 1
+  %last = icmp eq i32 %library, 0
+  br i1 %last, label %missing, label %thunks
+thunks:
+  %original = load i32, ptr %d, align 1
+  %bound.at = getelementptr i8, ptr %d, i64 16
+  %boundrva = load i32, ptr %bound.at, align 1
+  %hasoriginal = icmp ne i32 %original, 0
+  %lookup = select i1 %hasoriginal, i32 %original, i32 %boundrva
+  %lookup64 = zext i32 %lookup to i64
+  %bound64 = zext i32 %boundrva to i64
+  %names = getelementptr i8, ptr %base, i64 %lookup64
+  %addresses = getelementptr i8, ptr %base, i64 %bound64
+  br label %thunk
+thunk:
+  %i = phi i64 [ 0, %thunks ], [ %inext, %nextthunk ]
+  %named.at = getelementptr i64, ptr %names, i64 %i
+  %named = load i64, ptr %named.at, align 8
+  %done = icmp eq i64 %named, 0
+  br i1 %done, label %nextdescriptor, label %byname
+byname:
+  %ordinal = icmp slt i64 %named, 0
+  br i1 %ordinal, label %nextthunk, label %compare
+compare:
+  %hintrva = and i64 %named, 2147483647
+  %hint = getelementptr i8, ptr %base, i64 %hintrva
+  %name = getelementptr i8, ptr %hint, i64 2
+  %same = call i1 @ks_same(ptr %name, ptr %wanted)
+  br i1 %same, label %found, label %nextthunk
+found:
+  %address.at = getelementptr ptr, ptr %addresses, i64 %i
+  %address = load ptr, ptr %address.at, align 8
+  ret ptr %address
+nextthunk:
+  %inext = add i64 %i, 1
+  br label %thunk
+nextdescriptor:
+  %following = getelementptr i8, ptr %d, i64 20
+  br label %descriptor
+missing:
+  ret ptr null
+}
+
+define internal i1 @ks_same(ptr %a, ptr %b) {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %inext, %next ]
+  %at.a = getelementptr i8, ptr %a, i64 %i
+  %at.b = getelementptr i8, ptr %b, i64 %i
+  %ca = load i8, ptr %at.a, align 1
+  %cb = load i8, ptr %at.b, align 1
+  %equal = icmp eq i8 %ca, %cb
+  br i1 %equal, label %check, label %differ
+check:
+  %end = icmp eq i8 %ca, 0
+  br i1 %end, label %same, label %next
+next:
+  %inext = add i64 %i, 1
+  br label %loop
+same:
+  ret i1 true
+differ:
+  ret i1 false
+}
+
+define internal double @nupp_mingw_pow(double %x, double %y) {
 entry:
   %xbits = bitcast double %x to i64
   %xneg = icmp slt i64 %xbits, 0
@@ -400,6 +504,8 @@ function coff.binding(triple: string, names: {string}): string
     lines[#lines + 1] = "  %none = icmp eq ptr %module, null"
     lines[#lines + 1] = "  br i1 %none, label %done, label %fill"
     lines[#lines + 1] = "fill:"
+    lines[#lines + 1] = "  %pow = call ptr @ks_imported(ptr %module, ptr @ks_pow_name)"
+    lines[#lines + 1] = "  store ptr %pow, ptr @ks_pow_slot"
     local ok = "true"
     for position, name in ipairs(names) do
         lines[
