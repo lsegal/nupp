@@ -1548,26 +1548,27 @@ end
 --- done in its own process leaves the compiled program reachable from module state,
 --- several gigabytes for this repository's runner, and a collection gives little of it
 --- back. The process then holds all of it while it does nothing but wait, beside the
---- workers that need the memory. Built in a child, that memory goes when the child exits,
---- and only what `test` reads back crosses over: the status, the artifact, and any
---- gathered diagnostics. The child prints its own progress and diagnostics otherwise.
+--- workers that need the memory. Built in a child, that memory goes when the child
+--- exits, and only what `test` reads back crosses over: the status, the artifact, and
+--- any gathered diagnostics. The child prints its own progress and diagnostics
+--- otherwise.
 ---
 --- `command` is the compiler invocation up to the request file, and `trailing`
 --- follows it.
-function project.childTestBuild(
-    command: {string},
-    trailing: {string}?
-): function(string, project.BuildOptions): integer
+function project.childTestBuild(command: {string}, trailing: {string}?): function(string, project.BuildOptions): integer
     return function(root: string, opts: project.BuildOptions): integer
         local json = require("serde.json")
         local request = process.tmpname()
-        local written, problem = writeFile(request, json.encodevalue({
-            root = root,
-            target = opts.target,
-            outDir = opts.outDir,
-            coverage = opts.coverage,
-            gather = opts.diagnostics ~= nil,
-        }))
+        local written, problem = writeFile(
+            request,
+            json.encodevalue({
+                root = root,
+                target = opts.target,
+                outDir = opts.outDir,
+                coverage = opts.coverage,
+                gather = opts.diagnostics ~= nil,
+            })
+        )
         if not written then
             say(opts, "NUPP0004", "nupp: cannot hand the test build to a child: " .. tostring(problem) .. "\n")
             return 1
@@ -1625,11 +1626,14 @@ function project.serveTestBuild(request: string): integer
         produced = produced,
         diagnostics = diagnostics,
     })
-    local written, writeProblem = writeFile(request, json.encodevalue({
-        code = code,
-        artifact = produced.artifact,
-        diagnostics = json.asarray(diagnostics or {}),
-    }))
+    local written, writeProblem = writeFile(
+        request,
+        json.encodevalue({
+            code = code,
+            artifact = produced.artifact,
+            diagnostics = json.asarray(diagnostics or {}),
+        })
+    )
     if not written then
         io.stderr:write("nupp: cannot answer the test build request: " .. tostring(writeProblem) .. "\n")
         return 1
