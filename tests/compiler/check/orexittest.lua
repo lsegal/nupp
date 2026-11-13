@@ -1358,7 +1358,7 @@ return wrapped(1)
     assert(#diagnostics == 0, codesOf(diagnostics))
     local code, errors, sites = gen.generate(tree, FILE, {coverage = true})
     assert(#errors == 0, errors[1] and errors[1].msg)
-    assert(code:find(".branch(", 1, true), "the suffix registers a branch site")
+    assert(code:find("__nuppCoverage.branch ", 1, true), "the suffix registers a branch site")
     if sites then
         local branches = 0
         for _, site in ipairs(sites.sites or sites) do
