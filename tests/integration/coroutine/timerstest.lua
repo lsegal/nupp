@@ -95,6 +95,7 @@ end
 function M.concurrentSleepsShareOneSourceAndFireInDeadlineOrder()
     local order = {}
     local started = os.monotonic()
+
     -- Every deadline is measured from one reading. Measured from each child's own
     -- start, a loaded runner that paused for 20 milliseconds between the first and
     -- the last child really did give the 60 an earlier deadline than the 40. The
@@ -103,6 +104,7 @@ function M.concurrentSleepsShareOneSourceAndFireInDeadlineOrder()
     local function sleepUntil(offset)
         time.sleep(math.max(1, started + offset - os.monotonic()))
     end
+
     tasks.gather({
         function()
             sleepUntil(150)
