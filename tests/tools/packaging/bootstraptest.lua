@@ -587,6 +587,13 @@ function M.browserCompilerOmitsCliOnlyResources()
             local path = type(resource) == "table" and resource.source or resource
             assert(not path:match("%.ll$"), name .. " carries AOT link IR: " .. path)
             assert(path ~= "src/nupp/tools/doc/theme.css", name .. " carries the documentation theme")
+            -- The browser binds the GPU to WebGPU, so wgpu-native's provider is dead weight.
+            for _, module in ipairs({"nativegpu", "nativegpurelease", "gpudevice", "gpucosts", "wgpu"}) do
+                assert(
+                    path ~= "src/nupp/runtime/provider/" .. module .. ".nupp",
+                    name .. " carries the native GPU provider: " .. path
+                )
+            end
         end
     end
 end
