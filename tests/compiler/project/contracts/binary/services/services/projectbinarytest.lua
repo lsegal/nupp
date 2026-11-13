@@ -44,9 +44,11 @@ print("uuid-sidecar-ok")
     }) do
         assert(state.modules[name], "the UUID binary failed to stage " .. name)
     end
+    -- UUIDs come from the operating system through Nupp, so no provider library
+    -- is staged beside the program.
     assert(
-        exists(dir .. "/out/lib/" .. (jit.os == "Windows" and deps.sharedLibraryName("nupp_native") or "nupp_native")),
-        "UUID generation stages its native provider"
+        not exists(dir .. "/out/lib/" .. (jit.os == "Windows" and deps.sharedLibraryName("nupp_native") or "nupp_native")),
+        "UUID generation stages no native provider library"
     )
     local library = os.getenv("NUPP_NATIVE_LIBRARY")
     setEnvironment("NUPP_NATIVE_LIBRARY", nil)
@@ -74,7 +76,10 @@ assert(os.walltime() > 1000000000000)
 coroutine.sleep(2)
 assert(os.monotonic() - started >= 2)
 assert(rawget(_G, "__nuppHost") == nil)
-assert(rawget(_G, "__nuppNativeLibrary") == ffi.C)
+-- Clocks and timers are Nupp now, so nothing need open a provider at all; one
+-- that was opened is the executable itself.
+local provider = rawget(_G, "__nuppNativeLibrary")
+assert(provider == nil or provider == ffi.C)
 print("static-clocks-ok")
 ]],
     })
