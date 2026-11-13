@@ -178,7 +178,26 @@ attributes #0 = { nounwind }
 function M.theOptionsSearchStopsWhereTheMappingDoes()
     local ffi = require("ffi")
     if ffi.os ~= "Windows" then
-        assert(codegen.mappedWindow(ffi.new("uint8_t[1]")) == 2048)
+        pcall(ffi.cdef, [[
+int llvmcontract_getpagesize(void) __asm__("getpagesize");
+void *llvmcontract_mmap(void *address, size_t size, int protect, int flags, int fd, int64_t offset) __asm__("mmap");
+int llvmcontract_mprotect(void *address, size_t size, int protect) __asm__("mprotect");
+int llvmcontract_munmap(void *address, size_t size) __asm__("munmap");
+]])
+        local size = ffi.C.llvmcontract_getpagesize()
+        local anonymous = ffi.os == "OSX" and 0x1000 or 0x20
+        -- A readable page, then a guard page that is mapped but faults when read.
+        local page = ffi.cast("uint8_t *", ffi.C.llvmcontract_mmap(nil, 2 * size, 3, 2 + anonymous, -1, 0))
+        assert(ffi.cast("intptr_t", page) ~= -1, "mmap failed")
+        assert(ffi.C.llvmcontract_mprotect(page + size, size, 0) == 0, "mprotect failed")
+        local whole, guarded = codegen.mappedWindow(page), codegen.mappedWindow(page + size - 100)
+        -- Then nothing mapped after it at all.
+        ffi.C.llvmcontract_munmap(page + size, size)
+        local unmapped = codegen.mappedWindow(page + size - 100)
+        ffi.C.llvmcontract_munmap(page, size)
+        assert(whole == 2048, "a machine with room after it is searched across the whole window, not " .. whole)
+        assert(guarded == 100, "a machine 100 bytes before a guard page is searched over 100 bytes, not " .. guarded)
+        assert(unmapped == 100, "a machine 100 bytes before unmapped space is searched over 100 bytes, not " .. unmapped)
         return
     end
     pcall(ffi.cdef, [[
