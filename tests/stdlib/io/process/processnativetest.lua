@@ -11,7 +11,7 @@ local nativeStage = require("nupp.tools.build.native")
 local M = {}
 
 local root, process, buffers, priorPreload, priorLoaded
-local unavailable
+local unavailable, providerPath
 
 local function startProcess(options)
     local given = {stdin = "pipe", stdout = "pipe", stderr = "pipe"}
@@ -74,6 +74,7 @@ function M.beforeAll()
         assert(not output:find("/lib/", 1, true), "processes staged a native provider: " .. output)
     end
     local libraryPath = root .. "/out/lib/nupp_native"
+    providerPath = libraryPath
 
     priorPreload = package.preload["nupp.runtime.native"]
     priorLoaded = package.loaded["nupp.runtime.native"]
@@ -135,6 +136,56 @@ function M.deadlineEndsAQuietRealChild()
     assert(exit.killed, "the quiet child was terminated")
     assert(exit.timedout, "and the deadline was the reason")
     assert(not (not exit.killed and not exit.timedout and exit.exitcode == 0))
+end
+
+-- A script that returns with a child still open closes its state, and a closing
+-- LuaJIT state runs every cdata finalizer before any userdata one. The child's
+-- own finalizer has killed and reaped it by the time the Process's teardown asks
+-- whether it has exited, and teardown used to wait on an answer that never came.
+-- Nothing is collected mid-close, so that wait grew until the machine ran out of
+-- memory (#218). The child here runs under a memory cap so a regression fails
+-- with a message rather than taking the host down with it.
+function M.aChildLeftOpenWhenTheStateClosesDoesNotHoldTheExit()
+    ready()
+    local pidFile = root .. "/left-open.pid"
+    local script = root .. "/left-open.lua"
+    local bootstrapFile = root .. "/left-open-bootstrap.lua"
+    local bootstrap = assert(io.open(bootstrapFile, "wb"))
+    bootstrap:write(stdlib.bootstrap({["native.process"] = true, ["stdlib.io"] = true,}))
+    bootstrap:close()
+    local file = assert(io.open(script, "wb"))
+    file:write(
+        ([[
+package.path = %q
+local found = assert(package.searchpath("nupp.runtime.native", package.path))
+local text = assert(io.open(found, "rb")):read("*a"):gsub('os%%.getenv%%("NUPP_NATIVE_LIBRARY"%%)', function()
+    return (%q):format(%q)
+end)
+package.preload["nupp.runtime.native"] = assert(loadstring(text, "@nupp.runtime.native"))
+assert(loadfile(%q))()
+held = assert(require("io").popen({%q, "-c", "echo $$ > '%s'; exec sleep 30"}, {
+    stdin = "pipe", stdout = "pipe", stderr = "pipe",
+}))
+while not io.open(%q, "rb") do
+end
+io.stdout:write("started\n")
+]]):format(package.path, "%q", providerPath, bootstrapFile, SHELL, pidFile, pidFile)
+    )
+    file:close()
+
+    local started = os.time()
+    local pipe = assert(io.popen(("(ulimit -v 1000000 2>/dev/null; luajit '%s') 2>&1"):format(script)))
+    local output = pipe:read("*a")
+    pipe:close()
+
+    test.eq(output, "started\n", "the script started its child and closed without complaint")
+    assert(os.time() - started < 20, "closing the state took " .. (os.time() - started) .. "s")
+    local pid = assert(io.open(pidFile, "rb")):read("*l")
+    assert(tonumber(pid), "the child wrote its pid: " .. tostring(pid))
+    assert(
+        os.execute("kill -0 " .. pid .. " 2>/dev/null") ~= 0,
+        "the child outlived the state that started it"
+    )
 end
 
 function M.sharedViewsUseTheRealStreamsAndDeliverEof()

@@ -1585,7 +1585,16 @@ else
 
     reapExit = function(owner: any): nil
         local child = owner.child
-        if owner.exit ~= nil or child.reaped ~= 0 then
+        if owner.exit ~= nil then
+            return
+        end
+        if child.reaped ~= 0 then
+            -- Reaped without an exit recorded here: `closeChild`, the child's own
+            -- finalizer, killed it. A closing state runs every cdata finalizer
+            -- before the Process's, so its teardown then waits on this exit, and
+            -- with nothing to report it would wait forever -- allocating on every
+            -- pass while the collector, mid-close, frees nothing.
+            owner.exit = {exitcode = 128 + SIGKILL, killed = true, timedout = false, signal = SIGKILL}
             return
         end
         local result = C.waitpid(child.pid, status, WNOHANG)
