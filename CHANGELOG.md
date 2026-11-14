@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `nupp test` runs each suite that starts processes in a fresh worker
+  process, as it already did for isolated suites. Each worker used to keep
+  one process for every suite it took and kept growing. In this repository's
+  suite, eight such workers exhausted a 16 GB Linux CI runner partway through.
 - A native compile that `require`s a standard-library module keeps the checked
   interfaces in its cache and reads them back on the next command, instead of
   checking the module's whole graph from source every time. `nupp run` of a
