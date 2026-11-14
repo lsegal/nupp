@@ -3022,7 +3022,14 @@ then
                     local processProgressFd = progressFd and (package.config:sub(1, 1) == "\\" and 2 or progressFd)
                         or nil
                     local progress = processProgressFd and ("NUPP_TEST_PROGRESS_FD=%d "):format(processProgressFd) or ""
-                    local fresh = executionLane == "isolated" and "NUPP_TEST_FRESH_QUEUE_PIECES=1 " or ""
+                    -- Shell suites run each in a process of its own too. In one long-lived
+                    -- worker they added up: on a Linux runner two shell workers grew to
+                    -- 6-7 GB each and the runner ran out of memory, where no suite on its
+                    -- own comes near that (#250). A fresh process per suite holds a worker
+                    -- to the largest single suite, which is what its count is sized from.
+                    local fresh = (executionLane == "isolated" or executionLane == "shell")
+                        and "NUPP_TEST_FRESH_QUEUE_PIECES=1 "
+                        or ""
                     local invocation = rawget(_G, "__NUPP_TEST_RUNNER_COMMAND") or ("luajit '%s'"):format(arg[0])
                     local worker = (
                         "%s%s%s%s --json %s --color=%s%s"
