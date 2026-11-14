@@ -31,6 +31,9 @@ require("nupp.tools.bytecodecache").install()
 
 local arguments = require("io.cli").args
 local code = require("nupp.tools.cli").main(arguments)
+-- Before the code generator can end the process, so the peak it reads is the
+-- whole command's (#250).
+require("nupp.tools.peakmemory").report(arguments)
 -- Only a process that loaded the code generator can have linked anything.
 local codegen = package.loaded["nupp.compiler.aot.llvm.codegen"]
 if codegen ~= nil then

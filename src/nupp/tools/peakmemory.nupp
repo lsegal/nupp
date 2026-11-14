@@ -1,0 +1,76 @@
+--[[
+The process's own peak resident memory, for whoever asked to know it.
+
+Worker counts used to be set from out-of-memory scares rather than from what one
+compiler process actually holds (#250). This is the measurement those counts come
+from now. Each process reads its own peak, so a number is never one process's
+children added to it, and no platform needs an outside tool: `getrusage` on the
+POSIX hosts and `K32GetProcessMemoryInfo` on Windows, both through the FFI.
+
+`NUPP_PEAK_MEMORY_FILE` names a file a process appends one line to as it exits:
+its peak in bytes, a tab, and its arguments. Unset, nothing is read or written.
+]]
+
+module nupp.tools.peakmemory
+
+--- This process's peak resident set in bytes, or nil where it cannot be read.
+export function bytes(): integer?
+    local loaded, ffi = pcall(require, "ffi")
+    if not loaded then
+        return nil
+    end
+    local library: any = ffi
+    local C: any = library.C
+    if library.os == "Windows" then
+        pcall(library.cdef, "void *GetCurrentProcess(void); int K32GetProcessMemoryInfo(void *, void *, uint32_t);")
+        -- PROCESS_MEMORY_COUNTERS on x64 is two DWORDs and then eight SIZE_Ts, 72
+        -- bytes: the first word carries `cb` in its low half, and the peak working
+        -- set is the second.
+        local counters: any = library.new("int64_t[9]")
+        counters[0] = 72
+        local read, ok = pcall(function(): any
+            return C.K32GetProcessMemoryInfo(C.GetCurrentProcess(), counters, 72)
+        end)
+        if not read or ok == 0 then
+            return nil
+        end
+
+        return math.floor(tonumber(counters[1]) or 0)
+    end
+    pcall(library.cdef, "int getrusage(int, void *);")
+    -- `struct rusage` is two timevals, sixteen bytes each on every 64-bit host this
+    -- runs on, and then `ru_maxrss` as a long: the fifth word. Sized generously,
+    -- because the rest of the struct differs between platforms and is never read.
+    local usage: any = library.new("int64_t[32]")
+    local read, status = pcall(function(): any
+        return C.getrusage(0, usage)
+    end)
+    if not read or status ~= 0 then
+        return nil
+    end
+    local peak = tonumber(usage[4]) or 0
+    -- Linux counts kilobytes and the BSDs count bytes.
+    if library.os ~= "OSX" then
+        peak = peak * 1024
+    end
+
+    return math.floor(peak)
+end
+
+--- Appends this process's peak to `NUPP_PEAK_MEMORY_FILE`, when it is set.
+export function report(arguments: {string}?): nil
+    local path = os.getenv("NUPP_PEAK_MEMORY_FILE")
+    if path == nil or path == "" then
+        return
+    end
+    local peak = bytes()
+    if peak == nil then
+        return
+    end
+    local file = io.open(path, "ab")
+    if file == nil then
+        return
+    end
+    file:write(tostring(peak), "\t", table.concat(arguments or {}, " "), "\n")
+    file:close()
+end
