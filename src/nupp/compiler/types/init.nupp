@@ -4336,4 +4336,58 @@ function types.resumeIdentity(identity: any): nil
     end
 end
 
+local releasable: {{[string]: any}} = {}
+for _, into in pairs(ARENAS) do
+    releasable[#releasable + 1] = into
+end
+
+local forgettable: {{[any]: any}} = {}
+
+--- Adds another module's table of interned things, keyed by spelling, to the ones
+--- `releaseUnreferenced` lets go of. Returns the table.
+function types.releasable<V>(into: {[string]: V}): {[string]: V}
+    releasable[#releasable + 1] = into as {[string]: any}
+
+    return into
+end
+
+--- Adds a cache that `releaseUnreferenced` empties. Returns the table.
+---
+--- For a weakly keyed cache whose values reach their own keys. LuaJIT's weak keys
+--- are not ephemerons, so such an entry outlives every other reference to its key,
+--- and only a cache whose answers can be worked out again may be emptied.
+function types.forgettable<K, V>(cache: {[K]: V}): {[K]: V}
+    forgettable[#forgettable + 1] = cache as {[any]: any}
+
+    return cache
+end
+
+--- Drops every interned thing nothing outside the arenas still holds.
+---
+--- The arenas are strong because an id is a serial: a type built again after its
+--- entry went would be the same structure under a new id, and a compile whose ids
+--- depended on when the collector ran would not be repeatable. One command never
+--- needs more than that. A process that compiles project after project -- a test
+--- worker -- kept every type of every one of them, about 45 MB a build (#266).
+---
+--- So this is for that process, between compiles, never during one: every arena is
+--- weak in its values for exactly one full collection, which keeps what anything
+--- still reaches and frees the rest. Nothing reached can be asked for again under
+--- a different id, and serials only ever move forward, so none is issued twice.
+function types.releaseUnreferenced(): nil
+    for _, cache in ipairs(forgettable) do
+        for key in pairs(cache) do
+            cache[key] = nil
+        end
+    end
+    local weak = {__mode = "v"}
+    for _, into in ipairs(releasable) do
+        setmetatable(into, weak)
+    end
+    collectgarbage("collect")
+    for _, into in ipairs(releasable) do
+        setmetatable(into, nil)
+    end
+end
+
 export = types

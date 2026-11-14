@@ -1,0 +1,660 @@
+@!internal
+
+--[[
+Checked interfaces of a project's own modules, kept between single-file compiles.
+
+`nupp check FILE` goes through the project build, which keeps a record of every
+module it checked and replays it while the module is unchanged. `nupp bc`, `nupp
+run` and `nupp lsp artifact` compile one file on a plain environment instead, and
+checked the file's whole import graph from source every time: in the compiler's own
+checkout one benchmark file is a hundred and forty modules and half a gigabyte.
+
+This keeps what those checks produce, as `nupp.compiler.project.interfaceimage`
+encodes it for semantic workers, in the project's build directory. What a command
+checked from source is written as one image; the next command decodes the images it
+can still trust and checks only the rest, the requested file always among them,
+because generating code needs its tree.
+
+An image is trusted only while all of this holds:
+
+- every declaration in the project reads as it did when the image was written, since
+  a module can name another module's exported type without requiring it;
+- every module in it has the source it was checked from, and each `require` it made
+  still finds the file it found then;
+- every project module those requires reach is itself in a trusted image;
+- every image it refers into is trusted;
+- none of its modules has been checked in this environment already, because decoding
+  a module fills in the declarations its checker would.
+
+Anything else is checked from source, which is always correct, and
+`NUPP_NO_INTERFACE_CACHE` turns the store off entirely.
+]]
+module nupp.compiler.project.projectimage
+
+local interfaceimage = require("nupp.compiler.project.interfaceimage")
+
+--- Bumped when what is stored changes shape.
+const SCHEMA = 1
+
+--- Where the prelude image's tables are, by name, inside an interface image.
+const PRELUDE_ARENA = "prelude"
+
+--- What one module in an image was checked from.
+export type Member = {
+    name: string,
+    path: string,
+
+    --- The digest of the source it was checked from.
+    hash: string,
+
+    declared: boolean,
+
+    --- Each module its check asked for, by name: the file that resolved to, or "" for
+    --- none in the project.
+    requires: {[string]: string},
+
+    --- The digest of each required file no image holds: a `.lua` or declaration file,
+    --- which only ever checks the same way while its source does.
+    leaves: {[string]: string}
+}
+
+--- One stored image and what it stands for.
+export type Stored = {
+    --- The arena its types are mounted under, unique among every image kept.
+    name: string,
+
+    members: {Member},
+
+    --- The images its types refer into, by arena name.
+    prerequisites: {string},
+
+    --- The bundled modules whose declarations its types refer to.
+    bundled: {string},
+
+    image: any
+}
+
+--- What `attach` hands the environment.
+export type Images = {
+    --- The record for project module `name` at `path` from a trusted image, or nil to
+    --- check it from source.
+    module: function(name: string, path: string): any,
+
+    --- Notes that the module being checked asked for `name`.
+    required: function(name: string): nil,
+
+    --- Writes what this environment checked from source beside what it decoded.
+    store: function(): nil,
+
+    --- Brackets one module's check, so what it asks for is charged to it.
+    enter: function(record: any): nil,
+    leave: function(): nil
+}
+
+local function sortedKeys(map: {[string]: any}): {string}
+    local keys: {string} = {}
+    for key in pairs(map) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys)
+
+    return keys
+end
+
+--- Attaches a store of project interfaces to `env`, which must have been built from
+--- the stored prelude image: that is the graph the interfaces refer into.
+---
+--- @param envMod the environment module, passed in because it requires this one
+--- @param helpers path and file functions the environment already has
+export function attach(env: any, envMod: any, helpers: {
+    readFile: function(string): string?,
+    normalizePath: function(string): string,
+    outDir: string
+}): Images
+    local readFile = helpers.readFile
+    local normalizePath = helpers.normalizePath
+    local digest = env.compilerServices and env.compilerServices.hash and env.compilerServices.hash.digest
+        or require("nupp.compiler.hash").digest
+
+    local entries: any = nil
+    local key: string? = nil
+    local surface: string? = nil
+
+    -- What decoding found, filled in once.
+    local decoded: boolean = false
+    local kept: {Stored} = {}
+    local semantics: {[string]: any} = {}
+    local members: {[string]: Member} = {}
+    local sources: {[string]: string} = {}
+    local hydrated: {[string]: boolean} = {}
+    local origins: {[any]: any} = {}
+    local arenas: {[string]: {any}} = {}
+    local checking: {any} = {}
+
+    local function settingsKey(): string
+        local parts = {
+            "projectimage",
+            tostring(SCHEMA),
+            tostring(env.preludeStamp),
+            tostring(env.layoutTarget or ""),
+            tostring(env.compat or ""),
+            require("nupp.compiler.compat").VERSION,
+            require("nupp.compiler.fs").absolute(env.rootDir or "."),
+            tostring(env.rootDir or "."),
+            readFile((env.rootDir or ".") .. "/nupp.lua") or "",
+        }
+        for _, list in ipairs({env.roots or {}, env.typeRoots or {}, env.ambientTypeRoots or {}}) do
+            parts[#parts + 1] = table.concat(list as {string}, "\1")
+        end
+        local lints = (env.config or {}).lints
+        if type(lints) == "table" then
+            local named: {string} = {}
+            for name, level in pairs(lints as {[string]: any}) do
+                named[#named + 1] = tostring(name) .. "=" .. tostring(level)
+            end
+            table.sort(named)
+            parts[#parts + 1] = table.concat(named, ",")
+        end
+
+        return digest(table.concat(parts, "\0"))
+    end
+
+    --- Everything any module of the project declares, as written.
+    local function surfaceDigest(): string
+        local index: any = envMod.ensureProjectIndex(env)
+        local parts: {string} = {}
+        for _, path in ipairs(sortedKeys(index.byPath or {})) do
+            for _, entry in ipairs(index.byPath[path]) do
+                parts[
+                    #parts + 1
+                ] = table.concat(
+                    {
+                        path,
+                        tostring(entry.moduleName or ""),
+                        tostring(entry.name),
+                        tostring(entry.kind),
+                        tostring(entry.visibility),
+                        tostring(entry.signature or ""),
+                    },
+                    "\1"
+                )
+            end
+        end
+
+        return digest(table.concat(parts, "\0"))
+    end
+
+    local function open(): any
+        if entries == nil then
+            local storeMod: any = require("nupp.compiler.project.store")
+            local fingerprintMod: any = require("nupp.compiler.project.fingerprint")
+            local storeDir = helpers.outDir .. "/cache"
+            -- Keyed by how the environment spells its root as well as by settings: an
+            -- editor names the project by its absolute path and a command by `.`, and
+            -- every module path it stores is spelled from that root.
+            entries = storeMod.open(
+                storeDir .. "/interfaces.buf",
+                fingerprintMod.subsystemFingerprint(
+                    {"nupp.compiler.check", "nupp.compiler.project.env", "nupp.compiler.project.projectimage"},
+                    env.cacheDir or storeDir,
+                    digest,
+                    env.cacheReadOnly
+                )
+            )
+            key = settingsKey()
+            surface = surfaceDigest()
+        end
+
+        return entries
+    end
+
+    --- Trusted images, by arena name, worked out to a fixpoint.
+    local function trusted(images: {Stored}): {[string]: boolean}
+        local owner: {[string]: string} = {}
+        local trust: {[string]: boolean} = {}
+        for _, stored in ipairs(images) do
+            for _, member in ipairs(stored.members) do
+                owner[member.path] = stored.name
+            end
+        end
+        local resolved: {[string]: string} = {}
+
+        local function resolve(name: string): string
+            local known = resolved[name]
+            if known ~= nil then
+                return known
+            end
+            local path = envMod.findModulePath(env, name)
+            local found: string = path and normalizePath(path) or ""
+            resolved[name] = found
+
+            return found
+        end
+
+        for _, stored in ipairs(images) do
+            local ok = true
+            for _, member in ipairs(stored.members) do
+                if env.loadedPaths[member.path] ~= nil then
+                    ok = false
+                    break
+                end
+                local source = sources[member.path] or readFile(member.path)
+                if source == nil or digest(source) ~= member.hash then
+                    ok = false
+                    break
+                end
+                sources[member.path] = source
+                if envMod.moduleNameForPath(env, member.path) ~= member.name then
+                    ok = false
+                    break
+                end
+                for name, path in pairs(member.requires or {}) do
+                    if resolve(name) ~= path then
+                        ok = false
+                        break
+                    end
+                    -- A module no image holds is trusted only as a leaf whose source
+                    -- has not moved; anything else could have checked differently
+                    -- because of something it requires in turn.
+                    if path ~= "" and owner[path] == nil then
+                        local leaf = (member.leaves or {})[path]
+                        local text = leaf and (sources[path] or readFile(path)) or nil
+                        if text == nil or digest(text) ~= leaf then
+                            ok = false
+                            break
+                        end
+                        sources[path] = text
+                    end
+                end
+                if not ok then
+                    break
+                end
+            end
+            trust[stored.name] = ok
+        end
+        local changed = true
+        while changed do
+            changed = false
+            for _, stored in ipairs(images) do
+                if trust[stored.name] then
+                    local ok = true
+                    for _, prerequisite in ipairs(stored.prerequisites or {}) do
+                        ok = ok and trust[prerequisite] == true
+                    end
+                    for _, member in ipairs(stored.members) do
+                        for _, path in pairs(member.requires or {}) do
+                            local other = path ~= "" and owner[path] or nil
+                            ok = ok and (other == nil or trust[other] == true)
+                        end
+                    end
+                    if not ok then
+                        trust[stored.name] = false
+                        changed = true
+                    end
+                end
+            end
+        end
+
+        return trust
+    end
+
+    --- Decodes every trusted image, each after the images it refers into.
+    local function decode(): nil
+        if decoded then
+            return
+        end
+        decoded = true
+        -- Registered whether or not anything is decoded, because what this
+        -- environment writes refers into the prelude the same way.
+        local arena = env.preludeArena or {}
+        arenas[PRELUDE_ARENA] = arena
+        for index, item in ipairs(arena) do
+            if origins[item] == nil then
+                origins[item] = {arena = PRELUDE_ARENA, node = index}
+            end
+        end
+        local current = open().get(key as string)
+        if type(current) ~= "table"
+            or current.key ~= key
+            or current.surface ~= surface
+            or type(current.images) ~= "table"
+        then
+            return
+        end
+        local images = current.images as {Stored}
+        local trust = trusted(images)
+        -- The project's own declarations by key, and those of every bundled module a
+        -- trusted image refers to, as this environment loads them.
+        local nominals: {[string]: any} = {}
+        for declaration, nominal in pairs(env.projectNominals or {}) do
+            nominals[declaration] = nominal
+        end
+        local loadedBundled: {[string]: boolean} = {}
+        for _, stored in ipairs(images) do
+            for _, name in ipairs(trust[stored.name] and stored.bundled or {}) do
+                if not loadedBundled[name] then
+                    loadedBundled[name] = true
+                    local record = env.bundled[name]
+                    local exports = record and record.exports or {}
+                    -- The module's own value can be a record, as `bit`'s is, beside
+                    -- what it exports by name and the witnesses of those.
+                    local candidates: {any} = {record and record.type or nil}
+                    for _, exported in pairs(exports.types or {}) do
+                        candidates[#candidates + 1] = exported
+                    end
+                    for _, exported in pairs(exports.values or {}) do
+                        candidates[#candidates + 1] = exported.tag == "typeobject" and exported.of or nil
+                    end
+                    for _, candidate in pairs(candidates) do
+                        if candidate.tag == "nominal" and type(candidate.declarationKey) == "string" then
+                            nominals[candidate.declarationKey] = candidate
+                        end
+                    end
+                end
+            end
+        end
+        local mounted: {[string]: boolean} = {}
+        local progressed = true
+        while progressed do
+            progressed = false
+            for _, stored in ipairs(images) do
+                if trust[stored.name] and not mounted[stored.name] then
+                    local ready = true
+                    for _, prerequisite in ipairs(stored.prerequisites or {}) do
+                        ready = ready and mounted[prerequisite] == true
+                    end
+                    if ready then
+                        local found = interfaceimage.decode(stored.image, {
+                            nominals = nominals,
+                            arenas = arenas,
+                            origins = origins,
+                        })
+                        if found == nil then
+                            trust[stored.name] = false
+                        else
+                            mounted[stored.name] = true
+                            progressed = true
+                            kept[#kept + 1] = stored
+                            for _, member in ipairs(stored.members) do
+                                semantics[member.path] = (found as {[string]: any})[member.name]
+                                members[member.path] = member
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local function module(name: string, path: string): any
+        if not decoded then
+            decode()
+        end
+        local semantic = semantics[path]
+        local member = members[path]
+        if semantic == nil or member == nil or member.name ~= name or env.loadedPaths[path] ~= nil then
+            return nil
+        end
+        -- Checking a module registers the annotations it declares; importing it has to.
+        for _, definition in ipairs(semantic.annotations or {}) do
+            env.annotations:define(definition)
+        end
+        local record = {
+            inProgress = false,
+            path = path,
+            source = sources[path],
+            checkContext = {
+                moduleName = name,
+                compat = env.compat,
+                strict = require("nupp.compiler.check").strictByDefault(path),
+                declarationFile = false,
+            },
+            exports = semantic.exports,
+            compatDiagnostics = semantic.diags or {},
+            type = semantic.interface.type,
+            declared = member.declared,
+        }
+        hydrated[path] = true
+        env.loadedPaths[path] = record
+
+        return record
+    end
+
+    local function required(name: string): nil
+        local record = checking[#checking]
+        if record ~= nil then
+            record.requires = record.requires or {}
+            record.requires[name] = true
+        end
+    end
+
+    --- The bundled modules `image` names declarations of, or nil when it names one
+    --- declared anywhere else it does not own.
+    ---
+    --- A declaration in a module of this image is filled in from the image. One in a
+    --- bundled module -- `bit`, or a standard-library module when the project does not
+    --- shadow it -- belongs to whatever loads that module in the reading environment,
+    --- so it is marked as a reference to be looked up there by key rather than declared
+    --- a second time. Anything else, a C header's struct for one, would come back as a
+    --- second type of the same name, so an image naming one is not kept.
+    local function bundledNames(image: any, owned: {[string]: boolean}): {string}?
+        local names: {string} = {}
+        local seen: {[string]: boolean} = {}
+        local bundled: {[string]: boolean} = {}
+        for _, name in ipairs(env.bundledModuleNames and env.bundledModuleNames() or {}) do
+            bundled[name] = true
+        end
+        for _, node in ipairs(image.descriptor.types) do
+            if node.nominal and not node.external and not node.instantiation then
+                local declaration = type(node.declarationKey) == "string" and node.declarationKey or ""
+                local path = declaration:match("^([^%z]+)%z")
+                if path == nil then
+                    return nil
+                end
+                if not owned[path] then
+                    if not bundled[path] then
+                        return nil
+                    end
+                    node.external = true
+                    if not seen[path] then
+                        seen[path] = true
+                        names[#names + 1] = path
+                    end
+                end
+            end
+        end
+        table.sort(names)
+
+        return names
+    end
+
+    local function store(): nil
+        if env.cacheReadOnly then
+            return
+        end
+        local fresh: {any} = {}
+        local imaged: {[string]: boolean} = {}
+        for _, stored in ipairs(kept) do
+            for _, member in ipairs(stored.members) do
+                imaged[member.path] = true
+            end
+        end
+        for path, record in pairs(env.loadedPaths) do
+            if record.dependency
+                and not hydrated[path]
+                and not imaged[path]
+                and not record.inProgress
+                and record.type ~= nil
+                and record.result ~= nil
+                and #record.result.errors == 0
+                and not path:match("%.d%.nupp$")
+                and envMod.isProjectPath(env, path)
+            then
+                fresh[#fresh + 1] = record
+            end
+        end
+        -- Every module reached through a require was offered to `module` first, which
+        -- decoded, so an environment that never decoded reached none and has nothing
+        -- to add.
+        if not decoded then
+            return
+        end
+        -- A module that requires a project module no image will hold could not be
+        -- trusted next time, and would take every module stored beside it down with
+        -- it, so it is left out, and so is anything requiring it in turn.
+        local willHold: {[string]: boolean} = {}
+        for path in pairs(imaged) do
+            willHold[path] = true
+        end
+        for _, record in ipairs(fresh) do
+            willHold[record.path] = true
+        end
+        local dropped = true
+        while dropped do
+            dropped = false
+            local remaining: {any} = {}
+            for _, record in ipairs(fresh) do
+                local holdable = true
+                for required in pairs(record.requires or {}) do
+                    local found = envMod.findModulePath(env, required)
+                    local path = found and normalizePath(found) or ""
+                    if path ~= ""
+                        and not willHold[path]
+                        and not path:match("%.lua$")
+                        and not path:match("%.d%.nupp$")
+                    then
+                        holdable = false
+                    end
+                end
+                if holdable then
+                    remaining[#remaining + 1] = record
+                else
+                    willHold[record.path] = nil
+                    dropped = true
+                end
+            end
+            fresh = remaining
+        end
+        local current = entries.get(key as string)
+        local previous = 0
+        if type(current) == "table"
+            and current.key == key
+            and current.surface == surface
+            and type(current.images) == "table"
+        then
+            previous = #(current.images as {any})
+        end
+        if #fresh == 0 and #kept == previous then
+            return
+        end
+        table.sort(fresh, function(left: any, right: any): boolean
+            return left.path < right.path
+        end)
+        local images: {Stored} = {}
+        for _, stored in ipairs(kept) do
+            images[#images + 1] = stored
+        end
+        if #fresh > 0 then
+            local projectPaths: {string} = {}
+            for _, path in ipairs(envMod.listProjectFiles(env)) do
+                projectPaths[#projectPaths + 1] = normalizePath(path)
+            end
+            local encoded: {[string]: any} = {}
+            local owned: {[string]: boolean} = {}
+            local newMembers: {Member} = {}
+            local identity: {string} = {}
+            for _, record in ipairs(fresh) do
+                local name = envMod.moduleNameForPath(env, record.path)
+                if name ~= nil then
+                    local exports = {}
+                    for field, member in pairs(record.exports or {}) do
+                        exports[field] = member
+                    end
+                    -- What an incremental session compares to decide whether dependents
+                    -- are rechecked. An image is never rechecked, so it is not kept.
+                    exports.nominalEffectFingerprint = nil
+                    encoded[
+                        name
+                    ] = {
+                        path = record.path,
+                        interface = {
+                            type = record.type,
+                            deriveInterfaceFingerprint = exports.deriveInterfaceFingerprint,
+                        },
+                        exports = exports,
+                        diags = record.compatDiagnostics or {},
+                        annotations = env.annotations:definedBy(record.path),
+                    }
+                    owned[record.path] = true
+                    local requires: {[string]: string} = {}
+                    local leaves: {[string]: string} = {}
+                    for _, required in ipairs(sortedKeys(record.requires or {})) do
+                        local found = envMod.findModulePath(env, required)
+                        local path = found and normalizePath(found) or ""
+                        requires[required] = path
+                        if path ~= "" and (path:match("%.lua$") or path:match("%.d%.nupp$")) then
+                            local text = readFile(path)
+                            if text ~= nil then
+                                leaves[path] = digest(text)
+                            end
+                        end
+                    end
+                    local hash = digest(record.source or "")
+                    newMembers[
+                        #newMembers + 1
+                    ] = {
+                        name = name,
+                        path = record.path,
+                        hash = hash,
+                        declared = record.declared == true,
+                        requires = requires,
+                        leaves = leaves,
+                    }
+                    identity[#identity + 1] = record.path .. "\0" .. hash
+                end
+            end
+            local image = #newMembers > 0 and interfaceimage.encode(encoded, {
+                origins = origins,
+                projectPaths = projectPaths
+            }) or nil
+            local bundled = image ~= nil and bundledNames(image, owned) or nil
+            if image ~= nil and bundled ~= nil then
+                identity[#identity + 1] = tostring(os.time())
+                identity[#identity + 1] = tostring(require("nupp.compiler.fs").processId())
+                local name = "project-" .. digest(table.concat(identity, "\0"))
+                image.fingerprint = name
+                local prerequisites: {string} = {}
+                local seen: {[string]: boolean} = {}
+                for _, node in ipairs(image.descriptor.types) do
+                    if node.kind == "external" and node.arena ~= PRELUDE_ARENA and not seen[node.arena] then
+                        seen[node.arena] = true
+                        prerequisites[#prerequisites + 1] = node.arena
+                    end
+                end
+                table.sort(prerequisites)
+                images[
+                    #images + 1
+                ] = {
+                    name = name,
+                    members = newMembers,
+                    prerequisites = prerequisites,
+                    bundled = bundled,
+                    image = image,
+                }
+            end
+        end
+        entries.put(key as string, {key = key, surface = surface, images = images})
+        entries.save()
+    end
+
+    --- Brackets one module's check, so what it asks for is charged to it.
+    local function enter(record: any): nil
+        checking[#checking + 1] = record
+    end
+
+    local function leave(): nil
+        checking[#checking] = nil
+    end
+
+    return {module = module, required = required, store = store, enter = enter, leave = leave,}
+end

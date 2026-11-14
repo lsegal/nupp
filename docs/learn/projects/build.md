@@ -260,8 +260,9 @@ nativeFeatures = {
 }
 ```
 
-The forceable binary feature names are `json`, `lpeg`, `path`,
-`uri`, `uuid`, `files`, `process`, `workers`, and `http`. The registered module
+Every native facility can be forced by name, whether it stages an artifact or
+is written in Nupp: among them `json`, `lpeg`, `path`, `uri`, `uuid`, `time`,
+`files`, `process`, `workers`, and `http`. The registered module
 effects include `serde.json` and native `lpeg`. Bundled LuaRock modules are
 checked too, so Lunamark
 contributes LPeg even when application source does not require it directly.

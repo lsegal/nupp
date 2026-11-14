@@ -168,8 +168,10 @@ exit 0
     assert(os.execute("chmod +x " .. quote(fake) .. "/*") == 0)
 
     local record, built = root .. "/asked.txt", root .. "/provider.dylib"
+    -- A run beneath `nupp test` hands down the operating system it found, which
+    -- would override the fake `uname` above.
     local environment = (
-        "PATH=%s:$PATH NUPP_TEST_RECORD=%s NUPP_TEST_BUILT=%s NUPP_TEST_STAGE0=%s "
+        "PATH=%s:$PATH NUPP_LAUNCHER_OS= NUPP_TEST_RECORD=%s NUPP_TEST_BUILT=%s NUPP_TEST_STAGE0=%s "
     ):format(quote(fake), quote(record), quote(built), quote(root .. "/stage0.lua"))
     assert(os.execute(environment .. quote(root .. "/bin/nupp") .. " clean") == 0)
     local asked = read(record)

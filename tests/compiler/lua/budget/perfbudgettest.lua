@@ -486,4 +486,104 @@ function M.aCompileThatRequiresTheStandardLibraryStaysUnderItsMemoryBudget()
     )
 end
 
+--- The peak `nupp bc` reports compiling `file` in `dir`, with `prefix` before it.
+local function bytecodePeak(dir, file, prefix)
+    local peaks = dir .. "/peaks.tsv"
+    os.remove(peaks)
+    local named = package.config:sub(1, 1) == "\\" and peaks:gsub("/", "\\") or peaks
+    local env = ("%sNUPP_PEAK_MEMORY_FILE='%s' "):format(prefix, named)
+    -- Through a pipe, because the test runner's compile service answers a plain `bc`
+    -- inside its own long-lived process, whose peak is not this command's.
+    local pipe = assert(io.popen(("cd '%s' && %s'%s' bc --json -O1 %s 2>&1 | cat"):format(dir, env, NUPP, file)))
+    local out = pipe:read("*a")
+    pipe:close()
+    local peak = nil
+    for line in (readFile(peaks) or ""):gmatch("[^\n]+") do
+        local bytes, arguments = line:match("^(%d+)\t(.*)$")
+        if arguments and arguments:match("^bc ") then
+            peak = tonumber(bytes)
+        end
+    end
+    assert(peak, "the compiler reported no peak: " .. out)
+    local ok, report = pcall(json.decode, out)
+    assert(ok and type(report) == "table" and report.ok, "bc failed: " .. out)
+
+    return peak
+end
+
+-- A single-file compile inside a project holds its dependencies' checked interfaces
+-- rather than checking the whole import graph again (#277). `nupp bc` of one file in
+-- the compiler's own checkout checked a hundred and forty modules from source and
+-- peaked at about 530 MB; with the project's interfaces read back from the build
+-- directory, the same graph here costs what the one file does. Two warm-ups: the
+-- first command keeps the prelude, the second the interfaces checked against it.
+function M.aSingleFileCompileInAProjectReadsItsDependenciesBack()
+    local dir = temporary()
+    moduleGraph(dir, 120)
+    writeFile(dir .. "/src/main.nupp", 'local top = require("m119")\nprint(top.make(3).a)\n')
+    run(dir, "bc -O1 src/main.nupp")
+    run(dir, "bc -O1 src/main.nupp")
+    local warm = bytecodePeak(dir, "src/main.nupp", "")
+    local fromSource = bytecodePeak(dir, "src/main.nupp", "NUPP_NO_INTERFACE_CACHE=1 ")
+    os.execute("rm -rf '" .. dir .. "'")
+
+    assert(
+        warm <= SINGLE_COMPILE_PEAK_BYTES,
+        ("a single-file compile in a 120-module project peaked at %.1f MB, over the budget of %.1f MB"):format(
+            warm / 1048576,
+            SINGLE_COMPILE_PEAK_BYTES / 1048576
+        )
+    )
+    assert(
+        warm < fromSource,
+        ("reading the project's interfaces back peaked at %.1f MB, no less than checking them, %.1f MB"):format(
+            warm / 1048576,
+            fromSource / 1048576
+        )
+    )
+end
+
+-- What a build may leave behind in a process that builds again, once the types nothing
+-- holds have been released.
+local REBUILD_RETAINED_KB = 8 * 1024
+
+-- A test worker builds project after project in one process. Every type each build
+-- interned used to stay -- the arenas kept them, and weakly keyed caches whose answers
+-- reached their own keys kept them past the arenas -- so the heaviest suites grew by
+-- about 45 MB a build and peaked past 2 GB (#266). Released between builds, the heap
+-- after the last of several builds is where it was after the first.
+function M.repeatedBuildsInOneProcessKeepAFlatHeap()
+    local fs = require("nupp.compiler.fs")
+    local project = require("nupp.tools.build.project")
+    local types = require("nupp.compiler.types")
+    local function buildOnce(index)
+        local dir = temporary()
+        assert(fs.writeFile(dir .. "/nupp.lua", [[return {include = {"src"}, build = {
+            kind = "bundle", outDir = "out", output = "out/app.lua", entries = {"main"}
+        }}]]))
+        assert(fs.mkdir(dir .. "/src"))
+        assert(fs.writeFile(dir .. "/src/main.nupp", ("module main\nlocal x = %d\nprint(x)\n"):format(index)))
+        local status = project.build(dir)
+        os.execute("rm -rf '" .. dir .. "'")
+        assert(status == 0, "a fixture project did not build")
+        types.releaseUnreferenced()
+
+        return collectgarbage("count")
+    end
+    -- The first build loads and checks what every later one reuses.
+    buildOnce(1)
+    local settled = buildOnce(2)
+    local last = settled
+    for index = 3, 5 do
+        last = buildOnce(index)
+    end
+    assert(
+        last - settled <= REBUILD_RETAINED_KB,
+        ("three more builds left %.1f MB behind, over the budget of %.1f MB"):format(
+            (last - settled) / 1024,
+            REBUILD_RETAINED_KB / 1024
+        )
+    )
+end
+
 return M
