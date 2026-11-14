@@ -249,7 +249,7 @@ function M.aBuildSessionLetsGoOfAParseMadeOnlyForItsHeader()
     os.execute("mkdir -p '" .. dir .. "'")
     local path = dir .. "/lib.nupp"
     local file = assert(io.open(path, "wb"))
-    file:write("export function answer(): integer return 42 end\n")
+    file:write("module lib\nexport function answer(): integer return 42 end\n")
     file:close()
 
     local inc = incremental.new(dir, {releaseTrees = true, cache = false})

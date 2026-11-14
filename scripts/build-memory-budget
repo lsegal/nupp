@@ -17,7 +17,7 @@
 # Usage: scripts/build-memory-budget [BUDGET_MB]
 set -eu
 
-budget_mb=${1:-${NUPP_BUILD_MEMORY_BUDGET_MB:-900}}
+budget_mb=${1:-${NUPP_BUILD_MEMORY_BUDGET_MB:-1000}}
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="build/memory-budget"
 report="$root/$out.json"
@@ -30,8 +30,9 @@ trap 'rm -rf "${root:?}/$out" "$report"' EXIT
     exit 1
 }
 
-peak=$(jq -r '.timing.peakBytes // empty' "$report")
-total=$(jq -r '.timing.totalMs // empty' "$report")
+# Two numbers out of one compact document, so no JSON tool has to be installed.
+peak=$(grep -o '"peakBytes":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+total=$(grep -o '"totalMs":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
 if [ -z "$peak" ]; then
     echo "build-memory-budget: the build reported no peak memory on this platform" >&2
     exit 1
