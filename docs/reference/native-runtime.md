@@ -286,8 +286,8 @@ artifact:
   deleted, with Rust provisioning and Rust output caching in
   `scripts/toolchain` and `bin/nupp`. `NUPP_RUSTC`, `NUPP_CARGO`,
   `NUPP_RUST_BUILD_DIR` and `NUPP_RUST_VENDOR_DIR` no longer mean anything to
-  the build, and `scripts/toolchain rust-vendor` is gone. `native-rust` stays
-  only as the name the pinned stage-zero compiler asks `native-provider` by. A
+  the build, and `scripts/toolchain rust-vendor` and `scripts/toolchain
+  native-rust` are gone; the provider is `scripts/toolchain native-provider`. A
   project's own [Rust dependencies](../learn/projects/build.md#rust-dependencies)
   still build with the project's Cargo.
 - SDL GPU, SPIRV-Cross, MSL artifacts, and the SDL provider ABI were removed.
