@@ -1,0 +1,80 @@
+name: diag261
+on:
+  push:
+    branches: [scratch/issue-261-lanes]
+jobs:
+  lane:
+    name: ${{ matrix.os }} ${{ matrix.lane }} ${{ matrix.variant }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, lane: shell, variant: fixed, timeout: 150, limit: 7800}
+          - {os: ubuntu-24.04, lane: shell, variant: baseline, timeout: 120, limit: 6000}
+          - {os: macos-15, lane: shell, variant: fixed, timeout: 330, limit: 18000}
+          - {os: ubuntu-24.04, lane: shared, variant: fixed, timeout: 120, limit: 6000}
+          - {os: macos-15, lane: shared, variant: fixed, timeout: 300, limit: 15600}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v5
+        with:
+          repository: teal-language/tl
+          ref: 8ea89e75751e6cea0547f3838e0e244497d88bd6
+          path: .ci-corpus/teal
+          sparse-checkout: tl.lua
+          sparse-checkout-cone-mode: false
+      - name: Baseline runner
+        if: matrix.variant == 'baseline'
+        run: git show origin/main:tests/run.lua > tests/run.lua && git diff --stat
+      - name: Machine
+        shell: bash
+        run: |
+          echo "cores: $(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)"
+          if [ -r /proc/meminfo ]; then grep -E 'MemTotal|MemAvailable|SwapTotal' /proc/meminfo; else echo "memsize: $(sysctl -n hw.memsize)"; sysctl vm.swapusage; fi
+      - uses: ./.github/actions/pinned-llvm
+      - name: Provision
+        shell: bash
+        env:
+          NUPP_REQUIRE_CODEGEN: '1'
+        run: |
+          ./scripts/toolchain --all
+          echo "$(./scripts/toolchain luajit)/bin" >> "$GITHUB_PATH"
+      - name: Bootstrap
+        shell: bash
+        run: |
+          ./bin/nupp build
+          ./bin/nupp build --target bootstrapCompiler
+          ./bin/nupp build --target docs || true
+          ./bin/nupp build --target dist || true
+      - name: Lane
+        shell: bash
+        env:
+          NUPP_TEST_TRACE_CASES: 1
+        run: |
+          set +e
+          bash .github/diag261/sampler.sh >&2 & spid=$!
+          s=$(date +%s)
+          perl -e 'alarm(shift); exec(@ARGV)' ${{ matrix.limit }} ./bin/nupp test --scope=all --lane=${{ matrix.lane }} \
+            --exclude-group=external-corpus,measurement,wasm-conformance --json > "$RUNNER_TEMP/lane.json"
+          echo "LANE exit=$? wall=$(( $(date +%s) - s ))s"
+          kill $spid
+          node .github/diag261/summarize.js "$RUNNER_TEMP/lane.json" || head -c 3000 "$RUNNER_TEMP/lane.json"
+      - name: Report a stalled run
+        if: always() && runner.os == 'macOS'
+        continue-on-error: true
+        shell: bash
+        run: |
+          ps -axo pid,ppid,pgid,stat,etime,rss,command | grep -E 'nupp|luajit' | grep -v grep | cut -c1-250 || true
+          for pid in $(pgrep -f 'nupp-test|tests/run' || true); do
+            echo "=== sample $pid"; sample "$pid" 2 -file /dev/stdout 2>/dev/null | head -60 || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diag261-${{ matrix.os }}-${{ matrix.lane }}-${{ matrix.variant }}
+          path: ${{ runner.temp }}/lane.json
+          if-no-files-found: ignore
