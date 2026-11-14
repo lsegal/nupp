@@ -879,9 +879,12 @@ function M.aTestRunsCommandsUseTheBuildTheRunChecked()
     )
     -- The launcher stops quietly when the driver fails, so say what it asked.
     local asked = io.open(directory .. "/toolchain", "rb")
-    assert(status == 0, ("the launcher exited %s:\n%s\nit asked the toolchain:\n%s"):format(
-        tostring(status), output, asked and asked:read("*a") or "nothing"
-    ))
+    assert(
+        status == 0,
+        (
+            "the launcher exited %s:\n%s\nit asked the toolchain:\n%s"
+        ):format(tostring(status), output, asked and asked:read("*a") or "nothing")
+    )
     local commands = read(directory .. "/commands")
     local runRoot, answers, checkRoot = commands:match("^test run=(%S+) answers=(%S+)\ncheck run=(%S+) answers=")
     assert(runRoot and runRoot == checkRoot, "the run was not handed down:\n" .. commands)
