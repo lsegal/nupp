@@ -392,10 +392,41 @@ end
 -- runners when this was set; the bound is the requirement, not a snapshot.
 local SINGLE_COMPILE_PEAK_BYTES = 200 * 1024 * 1024
 
-function M.aSingleTestProgramCompileStaysUnderItsMemoryBudget()
+--- Runs `program` from a fresh directory once for every warm-up, then once more with
+--- `NUPP_PEAK_MEMORY_FILE` set, and answers what that last run printed and its peak.
+local function measuredRun(program, warmups)
     local dir = temporary()
-    writeFile(
-        dir .. "/main.nupp",
+    writeFile(dir .. "/main.nupp", program)
+    -- Named with backslashes on Windows: the harness rewrites a drive-letter path in a
+    -- command into the shell's spelling, and the compiler reading it is not the shell.
+    local peaks = dir .. "/peaks.tsv"
+    local named = package.config:sub(1, 1) == "\\" and peaks:gsub("/", "\\") or peaks
+    for _ = 1, warmups do
+        run(dir, "run main.nupp")
+    end
+    local env = ("NUPP_PEAK_MEMORY_FILE='%s' "):format(named)
+    local pipe = assert(io.popen(("cd '%s' && %s'%s' run main.nupp 2>&1"):format(dir, env, NUPP)))
+    local out = pipe:read("*a"):gsub("\r", "")
+    pipe:close()
+    local reported = readFile(peaks) or ""
+    os.execute("rm -rf '" .. dir .. "'")
+
+    local peak = nil
+    for line in reported:gmatch("[^\n]+") do
+        local bytes, arguments = line:match("^(%d+)\t(.*)$")
+        if arguments and arguments:match("^run ") then
+            peak = tonumber(bytes)
+        end
+    end
+    assert(peak, "the compiler reported no peak: " .. reported)
+
+    return out, peak
+end
+
+function M.aSingleTestProgramCompileStaysUnderItsMemoryBudget()
+    -- One warm-up, so the run measured reads the checked prelude back the way every
+    -- command in a lane after the first does, rather than checking it.
+    local out, peak = measuredRun(
         table.concat({
             "local type Point = {x: number, y: number}",
             "",
@@ -414,34 +445,41 @@ function M.aSingleTestProgramCompileStaysUnderItsMemoryBudget()
             "end",
             'print(string.format("%.3f", total))',
             "",
-        }, "\n")
+        }, "\n"),
+        1
     )
-    -- Named with backslashes on Windows: the harness rewrites a drive-letter path in a
-    -- command into the shell's spelling, and the compiler reading it is not the shell.
-    local peaks = dir .. "/peaks.tsv"
-    local named = package.config:sub(1, 1) == "\\" and peaks:gsub("/", "\\") or peaks
-    -- Once first, so the run measured reads the checked prelude back the way every
-    -- command in a lane after the first does, rather than checking it.
-    run(dir, "run main.nupp")
-    local env = ("NUPP_PEAK_MEMORY_FILE='%s' "):format(named)
-    local pipe = assert(io.popen(("cd '%s' && %s'%s' run main.nupp 2>&1"):format(dir, env, NUPP)))
-    local out = pipe:read("*a"):gsub("\r", "")
-    pipe:close()
-    local reported = readFile(peaks) or ""
-    os.execute("rm -rf '" .. dir .. "'")
-
     assert(out:find("221.371", 1, true), "the program did not run: " .. out)
-    local peak = nil
-    for line in reported:gmatch("[^\n]+") do
-        local bytes, arguments = line:match("^(%d+)\t(.*)$")
-        if arguments and arguments:match("^run ") then
-            peak = tonumber(bytes)
-        end
-    end
-    assert(peak, "the compiler reported no peak: " .. reported)
     assert(
         peak <= SINGLE_COMPILE_PEAK_BYTES,
         ("compiling and running one test program peaked at %.1f MB, over the budget of %.1f MB"):format(
+            peak / 1048576,
+            SINGLE_COMPILE_PEAK_BYTES / 1048576
+        )
+    )
+end
+
+-- The same bound for a program that requires a standard-library module (#265).
+-- Checking `serde.json`'s graph from source peaked at 274-320 MB; the checked
+-- interfaces are kept beside the prelude and hydrated instead. Two warm-ups: the
+-- first command keeps the prelude, the second the interfaces checked against it.
+function M.aCompileThatRequiresTheStandardLibraryStaysUnderItsMemoryBudget()
+    local out, peak = measuredRun(
+        table.concat({
+            'local json = require("serde.json")',
+            "local record User",
+            "    id: uint32",
+            "    name: string?",
+            "end",
+            "local users = serde.binding(User)",
+            'print(json.encode(users, User(id = 41, name = "Ada")))',
+            "",
+        }, "\n"),
+        2
+    )
+    assert(out:find('{"id":41,"name":"Ada"}', 1, true), "the program did not run: " .. out)
+    assert(
+        peak <= SINGLE_COMPILE_PEAK_BYTES,
+        ("compiling and running a serde.json program peaked at %.1f MB, over the budget of %.1f MB"):format(
             peak / 1048576,
             SINGLE_COMPILE_PEAK_BYTES / 1048576
         )
