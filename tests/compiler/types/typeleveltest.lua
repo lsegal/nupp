@@ -1415,13 +1415,17 @@ function M.genericMemberIdentitiesIgnoreHashIterationOrder()
     local ok, instance = pcall(generics.instantiate, declaration, {[parameter] = argument})
     _G.pairs = originalPairs
     assert(ok, instance)
-    for _, surface in ipairs(surfaces) do
+    -- An interned id is a digest of the structure, not a serial saying which member
+    -- was substituted first, so it is the id the same structure gets built on its
+    -- own, whatever order the maps were walked in.
+    for index, surface in ipairs(surfaces) do
         local members = instance[surface]
         testAssert.eq(members.alpha.elems[1], argument, surface .. " alpha argument")
         testAssert.eq(members.zeta.elems[1], argument, surface .. " zeta argument")
-        local alpha = assert(tonumber(members.alpha.id:match("(%d+)$")))
-        local zeta = assert(tonumber(members.zeta.id:match("(%d+)$")))
-        assert(alpha < zeta, surface .. " identities depend on member map enumeration")
+        local alpha = types.tuple({argument, types.literal(index, types.number)})
+        local zeta = types.tuple({argument, types.literal(index + #surfaces, types.number)})
+        testAssert.eq(members.alpha.id, alpha.id, surface .. " alpha identity depends on member map enumeration")
+        testAssert.eq(members.zeta.id, zeta.id, surface .. " zeta identity depends on member map enumeration")
     end
 end
 
