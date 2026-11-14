@@ -204,6 +204,20 @@
         }
       ]
     },
+    "build-memory": {
+      "platforms": ["linux", "macos", "windows"],
+      "selectedBy": "fixpoint",
+      "steps": [
+        {
+          "name": "Bootstrap the compiler",
+          "guarantees": ["a checkout without Cargo bootstraps the compiler on every platform"]
+        },
+        {
+          "name": "Hold the full build to its memory budget",
+          "guarantees": ["a cold full build stays under its peak memory budget on every platform"]
+        }
+      ]
+    },
     "required-ci": {
       "platforms": ["linux"],
       "selectedBy": "always",

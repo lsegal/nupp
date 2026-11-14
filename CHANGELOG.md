@@ -28,6 +28,11 @@
   bit. Under a MinGW LuaJIT built against `msvcrt.dll`, `0.3 ^ 3` was
   `0.026999999999999996` compiled and `0.027` in Lua. A native build on
   Windows also no longer crashes now and then while it sets up LLVM.
+- `nupp build` and `nupp check` use a fraction of the memory they did. A build
+  kept every module's checked syntax tree until it finished, so a cold build of
+  this repository's test runner peaked at 4 to 6 GB; each tree is now let go
+  once its module is generated, and the same build peaks under 1 GB.
+  `nupp build --json` reports the build's peak in `timing.peakBytes`.
 - `nupp test` builds the code under test in a child process, so it no longer
   holds the build's memory while the tests run. For this repository's own
   suite the command used to stay at 6 to 7 GB resident for the whole run; it
