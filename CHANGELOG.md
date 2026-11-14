@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A native compile that `require`s a standard-library module keeps the checked
+  interfaces in its cache and reads them back on the next command, instead of
+  checking the module's whole graph from source every time. `nupp run` of a
+  program that requires `serde.json` went from about 300 MB and 24 s to about
+  110 MB and 5 s on Windows once warm. `NUPP_NO_STDLIB_CACHE` turns the cache
+  off.
 - A cold `nupp build` of a project that declares a const-generic function no
   longer starts parallel check workers it then discards. The build used to
   start up to six workers, have them parse every source, and only then decide
