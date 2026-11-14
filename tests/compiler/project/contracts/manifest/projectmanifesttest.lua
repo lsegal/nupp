@@ -519,11 +519,11 @@ return {include = {"src"}, build = {targets = {app = {
         return config, err, task
     end
 
-    local config, err, task = load("{lpeg = true, path = true, uuid = false}")
+    local config, err, task = load("{lpeg = true, path = true, files = false}")
     assert(config, "boolean native feature overrides are accepted: " .. tostring(err))
     testAssert.eq(task.nativeFeatures.lpeg, true, "task reports forced inclusion")
     testAssert.eq(task.nativeFeatures.path, true, "new native providers can be forced in")
-    testAssert.eq(task.nativeFeatures.uuid, false, "new native providers can be forced out")
+    testAssert.eq(task.nativeFeatures.files, false, "new native providers can be forced out")
 
     local _, unknown = load("{jsoon = true}")
     assert(unknown and unknown:find("nativeFeatures names no feature jsoon", 1, true), tostring(unknown))

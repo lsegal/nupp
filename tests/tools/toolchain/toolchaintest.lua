@@ -830,20 +830,21 @@ function M.legacyNativeProviderComponentIsAbsent()
     )
 end
 
--- Resolve tools from the exact channel before considering ambient proxies.
--- A moving `stable` alias is not a fallback: even when it happens to report
--- the same version today, it is not a reproducible toolchain identity.
-function M.rustupSelectsOnlyThePinnedToolchain()
+-- Nothing here is Rust any more (#8), so the driver neither selects nor pins a
+-- Rust toolchain, and the component that vendored Cargo sources is gone.
+function M.theDriverProvisionsNoRust()
     local driver = read(ROOT .. "/scripts/toolchain")
-    assert(
-        driver:find("rustup_toolchain=$expected", 1, true),
-        "rustup does not select rust-toolchain.toml's exact channel"
+    for _, needle in ipairs({"select_rust_tools", "rust-toolchain.toml", "NUPP_CARGO", "NUPP_RUSTC", "RUSTUP", "build/rust"}) do
+        assert(not driver:find(needle, 1, true), "the toolchain still names " .. needle)
+    end
+    local directory = temporary()
+    local compiler = fakeCompiler(directory, "fake-cc", "fake")
+    local status, output = run(
+        {NUPP_TOOLCHAIN_DIR = directory .. "/cache", NUPP_CC = compiler, PATH = "$PATH"},
+        "rust-vendor " .. quote(directory .. "/vendor")
     )
-    assert(
-        driver:find('RUSTUP_TOOLCHAIN="$rustup_toolchain"', 1, true),
-        "rustup does not resolve tools from the selected exact channel"
-    )
-    assert(not driver:find("RUSTUP_TOOLCHAIN=stable", 1, true), "the moving stable alias remains a toolchain fallback")
+    assert(status ~= 0, "the removed rust-vendor component returned success:\n" .. output)
+    assert(output:find("unknown component rust-vendor", 1, true), output)
 end
 
 -- A release archive is published by digest, so its bytes are its files' names,
@@ -1052,19 +1053,19 @@ function M.staticHostsRetainTheRustApplicationArchive()
     )
 end
 
-function M.networkAndTlsAreRustOnlyToolchainFeatures()
+function M.networkTlsAndCompressionAreHostFeatures()
     local driver = read(ROOT .. "/scripts/toolchain")
     assert(
-        driver:find('host_cargo_features="$host_cargo_features,native-net"', 1, true),
-        "a network host does not select the Rust net crate"
+        driver:find('host_features="$host_features,native-net"', 1, true),
+        "a network host does not select the net feature"
     )
     assert(
-        driver:find('host_cargo_features="$host_cargo_features,native-tls"', 1, true),
-        "a TLS host does not select the Rust TLS crate"
+        driver:find('host_features="$host_features,native-tls"', 1, true),
+        "a TLS host does not select the TLS feature"
     )
     assert(
-        driver:find('host_cargo_features="$host_cargo_features,native-compression"', 1, true),
-        "a compression host does not select the Rust compression crate"
+        driver:find('host_features="$host_features,native-compression"', 1, true),
+        "a compression host does not select the compression feature"
     )
     for _, obsolete in ipairs({"libuv", "mbedtls"}) do
         assert(not driver:lower():find(obsolete, 1, true), "the toolchain still provisions " .. obsolete)
@@ -1249,7 +1250,7 @@ function M.luaJitPatchContentChangesNativeAndHostKeys()
     local hostProbe = root .. "/scripts/host-key"
     local text = read(DRIVER)
     local entry = assert(text:find("# --- entry", 1, true))
-    write(hostProbe, text:sub(1, entry - 1) .. '\nrust_sources_digest\n')
+    write(hostProbe, text:sub(1, entry - 1) .. '\nhost_sources_digest\n')
     assert(os.execute("chmod +x " .. quote(driver) .. " " .. quote(hostProbe)) == 0)
     local compiler = fakeCompiler(directory, "fake-cc", "fixed")
     local env = {NUPP_TOOLCHAIN_DIR = directory .. "/cache", NUPP_CC = compiler, NUPP_CXX = compiler, PATH = "$PATH"}
@@ -1818,7 +1819,6 @@ end
 -- A fixture for `native-provider` in a checkout with no compiler yet: the code
 -- generator is this machine's prebuilt provider, so the driver is told it runs
 -- on Linux x86-64, the platform the fixture pins, whatever the suite runs on.
--- Cargo is unusable too, since no provider is built with it.
 local function compilerlessFixture(features)
     local fixture = prebuiltFixture({["nupp-codegen-x86_64-unknown-linux-gnu.tar.gz"] = "codegen"}, nil, features)
     write(
@@ -1831,8 +1831,6 @@ esac
 ]]
     )
     assert(os.execute("chmod +x " .. quote(fixture.directory .. "/bin/uname")) == 0)
-    fixture.environment.NUPP_CARGO = "/nonexistent"
-    fixture.environment.NUPP_RUSTC = "/nonexistent"
 
     return fixture
 end

@@ -166,8 +166,15 @@ assert(loadfile(%q))()
 held = assert(require("nupp.runtime.standardio").popen({%q, "-c", "echo $$ > '%s'; exec sleep 30"}, {
     stdin = "pipe", stdout = "pipe", stderr = "pipe",
 }))
-while not io.open(%q, "rb") do
-end
+-- The redirect creates the file before echo fills it.
+local pid
+repeat
+    local written = io.open(%q, "rb")
+    pid = written and written:read("*l")
+    if written then
+        written:close()
+    end
+until pid and pid ~= ""
 io.stdout:write("started\n")
 io.stdout:flush()
 ]]):format(package.path, "%q", providerPath, bootstrapFile, SHELL, pidFile, pidFile)
@@ -188,10 +195,17 @@ io.stdout:flush()
     assert(result:succeeded(), "closing the script's state did not end it within the deadline")
     local pid = assert(io.open(pidFile, "rb")):read("*l")
     assert(tonumber(pid), "the child wrote its pid: " .. tostring(pid))
-    assert(
-        os.execute("kill -0 " .. pid .. " 2>/dev/null") ~= 0,
-        "the child outlived the state that started it"
-    )
+    -- The closing state kills the child without waiting for it, so it can take a
+    -- moment to die and be reaped. A zombie has already ended.
+    local alive = true
+    for _ = 1, 50 do
+        alive = os.execute(("kill -0 %s 2>/dev/null && ! ps -o stat= -p %s 2>/dev/null | grep -q Z"):format(pid, pid)) == 0
+        if not alive then
+            break
+        end
+        os.execute("sleep 0.1")
+    end
+    assert(not alive, "the child outlived the state that started it")
 end
 
 function M.sharedViewsUseTheRealStreamsAndDeliverEof()

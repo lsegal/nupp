@@ -40,43 +40,123 @@ local function tool(command, arguments, environment)
     }
 end
 
+-- Wasmtime's prebuilt C API, which wasmtime-host.lua drives through LuaJIT's
+-- FFI. Each release archive has its own digest, named by the host it serves,
+-- and the digest is what a download or a supplied copy is held to. The Windows
+-- x86_64 build is the MinGW one, which needs nothing beyond the system DLLs.
+local WASMTIME_VERSION = "v48.0.2"
+local WASMTIME_URL = "https://github.com/bytecodealliance/wasmtime/releases/download/"
+local WASMTIME_ARCHIVES = {
+    ["Linux-x64"] = {
+        platform = "x86_64-linux",
+        suffix = ".tar.xz",
+        library = "lib/libwasmtime.so",
+        sha256 = "d9a2b5dfaf688035f288a7ae81a4b96c3acdd3e849262c2ab577b61908c3f9f9",
+    },
+    ["Linux-arm64"] = {
+        platform = "aarch64-linux",
+        suffix = ".tar.xz",
+        library = "lib/libwasmtime.so",
+        sha256 = "af6d19b2bf6a3147b7550356f557dc5a5e538a70c099f4c435d12311e20e5c6c",
+    },
+    ["OSX-x64"] = {
+        platform = "x86_64-macos",
+        suffix = ".tar.xz",
+        library = "lib/libwasmtime.dylib",
+        sha256 = "5fbf2c7700063282000dcefe9d0691ac9e27f2f213746acd56f42d1772cebe4a",
+    },
+    ["OSX-arm64"] = {
+        platform = "aarch64-macos",
+        suffix = ".tar.xz",
+        library = "lib/libwasmtime.dylib",
+        sha256 = "c4b95346d92168963607f8ac56ef70298aa83b9d2b23af3e801759df3443ed09",
+    },
+    ["Windows-x64"] = {
+        platform = "x86_64-mingw",
+        suffix = ".zip",
+        library = "lib/wasmtime.dll",
+        sha256 = "597cc4c2fd2dc7e58ac1e217fc9b3a56026831a3ed69e389f381a48846556714",
+    },
+}
+
+local function offline()
+    local value = (os.getenv("NUPP_HOST_OFFLINE") or ""):lower()
+    return value == "1" or value == "true" or value == "yes" or value == "on"
+end
+
+-- The pinned C API archive for this host, and how it can be had: from
+-- NUPP_HOST_SOURCE_DIR, the directory of already-downloaded pinned archives
+-- scripts/toolchain also reads, or downloaded unless NUPP_HOST_OFFLINE is set.
+local function pinnedHost()
+    local host = jit.os .. "-" .. jit.arch
+    local pin = WASMTIME_ARCHIVES[host]
+    if not pin then
+        return {
+            available = false,
+            source = "pinned",
+            version = WASMTIME_VERSION,
+            reason = "Wasmtime " .. WASMTIME_VERSION .. " publishes no pinned C API library for " .. host,
+        }
+    end
+    local name = "wasmtime-" .. WASMTIME_VERSION .. "-" .. pin.platform .. "-c-api"
+    local sourceDir = os.getenv("NUPP_HOST_SOURCE_DIR")
+    local supplied = sourceDir and sourceDir ~= "" and sourceDir .. "/" .. name .. pin.suffix or nil
+    if supplied and not exists(supplied) then
+        supplied = nil
+    end
+    local extractor = pin.suffix == ".zip" and tool("unzip", "-v") or tool("tar")
+    local downloader = tool("curl")
+    local digest = tool("sha256sum")
+    if not digest.available then
+        digest = tool("shasum")
+    end
+    local reason
+    if not extractor.available then
+        reason = "unpacking the Wasmtime C API needs " .. extractor.command
+    elseif not digest.available then
+        reason = "verifying the Wasmtime C API needs sha256sum or shasum"
+    elseif not supplied and offline() then
+        reason = "NUPP_HOST_OFFLINE is set and NUPP_HOST_SOURCE_DIR has no " .. name .. pin.suffix
+    elseif not supplied and not downloader.available then
+        reason = "fetching the Wasmtime C API needs curl"
+    end
+
+    return {
+        available = reason == nil,
+        source = "pinned",
+        version = WASMTIME_VERSION,
+        archive = name .. pin.suffix,
+        library = name .. "/" .. pin.library,
+        sha256 = pin.sha256,
+        supplied = supplied,
+        digest = digest.command,
+        reason = reason,
+    }
+end
+
 function M.capabilities()
     local lua = os.getenv("NUPP_SIMD_LUA") or "luajit"
-    local prebuilt = os.getenv("NUPP_WASMTIME_HOST_LIBRARY")
-    local capabilities = {
-        node = tool("node"),
-        cargo = tool("cargo"),
-        rustc = tool("rustc"),
-        prebuilt = prebuilt,
-        lua = tool(lua, "-v"),
-    }
+    local library = os.getenv("NUPP_WASMTIME_LIBRARY")
+    local capabilities = {node = tool("node"), lua = tool(lua, "-v"),}
     -- nupp compiles and links the Wasm itself, through its own LLVM.
     local version, problem = runner.codegen()
     capabilities.wasm = {available = version ~= nil, command = "nupp", version = version, output = problem,}
     capabilities.lua.runtime = jit.version
     capabilities.lua.os = jit.os
     capabilities.lua.arch = jit.arch
-    if prebuilt then
-        capabilities.host = {available = exists(prebuilt), source = "NUPP_WASMTIME_HOST_LIBRARY", path = prebuilt,}
-    else
+    if library and library ~= "" then
+        local found = exists(library)
         capabilities.host = {
-            available = capabilities.cargo.available and capabilities.rustc.available,
-            source = "cargo",
-            cargo = capabilities.cargo.version,
-            rustc = capabilities.rustc.version,
+            available = found,
+            source = "NUPP_WASMTIME_LIBRARY",
+            path = library,
+            reason = not found and ("NUPP_WASMTIME_LIBRARY names no file: " .. library) or nil,
         }
+    else
+        capabilities.host = pinnedHost()
     end
 
     return capabilities
-end
-
-local function hostSources()
-    return {
-        root .. "/tests/integration/simd/wasmtime-host/Cargo.toml",
-        root .. "/tests/integration/simd/wasmtime-host/Cargo.lock",
-        root .. "/tests/integration/simd/wasmtime-host/src/lib.rs",
-        root .. "/tests/integration/simd/build-wasmtime-host.sh",
-    }
 end
 
 local function digestFiles(prefix, paths, extra)
@@ -92,41 +172,60 @@ local function digestFiles(prefix, paths, extra)
     return hash.digest(table.concat(parts, "\0"))
 end
 
+-- The Wasmtime C API library and its identity. A pinned archive is fetched or
+-- copied, verified and unpacked once, into a fixture keyed by its digest.
 function M.host(test, capabilities)
-    if capabilities.prebuilt then
-        return capabilities.prebuilt, {
-            key = "prebuilt-" .. hash.digest(runner.read(capabilities.prebuilt)),
-            source = "prebuilt",
-        }
+    local host = capabilities.host
+    if host.source == "NUPP_WASMTIME_LIBRARY" then
+        return host.path, {key = "prebuilt-" .. hash.digest(runner.read(host.path)), source = "prebuilt",}
     end
-    local key = "simd-wasmtime-host-" .. digestFiles("simd-wasmtime-host-v1", hostSources(), {
-        capabilities.cargo.version,
-        capabilities.rustc.version,
-        jit.os,
-        jit.arch
-    })
+    local key = "simd-wasmtime-capi-" .. hash.digest(
+        table.concat({"simd-wasmtime-capi-v1", host.version, host.archive, host.sha256}, "\0")
+    )
     local directory, evidence = test.suite.fixture(key, function(private)
-        local target = private .. "/target"
-        local output = runner.command(
-            "NUPP_WASMTIME_TARGET_DIR=" .. runner.quote(
-                target
-            ) .. " " .. runner.quote(root .. "/tests/integration/simd/build-wasmtime-host.sh"),
-            private .. "/build.log"
+        local archive = private .. "/" .. host.archive
+        if host.supplied then
+            runner.command("cp " .. runner.quote(host.supplied) .. " " .. runner.quote(archive), private .. "/fetch.log")
+        else
+            local base = os.getenv("NUPP_HOST_SOURCE_BASE_URL")
+            local url = base and base ~= "" and base:gsub("/$", "") .. "/" .. host.archive
+                or WASMTIME_URL .. host.version .. "/" .. host.archive
+            -- The scheme travels as a flag: the Windows test shell rewrites every
+            -- `x:/` in a command as a drive path, `https://` included.
+            local scheme, location = url:match("^(%a+)://(.*)$")
+            runner.command(
+                "curl --fail --location --silent --show-error --proto-default " .. scheme .. " --output " .. runner.quote(
+                    archive
+                ) .. " " .. runner.quote(location),
+                private .. "/fetch.log"
+            )
+        end
+        local flags = host.digest == "shasum" and " -a 256 " or " "
+        local found = runner.command(host.digest .. flags .. runner.quote(archive), private .. "/digest.log")
+        found = found:match("^(%x+)")
+        assert(
+            found == host.sha256,
+            host.archive .. " has digest " .. tostring(found) .. ", expected " .. host.sha256 .. "; refusing it"
         )
-        local library = output:match("([^\r\n]+)%s*$")
-        assert(library and exists(library), "Wasmtime host build returned no library")
-        local relative = library:gsub("\\", "/"):sub(#private + 2)
-        assert(relative ~= library and relative ~= "", "Wasmtime host library escaped its fixture")
+        local unpack = "tar -xJf " .. runner.quote(archive) .. " -C " .. runner.quote(private)
+        if host.archive:sub(-4) == ".zip" then
+            unpack = "unzip -q -o " .. runner.quote(archive) .. " -d " .. runner.quote(private)
+        end
+        runner.command(
+            unpack .. " " .. runner.quote(host.library) .. " && rm -f " .. runner.quote(archive),
+            private .. "/unpack.log"
+        )
+        assert(exists(private .. "/" .. host.library), host.archive .. " did not contain " .. host.library)
 
-        return {
-            library = relative,
-            libraryName = basename(library),
-            cargo = capabilities.cargo.version,
-            rustc = capabilities.rustc.version,
-        }
+        return {library = host.library, version = host.version, sha256 = host.sha256,}
     end)
 
-    return directory .. "/" .. evidence.library, {key = key, source = "fixture", library = evidence.libraryName,}
+    return directory .. "/" .. evidence.library, {
+        key = key,
+        source = "pinned",
+        version = evidence.version,
+        library = basename(evidence.library),
+    }
 end
 
 local function generatedSources(generated)
@@ -149,6 +248,7 @@ function M.fixtureKey(pack, generated, capabilities, host)
         root .. "/tests/integration/simd/runner.lua",
         root .. "/tests/integration/simd/wasmtime.lua",
         root .. "/tests/integration/simd/run-wasmtime-guest.lua",
+        root .. "/tests/integration/simd/wasmtime-host.lua",
         root .. "/tests/integration/simd/prepare-wasm-reference.lua",
         root .. "/tests/integration/simd/native-packs.lua",
     }

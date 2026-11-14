@@ -19,7 +19,7 @@ x64, baseline, AVX2, AVX512F and NEON.
 The ordinary integration jobs stay separate.
 `runtime-boundaries.json` records modeled layouts outside those execution rows.
 Windows ARM64 and Windows32 are not supported by the native toolchain: it
-explicitly accepts only x86_64 GNU/GNU-LLVM Rust hosts. Linux32 has a modeled
+explicitly accepts only x86_64 MinGW hosts. Linux32 has a modeled
 layout and SIMD target but no provisioned 32-bit process in this matrix; it is
 recorded as not executed. A target layout is not evidence of a working runtime.
 
@@ -72,14 +72,23 @@ through Wasmtime 48, compiled by nupp's own LLVM. Its species case covers every 
 lane width; its semantic case covers the independent operation, representation,
 conversion, tail and reducer corpora. Each case uses immutable
 content-addressed fixtures and publishes `coverage.witness` facts plus generated
-source, unit, call and case work counts. Missing Rust, Node or child LuaJIT
-tooling is recorded as `not-executed` in an ordinary broad test run.
+source, unit, call and case work counts. A missing Wasmtime C API, Node or child
+LuaJIT is recorded as `not-executed` in an ordinary broad test run.
+
+Wasmtime is Wasmtime 48's prebuilt C API library, which `wasmtime-host.lua`
+drives through LuaJIT's FFI. `wasmtime.lua` pins the release archive for each
+host it publishes one for (Linux and macOS on x64 and arm64, and the MinGW
+build on Windows x64) by SHA-256, and unpacks the verified library into a
+content-keyed fixture once. It takes the archive from `NUPP_HOST_SOURCE_DIR`
+when it is there, and otherwise downloads it unless `NUPP_HOST_OFFLINE` is set;
+a host with no pinned archive, no way to fetch it, or no `sha256sum`/`shasum`
+and unpacker records the host capability as unavailable, with the reason.
+`NUPP_WASMTIME_LIBRARY` names a Wasmtime 48 C API library to use instead.
 
 `run-wasm-wasmtime.sh` invokes that ordinary harness and rejects a report unless
-both packs actually passed. `NUPP_WASMTIME_HOST_LIBRARY` and
-`NUPP_SIMD_WASM_OUTPUT` select an optional prebuilt host and the retained
+both packs actually passed. `NUPP_SIMD_WASM_OUTPUT` selects the retained
 harness report. The generated browser bundle still owns the independently
-authored Lua oracle; host LuaJIT executes it while the test-only Rust bridge routes
+authored Lua oracle; host LuaJIT executes it while the test-only C API bridge routes
 every emitted independent module through Wasmtime. The manifest must contain only
 SIMD128 side modules, and every named probe must map to an executed independent
 Wasm entry. The application uses `aot = "require-wasm"`, so successful completion
@@ -113,7 +122,7 @@ claim that a compiler chose a particular machine instruction for every operation
 `simdnativealgorithmdifferentialtest` runs UTF-8, Base64, structural JSON and
 fused JSON through native SIMD entries against their owned scalar differentials.
 The portable `simdwasmalgorithmdifferentialtest` runs UTF-8, Base64 and
-structural JSON through the Rust Wasmtime host against those same independent
+structural JSON through the Wasmtime C API host against those same independent
 oracles. Both are ordinary parameterized suites with immutable
 fixtures, source hashes, case and call counts, distinct artifact identities and
 `coverage.witness` facts. A missing algorithm, smaller corpus or interpreted-only

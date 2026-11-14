@@ -22,13 +22,13 @@ local groups = {
     -- instead of arriving twenty minutes later as unrun shards.
     [
         "windows-preflight"
-    ] = {"netnativetest", "runnertest", "rusttoolchaintest", "soatest", "toolchaintest", "worktreetest",},
+    ] = {"deliveryworkflowtest", "netnativetest", "runnertest", "soatest", "toolchaintest", "worktreetest",},
 
     -- Fixtures whose inputs come from outside the repository. Kept nameable
     -- because a configured corpus used to be absent and silently skipped.
     ["external-corpus"] = {"corpustest", "importctest"},
 
-    -- The Rust-native platform boundary: resource owners, the aggregate C ABI,
+    -- The native platform boundary: resource owners, the aggregate C ABI,
     -- and C consumers of the executable and embedding SDKs.
     [
         "native-platform"
@@ -103,7 +103,7 @@ local groups = {
     -- the structural checks which keep the replacement corpus bounded.
     ["simd-conformance"] = {"aotsimdconditiontest", "simd*test"},
 
-    -- The Wasm packs through wasmtime and the browser: a cargo-built host and
+    -- The Wasm packs through wasmtime and the browser: the Wasmtime C API and
     -- hundreds of modules, a quarter of an hour on a fast machine. The SIMD
     -- conformance workflow runs the same harness sharded, so the per-push
     -- matrix leaves these to it.
@@ -242,7 +242,7 @@ for name in (
     [[
 hostbinarytest hostembeddingtest nupphosttest spitest bootstraptest bundletest
 compilerpacktest releasetest rocktest spipackagetest worktreetest
-rusttoolchaintest toolchaintest
+deliveryworkflowtest toolchaintest
 ]]
 ):gmatch("%S+") do
     scopes[name] = "delivery"
@@ -473,9 +473,6 @@ local repositoryInputs = {
     "native",
     "runtime",
     "host",
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain.toml",
     "bench/serde-spike/contracts",
     "editors/playground/src/examples",
 }
@@ -752,13 +749,13 @@ packages[
 ] = {cache = false, reason = "Builds a native host against external C libraries."}
 packages[
     "compiler/project/contracts/binary/process/pipes"
-] = {cache = false, reason = "Builds native hosts with the external Rust toolchain."}
+] = {cache = false, reason = "Builds native hosts with the external native link toolchain."}
 packages[
     "compiler/project/contracts/binary/services/filesystem"
-] = {cache = false, reason = "Builds native hosts with the external Rust toolchain."}
+] = {cache = false, reason = "Builds native hosts with the external native link toolchain."}
 packages[
     "compiler/project/contracts/binary/services/services"
-] = {cache = false, reason = "Builds native hosts with the external Rust toolchain."}
+] = {cache = false, reason = "Builds native hosts with the external native link toolchain."}
 packages["compiler/project/contracts/c"] = {cache = false, reason = "External C compiler, SDK and link libraries."}
 packages[
     "compiler/project/contracts/cargo"
@@ -858,7 +855,7 @@ packages[
 
 packages[
     "tools/packaging/bundle/providers"
-] = {cache = false, reason = "Builds an exact-feature native host with an external Rust SDK."}
+] = {cache = false, reason = "Builds an exact-feature native host with the external native link toolchain."}
 
 packages[
     "compiler/project/contracts/generators"

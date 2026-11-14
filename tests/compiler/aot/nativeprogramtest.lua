@@ -833,8 +833,16 @@ function M.wideDivisionAgreesWithLuaJIT()
     local lua
     status, lua = run(("cd %s && NO_COLOR= %s lsp artifact --kind lua host.nupp"):format(quote(dir), quote(NUPP)))
     test.eq(status, 0, lua)
+    local exit = "os.exit(main())"
+    if jit.os == "Windows" then
+        -- A `luajit` linked against UCRT exports no `printf`. Take msvcrt's, as
+        -- the native program does, and flush it before exiting through UCRT.
+        lua = lua:gsub("__nuppFfi%.C%.printf", '__nuppFfi.load("msvcrt").printf')
+        exit = 'local status = main() __nuppFfi.cdef("int fflush(void *);") '
+            .. '__nuppFfi.load("msvcrt").fflush(nil) os.exit(status)'
+    end
     local chunk = assert(io.open(dir .. "/host.lua", "wb"))
-    chunk:write(lua, "\nos.exit(main())\n")
+    chunk:write(lua, "\n", exit, "\n")
     chunk:close()
     -- The runtime is found relative to `build/` rather than through an
     -- absolute LUA_PATH: under Git Bash `HERE` is spelled `/c/...`, which a

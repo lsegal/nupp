@@ -34,6 +34,7 @@ local function projectFiles(name)
     for _, relative in ipairs({
         "tests/integration/simd/build-algorithm-wasm.lua",
         "tests/integration/simd/run-wasmtime-guest.lua",
+        "tests/integration/simd/wasmtime-host.lua",
         "tests/integration/simd/wasmtime.lua",
         "tests/integration/simd/runner.lua",
         "tests/integration/simd/corpusmath.lua",
