@@ -58,37 +58,60 @@ function M.redirectionsApplyInOrder()
     test.eq(parse("/repo/bin/nupp check", "out").stderr, "err")
 end
 
--- The suites' usual way of reading a status beside merged output.
-function M.aTrailingEchoOfTheStatusIsKept()
+-- The suites' usual ways of reading a status beside merged output.
+function M.aTrailingReportOfTheStatusIsKept()
+    local S = compileservice.STATUS
     local forms = {
-        {[[/repo/bin/nupp check 2>&1; echo "__exit__:$?"]], "__exit__:", ""},
-        {"/repo/bin/nupp check 2>&1; echo '__exit__:'$?", "__exit__:", ""},
-        {"/repo/bin/nupp check; echo rc=$?", "rc=", ""},
-        {"/repo/bin/nupp check ; echo $?", "", ""},
-        {[[/repo/bin/nupp check; echo "[$?]"]], "[", "]"},
+        {[[/repo/bin/nupp check 2>&1; echo "__exit__:$?"]], "__exit__:" .. S .. "\n", "pipe"},
+        {"/repo/bin/nupp check 2>&1; echo '__exit__:'$?", "__exit__:" .. S .. "\n", "pipe"},
+        {"/repo/bin/nupp check; echo rc=$?", "rc=" .. S .. "\n", "pipe"},
+        {"/repo/bin/nupp check ; echo $? done", S .. " done\n", "pipe"},
+        {[[/repo/bin/nupp check; echo "[$?]"]], "[" .. S .. "]\n", "pipe"},
+        {"/repo/bin/nupp check 2>&1; printf ' __status__:%s' $?", " __status__:" .. S, "pipe"},
+        {[[/repo/bin/nupp check > out 2>&1; printf '%s\n' "$?" > status]], S .. "\n", "file:status"},
+        {"/repo/bin/nupp check; echo $? >/dev/null", S .. "\n", "null"},
     }
     for _, form in ipairs(forms) do
         local command = parse(form[1])
         test.ne(command, nil, form[1])
         test.eq(command.argv[1], "check", form[1])
-        test.eq(command.echo[1], form[2], form[1])
-        test.eq(command.echo[2], form[3], form[1])
+        test.eq(command.report.text, form[2], form[1])
+        test.eq(command.report.target, form[3], form[1])
     end
-    test.eq(parse("/repo/bin/nupp check").echo, nil)
-    test.eq(parse([[/repo/bin/nupp check; echo "$HOME$?"]]), nil)
-    test.eq(parse("/repo/bin/nupp check; echo $? > status"), nil)
-    test.eq(parse("/repo/bin/nupp check; echo done; echo $?"), nil)
+    test.eq(compileservice.withStatus("rc=" .. S .. " [" .. S .. "]", 3), "rc=3 [3]")
+    test.eq(parse("/repo/bin/nupp check").report, nil)
+    local refused = {
+        [[/repo/bin/nupp check; echo "$HOME$?"]],
+        "/repo/bin/nupp check; echo -n $?",
+        "/repo/bin/nupp check; echo done; echo $?",
+        "/repo/bin/nupp check; printf '%d' $?",
+        "/repo/bin/nupp check; printf '%s %s' $? $?",
+        [[/repo/bin/nupp check; printf '\t%s' $?]],
+        "/repo/bin/nupp check; true",
+        "/repo/bin/nupp check $?",
+        "/repo/bin/nupp check; echo $? > status 2>&1",
+    }
+    for _, command in ipairs(refused) do
+        test.eq(parse(command), nil, command)
+    end
+end
+
+function M.redirectionsToFilesNameThem()
+    local command = parse("cd /p && /repo/bin/nupp fmt > 'out file' 2> .err")
+    test.eq(command.stdout, "file:out file")
+    test.eq(command.stderr, "file:.err")
+    local merged = parse("/repo/bin/nupp check >log 2>&1")
+    test.eq(merged.stdout, "file:log")
+    test.eq(merged.stderr, "file:log")
 end
 
 function M.anythingNeedingMoreOfAShellIsLeftToIt()
     local refused = {
         "/repo/bin/nupp check | head -1",
-        "/repo/bin/nupp check; echo done",
         "/repo/bin/nupp check $FILE",
         "/repo/bin/nupp check \"$FILE\"",
         "/repo/bin/nupp check `pwd`",
         "/repo/bin/nupp check *.nupp",
-        "/repo/bin/nupp check > out.txt",
         "/repo/bin/nupp check >> /dev/null",
         "/repo/bin/nupp fmt - < main.nupp",
         "cd /p && /repo/bin/nupp check && /repo/bin/nupp build",
@@ -189,14 +212,33 @@ function M.anAnsweredCommandReadsAsTheShellsOwn()
         ("'%s' --version"):format(NUPP),
         ("'%s' explain NUPP2004"):format(NUPP),
         ("cd '%s' && NO_COLOR= '%s' check 2>&1; echo \"__exit__:$?\""):format(dir, NUPP),
+        ("cd '%s' && '%s' check > out.txt 2>&1; printf '%%s\\n' \"$?\" > status.txt"):format(dir, NUPP),
+        ("cd '%s' && '%s' check main.nupp 2> out.txt; printf ' __status__:%%s' $?"):format(dir, NUPP),
     }
+    -- What a command left in the files it was told to write, taken away again.
+    local function written()
+        local text = {}
+        for _, name in ipairs({"out.txt", "status.txt"}) do
+            local file = io.open(dir .. "/" .. name, "rb")
+            if file then
+                text[#text + 1] = name .. ":" .. file:read("*a")
+                file:close()
+                os.remove(dir .. "/" .. name)
+            end
+        end
+
+        return table.concat(text, "\n")
+    end
+
     for _, command in ipairs(commands) do
         local before = counts()
         local routed, ok, how, code = capture(command)
+        local routedFiles = written()
         test.eq(counts(), before + 1, "answered by the service: " .. command)
         local direct = "true && " .. command
         local shell, shellOk, shellHow, shellCode = capture(direct)
         test.eq(counts(), before + 1, "answered by the shell: " .. command)
+        test.eq(routedFiles, written(), command)
         -- How long a check took is the one thing two runs of it do not agree on.
         local function untimed(text)
             return (text:gsub('"timing":.*$', ""))

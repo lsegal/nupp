@@ -113,7 +113,8 @@ end
 ---
 --- `stdout` and `stderr` say where each stream went once every redirection was
 --- applied: `"pipe"`, the pipe the caller reads; `"out"` and `"err"`, the
---- caller's own standard output and error; `"null"`, the null device.
+--- caller's own standard output and error; `"null"`, the null device; or
+--- `"file:"` and the path a redirection named, relative to `cwd`.
 type compileservice.Command = {
     cwd: string?,
     env: {{string}},
@@ -122,11 +123,18 @@ type compileservice.Command = {
     stdout: string,
     stderr: string,
 
-    --- A trailing `; echo TEXT$?` that reports the status: the text before and
-    --- after the status, which the caller writes where the shell would have,
-    --- answering the shell's own status, 0.
-    echo: {string}?
+    --- What a trailing `; echo ...$?` or `; printf FORMAT $?` writes: its text,
+    --- with `compileservice.STATUS` where the command's status goes, and where
+    --- it goes, in the same terms as `stdout`. The shell then answers the
+    --- status of that report, 0.
+    report: {
+        text: string,
+        target: string
+    }?
 }
+
+--- Where a status report's text carries the status.
+compileservice.STATUS = "\0?\0"
 
 -- Unquoted characters the shell gives no meaning to.
 local function plain(char: string): boolean
@@ -135,7 +143,8 @@ end
 
 --- The words and operators of a command line, or nil for one that needs more of a
 --- shell than this reads. A word carries whether its leading name and `=` were
---- unquoted, which is what makes it an assignment.
+--- unquoted, which is what makes it an assignment. `$?` is the one expansion
+--- read, and becomes `compileservice.STATUS`.
 local function tokens(command: string): {any}?
     local list: {any} = {}
     local index: integer = 1
@@ -147,15 +156,16 @@ local function tokens(command: string): {any}?
         elseif command:sub(index, index + 1) == "&&" then
             list[#list + 1] = {op = "&&"}
             index = index + 2
+        elseif char == ";" then
+            list[#list + 1] = {op = ";"}
+            index = index + 1
         elseif command:sub(index, index + 3) == "2>&1" then
             list[#list + 1] = {op = "2>&1"}
             index = index + 4
         elseif command:sub(index, index + 1) == "2>" or command:sub(index, index + 1) == "1>" or char == ">" then
             local op = char == ">" and ">" or command:sub(index, index + 1)
             index = index + #op
-            if op ~= ">" then
-                op = op == "1>" and ">" or op
-            end
+            op = op == "1>" and ">" or op
             if command:sub(index, index) == ">" or command:sub(index, index) == "&" then
                 return nil
             end
@@ -166,8 +176,15 @@ local function tokens(command: string): {any}?
             local unquoted: integer? = nil
             while index <= length do
                 char = command:sub(index, index)
-                if char == " " or char == "\t" then
+                if char == " " or char == "\t" or char == ";" or char == ">" then
                     break
+                elseif char == "$" then
+                    if command:sub(index + 1, index + 1) ~= "?" then
+                        return nil
+                    end
+                    unquoted = unquoted or #text
+                    text[#text + 1] = compileservice.STATUS
+                    index = index + 2
                 elseif char == "'" then
                     unquoted = unquoted or #text
                     local close = command:find("'", index + 1, true)
@@ -186,6 +203,9 @@ local function tokens(command: string): {any}?
                             closed = true
                             index = index + 1
                             break
+                        elseif inner == "$" and command:sub(index + 1, index + 1) == "?" then
+                            text[#text + 1] = compileservice.STATUS
+                            index = index + 2
                         elseif inner == "$" or inner == "`" then
                             return nil
                         elseif inner == "\\" then
@@ -230,27 +250,121 @@ local function tokens(command: string): {any}?
     return list
 end
 
+--- A status report's text with the status written in.
+function compileservice.withStatus(text: string, status: integer): string
+    local parts: {string} = {}
+    local at: integer = 1
+    while true do
+        local first, last = text:find(compileservice.STATUS, at, true)
+        if first == nil then
+            parts[#parts + 1] = text:sub(at)
+            break
+        end
+        parts[#parts + 1] = text:sub(at, first - 1)
+        parts[#parts + 1] = tostring(status)
+        at = (last as integer) + 1
+    end
+
+    return table.concat(parts)
+end
+
+-- Whether a word carries the status, which only a report may.
+local function hasStatus(word: string): boolean
+    return word:find(compileservice.STATUS, 1, true) ~= nil
+end
+
+-- Where a redirection to `word` sends its stream.
+local function redirectTarget(word: string): string
+    return word == "/dev/null" and "null" or "file:" .. word
+end
+
+-- The text `printf FORMAT $?` writes, for the formats a status report uses: one
+-- `%s` and the escapes `\n` and `\\`.
+local function printed(format: string): string?
+    local _, conversions = format:gsub("%%", "")
+    local _, strings = format:gsub("%%s", "")
+    if conversions ~= 1 or strings ~= 1 then
+        return nil
+    end
+    local text: {string} = {}
+    local index: integer = 1
+    while index <= #format do
+        local char = format:sub(index, index)
+        if char == "\\" then
+            local escaped = format:sub(index + 1, index + 1)
+            if escaped == "n" then
+                text[#text + 1] = "\n"
+            elseif escaped == "\\" then
+                text[#text + 1] = "\\"
+            else
+                return nil
+            end
+            index = index + 2
+        elseif char == "%" then
+            text[#text + 1] = compileservice.STATUS
+            index = index + 2
+        else
+            text[#text + 1] = char
+            index = index + 1
+        end
+    end
+
+    return table.concat(text)
+end
+
+-- The report a trailing `echo` or `printf` makes of the status, from the words
+-- after the `;`, or nil for anything else.
+local function readReport(list: {any}, first: integer, mode: string): {
+    text: string,
+    target: string
+}?
+    local name = list[first] and list[first].word or nil
+    local words: {string} = {}
+    local target = mode
+    local at: integer = first + 1
+    while list[at] ~= nil do
+        local token = list[at]
+        if token.word ~= nil then
+            words[#words + 1] = token.word
+        elseif token.op == ">" and list[at + 1] ~= nil and list[at + 1].word ~= nil and list[at + 2] == nil then
+            if hasStatus(list[at + 1].word as string) then
+                return nil
+            end
+            target = redirectTarget(list[at + 1].word as string)
+            at = at + 1
+        else
+            return nil
+        end
+        at = at + 1
+    end
+    if name == "echo" and list[first].unquoted == 4 then
+        if words[1] ~= nil and words[1]:sub(1, 1) == "-" then
+            return nil
+        end
+
+        return {text = table.concat(words, " ") .. "\n", target = target}
+    elseif name == "printf"
+        and list[first].unquoted == 6
+        and #words == 2
+        and words[2] == compileservice.STATUS
+        and not hasStatus(words[1])
+    then
+        local text = printed(words[1])
+
+        return text and {text = text as string, target = target} or nil
+    end
+
+    return nil
+end
+
 --- Reads a shell command line as a compiler command, or answers nil when it is
 --- anything else.
 ---
 --- `mode` is `"pipe"` for a command whose standard output the caller reads and
 --- `"out"` for one whose output goes where the caller's does.
 function compileservice.parse(command: string, mode: string): compileservice.Command?
-    if command:find("[\r\n]") then
+    if command:find("[\r\n%z]") then
         return nil
-    end
-    local echo: {string}? = nil
-    local rest, before, after = command:match('^(.-)%s*;%s*echo%s+"([^"$`\\]*)%$%?([^"$`\\]*)"%s*$')
-    if rest == nil then
-        rest, before = command:match("^(.-)%s*;%s*echo%s+'([^']*)'%$%?%s*$")
-        after = ""
-    end
-    if rest == nil then
-        rest, before, after = command:match("^(.-)%s*;%s*echo%s+([%w_:=,.+-]*)%$%?([%w_:=,.+-]*)%s*$")
-    end
-    if rest ~= nil then
-        echo = {before as string, after as string}
-        command = rest as string
     end
     local list = tokens(command)
     if list == nil or #list == 0 then
@@ -260,7 +374,7 @@ function compileservice.parse(command: string, mode: string): compileservice.Com
     local cwd: string? = nil
     if list[1].word == "cd" and list[1].unquoted == 2 then
         local target = list[2]
-        if target == nil or target.word == nil or list[3] == nil or list[3].op ~= "&&" then
+        if target == nil or target.word == nil or hasStatus(target.word) or list[3] == nil or list[3].op ~= "&&" then
             return nil
         end
         cwd = target.word
@@ -273,40 +387,64 @@ function compileservice.parse(command: string, mode: string): compileservice.Com
         if name == nil or list[at].unquoted < #name + 1 then
             break
         end
+        if hasStatus(word) then
+            return nil
+        end
         env[#env + 1] = {name, word:sub(#name + 2)}
         at = at + 1
     end
     local executable = list[at] and list[at].word or nil
-    if executable == nil then
+    if executable == nil or hasStatus(executable) then
         return nil
     end
     at = at + 1
     local argv: {string} = {}
     local stdout, stderr = mode, "err"
+    local report: {
+        text: string,
+        target: string
+    }? = nil
     while list[at] ~= nil do
         local token = list[at]
         if token.word ~= nil then
+            if hasStatus(token.word) then
+                return nil
+            end
             argv[#argv + 1] = token.word
         elseif token.op == "2>&1" then
             stderr = stdout
         elseif token.op == ">" or token.op == "2>" then
             local target = list[at + 1]
-            if target == nil or target.word ~= "/dev/null" then
+            if target == nil or target.word == nil or hasStatus(target.word) then
                 return nil
             end
             if token.op == ">" then
-                stdout = "null"
+                stdout = redirectTarget(target.word as string)
             else
-                stderr = "null"
+                stderr = redirectTarget(target.word as string)
             end
             at = at + 1
+        elseif token.op == ";" then
+            report = readReport(list, at + 1, mode)
+            if report == nil then
+                return nil
+            end
+            break
         else
             return nil
         end
         at = at + 1
     end
 
-    return {cwd = cwd, env = env, executable = executable, argv = argv, stdout = stdout, stderr = stderr, echo = echo}
+    return {
+        cwd = cwd,
+        env = env,
+        executable = executable,
+        argv = argv,
+        stdout = stdout,
+        stderr = stderr,
+        report = report
+    }
 end
 
 --- A path with `.` and `..` resolved, separators made forward, and on Windows the
@@ -433,7 +571,31 @@ function compileservice.request(command: compileservice.Command, root: string, c
         env[index] = {pair[1], value}
     end
 
-    return {cwd = directory, argv = argv, env = env}
+    -- A redirection's file is a word like any other.
+    local function target(disposition: string): string?
+        if forWindows and disposition:sub(1, 5) == "file:" then
+            local converted = windowsWord(disposition:sub(6))
+
+            return converted and "file:" .. converted or nil
+        end
+
+        return disposition
+    end
+
+    local stdout, stderr = target(command.stdout), target(command.stderr)
+    local report: any = nil
+    if command.report ~= nil then
+        local reported = target(command.report.target)
+        if reported == nil then
+            return nil
+        end
+        report = {text = command.report.text, target = reported}
+    end
+    if stdout == nil or stderr == nil then
+        return nil
+    end
+
+    return {cwd = directory, argv = argv, env = env, stdout = stdout, stderr = stderr, report = report}
 end
 
 -- The C library calls both halves use, declared under names of their own so a
@@ -822,7 +984,8 @@ end
 
 --- Serves requests from standard input until it closes.
 ---
---- A request is `cwd`, the stdout and stderr targets, the argument count and the
+--- A request is `cwd`, the stdout and stderr targets, a status report's text,
+--- file and `io.open` mode (all empty for none), the argument count and the
 --- arguments, then name and value pairs to set in the environment for the
 --- request. The response is the exit status, and `"end"` when the service
 --- ends after answering.
@@ -848,17 +1011,18 @@ function compileservice.serviceMain(): integer
             return 0
         end
         local items = compileservice.unpack(body as string)
-        if items == nil or #items < 4 then
+        if items == nil or #items < 7 then
             return 2
         end
         local cwd, out, err = items[1], items[2], items[3]
-        local count = (tonumber(items[4]) or 0) as integer
+        local reportText, reportPath, reportMode = items[4], items[5], items[6]
+        local count = (tonumber(items[7]) or 0) as integer
         local argv: {string} = {}
         for index = 1, count do
-            argv[index] = items[4 + index]
+            argv[index] = items[7 + index]
         end
         local assignments: {{any}} = {}
-        local at: integer = 5 + count
+        local at: integer = 8 + count
         while items[at] ~= nil do
             assignments[#assignments + 1] = {items[at], items[at + 1]}
             at = at + 2
@@ -878,6 +1042,15 @@ function compileservice.serviceMain(): integer
             local restore = redirect(out, err)
             status, codegen = runFresh(interpreter, main, argv)
             restore()
+        end
+        -- The status report, in the command's directory as the shell would have
+        -- written it.
+        if reportPath ~= "" then
+            local file = io.open(reportPath, reportMode)
+            if file ~= nil then
+                file:write(compileservice.withStatus(reportText, status))
+                file:close()
+            end
         end
         for index = #previous, 1, -1 do
             setEnvironment(previous[index][1] as string, previous[index][2] as string?)
@@ -953,8 +1126,8 @@ function compileservice.client(options: any): any
     end
 
     -- Sends one request and answers its status, or nil when the service failed it.
-    local function ask(request: any, out: string, err: string): integer?
-        local items: {string} = {request.cwd, out, err, tostring(#request.argv)}
+    local function ask(request: any, out: string, err: string, report: {string}): integer?
+        local items: {string} = {request.cwd, out, err, report[1], report[2], report[3], tostring(#request.argv)}
         for _, word in ipairs(request.argv) do
             items[#items + 1] = word
         end
@@ -986,9 +1159,10 @@ function compileservice.client(options: any): any
         return status as integer
     end
 
-    --- Runs a parsed command through the service. Answers its status and the
-    --- files holding what it wrote to the caller's pipe, standard output and
-    --- standard error, or nil when the caller should run the command itself.
+    --- Runs a parsed command through the service. Answers the status the shell
+    --- would have and the files holding what was written to the caller's pipe,
+    --- standard output and standard error, or nil when the caller should run the
+    --- command itself.
     function self:run(command: compileservice.Command): (integer?, string?, string?, string?)
         local cwd = compileservice.cwd()
         if cwd == nil then
@@ -998,11 +1172,15 @@ function compileservice.client(options: any): any
         if request == nil then
             return nil, nil, nil, nil
         end
+        -- The caller's own streams go through files this client makes; a named
+        -- file is the service's to open, in the command's directory.
         local files: {[string]: string} = {}
 
         local function target(disposition: string): string
             if disposition == "null" then
                 return "null"
+            elseif disposition:sub(1, 5) == "file:" then
+                return disposition:sub(6)
             end
             local path = files[disposition] or self.tmpname() as string
             files[disposition] = path
@@ -1010,12 +1188,17 @@ function compileservice.client(options: any): any
             return path
         end
 
-        local out = target(command.stdout)
-        local err = target(command.stderr)
+        local out = target(request.stdout)
+        local err = target(request.stderr)
         if err == out and err ~= "null" then
             err = "stdout"
         end
-        local status = ask(request, out, err)
+        local report: {string} = {"", "", ""}
+        if request.report ~= nil and request.report.target ~= "null" then
+            local named = request.report.target:sub(1, 5) == "file:"
+            report = {request.report.text, target(request.report.target), named and "wb" or "ab"}
+        end
+        local status = ask(request, out, err, report)
         if status == nil then
             for _, path in pairs(files) do
                 self.remove(path)
@@ -1024,6 +1207,9 @@ function compileservice.client(options: any): any
             return nil, nil, nil, nil
         end
         routed = routed + 1
+        if request.report ~= nil then
+            status = 0
+        end
 
         return status, files.pipe, files.out, files.err
     end

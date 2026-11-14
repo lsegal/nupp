@@ -312,8 +312,9 @@ end
 
 -- Whether a call came from the suites or this runner, rather than from compiler
 -- or runtime code a suite runs in this process: only theirs are shell commands
--- written for the test shell.
-local function usesTestShell(source)
+-- written for the test shell. The Windows route below asks the same question of
+-- its own; its block is loaded on its own by runnertest.
+local function startedByTests(source)
     return source == "@nupp:test-runner"
         or source == "@nupp:test-cache"
         or source:find("/tests/", 1, true) ~= nil
@@ -403,12 +404,6 @@ local function routedExecute(command)
         return false
     end
     client:forward(out, err)
-    -- A trailing `echo` of the status writes to the shell's own output, and its
-    -- success is what the shell answers.
-    if parsed.echo then
-        io.stdout:write(parsed.echo[1], tostring(status), parsed.echo[2], "\n")
-        status = 0
-    end
 
     return true, executeResult(status)
 end
@@ -430,13 +425,6 @@ local function routedPopen(command, mode)
         return nil
     end
     client:forward(out, err)
-    if parsed.echo then
-        pipe = pipe or os.tmpname()
-        local tail = assert(io.open(pipe, "ab"))
-        tail:write(parsed.echo[1], tostring(status), parsed.echo[2], "\n")
-        tail:close()
-        status = 0
-    end
     local file = assert(io.open(pipe or (windowsHost and "NUL" or "/dev/null"), mode == "rb" and "rb" or "r"))
     local proxy = {}
     function proxy:read(...)
@@ -475,7 +463,7 @@ if not windowsHost then
             local underlying = io.popen
             popenRoute = function(command, mode)
                 local caller = debug.getinfo(2, "S")
-                if type(command) == "string" and caller and usesTestShell(caller.source) then
+                if type(command) == "string" and caller and startedByTests(caller.source) then
                     local pipe = routedPopen(command, mode)
                     if pipe then
                         return pipe
@@ -490,7 +478,7 @@ if not windowsHost then
             local underlying = os.execute
             executeRoute = function(command)
                 local caller = debug.getinfo(2, "S")
-                if type(command) == "string" and caller and usesTestShell(caller.source) then
+                if type(command) == "string" and caller and startedByTests(caller.source) then
                     local handled, a, b, c = routedExecute(command)
                     if handled then
                         return a, b, c
@@ -530,6 +518,13 @@ if package.config:sub(1, 1) == "\\" then
     local nativeMarker = "__NUPP_WINDOWS_COMMAND__"
     _G.__NUPP_TEST_CMD_MARKER = nativeMarker
     _G.__NUPP_TEST_BASH = bash
+
+    local function usesTestShell(source)
+        return source == "@nupp:test-runner"
+            or source == "@nupp:test-cache"
+            or source:find("/tests/", 1, true) ~= nil
+            or source:match("^@?tests/") ~= nil
+    end
 
     -- Asked for when a test wants it, not while this file loads. `io.popen` is
     -- refused in a shared worker lane, and a `pwd` nothing has asked for yet is
@@ -580,8 +575,9 @@ if package.config:sub(1, 1) == "\\" then
             return rawExecute(command)
         end
         -- Only where pipes are allowed: a shared worker lane refuses them, and a
-        -- command the service ran would be one the lane never let start.
-        if nativePopen then
+        -- command the service ran would be one the lane never let start. The route
+        -- is absent when runnertest loads this block on its own.
+        if nativePopen and routedExecute then
             local handled, a, b, c = routedExecute(command)
             if handled then
                 return a, b, c
@@ -632,7 +628,7 @@ if package.config:sub(1, 1) == "\\" then
                 end,
             }
         end
-        if nativePopen then
+        if nativePopen and routedPopen then
             local pipe = routedPopen(command, mode)
             if pipe then
                 return pipe
