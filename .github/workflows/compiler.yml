@@ -622,6 +622,12 @@ jobs:
       # (#252). A lane that cannot hold eight workers in the runner's memory is a
       # per-worker footprint to fix (#250), not a reason to name fewer here.
       #
+      # On macOS and Windows every lane runs in one `nupp test`, so the
+      # compiler, the test runner and the native provider are checked and built
+      # once for all of them, and each command a test starts uses that build
+      # rather than checking it again (bin/nupp, "One test run is one build of
+      # this tree").
+      #
       # `--exclude-group` names what earlier steps in this job already ran, and
       # `wasm-conformance`, which the SIMD conformance workflow runs sharded.
       # The shared lane is excluded on Linux only, where the fast gate this job
@@ -645,12 +651,11 @@ jobs:
         run: |
           set -euo pipefail
           ulimit -c unlimited || true
-          ./bin/nupp test --scope=all --lane=isolated \
-            --exclude-group=external-corpus,measurement,wasm-conformance
-          if [ "$RUNNER_OS" != Linux ]; then
-            ./bin/nupp test --scope=all --lane=shared \
+          if [ "$RUNNER_OS" = Linux ]; then
+            ./bin/nupp test --scope=all --lane=isolated \
               --exclude-group=external-corpus,measurement,wasm-conformance
-            ./bin/nupp test --scope=all --lane=shell \
+          else
+            ./bin/nupp test --scope=all \
               --exclude-group=external-corpus,measurement,wasm-conformance
           fi
 
@@ -726,11 +731,7 @@ jobs:
           NUPP_TEST_BASH=$(cygpath -w "$bash_path")
           NUPP_TEST_SH=$(cygpath -w "$sh_path")
           export NUPP_TEST_BASH NUPP_TEST_SH
-          ./bin/nupp test --scope=all --lane=isolated \
-            --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
-          ./bin/nupp test --scope=all --lane=shared \
-            --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
-          ./bin/nupp test --scope=all --lane=shell \
+          ./bin/nupp test --scope=all \
             --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
 
       # What the suite saved, named in the log so a reader knows what the

@@ -216,10 +216,18 @@ function validator.narrowTestRuns(text)
     local number = 0
     for line in ((text:gsub("\r\n", "\n")) .. "\n"):gmatch("(.-)\n") do
         number = number + 1
-        for jobs in line:gmatch("%-%-jobs=(%d+)") do
-            if tonumber(jobs) < validator.minimumJobs then
-                found[#found + 1] = ("line %d: %s"):format(number, (line:gsub("^%s+", "")))
+        -- `--jobs=N` for every lane, or `--jobs=shell:2,isolated:8` for some.
+        local narrow = false
+        for list in line:gmatch("%-%-jobs=([%w:,]+)") do
+            for spec in list:gmatch("[^,]+") do
+                local count = tonumber(spec:match("^%d+$") or spec:match("^%a+:(%d+)$"))
+                if count and count < validator.minimumJobs then
+                    narrow = true
+                end
             end
+        end
+        if narrow then
+            found[#found + 1] = ("line %d: %s"):format(number, (line:gsub("^%s+", "")))
         end
     end
 

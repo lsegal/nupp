@@ -341,10 +341,15 @@ function M.noTestRunNamesFewerThanEightWorkers()
         "          ./bin/nupp test --jobs=8 --group=measurement",
         "          ./bin/nupp test --jobs=12 --lane=isolated",
         "          ./bin/nupp test --lane=shared",
+        "          ./bin/nupp test --scope=all --jobs=shell:2 \\",
+        "          ./bin/nupp test --jobs=isolated:8,shell:4",
+        "          ./bin/nupp test --jobs=shared:16",
     }, "\r\n"))
     test.eq(table.concat(found, "; "), table.concat({
         "line 1: run: ./bin/nupp test --fresh --lane=shell --jobs=2 \\",
         "line 2: ./tests/run --jobs=1 --group=external-corpus",
+        "line 6: ./bin/nupp test --scope=all --jobs=shell:2 \\",
+        "line 7: ./bin/nupp test --jobs=isolated:8,shell:4",
     }, "; "))
 end
 
