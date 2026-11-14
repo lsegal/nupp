@@ -192,10 +192,7 @@ end
 --- Whether `recorded` is `origin`: the counters first, the listing only when they
 --- agree.
 local function sameOrigin(recorded: any, origin: preludecache.Origin): boolean
-    if not isOrigin(recorded)
-        or recorded.capability ~= origin.capability
-        or recorded.nominal ~= origin.nominal
-    then
+    if not isOrigin(recorded) or recorded.capability ~= origin.capability or recorded.nominal ~= origin.nominal then
         return false
     end
 
@@ -564,11 +561,7 @@ function preludecache.encode(roots: any, origin: preludecache.Origin?): any?
         triviaOf = triviaOf,
         internedAs = internedAs,
         identity = {capability = identity.capability, nominal = identity.nominal,},
-        origin = {
-            capability = origin.capability,
-            nominal = origin.nominal,
-            digest = origin.digest,
-        },
+        origin = {capability = origin.capability, nominal = origin.nominal, digest = origin.digest,},
         roots = rootIds,
         runtime = roots.preludeRuntime,
     }
