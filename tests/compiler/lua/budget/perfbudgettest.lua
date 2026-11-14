@@ -264,13 +264,18 @@ end
 
 --- Bytes the checker allocates checking every module of a `count`-module graph, with
 --- the collector held so that what is counted is what was allocated.
+---
+--- The persistent store is off. With it on, what was counted included reading and
+--- writing a store whose size is whatever ran before: a process worker gives every
+--- suite it runs one `NUPP_CACHE_DIR`, and the Windows shell lane counted 2.4 to 3.6
+--- MB a module against about 1 MB alone, varying with the suites that worker had run.
 local function checkerAllocation(count)
     local envMod = require("nupp.compiler.project.env")
     local parser = require("nupp.compiler.syntax.parser")
     local check = require("nupp.compiler.check")
     local dir = temporary()
     moduleGraph(dir, count)
-    local env = envMod.new(dir, {config = {include = {"src"}}})
+    local env = envMod.new(dir, {config = {include = {"src"}}, cache = false})
     collectgarbage()
     collectgarbage()
     collectgarbage("stop")

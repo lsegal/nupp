@@ -3074,10 +3074,17 @@ local function declarations(
     return hasMain
 end
 
---- Declares every C function the modules of a program call.
+--- Declares every C function the modules of a program call, each module's by
+--- name: `callees` is a hash table, whose order differs from run to run.
 local function declareForeign(module: builder.Module, programs: {Program}): nil
     for _, program in ipairs(programs) do
-        for _, callee in pairs(program.callees) do
+        local names: {string} = {}
+        for name in pairs(program.callees) do
+            names[#names + 1] = name
+        end
+        table.sort(names)
+        for _, name in ipairs(names) do
+            local callee = program.callees[name] as Callee
             if callee.foreign and callee.atomic == nil then
                 local params: {string} = {}
                 for index, kind in ipairs(callee.params) do
