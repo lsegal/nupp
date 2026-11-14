@@ -3027,7 +3027,14 @@ then
                     local processProgressFd = progressFd and (package.config:sub(1, 1) == "\\" and 2 or progressFd)
                         or nil
                     local progress = processProgressFd and ("NUPP_TEST_PROGRESS_FD=%d "):format(processProgressFd) or ""
-                    local fresh = executionLane == "isolated" and "NUPP_TEST_FRESH_QUEUE_PIECES=1 " or ""
+                    -- Shell suites run each in a process of its own too (#261). One
+                    -- long-lived shell worker kept what every suite it claimed left
+                    -- behind, and eight of them on a hosted runner added up to more
+                    -- memory than it has: Linux runners were shut down half an hour
+                    -- into the lane and macOS swapped until the job timed out.
+                    local fresh = (executionLane == "isolated" or executionLane == "shell")
+                        and "NUPP_TEST_FRESH_QUEUE_PIECES=1 "
+                        or ""
                     local invocation = rawget(_G, "__NUPP_TEST_RUNNER_COMMAND") or ("luajit '%s'"):format(arg[0])
                     local worker = (
                         "%s%s%s%s --json %s --color=%s%s"
