@@ -737,13 +737,10 @@ local supervisedPiece = os.getenv("NUPP_TEST_SUPERVISED_PIECE") == "1"
 -- few suites. `NUPP_TEST_WORKER_HEAP_MB` overrides it; 0 retires a state after
 -- every suite.
 local workerHeapLimit = (tonumber(os.getenv("NUPP_TEST_WORKER_HEAP_MB") or "") or 256) * 1024
--- A worker state collects once its heap reaches 1.2 times what was live after the
--- last collection, rather than LuaJIT's default of twice. Eight states each
--- carrying a doubled heap of garbage is most of what the shared lane holds:
--- measured at eight workers, this alone took the process from 8.8 GB to 6.3 GB
--- for about 2% more time.
-if embedded then
-    collectgarbage("setpause", 120)
+-- The collector pause the parent chose for this worker state, from what memory
+-- each of its states has to itself. See `workerPause` below.
+if embedded and rawget(_G, "__NUPP_TEST_GC_PAUSE") then
+    collectgarbage("setpause", rawget(_G, "__NUPP_TEST_GC_PAUSE"))
 end
 -- Set when this state stopped taking work for that reason.
 local retired = false
@@ -2372,6 +2369,36 @@ local function defaultJobs()
     return math.max(minimumJobs, found and found >= 1 and math.floor(found) or 1)
 end
 
+--- The machine's physical memory in bytes, or nil when it cannot be read.
+local function physicalMemory()
+    local handle = io.popen("sysctl -n hw.memsize 2>/dev/null || echo $(( $(getconf _PHYS_PAGES) * $(getconf PAGESIZE) ))")
+    local text = handle and handle:read("*l") or nil
+    if handle then
+        handle:close()
+    end
+    local found = tonumber(text or "")
+
+    return found and found > 0 and found or nil
+end
+
+--- The collector pause for Nupp worker states, or nil for LuaJIT's default.
+---
+--- At the default a state collects once its heap is twice what was live, and
+--- eight states peaked at about 1.1 GB each. Where a state has less than 1.5 GB
+--- of the machine to itself, 120 holds it to 1.2 times its live heap instead:
+--- on the 7 GB macOS runner the shared lane went from 4437 s to 823 s (#287).
+--- Not everywhere, because collecting that often costs kernel time: on the
+--- 16 GB Linux runner the same lane went from 613 s to 1047 s, most of it system
+--- time, for memory it had to spare.
+local function workerPause(workers)
+    local memory = physicalMemory()
+    if memory and workers > 0 and memory / workers < 1.5 * 1024 * 1024 * 1024 then
+        return 120
+    end
+
+    return nil
+end
+
 --- What the last run measured, so this one can start the slow work first.
 ---
 --- Suites are nothing like equal and nothing about a suite says in advance how long it
@@ -3158,6 +3185,7 @@ then
                 -- Keep inherited output quiet for the threaded phase; ordinary Lua
                 -- output is captured in its state, process-writing suites are in the
                 -- process-worker queues, and progress has its own saved descriptor.
+                local pause = workerPause(#lanes)
                 local restoreOutput = silenceProcessOutput()
                 -- Each lane gets a worker of its own rather than a share of the
                 -- pool. The pool is as wide as the machine has cores, so on a
@@ -3173,7 +3201,8 @@ then
                         progressFd,
                         verbose,
                         colorMode,
-                        suiteCatalog
+                        suiteCatalog,
+                        pause
                     )
                 end
                 local launched, problem = pcall(function()

@@ -944,6 +944,7 @@ function M.workerJobsRefillTheCanonicalArgvBetweenRuns()
         "__NUPP_TEST_PROGRESS_FD",
         "__NUPP_TEST_LANE_CACHE",
         "__NUPP_TEST_SUITE_CATALOG",
+        "__NUPP_TEST_GC_PAUSE",
     }
     local originals = {}
     for _, name in ipairs(names) do
@@ -955,7 +956,7 @@ function M.workerJobsRefillTheCanonicalArgvBetweenRuns()
             loadfile = function(path)
                 paths[#paths + 1] = path
                 return function()
-                    return {argument = argv[2], verbose = argv[4]}
+                    return {argument = argv[2], verbose = argv[4], pause = rawget(_G, "__NUPP_TEST_GC_PAUSE")}
                 end
             end
             rawset(argv, -17, "old interpreter token")
@@ -969,8 +970,10 @@ function M.workerJobsRefillTheCanonicalArgvBetweenRuns()
             test.eq(argv[50], nil)
             test.eq(rawget(argv, "oldJob"), nil)
 
-            local second = job.run("--queue=second", "second-cache", nil, false, "always", "second-catalog")
+            test.eq(first.pause, nil, "no pause leaves LuaJIT's default")
+            local second = job.run("--queue=second", "second-cache", nil, false, "always", "second-catalog", 120)
             test.eq(second.argument, "--queue=second")
+            test.eq(second.pause, 120, "the parent's collector pause reaches the job")
             test.eq(second.verbose, nil, "the prior job's optional token was removed")
             test.eq(argv[0], "tests/run.lua")
             test.eq(argv[1], "--json")

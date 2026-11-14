@@ -496,7 +496,9 @@ process, each on a thread of its own. A state keeps what the suites it ran
 leave behind. Once its suite is done and its live heap is over 256 MB, it stops
 taking work and a fresh state takes its place on the same queue.
 `NUPP_TEST_WORKER_HEAP_MB` names a different bound, and `0` gives every suite a
-fresh state.
+fresh state. Where the machine has less than 1.5 GB of memory for each worker,
+the states also collect garbage sooner, which holds each one closer to its
+live heap at some cost in time.
 
 Every lane a run selects shares that run's one build of the compiler, the test
 runner and the native provider. `--lane=isolated,shell` keeps two lanes, and
