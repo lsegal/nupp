@@ -216,7 +216,7 @@ aotsimdconditiontest aotsymboltest aotvectorfieldtest apiidentitytest builtinext
 effectregiontest effecttransporttest eventschecktest ownershiptest comptimetest
 deriveprovidertest materializeirtest cdeftest cheadertest importctest
 perfbudgettest cachestamptest declaredmoduletest incrementaltest parallelchecktest
-preludecachetest projectlinktest projecttest targetprofiletest annotatedluatest
+preludecachetest interningtest projectlinktest projecttest targetprofiletest annotatedluatest
 fixedwidthtest browserhosttest browserprovidertest browserworkerstest lua51compattest
 corpustest evalstest selfhosttest timerstest fleettest
 lpegtest ffitest nativefoundationstest rustabitest profiletest
@@ -233,7 +233,7 @@ clitest duplicateclitest coveragereporttest coveragetest clidoctest
 diagnosticgoldentest doctest examplestest explaintest homesampletest
 referencetest fmtclitest fmtcorpustest fmtimportstest fmttreetest
 associatedtoolingtest lspclitest lsptest repositoryscriptstest
-runnertest testtimingstest buildprogresstest buildtest
+runnertest testtimingstest compileservicetest buildprogresstest buildtest
 ]]
 ):gmatch("%S+") do
     scopes[name] = "integration"

@@ -193,4 +193,16 @@ function M.fusedJsonKeyCoversTheNativeBuilder()
     test(covered["native/aotruntime/common/ksrt/values.nupp"], "the fused-json key omits the runtime's values")
 end
 
+-- The fused pass runs every case of the compiled-decoder differential, so its
+-- ceiling must follow that suite even on hosts that cannot run the pass.
+function M.fusedJsonCeilingCountsEveryDifferentialCase()
+    local source = runner.read(ROOT .. "/tests/stdlib/serde/json/jsonfuseddifferentialtest.lua")
+    local count = 0
+    for _ in source:gmatch("\nfunction M%.[%w_]+%(") do
+        count = count + 1
+    end
+    test(count > 0, "found no compiled-decoder differential cases")
+    test.eq(WORK_CEILINGS["fused-json"].cases, count)
+end
+
 return M

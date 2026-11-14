@@ -63,7 +63,9 @@ end
 -- Keep command status separate from stdout. `--emit spirv` writes arbitrary binary,
 -- and a Windows text-mode pipe can translate it or treat Ctrl-Z as the end before a
 -- sentinel appended to that same stream. The artifact is always read in binary mode;
--- failed commands still put their ordinary diagnostic in the same file.
+-- failed commands still put their ordinary diagnostic in the same file. Spelled
+-- without a group, so the run's compile service can answer it
+-- (`nupp.tools.compileservice`).
 local function runOnce(dir, argv)
     local outputPath = dir .. "/.nupp-aot-output"
     local statusPath = dir .. "/.nupp-aot-status"
@@ -71,7 +73,7 @@ local function runOnce(dir, argv)
     os.remove(statusPath)
     os.execute(
         (
-            "cd %q && { NO_COLOR= '%s' aot %s > .nupp-aot-output 2>&1; code=$?; printf '%%s\\n' \"$code\" > .nupp-aot-status; }"
+            "cd %q && NO_COLOR= '%s' aot %s > .nupp-aot-output 2>&1; printf '%%s\\n' \"$?\" > .nupp-aot-status"
         ):format(dir, NUPP, argv)
     )
     local output = assert(io.open(outputPath, "rb"), "aot command wrote no output file")

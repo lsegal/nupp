@@ -101,10 +101,15 @@ function artifacts.install(s: artifacts.Session): artifacts.Api
     local function lower(doc: any, path: string, optLevel: integer, boundary: string?): (string?, {any}, string?)
         local collected: {any} = {}
         local compile = require("nupp.tools.cli.compile")
-        local env = require("nupp.compiler.project.env").new(s.currentRoot or ".")
+        local envMod = require("nupp.compiler.project.env")
+        -- The buffer's dependencies are read back from what the last compile in this
+        -- project checked, which is only correct while they are unchanged on disk:
+        -- `nupp.compiler.project.projectimage` checks that before trusting any.
+        local env = envMod.new(s.currentRoot or ".", {projectInterfaces = true})
         local settings = compile.settings({optLevel = tostring(optLevel)}, collected)
         settings.bytecodeBoundary = boundary
         local code, _, generated = compile.module(path, env, settings, nil, doc.text)
+        envMod.persist(env)
 
         return code, collected, generated
     end

@@ -10,12 +10,14 @@ export function run(
     progressFd: integer?,
     verbose: boolean,
     colorMode: string,
-    suiteCatalog: string
+    suiteCatalog: string,
+    gcPause: integer?
 ): any
     rawset(_G, "__NUPP_TEST_EMBEDDED", true)
     rawset(_G, "__NUPP_TEST_PROGRESS_FD", progressFd)
     rawset(_G, "__NUPP_TEST_LANE_CACHE", cacheDir)
     rawset(_G, "__NUPP_TEST_SUITE_CATALOG", suiteCatalog)
+    rawset(_G, "__NUPP_TEST_GC_PAUSE", gcPause)
 
     -- A Nupp worker is a Lua state inside this process. libc's popen walks and
     -- locks the process-wide stdio table; concurrent calls from worker states can
