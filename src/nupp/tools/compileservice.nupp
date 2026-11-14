@@ -21,16 +21,25 @@ at the descriptor level so that what the compiler, and anything it starts,
 writes lands where the shell would have put it.
 
 Only commands that are plainly a compiler invocation are taken: an optional `cd`,
-assignments, this checkout's `bin/nupp`, words, redirections of standard output
-and error to the pipe, a file or the null device, and a trailing `; echo ...$?` or
-`; printf FORMAT $?` that reports the status, which the service writes. Anything
-else the shell would have to interpret -- a pipe, a group, another expansion --
-still goes to the shell. So do the
-commands that are about the process rather than the compilation: `run` and `test`
-run programs, `lsp serve` and `watch` stay up, `bench`, `task`, `fixpoint` and
-`rock` start their own processes to measure or fetch. `build` and `clean` of this
-checkout itself are its own writers and keep the launcher's lock. Asking any of
-them for `--help`, listing tasks and a one-shot `lsp` query are still answered.
+assignments (a `PATH` one may extend the caller's `$PATH`), this checkout's
+`bin/nupp` or a bare `nupp` such a `PATH` finds there, words, redirections of
+standard output and error to the pipe, a file or the null device, and a trailing
+`; echo ...$?` or `; printf FORMAT $?` that reports the status, which the service
+writes. A caller holding an argv rather than a command line hands it over as it
+is. Anything else the shell would have to interpret -- a pipe, a group, another
+expansion -- still goes to the shell.
+
+`run` compiles and then runs a program in the same process, and the program keeps
+a process of its own (#218): the service starts it with the interpreter and entry
+the launcher would have, in the request's directory, environment and streams, so
+only the shell and the launcher are saved. A fresh state per request means the
+service has nothing warm to compile it with that the child does not. The
+commands that are about the process rather than the compilation still go to the
+shell: `test` runs a test run of its own, `lsp serve`, `watch` and `run --watch`
+stay up, `bench`, `task`, `fixpoint` and `rock` start their own processes to
+measure or fetch. `build` and `clean` of this checkout itself are its own writers
+and keep the launcher's lock. Asking any of them for `--help`, listing tasks and
+a one-shot `lsp` query are still answered.
 
 A service that dies or stops answering mid-request is stopped, and the request is
 answered by the shell after all, so a compiler crash is still attributed to the
@@ -84,29 +93,43 @@ local WRITERS: {[string]: boolean} = {build = true, clean = true}
 
 local HELP: {[string]: boolean} = {["--help"] = true, ["-h"] = true}
 
---- Whether a command line is one the service answers, and whether it is a request
---- for help, which writes nothing whatever command it names. `run` is the one
---- command whose later words can belong to the program it runs.
-local function answered(argv: {string}): (boolean, boolean)
+--- Whether a command line is one the service answers, whether it is a request
+--- for help, which writes nothing whatever command it names, and whether it
+--- starts a program, which the service starts as a process of its own. `run` is
+--- the one command whose later words can belong to the program it runs.
+local function answered(argv: {string}): (boolean, boolean, boolean)
     local name = argv[1] or ""
     local second, third = argv[2] or "", argv[3] or ""
     local help = HELP[second] or (name ~= "run" and second:sub(1, 1) ~= "-" and HELP[third] == true)
     if help or ANSWERED[name] then
-        return true, help == true
+        return true, help == true, false
     end
-    if name == "lsp" then
+    if name == "run" then
+        -- The program is the process's, as it is from the shell; only the shell
+        -- and the launcher in front of it are skipped. `--watch` stays up.
+        for index = 2, #argv do
+            local word = argv[index]
+            if word:sub(1, 1) ~= "-" then
+                break
+            elseif word == "--watch" then
+                return false, false, false
+            end
+        end
+
+        return true, false, true
+    elseif name == "lsp" then
         -- One answer each, unlike the server `lsp` and `lsp serve` start.
-        return second ~= "" and second ~= "serve" and second:sub(1, 1) ~= "-", false
+        return second ~= "" and second ~= "serve" and second:sub(1, 1) ~= "-", false, false
     elseif name == "task" then
         -- Listing the tasks runs none of them.
         for _, word in ipairs(argv) do
             if word == "--list" or word == "-l" then
-                return true, false
+                return true, false, false
             end
         end
     end
 
-    return false, false
+    return false, false, false
 end
 
 --- Joins strings into one frame body, each as its length, a colon and its bytes.
@@ -153,6 +176,11 @@ type compileservice.Command = {
     stdout: string,
     stderr: string,
 
+    --- Whether the words are already the ones the compiler receives, as an argv a
+    --- caller passed rather than read off a command line: on Windows nothing
+    --- about them is translated.
+    native: boolean?,
+
     --- What a trailing `; echo ...$?` or `; printf FORMAT $?` writes: its text,
     --- with `compileservice.STATUS` where the command's status goes, and where
     --- it goes, in the same terms as `stdout`. The shell then answers the
@@ -166,6 +194,21 @@ type compileservice.Command = {
 --- Where a status report's text carries the status.
 compileservice.STATUS = "\0?\0"
 
+--- Where a `PATH` assignment carries the caller's own search path, as in
+--- `PATH='dir':"$PATH"`.
+compileservice.PATH = "\0P\0"
+
+-- The length of `$PATH` or `${PATH}` at `index`, or nil for anything else.
+local function pathExpansion(command: string, index: integer): integer?
+    if command:sub(index, index + 6) == "${PATH}" then
+        return 7
+    elseif command:sub(index, index + 4) == "$PATH" and not command:sub(index + 5, index + 5):match("[%w_]") then
+        return 5
+    end
+
+    return nil
+end
+
 -- Unquoted characters the shell gives no meaning to.
 local function plain(char: string): boolean
     return char:match("^[%w%-_%./:=,+@%%^]$") ~= nil
@@ -173,8 +216,8 @@ end
 
 --- The words and operators of a command line, or nil for one that needs more of a
 --- shell than this reads. A word carries whether its leading name and `=` were
---- unquoted, which is what makes it an assignment. `$?` is the one expansion
---- read, and becomes `compileservice.STATUS`.
+--- unquoted, which is what makes it an assignment. `$?` and `$PATH` are the
+--- expansions read, and become `compileservice.STATUS` and `compileservice.PATH`.
 local function tokens(command: string): {any}?
     local list: {any} = {}
     local index: integer = 1
@@ -209,12 +252,17 @@ local function tokens(command: string): {any}?
                 if char == " " or char == "\t" or char == ";" or char == ">" then
                     break
                 elseif char == "$" then
-                    if command:sub(index + 1, index + 1) ~= "?" then
+                    local path = pathExpansion(command, index)
+                    unquoted = unquoted or #text
+                    if path ~= nil then
+                        text[#text + 1] = compileservice.PATH
+                        index = index + (path as integer)
+                    elseif command:sub(index + 1, index + 1) == "?" then
+                        text[#text + 1] = compileservice.STATUS
+                        index = index + 2
+                    else
                         return nil
                     end
-                    unquoted = unquoted or #text
-                    text[#text + 1] = compileservice.STATUS
-                    index = index + 2
                 elseif char == "'" then
                     unquoted = unquoted or #text
                     local close = command:find("'", index + 1, true)
@@ -236,6 +284,9 @@ local function tokens(command: string): {any}?
                         elseif inner == "$" and command:sub(index + 1, index + 1) == "?" then
                             text[#text + 1] = compileservice.STATUS
                             index = index + 2
+                        elseif inner == "$" and pathExpansion(command, index) ~= nil then
+                            text[#text + 1] = compileservice.PATH
+                            index = index + (pathExpansion(command, index) as integer)
                         elseif inner == "$" or inner == "`" then
                             return nil
                         elseif inner == "\\" then
@@ -298,9 +349,10 @@ function compileservice.withStatus(text: string, status: integer): string
     return table.concat(parts)
 end
 
--- Whether a word carries the status, which only a report may.
+-- Whether a word carries an expansion: the status, which only a report may, or
+-- the search path, which only a `PATH` assignment may.
 local function hasStatus(word: string): boolean
-    return word:find(compileservice.STATUS, 1, true) ~= nil
+    return word:find(compileservice.STATUS, 1, true) ~= nil or word:find(compileservice.PATH, 1, true) ~= nil
 end
 
 -- Where a redirection to `word` sends its stream.
@@ -371,6 +423,11 @@ local function readReport(list: {any}, first: integer, mode: string): {
         if words[1] ~= nil and words[1]:sub(1, 1) == "-" then
             return nil
         end
+        for _, word in ipairs(words) do
+            if word:find(compileservice.PATH, 1, true) then
+                return nil
+            end
+        end
 
         return {text = table.concat(words, " ") .. "\n", target = target}
     elseif name == "printf"
@@ -417,7 +474,7 @@ function compileservice.parse(command: string, mode: string): compileservice.Com
         if name == nil or list[at].unquoted < #name + 1 then
             break
         end
-        if hasStatus(word) then
+        if word:find(compileservice.STATUS, 1, true) or (name ~= "PATH" and hasStatus(word)) then
             return nil
         end
         env[#env + 1] = {name, word:sub(#name + 2)}
@@ -544,6 +601,50 @@ local function windowsWord(word: string): string?
     return converted
 end
 
+-- The entries of a search path a command assigned, in order, with
+-- `compileservice.PATH` standing alone where the caller's own goes. One read off a
+-- Git Bash command line is separated by colons, past a drive letter's; one a
+-- Windows caller passed as it is, by semicolons.
+local function pathEntries(value: string, translate: boolean?, forWindows: boolean?): {string}
+    local separator = forWindows and not translate and ";" or ":"
+    local entries: {string} = {}
+    local at: integer = 1
+    while at <= #value do
+        local from = at
+        if translate and value:match("^%a:[/\\]", at) then
+            at = at + 2
+        end
+        local stop = value:find(separator, at, true) or (#value + 1)
+        entries[#entries + 1] = value:sub(from, stop - 1)
+        at = stop + 1
+    end
+
+    return entries
+end
+
+-- The search path a `PATH` assignment gives the compiler: the caller's own where
+-- it was expanded, and on Windows each entry as a native program receives it.
+local function searchPathValue(value: string, translate: boolean?, forWindows: boolean?): string?
+    local parts: {string} = {}
+    for _, entry in ipairs(pathEntries(value, translate, forWindows)) do
+        if entry == compileservice.PATH then
+            parts[#parts + 1] = os.getenv("PATH") or ""
+        elseif entry:find(compileservice.PATH, 1, true) then
+            return nil
+        elseif translate then
+            local converted = windowsWord(entry)
+            if converted == nil then
+                return nil
+            end
+            parts[#parts + 1] = converted as string
+        else
+            parts[#parts + 1] = entry
+        end
+    end
+
+    return table.concat(parts, forWindows and ";" or ":")
+end
+
 --- The request a command makes of the service: the working directory, argv and
 --- environment, ready for the platform the compiler runs on. Nil when the command
 --- is not one the service answers.
@@ -551,20 +652,46 @@ end
 --- `root` is the checkout whose `bin/nupp` the service runs, and `cwd` the
 --- caller's own working directory, both normalized.
 function compileservice.request(command: compileservice.Command, root: string, cwd: string, forWindows: boolean?): any?
-    local executable = compileservice.normalize(command.executable, forWindows)
-    if not absolute(executable, forWindows) then
-        executable = compileservice.normalize(cwd .. "/" .. executable, forWindows)
-    end
+    local translate = forWindows and not command.native
     local expected = root .. "/bin/nupp"
-    if forWindows then
-        if executable:lower() ~= expected:lower() then
+
+    local function isCompiler(path: string): boolean
+        local executable = compileservice.normalize(path, forWindows)
+        if not absolute(executable, forWindows) then
+            executable = compileservice.normalize(cwd .. "/" .. executable, forWindows)
+        end
+
+        return forWindows and executable:lower() == expected:lower() or executable == expected
+    end
+
+    local searchPath: string? = nil
+    for _, pair in ipairs(command.env) do
+        if pair[1] == "PATH" then
+            searchPath = pair[2]
+        end
+    end
+    if command.executable:find("[/\\]") then
+        if not isCompiler(command.executable) then
             return nil
         end
-    elseif executable ~= expected then
-        return nil
+    else
+        -- A bare name is the compiler only when the command's own search path
+        -- reaches this checkout's `bin` before anything this cannot see.
+        local found = false
+        for _, entry in ipairs(searchPath and pathEntries(searchPath as string, translate, forWindows) or {}) do
+            if entry == "" or entry:find(compileservice.PATH, 1, true) then
+                break
+            elseif isCompiler(entry .. "/" .. command.executable) then
+                found = true
+                break
+            end
+        end
+        if not found then
+            return nil
+        end
     end
     local name = command.argv[1] or ""
-    local taken, help = answered(command.argv)
+    local taken, help, spawn = answered(command.argv)
     if not taken then
         return nil
     end
@@ -579,7 +706,7 @@ function compileservice.request(command: compileservice.Command, root: string, c
     end
     local argv: {string} = {}
     for index, word in ipairs(command.argv) do
-        if forWindows then
+        if translate then
             local converted = windowsWord(word)
             if converted == nil then
                 return nil
@@ -591,20 +718,21 @@ function compileservice.request(command: compileservice.Command, root: string, c
     end
     local env: {{string}} = {}
     for index, pair in ipairs(command.env) do
-        local value = pair[2]
-        if forWindows then
-            local converted = windowsWord(value)
-            if converted == nil then
-                return nil
-            end
-            value = converted
+        local value: string? = pair[2]
+        if pair[1] == "PATH" and (translate or pair[2]:find(compileservice.PATH, 1, true)) then
+            value = searchPathValue(pair[2], translate, forWindows)
+        elseif translate then
+            value = windowsWord(pair[2])
         end
-        env[index] = {pair[1], value}
+        if value == nil then
+            return nil
+        end
+        env[index] = {pair[1], value as string}
     end
 
     -- A redirection's file is a word like any other.
     local function target(disposition: string): string?
-        if forWindows and disposition:sub(1, 5) == "file:" then
+        if translate and disposition:sub(1, 5) == "file:" then
             local converted = windowsWord(disposition:sub(6))
 
             return converted and "file:" .. converted or nil
@@ -626,7 +754,7 @@ function compileservice.request(command: compileservice.Command, root: string, c
         return nil
     end
 
-    return {cwd = directory, argv = argv, env = env, stdout = stdout, stderr = stderr, report = report}
+    return {cwd = directory, argv = argv, env = env, stdout = stdout, stderr = stderr, report = report, spawn = spawn}
 end
 
 -- The C library calls both halves use, declared under names of their own so a
@@ -1002,6 +1130,30 @@ local function runFresh(interpreter: {string}, main: string, argv: {string}): (i
     return status, codegen
 end
 
+-- Starts a command that runs a program the way the launcher would have: the
+-- interpreter and entry this service was started with, as a process of its own
+-- that inherits the request's directory, environment and standard streams, and
+-- answers its exit status. Nil when it could not be started.
+local function spawned(interpreter: {string}, main: string, argv: {string}): integer?
+    local args: {string} = {}
+    for _, word in ipairs(interpreter) do
+        args[#args + 1] = word
+    end
+    args[#args + 1] = main
+    for _, word in ipairs(argv) do
+        args[#args + 1] = word
+    end
+    local native: any = require("nupp.runtime.standardio")
+    local child: any = native.popen(args, {stdin = "inherit", stdout = "inherit", stderr = "inherit"})
+    if child == nil then
+        return nil
+    end
+    local exit: any = child:wait()
+    child:close()
+
+    return exit.exitcode as integer
+end
+
 -- Ends this process now, without static destructors or finalizers.
 local function endNow(code: integer): nil
     local c = C()
@@ -1016,10 +1168,11 @@ end
 --- Serves requests from standard input until it closes.
 ---
 --- A request is `cwd`, the stdout and stderr targets, a status report's text,
---- file and `io.open` mode (all empty for none), the argument count and the
---- arguments, then name and value pairs to set in the environment for the
---- request. The response is the exit status, and `"end"` when the service
---- ends after answering.
+--- file and `io.open` mode (all empty for none), `"spawn"` for a command that
+--- starts a program (empty otherwise), the argument count and the arguments,
+--- then name and value pairs to set in the environment for the request. The
+--- response is the exit status, and `"end"` when the service ends after
+--- answering or `"declined"` when the caller is to run the command itself.
 function compileservice.serviceMain(): integer
     local library: any = ffiLibrary
     local c = C()
@@ -1042,18 +1195,19 @@ function compileservice.serviceMain(): integer
             return 0
         end
         local items = compileservice.unpack(body as string)
-        if items == nil or #items < 7 then
+        if items == nil or #items < 8 then
             return 2
         end
         local cwd, out, err = items[1], items[2], items[3]
         local reportText, reportPath, reportMode = items[4], items[5], items[6]
-        local count = (tonumber(items[7]) or 0) as integer
+        local spawn = items[7] == "spawn"
+        local count = (tonumber(items[8]) or 0) as integer
         local argv: {string} = {}
         for index = 1, count do
-            argv[index] = items[7 + index]
+            argv[index] = items[8 + index]
         end
         local assignments: {{any}} = {}
-        local at: integer = 8 + count
+        local at: integer = 9 + count
         while items[at] ~= nil do
             assignments[#assignments + 1] = {items[at], items[at + 1]}
             at = at + 2
@@ -1065,18 +1219,25 @@ function compileservice.serviceMain(): integer
         end
         local status: integer = 1
         local codegen = false
+        local declined = false
         if c.nuppcs_chdir(cwd) ~= 0 then
             local restore = redirect(out, err)
             io.stderr:write("cd: ", cwd, ": No such file or directory\n")
             restore()
         else
             local restore = redirect(out, err)
-            status, codegen = runFresh(interpreter, main, argv)
+            if spawn then
+                local started = spawned(interpreter, main, argv)
+                declined = started == nil
+                status = started or 1
+            else
+                status, codegen = runFresh(interpreter, main, argv)
+            end
             restore()
         end
         -- The status report, in the command's directory as the shell would have
         -- written it.
-        if reportPath ~= "" then
+        if reportPath ~= "" and not declined then
             local file = io.open(reportPath, reportMode)
             if file ~= nil then
                 file:write(compileservice.withStatus(reportText, status))
@@ -1089,7 +1250,14 @@ function compileservice.serviceMain(): integer
         if home ~= nil then
             c.nuppcs_chdir(home)
         end
-        if not writeAll(workerchannel.frame(compileservice.pack({tostring(status), codegen and "end" or ""}))) then
+        if not writeAll(
+            workerchannel.frame(
+                compileservice.pack({
+                    tostring(status),
+                    codegen and "end" or declined and "declined" or ""
+                })
+            )
+        ) then
             return 0
         end
         if codegen then
@@ -1156,9 +1324,21 @@ function compileservice.client(options: any): any
         return channel
     end
 
-    -- Sends one request and answers its status, or nil when the service failed it.
-    local function ask(request: any, out: string, err: string, report: {string}): integer?
-        local items: {string} = {request.cwd, out, err, report[1], report[2], report[3], tostring(#request.argv)}
+    -- Sends one request and answers its status, or nil when the service failed it
+    -- and whether it declined it instead.
+    local function ask(request: any, out: string, err: string, report: {string}): (integer?, boolean)
+        local items: {
+            string
+        } = {
+            request.cwd,
+            out,
+            err,
+            report[1],
+            report[2],
+            report[3],
+            request.spawn and "spawn" or "",
+            tostring(#request.argv)
+        }
         for _, word in ipairs(request.argv) do
             items[#items + 1] = word
         end
@@ -1168,18 +1348,21 @@ function compileservice.client(options: any): any
         end
         local current = start()
         if current == nil then
-            return nil
+            return nil, false
         end
         local text, _ = workerchannel.request(current, compileservice.pack(items), os.monotonic() + timeoutMs())
         if text == nil then
             stop(true)
-            return nil
+            return nil, false
         end
         local answer = compileservice.unpack(text as string)
         local status = answer and tonumber(answer[1]) or nil
         if status == nil then
             stop(true)
-            return nil
+            return nil, false
+        end
+        if answer ~= nil and answer[2] == "declined" then
+            return nil, true
         end
         -- A service that ends itself after answering (see `endNow`) is let go
         -- now, so the next request starts a new one rather than reaching this.
@@ -1187,7 +1370,7 @@ function compileservice.client(options: any): any
             stop(false)
         end
 
-        return status as integer
+        return status as integer, false
     end
 
     --- Runs a parsed command through the service. Answers the status the shell
@@ -1229,12 +1412,14 @@ function compileservice.client(options: any): any
             local named = request.report.target:sub(1, 5) == "file:"
             report = {request.report.text, target(request.report.target), named and "wb" or "ab"}
         end
-        local status = ask(request, out, err, report)
+        local status, declined = ask(request, out, err, report)
         if status == nil then
             for _, path in pairs(files) do
                 self.remove(path)
             end
-            fallen = fallen + 1
+            if not declined then
+                fallen = fallen + 1
+            end
             return nil, nil, nil, nil
         end
         routed = routed + 1

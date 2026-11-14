@@ -453,6 +453,97 @@ local function routedPopen(command, mode)
     return proxy
 end
 
+-- Suites start the compiler by argv too, through `nupp.compiler.process`:
+-- `process.capture({NUPP, "check", path}, {cwd = dir})`. The call is already the
+-- command the service would have read off a command line, so it goes through the
+-- same route as it is. A bounded or serviced child stays the caller's.
+local function routedArgv(argv, opts, mode)
+    if type(argv) ~= "table" or type(argv[1]) ~= "string" or not argv[1]:find("nupp", 1, true) then
+        return nil
+    end
+    opts = opts or {}
+    if opts.timeoutMs or opts.memoryMb or opts.pump or opts.cancelled or opts.replaceShell then
+        return nil
+    end
+    local client = compileServiceClient()
+    if not client then
+        return nil
+    end
+    local env, names = {}, {}
+    for name in pairs(opts.env or {}) do
+        names[#names + 1] = name
+    end
+    table.sort(names)
+    for _, name in ipairs(names) do
+        env[#env + 1] = {name, tostring(opts.env[name])}
+    end
+    local words = {}
+    for index = 2, #argv do
+        words[#words + 1] = tostring(argv[index])
+    end
+    local status, pipe, out, err = client:run({
+        cwd = opts.cwd,
+        env = env,
+        executable = argv[1],
+        argv = words,
+        stdout = mode,
+        stderr = mode == "pipe" and "pipe" or "err",
+        native = true,
+    })
+    if status == nil then
+        declined(table.concat(argv, " "))
+        return nil
+    end
+    client:forward(out, err)
+    local output = ""
+    if pipe then
+        local file = io.open(pipe, "rb")
+        if file then
+            output = file:read("*a") or ""
+            file:close()
+        end
+        os.remove(pipe)
+    end
+
+    return status, output
+end
+
+-- Put in front of the module's entry points before every case, as the suites may
+-- have loaded it, or put back an entry point of their own, since the last.
+local processRoutes = {}
+local isProcessRoute = setmetatable({}, {__mode = "k"})
+local function routeProcessCommands()
+    local process = package.loaded["nupp.compiler.process"]
+    if type(process) ~= "table" or rawget(_G, "__NUPP_TEST_EMBEDDED") or os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil then
+        return
+    end
+    local modes = {capture = "pipe", captureIsolated = "pipe", run = "out"}
+    for name, mode in pairs(modes) do
+        local underlying = process[name]
+        if isProcessRoute[underlying] then
+            processRoutes[name] = underlying
+        elseif type(underlying) == "function" then
+            processRoutes[name] = function(argv, opts)
+                local caller = debug.getinfo(2, "S")
+                if caller and startedByTests((caller.source:gsub("\\", "/"))) then
+                    local status, output = routedArgv(argv, opts, mode)
+                    if status ~= nil then
+                        if mode == "out" then
+                            return status
+                        end
+
+                        return status, output
+                    end
+                end
+
+                return underlying(argv, opts)
+            end
+            isProcessRoute[processRoutes[name]] = true
+            process[name] = processRoutes[name]
+        end
+    end
+end
+
 -- POSIX suites reach the shell through the interpreter's own functions, which the
 -- runtime's I/O module replaces the first time anything loads it. So the route is
 -- put back in front before every case rather than once, and only over the
@@ -2215,6 +2306,7 @@ end
 -- cleanup failure as the useful second half of the report.
 local function runCase(hooks, fn)
     routeCompileCommands()
+    routeProcessCommands()
     local ok, problem = call(hooks.beforeEach)
     if ok then
         ok, problem = call(fn)
