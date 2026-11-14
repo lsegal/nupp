@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- On ARM64, a 64-bit shift by a 64-bit constant count, such as
+  `x ~ (x << 1ULL)`, keeps its count once LuaJIT traces it. The traced code
+  shifted by zero instead, so `math.u64.prefixxor(1)` could answer `0ULL` on
+  Apple silicon and ARM64 Linux.
 - `nupp test` starts at least eight workers by default, one per processor on
   machines with more. A four-core machine used to run four suites at once and
   now runs eight. `--jobs=N` still sets the count explicitly.

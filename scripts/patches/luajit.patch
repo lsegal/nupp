@@ -85,3 +85,34 @@ Create and unlink the temporary file without changing signals.
  #else
    iof->fp = tmpfile();
  #endif
+
+The backends fuse a constant shift into the operand of an arithmetic or
+logic instruction (ARM64: `eor x, a, b, lsl #k`) and read the count as
+IR(op2)->i. A 64 bit count such as `x << 1ULL` is a KINT64, whose op12 is 0,
+so the shift was dropped once traced: `x ~ (x << 1ULL)` became 0. Fold such a
+count to a 32 bit constant before anything fuses it.
+
+--- a/src/lj_opt_fold.c
++++ b/src/lj_opt_fold.c
+@@ -1633,6 +1633,21 @@
+   return NEXTFOLD;
+ }
+ 
++/* A 64 bit constant shift count, e.g. x << 1ULL. The backends' fused shift
++** operands read the count as IR(op2)->i, which is 0 for a KINT64.
++*/
++LJFOLD(BSHL any KINT64)
++LJFOLD(BSHR any KINT64)
++LJFOLD(BSAR any KINT64)
++LJFOLD(BROL any KINT64)
++LJFOLD(BROR any KINT64)
++LJFOLDF(simplify_shift_ik64)
++{
++  int32_t mask = irt_is64(fins->t) ? 63 : 31;
++  fins->op2 = (IRRef1)lj_ir_kint(J, (int32_t)(ir_k64(fright)->u64 & mask));
++  return RETRYFOLD;
++}
++
+ LJFOLD(BSHL any BAND)
+ LJFOLD(BSHR any BAND)
+ LJFOLD(BSAR any BAND)

@@ -1425,6 +1425,13 @@ function M.luaJitBuildPatchesOnlyItsPrivateSourceCopy()
         .. "#if LJ_TARGET_PS3 || LJ_TARGET_PS4 || LJ_TARGET_PS5 || LJ_TARGET_PSVITA || LJ_TARGET_NX\n"
         .. "  iof->fp = NULL; errno = ENOSYS;\n#else\n  iof->fp = tmpfile();\n#endif\n"
     write(source .. "/src/lib_io.c", ioSource)
+    -- The 64-bit shift-count fold goes in after the 32-bit one, at line 1633.
+    local fold = string.rep(
+        "\n",
+        1632
+    )
+        .. "  return NEXTFOLD;\n}\n\nLJFOLD(BSHL any BAND)\nLJFOLD(BSHR any BAND)\nLJFOLD(BSAR any BAND)\n"
+    write(source .. "/src/lj_opt_fold.c", fold)
     local make = directory .. "/fake-make"
     write(
         make,
@@ -1444,6 +1451,7 @@ grep -F 'lj_ir_type_size[irt_type((t))]' "$tree/src/lj_ir.h" >/dev/null
 grep -F '|  mov PC, RC' "$tree/src/vm_arm64.dasc" >/dev/null
 grep -F 'static FILE *io_tmpfile_open(void)' "$tree/src/lib_io.c" >/dev/null
 grep -F 'iof->fp = io_tmpfile_open();' "$tree/src/lib_io.c" >/dev/null
+grep -F 'LJFOLDF(simplify_shift_ik64)' "$tree/src/lj_opt_fold.c" >/dev/null
 printf 'private\n' > "$tree/private-build-marker"
 if [ "$mode" = build ]; then
     : > "$tree/src/libluajit.a"
@@ -1474,6 +1482,7 @@ fi
     assert(read(source .. "/src/lj_ir.h") == header, "the shared verified source was patched")
     assert(read(source .. "/src/vm_arm64.dasc") == vm, "the shared verified VM source was patched")
     assert(read(source .. "/src/lib_io.c") == ioSource, "the shared verified I/O source was patched")
+    assert(read(source .. "/src/lj_opt_fold.c") == fold, "the shared verified fold source was patched")
     assert(not io.open(source .. "/private-build-marker", "rb"), "make wrote into the shared verified source")
 end
 
