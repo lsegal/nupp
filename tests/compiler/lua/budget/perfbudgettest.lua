@@ -384,4 +384,68 @@ function M.aStampedHelloWorldStaysSmall()
     )
 end
 
+-- What one compiler process holds compiling and running one test program (#250). The
+-- test lanes run at least eight workers wide on the strength of this bound (#252), so
+-- it growing back is what would make that unaffordable. A command reports its own
+-- peak resident set when `NUPP_PEAK_MEMORY_FILE` names a file, which reads the same
+-- however busy the machine is. It was 72-81 MB on the Linux, macOS and Windows
+-- runners when this was set; the bound is the requirement, not a snapshot.
+local SINGLE_COMPILE_PEAK_BYTES = 200 * 1024 * 1024
+
+function M.aSingleTestProgramCompileStaysUnderItsMemoryBudget()
+    local dir = temporary()
+    writeFile(
+        dir .. "/main.nupp",
+        table.concat({
+            "local type Point = {x: number, y: number}",
+            "",
+            "local function distance(a: Point, b: Point): number",
+            "    local dx, dy = a.x - b.x, a.y - b.y",
+            "    return math.sqrt(dx * dx + dy * dy)",
+            "end",
+            "",
+            "local points: {Point} = {}",
+            "for i = 1, 100 do",
+            "    points[#points + 1] = {x = i, y = i * 2}",
+            "end",
+            "local total = 0",
+            "for i = 2, #points do",
+            "    total = total + distance(points[i - 1], points[i])",
+            "end",
+            'print(string.format("%.3f", total))',
+            "",
+        }, "\n")
+    )
+    -- Named with backslashes on Windows: the harness rewrites a drive-letter path in a
+    -- command into the shell's spelling, and the compiler reading it is not the shell.
+    local peaks = dir .. "/peaks.tsv"
+    local named = package.config:sub(1, 1) == "\\" and peaks:gsub("/", "\\") or peaks
+    -- Once first, so the run measured reads the checked prelude back the way every
+    -- command in a lane after the first does, rather than checking it.
+    run(dir, "run main.nupp")
+    local env = ("NUPP_PEAK_MEMORY_FILE='%s' "):format(named)
+    local pipe = assert(io.popen(("cd '%s' && %s'%s' run main.nupp 2>&1"):format(dir, env, NUPP)))
+    local out = pipe:read("*a"):gsub("\r", "")
+    pipe:close()
+    local reported = readFile(peaks) or ""
+    os.execute("rm -rf '" .. dir .. "'")
+
+    assert(out:find("221.371", 1, true), "the program did not run: " .. out)
+    local peak = nil
+    for line in reported:gmatch("[^\n]+") do
+        local bytes, arguments = line:match("^(%d+)\t(.*)$")
+        if arguments and arguments:match("^run ") then
+            peak = tonumber(bytes)
+        end
+    end
+    assert(peak, "the compiler reported no peak: " .. reported)
+    assert(
+        peak <= SINGLE_COMPILE_PEAK_BYTES,
+        ("compiling and running one test program peaked at %.1f MB, over the budget of %.1f MB"):format(
+            peak / 1048576,
+            SINGLE_COMPILE_PEAK_BYTES / 1048576
+        )
+    )
+end
+
 return M

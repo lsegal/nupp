@@ -44,3 +44,7 @@
   (`cacheEligiblePackages`, `cacheHitRate`) beside the cached count, and CI
   run IDs, the commit SHA and `ACTIONS_*` tokens no longer change a result's
   fingerprint, so one CI run can reuse another's passes.
+- Every `nupp` process appends its peak resident memory and its arguments to
+  the file `NUPP_PEAK_MEMORY_FILE` names, when it is set.
+- On Windows, the first progress line of a build is no longer dropped when the
+  build starts early in its process.

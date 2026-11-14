@@ -484,6 +484,13 @@ nupp test --jobs=shell:2  # two workers for the shell lane, the default for the 
 nupp test checktest       # one named suite, one process
 ```
 
+A worker's memory is mostly the suite it runs, not the compiler. One compiler
+process compiling and running a test program peaks under 200 MB, and
+`perfbudgettest` holds it there. To see where a run's memory goes, set
+`NUPP_PEAK_MEMORY_FILE` to a file. Every `nupp` process, including each test
+worker, appends one line to it as it exits: its peak resident memory in bytes,
+a tab, and its arguments.
+
 Every lane a run selects shares that run's one build of the compiler, the test
 runner and the native provider. `--lane=isolated,shell` keeps two lanes, and
 `--jobs=LANE:N` sizes one lane without splitting it into a run of its own, which
