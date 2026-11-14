@@ -821,6 +821,7 @@ char *nuppcs_getcwd(char *, unsigned long) __asm__("getcwd");
 int nuppcs_setenv(const char *, const char *, int) __asm__("setenv");
 int nuppcs_unsetenv(const char *) __asm__("unsetenv");
 void nuppcs_exit(int) __asm__("_exit");
+int nuppcs_waitpid(int, int *, int) __asm__("waitpid");
 ]]
             )
         end
@@ -1172,6 +1173,25 @@ local function spawned(interpreter: {string}, main: string, argv: {string}): int
     return exit.exitcode as integer
 end
 
+-- Collects the children a request's state left behind. The process provider
+-- kills a child it closes and, when the child has not died yet, keeps its pid to
+-- collect later -- in the state, which closes with the request. A cold process
+-- leaves those to init when it exits; this one lives on, so every comptime
+-- worker a request started stayed a zombie until the service ended. Windows has
+-- none to collect.
+local function reapChildren(): nil
+    if windows then
+        return
+    end
+    local library: any = ffiLibrary
+    local c = C()
+    local status = library.new("int[1]")
+    -- WNOHANG: only the ones that have already ended.
+    while c.nuppcs_waitpid(-1, status, 1) > 0 do
+        status[0] = 0
+    end
+end
+
 -- Ends this process now, without static destructors or finalizers.
 local function endNow(code: integer): nil
     local c = C()
@@ -1252,6 +1272,7 @@ function compileservice.serviceMain(): integer
                 status, codegen = runFresh(interpreter, main, argv)
             end
             restore()
+            reapChildren()
         end
         -- The status report, in the command's directory as the shell would have
         -- written it.
