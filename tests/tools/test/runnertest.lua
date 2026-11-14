@@ -1290,6 +1290,35 @@ return M
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- Hosted runners report three or four processors, so one worker per processor
+-- left every CI lane narrower than eight. The machine here is made to report two,
+-- and a run with no `--jobs` still has to start eight workers for nine suites.
+function M.defaultWorkerCountHasAFloorOfEight()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/bin")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+    write(dir .. "/bin/getconf", "#!/bin/sh\necho 2\n")
+    write(dir .. "/bin/getconf.cmd", "@echo 2\r\n")
+    assert(os.execute("chmod +x " .. string.format("%q", dir .. "/bin/getconf")) == 0)
+    for index = 1, 9 do
+        write(
+            ("%s/tests/floor%dtest.lua"):format(dir, index),
+            'local M = {}\nfunction M.only() assert(os.execute("exit 0") == 0) end\nreturn M\n'
+        )
+    end
+    local command = (
+        'cd %q && PATH=%q:"$PATH" %sNUPP_TEST_BUILD=%q %q --lane=shell --timings=0 --no-color 2>&1'
+    ):format(dir, dir .. "/bin", MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+    local output, invocation = capturedRun(command)
+    test.eq(invocation.status, 0, "the nine shell suites succeeded" .. evidence(invocation))
+    test.matches(output, "9 shell suites across 8 process workers")
+    test.matches(output, "9 tests, 9 passed")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 function M.workerHostColorsOnlyWhenAskedDownAPipe()
     local colored, coloredRun = runWorkerHost("lexertest --timings=0 --color=always")
     test(colored:find("\27[", 1, true), "--color=always paints runner output" .. evidence(coloredRun))

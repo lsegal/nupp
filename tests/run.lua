@@ -2116,7 +2116,18 @@ end
 -- coverage is collected -- the shards would race each other for the one counter file
 -- that `NUPP_COVERAGE_FILE` names.
 
---- How many workers to make by default: one per processor.
+--- The fewest workers a run makes by default, whatever the machine reports.
+---
+--- Hosted CI runners report three or four processors, and one per core on those
+--- left every lane four wide or narrower. A worker spends most of its time waiting
+--- on child processes -- compiles, links, the programs it runs -- rather than on a
+--- processor, so eight is the floor on every machine and every lane. A memory
+--- footprint that cannot hold eight workers is a footprint to fix (#250), not a
+--- reason to lower this. `--jobs=N` still overrides it for a run that wants fewer.
+local minimumJobs = 8
+
+--- How many workers to make by default: one per processor, and never fewer than
+--- `minimumJobs`.
 ---
 --- It was two per processor, from a measurement on eight cores -- 71s at one per
 --- core, 63s at two. That machine no longer stands for this one. On eighteen
@@ -2128,51 +2139,15 @@ end
 --- full runs drifted from 70s to 120s at settings that should not have differed,
 --- so run order swamped the effect. One per core is the setting that does not
 --- oversubscribe, and `--jobs=N` is there for a machine that wants otherwise.
----
---- Memory caps it too, from measurement rather than from fear (#250). The compiler is
---- not what a worker spends memory on: one compiling a test program peaked at 72-81 MB
---- on all three hosted platforms, and an AOT build child at 97-160 MB. A worker's peak
---- is the suite it is running. Process workers run each suite in a fresh process, and
---- the largest one measured on its own was 2.25 GB; four Nupp workers share one
---- process, which peaked at 8.8-9.3 GB, about 2.3 GB each. So a machine runs as many
---- as fit three quarters of its physical memory at the figure below. That is every
---- core on the 16 GB Linux and Windows runners and two of three on the 7 GB macOS one,
---- where three Nupp workers swapped until the job timed out.
-local WORKER_PEAK_BYTES = 2.5 * 1024 * 1024 * 1024
-
-local function commandLine(command)
-    local handle = io.popen(command .. " 2>/dev/null")
+local function defaultJobs()
+    local handle = io.popen("getconf _NPROCESSORS_ONLN 2>/dev/null")
     local text = handle and handle:read("*l") or nil
     if handle then
         handle:close()
     end
+    local found = tonumber(text or "")
 
-    return text
-end
-
---- Physical memory in bytes, or nil where nothing answers.
----
---- `/proc/meminfo` is Linux's, and Git Bash on Windows provides one too; macOS says
---- through `sysctl`. Read through the shell, because on Windows the file is Git Bash's
---- and LuaJIT cannot open it.
-local function physicalMemory()
-    local kilobytes = tonumber((commandLine("cat /proc/meminfo") or ""):match("MemTotal:%s*(%d+)") or "")
-    if kilobytes then
-        return kilobytes * 1024
-    end
-
-    return tonumber(commandLine("sysctl -n hw.memsize") or "")
-end
-
-local function defaultJobs()
-    local found = tonumber(commandLine("getconf _NPROCESSORS_ONLN") or "")
-    local cores = found and found >= 1 and math.floor(found) or 4
-    local memory = physicalMemory()
-    if not memory then
-        return cores
-    end
-
-    return math.max(1, math.min(cores, math.floor(memory * 0.75 / WORKER_PEAK_BYTES)))
+    return math.max(minimumJobs, found and found >= 1 and math.floor(found) or 1)
 end
 
 --- What the last run measured, so this one can start the slow work first.
@@ -3058,14 +3033,7 @@ then
                     local processProgressFd = progressFd and (package.config:sub(1, 1) == "\\" and 2 or progressFd)
                         or nil
                     local progress = processProgressFd and ("NUPP_TEST_PROGRESS_FD=%d "):format(processProgressFd) or ""
-                    -- Shell suites run each in a process of its own too. In one long-lived
-                    -- worker they added up: on a Linux runner two shell workers grew to
-                    -- 6-7 GB each and the runner ran out of memory, where no suite on its
-                    -- own comes near that (#250). A fresh process per suite holds a worker
-                    -- to the largest single suite, which is what its count is sized from.
-                    local fresh = (executionLane == "isolated" or executionLane == "shell")
-                        and "NUPP_TEST_FRESH_QUEUE_PIECES=1 "
-                        or ""
+                    local fresh = executionLane == "isolated" and "NUPP_TEST_FRESH_QUEUE_PIECES=1 " or ""
                     local invocation = rawget(_G, "__NUPP_TEST_RUNNER_COMMAND") or ("luajit '%s'"):format(arg[0])
                     local worker = (
                         "%s%s%s%s --json %s --color=%s%s"

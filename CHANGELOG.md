@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `nupp test` starts at least eight workers by default, one per processor on
+  machines with more. A four-core machine used to run four suites at once and
+  now runs eight. `--jobs=N` still sets the count explicitly.
 - Nupp is self-hosted: building it from a checkout no longer needs Rust or a
   C++ compiler. Every crate of the former Rust workspace -- the native
   provider, the executable host and embedding SDK, the filesystem, process,
@@ -41,12 +44,6 @@
   (`cacheEligiblePackages`, `cacheHitRate`) beside the cached count, and CI
   run IDs, the commit SHA and `ACTIONS_*` tokens no longer change a result's
   fingerprint, so one CI run can reuse another's passes.
-- `nupp test` sizes each lane from the machine's memory as well as its cores,
-  and runs shell suites each in a fresh process, so a worker no longer grows
-  across suites. On this repository's suite a shell worker used to grow to 5-7
-  GB, which ran a 16 GB Linux runner out of memory at two workers. It now
-  stays near 100 MB, and four workers finish the Windows shell lane in about
-  two thirds of the time two did.
 - Every `nupp` process appends its peak resident memory and its arguments to
   the file `NUPP_PEAK_MEMORY_FILE` names, when it is set.
 - On Windows, the first progress line of a build is no longer dropped when the
