@@ -217,7 +217,7 @@ local function persistently(command)
     return run(command)
 end
 
-local function corrupted(name, bytes, out, status)
+local function corrupted(name, written, out, status)
     if status == KILLED then
         if jit.os == "OSX" then
             -- A signed macOS binary is authenticated before `main`. Damage to the
@@ -242,7 +242,17 @@ local function corrupted(name, bytes, out, status)
     -- recognition and the stub fell back to being an interpreter, which then has
     -- no such file to run. Both say so, under the name of the thing that failed.
     assert(out:match("nupp[%-%a]*:"), ("%s: nothing that names the tool said what was wrong:\n%s"):format(name, out))
-    assert(#bytes > 0, name .. ": nothing was written")
+    assert(written > 0, name .. ": nothing was written")
+end
+
+-- Writes `bytes` from `from` to `to` a slice at a time, so a prefix of the binary is
+-- never one more whole copy of it.
+local SLICE = 1048576
+
+local function writeRange(file, bytes, from, to)
+    for at = from, to, SLICE do
+        file:write(bytes:sub(at, math.min(at + SLICE - 1, to)))
+    end
 end
 
 --- Every way of damaging a stamped binary that this test knows how to make.
@@ -250,9 +260,10 @@ end
 --- All of them are inside the payload or the trailer. Rewriting the stub's own
 --- machine code would be fuzzing the linker.
 ---
---- A case says how to damage the binary rather than holding the damaged copy, and
---- `make` builds that copy when the case runs: twenty whole copies of a stamped
---- binary held at once were most of this suite's 2.85 GB peak (#266).
+--- A case writes its damaged copy into an open file -- the binary, then the
+--- damage written over it -- rather than building that copy as a string. Twenty
+--- copies of the 88 MB stamped binary built up front, and then the garbage of
+--- building them one at a time, were what this suite's 2.3-2.85 GB peak was (#266).
 local function damage(bytes, pick)
     local offset, trailerAt = payloadOffset(bytes)
     local cases = {}
@@ -262,8 +273,10 @@ local function damage(bytes, pick)
             #cases + 1
         ] = {
             name = name,
-            make = function()
-                return bytes:sub(1, at - 1) .. string.char(byte) .. bytes:sub(at + 1)
+            write = function(file)
+                file:write(bytes)
+                file:seek("set", at - 1)
+                file:write(string.char(byte))
             end,
         }
     end
@@ -287,8 +300,8 @@ local function damage(bytes, pick)
             #cases + 1
         ] = {
             name = "a file truncated at " .. at,
-            make = function()
-                return bytes:sub(1, at)
+            write = function(file)
+                writeRange(file, bytes, 1, at)
             end,
         }
     end
@@ -296,16 +309,18 @@ local function damage(bytes, pick)
         #cases + 1
     ] = {
         name = "bytes appended after the trailer",
-        make = function()
-            return bytes .. string.rep("\0", 32)
+        write = function(file)
+            file:write(bytes, string.rep("\0", 32))
         end,
     }
     cases[
         #cases + 1
     ] = {
         name = "a trailer with its magic removed",
-        make = function()
-            return bytes:sub(1, trailerAt) .. "XXXXXXXX" .. bytes:sub(trailerAt + 9)
+        write = function(file)
+            file:write(bytes)
+            file:seek("set", trailerAt)
+            file:write("XXXXXXXX")
         end,
     }
 
@@ -331,11 +346,13 @@ function M.damageIsDiagnosedRatherThanRun()
     local cases = damage(bytes, sequence(20260811))
     assert(#cases >= 20, "the sweep stopped generating cases")
     for _, case in ipairs(cases) do
-        local damaged = case.make()
-        writeFile(copy, damaged)
+        local file = assert(io.open(copy, "wb"))
+        case.write(file)
+        local written = file:seek("end")
+        file:close()
         assert(os.execute("chmod +x '" .. copy .. "'") == 0)
         local out, status = persistently(("'%s' explain NUPP2001"):format(copy))
-        corrupted(case.name, damaged, out, status)
+        corrupted(case.name, written, out, status)
     end
     os.execute("rm -rf '" .. dir .. "'")
 end
