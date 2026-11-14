@@ -349,6 +349,12 @@ local function compileServiceClient()
     return compileService or nil
 end
 
+-- How many commands the service has answered, for its own suite to tell which
+-- route a command took.
+rawset(_G, "__NUPP_TEST_COMPILE_SERVICE_COUNTS", function()
+    return compileService and (compileService:counts()) or 0
+end)
+
 -- What `os.execute` itself answers for an exit status: Lua 5.2's triple when the
 -- interpreter was built for it, otherwise the C library's `system` status,
 -- which on POSIX is a wait status.

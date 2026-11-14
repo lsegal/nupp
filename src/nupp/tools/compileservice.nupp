@@ -47,7 +47,9 @@ local windows = package.config:sub(1, 1) == "\\"
 local MAX_FRAME: integer = 1048576
 
 --- Commands the service answers. Everything else keeps its own process.
-local ANSWERED: {[string]: boolean} = {
+local ANSWERED: {
+    [string]: boolean
+} = {
     [""] = true,
     ["-h"] = true,
     ["--help"] = true,
@@ -426,7 +428,9 @@ local function C(): any
     if not ffiDeclared then
         ffiDeclared = true
         if windows then
-            pcall(library.cdef, [[
+            pcall(
+                library.cdef,
+                [[
 int nuppcs_dup(int) __asm__("_dup");
 int nuppcs_dup2(int, int) __asm__("_dup2");
 int nuppcs_open(const char *, int, int) __asm__("_open");
@@ -442,9 +446,12 @@ void *nuppcs_GetStdHandle(uint32_t) __asm__("GetStdHandle");
 int nuppcs_SetStdHandle(uint32_t, void *) __asm__("SetStdHandle");
 void *nuppcs_GetCurrentProcess(void) __asm__("GetCurrentProcess");
 int nuppcs_TerminateProcess(void *, unsigned int) __asm__("TerminateProcess");
-]])
+]]
+            )
         else
-            pcall(library.cdef, [[
+            pcall(
+                library.cdef,
+                [[
 int nuppcs_dup(int) __asm__("dup");
 int nuppcs_dup2(int, int) __asm__("dup2");
 int nuppcs_open(const char *, int, int) __asm__("open");
@@ -457,9 +464,12 @@ char *nuppcs_getcwd(char *, unsigned long) __asm__("getcwd");
 int nuppcs_setenv(const char *, const char *, int) __asm__("setenv");
 int nuppcs_unsetenv(const char *) __asm__("unsetenv");
 void nuppcs_exit(int) __asm__("_exit");
-]])
+]]
+            )
         end
-        pcall(library.cdef, [[
+        pcall(
+            library.cdef,
+            [[
 void *nuppcs_newstate(void) __asm__("luaL_newstate");
 void nuppcs_openlibs(void *) __asm__("luaL_openlibs");
 int nuppcs_loadbuffer(void *, const char *, size_t, const char *) __asm__("luaL_loadbuffer");
@@ -468,7 +478,8 @@ ptrdiff_t nuppcs_tointeger(void *, int) __asm__("lua_tointeger");
 int nuppcs_toboolean(void *, int) __asm__("lua_toboolean");
 const char *nuppcs_tolstring(void *, int, size_t *) __asm__("lua_tolstring");
 void nuppcs_close_state(void *) __asm__("lua_close");
-]])
+]]
+        )
     end
 
     return library.C
@@ -686,13 +697,19 @@ local function redirect(out: string, err: string): function(): nil
     local saved = {c.nuppcs_dup(0), c.nuppcs_dup(1), c.nuppcs_dup(2)}
     local handles: {any} = {}
     if windows then
-        handles = {c.nuppcs_GetStdHandle(0xFFFFFFF6), c.nuppcs_GetStdHandle(0xFFFFFFF5), c.nuppcs_GetStdHandle(0xFFFFFFF4)}
+        handles = {
+            c.nuppcs_GetStdHandle(0xFFFFFFF6),
+            c.nuppcs_GetStdHandle(0xFFFFFFF5),
+            c.nuppcs_GetStdHandle(0xFFFFFFF4)
+        }
     end
+
     local function openFor(target: string): integer
         local path = target == "null" and nullDevice() or target
 
         return c.nuppcs_open(path, writeFlags(), 438) as integer
     end
+
     local input = c.nuppcs_open(nullDevice(), windows and 0x8000 or 0, 0) as integer
     local output = openFor(out)
     local errors = err == "stdout" and output or openFor(err)
@@ -739,6 +756,7 @@ local function runFresh(interpreter: {string}, main: string, argv: {string}): (i
         return 1, false
     end
     c.nuppcs_openlibs(state)
+
     local function quoted(list: {string}): string
         local parts: {string} = {}
         for _, value in ipairs(list) do
@@ -747,11 +765,13 @@ local function runFresh(interpreter: {string}, main: string, argv: {string}): (i
 
         return "{" .. table.concat(parts, ",") .. "}"
     end
+
     local chunk = ("return (function(...) %s end)(%q, %s, %s)"):format(ENTRY, main, quoted(interpreter), quoted(argv))
     local status: integer = 1
     local codegen = false
     if c.nuppcs_loadbuffer(state, chunk, #chunk, "=nupp compile service") ~= 0
-        or c.nuppcs_pcall(state, 0, 2, 0) ~= 0 then
+        or c.nuppcs_pcall(state, 0, 2, 0) ~= 0
+    then
         local size = library.new("size_t[1]")
         local message = c.nuppcs_tolstring(state, -1, size)
         local text = message ~= nil and library.string(message, size[0]) or "unknown error"
@@ -961,6 +981,7 @@ function compileservice.client(options: any): any
             return nil, nil, nil, nil
         end
         local files: {[string]: string} = {}
+
         local function target(disposition: string): string
             if disposition == "null" then
                 return "null"
@@ -970,6 +991,7 @@ function compileservice.client(options: any): any
 
             return path
         end
+
         local out = target(command.stdout)
         local err = target(command.stderr)
         if err == out and err ~= "null" then
