@@ -8,6 +8,10 @@
   program that requires `serde.json` went from about 300 MB and 24 s to about
   110 MB and 5 s on Windows once warm. `NUPP_NO_STDLIB_CACHE` turns the cache
   off.
+- On ARM64, a 64-bit shift by a 64-bit constant count, such as
+  `x ~ (x << 1ULL)`, keeps its count once LuaJIT traces it. The traced code
+  shifted by zero instead, so `math.u64.prefixxor(1)` could answer `0ULL` on
+  Apple silicon and ARM64 Linux.
 - `nupp test` starts at least eight workers by default, one per processor on
   machines with more. A four-core machine used to run four suites at once and
   now runs eight. `--jobs=N` still sets the count explicitly.
@@ -30,6 +34,11 @@
   bit. Under a MinGW LuaJIT built against `msvcrt.dll`, `0.3 ^ 3` was
   `0.026999999999999996` compiled and `0.027` in Lua. A native build on
   Windows also no longer crashes now and then while it sets up LLVM.
+- `nupp build` and `nupp check` use a fraction of the memory they did. A build
+  kept every module's checked syntax tree until it finished, so a cold build of
+  this repository's test runner peaked at 4 to 6 GB; each tree is now let go
+  once its module is generated, and the same build peaks under 1 GB.
+  `nupp build --json` reports the build's peak in `timing.peakBytes`.
 - `nupp test` builds the code under test in a child process, so it no longer
   holds the build's memory while the tests run. For this repository's own
   suite the command used to stay at 6 to 7 GB resident for the whole run; it
