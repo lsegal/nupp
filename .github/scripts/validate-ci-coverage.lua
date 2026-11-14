@@ -204,6 +204,36 @@ function validator.workflowShape(text)
     return jobs, order, steps
 end
 
+--- The fewest test workers a step may ask for (#252).
+validator.minimumJobs = 8
+
+--- Every `--jobs=N` below the floor a test run in the workflow names, as
+--- `line N: text` sentences. The runner's own default never goes below the
+--- floor, so a lane only runs narrower because a step asked it to, and this is
+--- where that request would be written.
+function validator.narrowTestRuns(text)
+    local found = {}
+    local number = 0
+    for line in ((text:gsub("\r\n", "\n")) .. "\n"):gmatch("(.-)\n") do
+        number = number + 1
+        -- `--jobs=N` for every lane, or `--jobs=shell:2,isolated:8` for some.
+        local narrow = false
+        for list in line:gmatch("%-%-jobs=([%w:,]+)") do
+            for spec in list:gmatch("[^,]+") do
+                local count = tonumber(spec:match("^%d+$") or spec:match("^%a+:(%d+)$"))
+                if count and count < validator.minimumJobs then
+                    narrow = true
+                end
+            end
+        end
+        if narrow then
+            found[#found + 1] = ("line %d: %s"):format(number, (line:gsub("^%s+", "")))
+        end
+    end
+
+    return found
+end
+
 --- Every disagreement between the four files, as a list of sentences. Empty
 --- means they agree. Returned rather than printed so the suite can assert on it
 --- in process, which is what keeps this check in the fast gate rather than
@@ -224,8 +254,16 @@ function validator.problems()
     local workflowJobs, jobOrder, stepsByJob = validator.workflowShape(workflowText)
     require_(#jobOrder > 0, "no jobs were found in " .. map.workflow)
 
+    for _, narrow in ipairs(validator.narrowTestRuns(workflowText)) do
+        problems[#problems + 1] = ("%s runs tests narrower than %d workers at %s"):format(
+            map.workflow,
+            validator.minimumJobs,
+            narrow
+        )
+    end
+
     for id in pairs(map.jobs) do
-        require_(workflowJobs[id], ("ci-coverage.json describes job %q, which the workflow does not define"):format(id))
+        require_(workflowJobs[id],("ci-coverage.json describes job %q, which the workflow does not define"):format(id))
     end
     for _, id in ipairs(jobOrder) do
         require_(map.jobs[id] ~= nil, ("the workflow defines job %q, which ci-coverage.json does not describe"):format(id))

@@ -473,12 +473,23 @@ first changes nothing. A shard that cannot start, or that writes no report, is
 counted as a failure of its own rather than quietly removing its suites from
 the total.
 
+By default a run makes one worker per processor and never fewer than eight, so
+a small machine still runs eight suites at once; `--jobs=N` names a different
+count.
+
 ```bash
 nupp test --jobs=4        # four shards
 nupp test --jobs=1        # one process
 nupp test --jobs=shell:2  # two workers for the shell lane, the default for the rest
 nupp test checktest       # one named suite, one process
 ```
+
+A worker's memory is mostly the suite it runs, not the compiler. One compiler
+process compiling and running a test program peaks under 200 MB, and
+`perfbudgettest` holds it there. To see where a run's memory goes, set
+`NUPP_PEAK_MEMORY_FILE` to a file. Every `nupp` process, including each test
+worker, appends one line to it as it exits: its peak resident memory in bytes,
+a tab, and its arguments.
 
 Every lane a run selects shares that run's one build of the compiler, the test
 runner and the native provider. `--lane=isolated,shell` keeps two lanes, and

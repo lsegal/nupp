@@ -754,4 +754,61 @@ print(table.concat(answers, ' '))
     )
 end
 
+-- A traced shift by a 64-bit constant count, as in `x ~ (x << 1ULL)`: the
+-- backends fuse the shift into the other instruction's operand and read the
+-- count as a 32-bit constant, so ARM64 shifted by 0 and `math.u64.prefixxor(1)`
+-- answered 0ULL. The pinned build folds the count to 32 bits first. Each
+-- answer is the first, interpreted call's, and every traced call must agree.
+function M.aTracedSixtyFourBitShiftKeepsItsConstantCount()
+    withProject(
+        {
+            [
+                "shifts.lua"
+            ] = [==[
+if arg[1] == 'off' then jit.off() end
+local function prefixxor(bits)
+    bits = bits ~ (bits << 1ULL)
+    bits = bits ~ (bits << 2ULL)
+    bits = bits ~ (bits << 4ULL)
+    bits = bits ~ (bits << 8ULL)
+    bits = bits ~ (bits << 16ULL)
+    bits = bits ~ (bits << 32ULL)
+    return bits
+end
+local function fused(x)
+    return x + (x >> 4ULL), x & (x << 63ULL), x | bit.arshift(x, 60ULL), bit.bxor(x, bit.ror(x, 4ULL))
+end
+-- Loaded from a table, so a trace cannot fold the inputs into constants.
+local inputs = {1ULL, 0x8000000000000001ULL}
+local function answers()
+    return {tostring(prefixxor(inputs[1])), fused(inputs[2])}
+end
+local first = answers()
+for i = 2, #first do first[i] = tostring(first[i]) end
+local agree = true
+for _ = 1, 300 do
+    local now = answers()
+    for i = 1, #first do agree = agree and tostring(now[i]) == first[i] end
+end
+print(table.concat(first, ' '), agree)
+]==],
+        },
+        function(dir)
+            for _, mode in ipairs({"off", "on"}) do
+                local output = dir .. "/" .. mode .. ".log"
+                local status = os.execute(("luajit '%s/shifts.lua' %s > '%s' 2>&1"):format(dir, mode, output))
+                -- Windows writes the interpreter's print with CRLF.
+                local result = readFile(output):gsub("\r\n", "\n")
+                testAssert.eq(status, 0, mode .. ": " .. result)
+                testAssert.eq(
+                    result,
+                    "18446744073709551615ULL 9799832789158199297ULL 9223372036854775808ULL "
+                        .. "18446744073709551609ULL 10952754293765046273ULL\ttrue\n",
+                    mode .. " shifts"
+                )
+            end
+        end
+    )
+end
+
 return M
