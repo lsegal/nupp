@@ -41,7 +41,7 @@ usage: scripts/toolchain COMPONENT...
 Components: luajit luarocks lpeg lpeg-source stage0 llvm wgpu
             wgpu-static [PLATFORM]
             browser-sources browser-emulator browser-guest
-            native-provider FEATURES
+            native-provider FEATURES, native-sources DIRECTORY
             host FEATURES, host-library FEATURES
             kit FEATURES, kit-archive FEATURES OUTPUT
             codegen-library
@@ -52,6 +52,8 @@ Components: luajit luarocks lpeg lpeg-source stage0 llvm wgpu
 Prints the install prefix of each component named, building it first when it is
 not already cached. --all builds every component and prints nothing. --prefix
 prints the root the components are installed under without building anything.
+native-sources writes the native programs' sources under DIRECTORY without
+compiling them and prints a `program NAME ENTRY` line for each.
 
 Environment:
   NUPP_CC                    the C compiler. Probed when unset.
@@ -1020,6 +1022,21 @@ write_aot_runtime_build() {
     } > "$1/ksrt/build.nupp"
 }
 
+# Writes the provider's generated half into DIRECTORY: its manifest, its entry,
+# `ksrt.build` and the `exports` list its shared library exports.
+write_native_provider_program() {
+    mkdir -p "$1/ksrt"
+    # The compiler resolves a relative include against the manifest's own
+    # directory, and on Windows wants a drive-qualified path.
+    printf 'return { include = { ".", "%s", "%s", "%s" } }\n' "$(native_path "$ROOT/native/provider")" \
+        "$(native_path "$ROOT/native/aotruntime/common")" "$(native_path "$ROOT/native/aotruntime/bound")" \
+        > "$1/nupp.lua"
+    printf 'module main\n\nlocal _ = require("nuppnative.provider")\n' > "$1/main.nupp"
+    write_aot_runtime_build "$1"
+    printf '%s\n' nuppNativeAbiVersion nuppNativeFeatures nuppNativeLastError nuppNativeBytesCopy \
+        nuppNativeBytesRelease nuppNativeAvailableParallelism nuppAotRuntime > "$1/exports"
+}
+
 # Sets NATIVE_PROVIDER_OUT and NATIVE_PROVIDER_STATIC_OUT to the provider and
 # its static archive, compiling them with this checkout's compiler the first
 # time. Returns 1 when that compiler cannot, for want of a code generator.
@@ -1037,16 +1054,7 @@ build_native_provider() {
 
     note "building the native provider"
     rm -rf "$np_out"
-    mkdir -p "$np_out/src/ksrt"
-    # The compiler resolves a relative include against the manifest's own
-    # directory, and on Windows wants a drive-qualified path.
-    printf 'return { include = { ".", "%s", "%s", "%s" } }\n' "$(native_path "$ROOT/native/provider")" \
-        "$(native_path "$ROOT/native/aotruntime/common")" "$(native_path "$ROOT/native/aotruntime/bound")" \
-        > "$np_out/src/nupp.lua"
-    printf 'module main\n\nlocal _ = require("nuppnative.provider")\n' > "$np_out/src/main.nupp"
-    write_aot_runtime_build "$np_out/src"
-    printf '%s\n' nuppNativeAbiVersion nuppNativeFeatures nuppNativeLastError nuppNativeBytesCopy \
-        nuppNativeBytesRelease nuppNativeAvailableParallelism nuppAotRuntime > "$np_out/src/exports"
+    write_native_provider_program "$np_out/src"
     # The compiler runs on this checkout's provider, which may be the one
     # being replaced, so it is told to run on the one staged rather than
     # build another.
@@ -1117,6 +1125,41 @@ embedding_library_filename() {
     esac
 }
 
+# Writes the embedding library's generated half into DIRECTORY: a host program
+# whose entry, `embed.nupp`, names the embedding ABI instead of defining `main`.
+write_embedding_program() {
+    mkdir -p "$1"
+    write_host_program "$1" "$2" "$3"
+    {
+        printf 'module embed\n\n'
+        printf 'const {nupp_config_init} = require("nuppembed.abi")\n\n'
+        printf -- '--- Names the embedding ABI, whose exports are the library.\n'
+        printf 'export function nuppEmbedAbi(): voidptr\n'
+        printf '    return nupp_config_init as voidptr\n'
+        printf 'end\n'
+    } > "$1/embed.nupp"
+}
+
+# Writes the source of every native program the compiler ships into DIRECTORY,
+# without compiling any of them, and names each one's entry on a line of its
+# own: `program NAME ENTRY`, with `exports NAME FILE` after a program whose
+# shared library exports a fixed list. `nupp fixpoint` compiles them with each
+# stage it builds. The host and the embedding library are written for the
+# features every host can carry, which reach every module they have.
+write_native_sources() {
+    ns_out=$1
+    rm -rf "$ns_out/provider" "$ns_out/host" "$ns_out/embedding"
+    build_luajit
+    ns_features=lpeg,native-compression,native-files,native-net,native-process,native-tls,workers
+    write_native_provider_program "$ns_out/provider"
+    write_host_program "$ns_out/host" "$ns_features" "$PREFIX/luajit"
+    write_embedding_program "$ns_out/embedding" "$ns_features" "$PREFIX/luajit"
+    printf 'program provider %s\n' "$(native_path "$ns_out/provider/main.nupp")"
+    printf 'exports provider %s\n' "$(native_path "$ns_out/provider/exports")"
+    printf 'program host %s\n' "$(native_path "$ns_out/host/main.nupp")"
+    printf 'program embedding %s\n' "$(native_path "$ns_out/embedding/embed.nupp")"
+}
+
 # Builds the C embedding SDK for one normalized feature list into
 # NUPP_EMBED_OUT: libnupp.a (the Nupp embedding library, the native provider,
 # LuaJIT and LPeg), the shared library linked from it and, on Windows, its
@@ -1145,16 +1188,7 @@ build_nupp_embedding() {
 
     note "building the Nupp embedding library"
     rm -rf "$ne_out"
-    mkdir -p "$ne_out/src"
-    write_host_program "$ne_out/src" "$ne_features" "$ne_luajit"
-    {
-        printf 'module embed\n\n'
-        printf 'const {nupp_config_init} = require("nuppembed.abi")\n\n'
-        printf -- '--- Names the embedding ABI, whose exports are the library.\n'
-        printf 'export function nuppEmbedAbi(): voidptr\n'
-        printf '    return nupp_config_init as voidptr\n'
-        printf 'end\n'
-    } > "$ne_out/src/embed.nupp"
+    write_embedding_program "$ne_out/src" "$ne_features" "$ne_luajit"
     "$ROOT/bin/nupp" aot --emit static-library --output "$(native_path "$ne_out/libnuppembed.a")" \
         "$(native_path "$ne_out/src/embed.nupp")" >&2 \
         || die "cannot compile the Nupp embedding library"
@@ -2651,6 +2685,12 @@ case "$1" in
             || die "no prebuilt native provider is pinned for $PREBUILT_TARGET, and there is no compiler yet to build one with"
         prebuilt_provider "${2:-}"
         native_path "$PREBUILT_OUT"
+        exit 0
+        ;;
+    native-sources)
+        [ "$#" -eq 2 ] || die "usage: scripts/toolchain native-sources DIRECTORY"
+        mkdir -p "$2" || die "cannot create $2"
+        write_native_sources "$(cd "$2" && pwd)"
         exit 0
         ;;
     host)

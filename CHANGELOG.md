@@ -29,3 +29,11 @@
   branch instead of six. A long function that LuaJIT refused once instrumented,
   with NUPP3005 "function too long for return fixup", now loads, which is what
   stopped coverage runs over this repository from running any tests.
+- `nupp fixpoint` now also holds the compiler's native half to the fixpoint:
+  stages two and three each lower the native provider, the host and the
+  embedding library to LLVM IR, which must match, and each runs on the
+  provider the stage before it linked. `--json` reports them as `native` and
+  `nativeRelinked`.
+- A native program lowers to the same LLVM IR every time: the C functions it
+  calls are declared in name order rather than in an order that changed from
+  run to run.
