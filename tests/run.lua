@@ -2110,7 +2110,18 @@ end
 -- coverage is collected -- the shards would race each other for the one counter file
 -- that `NUPP_COVERAGE_FILE` names.
 
---- How many workers to make by default: one per processor.
+--- The fewest workers a run makes by default, whatever the machine reports.
+---
+--- Hosted CI runners report three or four processors, and one per core on those
+--- left every lane four wide or narrower. A worker spends most of its time waiting
+--- on child processes -- compiles, links, the programs it runs -- rather than on a
+--- processor, so eight is the floor on every machine and every lane. A memory
+--- footprint that cannot hold eight workers is a footprint to fix (#250), not a
+--- reason to lower this. `--jobs=N` still overrides it for a run that wants fewer.
+local minimumJobs = 8
+
+--- How many workers to make by default: one per processor, and never fewer than
+--- `minimumJobs`.
 ---
 --- It was two per processor, from a measurement on eight cores -- 71s at one per
 --- core, 63s at two. That machine no longer stands for this one. On eighteen
@@ -2130,7 +2141,7 @@ local function defaultJobs()
     end
     local found = tonumber(text or "")
 
-    return found and found >= 1 and math.floor(found) or 4
+    return math.max(minimumJobs, found and found >= 1 and math.floor(found) or 1)
 end
 
 --- What the last run measured, so this one can start the slow work first.

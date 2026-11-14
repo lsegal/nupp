@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `nupp test` starts at least eight workers by default, one per processor on
+  machines with more. A four-core machine used to run four suites at once and
+  now runs eight. `--jobs=N` still sets the count explicitly.
 - Nupp is self-hosted: building it from a checkout no longer needs Rust or a
   C++ compiler. Every crate of the former Rust workspace -- the native
   provider, the executable host and embedding SDK, the filesystem, process,
