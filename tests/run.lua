@@ -372,15 +372,34 @@ local function executeResult(status)
     return status
 end
 
+-- Where `NUPP_TEST_COMPILE_SERVICE_LOG` names a file, each compiler command a
+-- case started that the service did not answer is appended to it: what is left
+-- of the run's cold compiler processes, and the place to look for the next one
+-- worth taking.
+local declinedLog = os.getenv("NUPP_TEST_COMPILE_SERVICE_LOG")
+local function declined(command)
+    if declinedLog and declinedLog ~= "" and command:find("bin/nupp", 1, true) then
+        local file = io.open(declinedLog, "ab")
+        if file then
+            file:write((command:gsub("[\r\n]", " ")), "\n")
+            file:close()
+        end
+    end
+end
+
 -- Answers true and `os.execute`'s results when the service ran the command.
 local function routedExecute(command)
     local client = compileServiceClient()
-    local parsed = client and compileServiceModule.parse(command, "out")
-    if not parsed then
+    if not client then
         return false
     end
-    local status, _, out, err = client:run(parsed)
+    local parsed = compileServiceModule.parse(command, "out")
+    local status, _, out, err
+    if parsed then
+        status, _, out, err = client:run(parsed)
+    end
     if status == nil then
+        declined(command)
         return false
     end
     client:forward(out, err)
@@ -397,16 +416,17 @@ end
 -- A finished pipe for a command the service ran, closing with the status a
 -- process's `close` reports; nil when the shell has to run it.
 local function routedPopen(command, mode)
-    if mode ~= nil and mode ~= "r" and mode ~= "rb" then
-        return nil
-    end
     local client = compileServiceClient()
-    local parsed = client and compileServiceModule.parse(command, "pipe")
-    if not parsed then
+    if not client then
         return nil
     end
-    local status, pipe, out, err = client:run(parsed)
+    local parsed = (mode == nil or mode == "r" or mode == "rb") and compileServiceModule.parse(command, "pipe")
+    local status, pipe, out, err
+    if parsed then
+        status, pipe, out, err = client:run(parsed)
+    end
     if status == nil then
+        declined(command)
         return nil
     end
     client:forward(out, err)
