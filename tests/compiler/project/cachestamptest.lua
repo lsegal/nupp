@@ -856,4 +856,42 @@ function M.aMovedTreeGetsItsEntriesWrittenAgainRatherThanReused()
     os.execute("rm -rf '" .. dir .. "' '" .. elsewhere .. "'")
 end
 
+-- A standard-library module read back from the store says what checking it from
+-- source says (#265): the same diagnostics, the related note pointing into the
+-- module included, with or without `NUPP_NO_STDLIB_CACHE`.
+function M.aStoredStandardLibraryInterfaceChecksTheSameAsItsSource()
+    local dir = tempProject({
+        ["main.nupp"] = 'local json = require("serde.json")\n'
+            .. "local value, reason = json.decodevalue(42)\n"
+            .. "print(value, reason)\n",
+    })
+    local shared = dir .. "/cache"
+
+    local function check(prefix)
+        local pipe = assert(
+            io.popen(("cd '%s' && %sNUPP_CACHE_DIR='%s' '%s' check main.nupp 2>&1"):format(dir, prefix, shared, NUPP))
+        )
+        local output = pipe:read("*a"):gsub("\r", "")
+        pipe:close()
+        return output
+    end
+
+    -- The first command keeps the prelude, and the second the interfaces it checked
+    -- against that prelude; the third reads both back.
+    local fromSource = check("")
+    check("")
+    local stored = exists(shared .. "/stdlib.buf")
+    local hydrated = check("")
+    local bypassed = check("NUPP_NO_STDLIB_CACHE=1 ")
+    os.execute("rm -rf '" .. dir .. "'")
+
+    assert(stored, "the checked standard-library interfaces were not stored")
+    assert(
+        fromSource:find("NUPP2006", 1, true) and fromSource:find("called function is declared here", 1, true),
+        "the program has to report its call error and where the callee is: " .. fromSource
+    )
+    assert(hydrated == fromSource, "the stored interfaces reported differently:\n" .. hydrated .. "\n" .. fromSource)
+    assert(bypassed == fromSource, "bypassing the store reported differently:\n" .. bypassed .. "\n" .. fromSource)
+end
+
 return M
