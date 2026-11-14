@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A cold `nupp build` of a project that declares a const-generic function no
+  longer starts parallel check workers it then discards. The build used to
+  start up to six workers, have them parse every source, and only then decide
+  to build in one process; it now decides before starting any.
 - On ARM64, a 64-bit shift by a 64-bit constant count, such as
   `x ~ (x << 1ULL)`, keeps its count once LuaJIT traces it. The traced code
   shifted by zero instead, so `math.u64.prefixxor(1)` could answer `0ULL` on

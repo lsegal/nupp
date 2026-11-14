@@ -584,8 +584,9 @@ function M.parallelBuildsWriteWhatSerialBuildsWrite()
 end
 
 -- Const specialization is planned across every module of a build at once. A
--- project declaring a const-generic function is built in one process, and says so;
--- its check, which plans nothing, still uses workers.
+-- project declaring a const-generic function is built in one process, and says so,
+-- without starting a worker to find that out; its check, which plans nothing, still
+-- uses workers.
 function M.constGenericProjectsBuildSerially()
     local directory = tempProject(false)
     write(
@@ -606,16 +607,26 @@ end
 return {four = four}
 ]]
     )
-    local code, report = coldBuild(directory, {NUPP_CHECK_JOBS = "2"}, {"-O2"})
+    local buildPids = directory .. "/build-workers.pid"
+    local code, report = coldBuild(directory, {
+        NUPP_CHECK_JOBS = "2",
+        NUPP_TEST_PARALLEL_CHECK_PID_FILE = buildPids,
+    }, {"-O2"})
     testAssert.eq(code, 0, "const-generic build: " .. json.encode(report.diagnostics))
     testAssert.eq(report.timing.parallel.mode, "serial", "the build stays in one process")
     assert(
         tostring(report.timing.parallel.reason):find("const-generic", 1, true),
         "the build says why: " .. tostring(report.timing.parallel.reason)
     )
-    local checkCode, checkReport = coldCheck(directory, {NUPP_CHECK_JOBS = "2"})
+    testAssert.eq(countKeys(workerPids(buildPids)), 0, "the declined build started no worker")
+    local checkPids = directory .. "/check-workers.pid"
+    local checkCode, checkReport = coldCheck(directory, {
+        NUPP_CHECK_JOBS = "2",
+        NUPP_TEST_PARALLEL_CHECK_PID_FILE = checkPids,
+    })
     testAssert.eq(checkCode, 0, "const-generic check")
     testAssert.eq(checkReport.timing.parallel.mode, "parallel", "a check plans no specialization")
+    testAssert.eq(countKeys(workerPids(checkPids)), 2, "the check started its workers")
 
     assert(os.remove(directory, true))
 end
