@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `nupp bc --json`'s `bytecodeFingerprint`, and `nupp lsp artifact --kind
+  bytecode`'s `metadata.fingerprint`, are now the same on every run over the
+  same source. They hashed LuaJIT's raw dump, which lays out constant tables
+  by a string hash LuaJIT seeds per process, so the same bytecode could get a
+  different fingerprint each run.
 - `nupp bc`, `nupp run` and `nupp lsp artifact` of a file inside a project keep
   the checked interfaces of the project modules it requires in the build
   directory, and read them back on the next command instead of checking the
