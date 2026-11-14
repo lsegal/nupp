@@ -1657,7 +1657,8 @@ end
 -- A Nupp worker state past its heap bound hands the rest of its queue to a fresh
 -- state (#287). At a bound of 0 every suite gets a state of its own, and each lane
 -- still reports once: one state per suite it ran, plus the last, which found the
--- queue empty.
+-- queue empty. A shell suite makes the run replace states while the shell lane
+-- waits to join the shared queue's tail.
 function M.nuppWorkerStatesRetireAtTheirHeapBound()
     local dir = os.tmpname()
     os.remove(dir)
@@ -1671,6 +1672,7 @@ function M.nuppWorkerStatesRetireAtTheirHeapBound()
             ("local M = {}\nfunction M.only%s() end\nreturn M\n"):format(name)
         )
     end
+    write(dir .. "/tests/zshelltest.lua", '-- os.execute("true")\nreturn {onlyshell = function() end}\n')
 
     local output, invocation = capturedRun(
         (
@@ -1679,18 +1681,20 @@ function M.nuppWorkerStatesRetireAtTheirHeapBound()
     )
     test.eq(invocation.status, 0, "the recycled lanes did not pass" .. evidence(invocation))
     local report = require("testjson").decode(output)
-    test.eq(report.total, #names, evidence(invocation))
-    test.eq(report.passed, #names, evidence(invocation))
-    test.eq(#report.shards, 2, "each lane reports once however many states it went through")
-    local seen, states = {}, 0
+    test.eq(report.total, #names + 1, evidence(invocation))
+    test.eq(report.passed, #names + 1, evidence(invocation))
+    local seen, states, lanes = {}, 0, 0
     for _, shard in ipairs(report.shards) do
-        test.eq(shard.executionLane, "shared")
-        for _, spec in ipairs(shard.specs) do
-            test.eq(seen[spec], nil, spec .. " ran twice")
-            seen[spec] = true
+        if shard.executionLane == "shared" then
+            lanes = lanes + 1
+            for _, spec in ipairs(shard.specs) do
+                test.eq(seen[spec], nil, spec .. " ran twice")
+                seen[spec] = true
+            end
+            states = states + shard.states
         end
-        states = states + shard.states
     end
+    test.eq(lanes, 2, "each lane reports once however many states it went through")
     for _, name in ipairs(names) do
         assert(seen[name .. "test"], name .. "test never ran")
     end

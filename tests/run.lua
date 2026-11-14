@@ -745,7 +745,7 @@ local workerHeapLimit = (tonumber(os.getenv("NUPP_TEST_WORKER_HEAP_MB") or "") o
 if embedded then
     collectgarbage("setpause", 120)
 end
--- Set when this state stopped for that reason with work still queued.
+-- Set when this state stopped taking work for that reason.
 local retired = false
 local jobs = nil
 -- Workers for one lane only, from `--jobs=shell:2`. A lane whose suites start
@@ -3232,11 +3232,14 @@ then
                                 end)
                                 if ok and type(report) == "table" then
                                     merge(child, report)
+                                    local relaunched, problem = true, nil
                                     if report.retired then
-                                        launch(child)
-                                    else
-                                        child.finished = true
+                                        relaunched, problem = pcall(launch, child)
                                     end
+                                    if not relaunched then
+                                        child.failure = "a fresh worker state could not be started: " .. tostring(problem)
+                                    end
+                                    child.finished = not report.retired or not relaunched
                                 else
                                     child.failure = tostring(report)
                                     child.finished = true
