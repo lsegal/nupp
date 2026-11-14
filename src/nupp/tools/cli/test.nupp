@@ -49,9 +49,17 @@ local REPORT_SCHEMA = {
         },
         ok = {type = "boolean"},
         total = {type = "integer"},
-        passed = {type = "integer"},
-        cached = {type = "integer", description = "Cases reused from complete passing packages."},
+        passed = {type = "integer", description = "Cases that executed in this run and passed."},
+        cached = {type = "integer", description = "Cases reused from a recorded pass; never counted in `passed`."},
         cachedPackages = {type = "integer"},
+        cacheEligiblePackages = {
+            type = "integer",
+            description = "Packages whose fingerprint resolved, so a recorded pass could have been reused."
+        },
+        cacheHitRate = {
+            type = "number",
+            description = "cachedPackages over cacheEligiblePackages, from 0 to 1. Absent when nothing was eligible."
+        },
         skipped = {type = "integer"},
         notExecuted = {type = "integer"},
         failed = {type = "integer"},
