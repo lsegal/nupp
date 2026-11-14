@@ -176,6 +176,10 @@ const KIND_ARRAY = 5
 
 const KIND_OBJECT = 6
 
+--- The schema's scalar code for a string. Booleans and numbers share their
+--- codes, 1 and 3, with their Lua types; a string's Lua type is 4.
+const SCALAR_STRING = 2
+
 --- The frame at `index`: the inline frames until the stream spills them.
 local function frameAt(builder: Builder*, index: integer): Frame*
     @unsafe do
@@ -658,7 +662,7 @@ local function scalarWanted(L: voidptr, builder: Builder*, eager: boolean): bool
 end
 
 --- Checks a kept scalar against the schema the pending shape names: `actual`
---- is its Lua type, `integerToken` whether its token was an integer (-1
+--- is its schema scalar code, `integerToken` whether its token was an integer (-1
 --- for a value that had none), and `negative` its sign.
 local function scalarValidate(
     L: voidptr,
@@ -1843,7 +1847,7 @@ local function builderString(
     end
     local wanted = scalarWanted(L, builder, eager)
     if wanted then
-        scalarValidate(L, builder, eager, TSTRING, 0, 0, false)
+        scalarValidate(L, builder, eager, SCALAR_STRING, 0, 0, false)
     end
     if escaped and wanted then
         escapedString(L, builder, source, sourceLength, start, length)
@@ -1878,7 +1882,7 @@ local function builderStringEscapes(
     end
     local wanted = scalarWanted(L, builder, eager)
     if wanted then
-        scalarValidate(L, builder, eager, TSTRING, 0, 0, false)
+        scalarValidate(L, builder, eager, SCALAR_STRING, 0, 0, false)
     end
     local written = unescapeIndexed(L, builder, source, sourceLength, start, length, escapes, escapeIndex, escapeCount)
     if wanted then
@@ -2241,6 +2245,8 @@ local function builderPushedScalar(L: voidptr, builder: Builder*, eager: boolean
         local value: number = 0
         if actual == TNUMBER then
             value = lua_tonumber(L, -1)
+        elseif actual == TSTRING then
+            actual = SCALAR_STRING
         end
         scalarValidate(L, builder, eager, actual, value, -1, signbit(value))
     else

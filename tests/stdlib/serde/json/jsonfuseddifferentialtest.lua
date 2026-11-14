@@ -558,6 +558,39 @@ function M.compiledPullAndSerdeRefuseRepeatedMemberNames()
     end
 end
 
+-- A validated schema names each scalar by its own code, and only booleans and
+-- numbers share theirs with a Lua type. The runtime once checked a string
+-- against its Lua type, so every string a schema expected was refused.
+function M.compiledSerdeAcceptsEveryScalarKindItsSchemaNames()
+    if not pcall(fused.pull, "{}", {}) then
+        return
+    end
+    local plan = {
+        kind = "structure",
+        access = "dynamic",
+        fields = {
+            {wire = "name", name = "name", required = true, target = {kind = "string"}},
+            {wire = "flag", name = "flag", required = true, target = {kind = "boolean"}},
+            {wire = "count", name = "count", required = true, target = {kind = "integer"}},
+            {wire = "label", name = "label", target = {kind = "optional", element = {kind = "string"}}},
+        },
+    }
+    local schema = fused.compileserde(plan, "reject")
+    assert(schema.complete, "the schema does not validate its scalars")
+    for _, source in ipairs({
+        '{"name":"one","flag":true,"count":2,"label":"two"}',
+        '{"name":"o\\u006ee","flag":false,"count":3,"label":null}',
+    }) do
+        local ok, value, problem = pcall(fused.decodeserde, schema, source)
+        assert(ok and problem == nil, show(source) .. ": " .. tostring(ok and problem or value))
+        assert(value[1] == "one" and type(value[2]) == "boolean" and value[3] >= 2, show(source))
+    end
+    for _, source in ipairs({'{"name":1,"flag":true,"count":2}', '{"name":"one","flag":"true","count":2}'}) do
+        local ok, value = pcall(fused.decodeserde, schema, source)
+        assert(not ok or value == nil, show(source) .. " was decoded")
+    end
+end
+
 function M.theFusedScanReportsTheSameFirstErrorAsTheScalarReference()
     local checked = 0
     for _, text in ipairs(MALFORMED) do
