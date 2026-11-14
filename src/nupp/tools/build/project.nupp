@@ -1387,8 +1387,7 @@ end
 --- Builds one selected platform or every configured platform. The per-platform loop
 --- lives above `buildOne` so each result commits its own state and a later failure does
 --- not invalidate an earlier output.
-function project.build(root: string?, opts: project.BuildOptions?): integer
-    root, opts = root or ".", (opts or {}) as project.BuildOptions
+local function buildPlatforms(root: string, opts: project.BuildOptions): integer
     if opts.platform ~= "all" then
         return buildOne(root, opts)
     end
@@ -1456,6 +1455,23 @@ function project.build(root: string?, opts: project.BuildOptions?): integer
     end
 
     return failed and 1 or 0
+end
+
+--- How far the heap may grow past what the last collection kept before the next one
+--- starts, as a percentage, while a build or a check runs. LuaJIT's default of 200
+--- lets it double. A build keeps a few hundred megabytes alive and checking one
+--- module makes several times its size in garbage, so at the default the process
+--- held about twice what it needed. Measured on a cold build of the test runner,
+--- 200 peaked at 1.48 GB, 150 at 1.23 GB, 120 at 0.96 GB and 100 at 0.89 GB, and
+--- the build took no longer at 100 (#257).
+const BUILD_GC_PAUSE = 100
+
+function project.build(root: string?, opts: project.BuildOptions?): integer
+    local pause = collectgarbage("setpause", BUILD_GC_PAUSE)
+    local code = buildPlatforms(root or ".", (opts or {}) as project.BuildOptions)
+    collectgarbage("setpause", pause)
+
+    return code
 end
 
 function project.check(root: string?, opts: project.BuildOptions?): integer

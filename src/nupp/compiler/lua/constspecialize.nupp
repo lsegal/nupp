@@ -332,6 +332,45 @@ export function sort(plans: {any}): nil
     end)
 end
 
+--- Whether a parse declares a function this module could specialize. Read off the
+--- syntax alone, so a planner can find the declaring modules without checking the
+--- rest of a deliverable to learn that they declare nothing.
+export function declares(parsed: any): boolean
+    local found = false
+    walk(parsed and parsed.root, function(node): nil
+        found = found or candidate(node, "") ~= nil
+    end)
+
+    return found
+end
+
+--- Every name a call could reach one of these modules' candidates by: the
+--- declarations, the const locals that alias them, and the members that export
+--- them. A module that spells none of them calls none of them.
+export function candidateNames(checked: {any}): {[string]: boolean}
+    local candidates, plans = {}, {}
+    for _, module in ipairs(checked) do
+        collectCandidates(module.result, module.filename, candidates, plans, module.module)
+    end
+    local names: {[string]: boolean} = {}
+    for key, found in pairs(candidates) do
+        names[found.name] = true
+        if type(key) == "string" then
+            local member = key:match("^export%z.*%.([^%.]+)$") or key:match("^[^%z]*%z([^%z]+)")
+            if member ~= nil then
+                names[member] = true
+            end
+        elseif type(key) == "table" then
+            local name = key.name or key.token and key.token.text
+            if type(name) == "string" then
+                names[name] = true
+            end
+        end
+    end
+
+    return names
+end
+
 --- Collects a whole checked deliverable before either backend emits it.
 export function collectGraph(checked: {any}): {any}
     local candidates, plans = {}, {}

@@ -147,6 +147,11 @@ local REPORT_SCHEMA = {
             .. "account of itself to give.",
             properties = {
                 totalMs = {type = "number", description = "Wall-clock milliseconds for the whole build."},
+                peakBytes = {
+                    type = "integer",
+                    description = "The build process's peak resident memory in bytes. "
+                    .. "Absent where the platform does not report it.",
+                },
                 compiledModules = {type = "integer"},
                 reusedModules = {type = "integer"},
                 specializedBodies = {
@@ -316,6 +321,12 @@ local function run(options: any): integer
         -- different branch is the same defect as not implementing it.
         compile.writeRemarks(settings)
         if asJson then
+            -- Read at the end, so it covers the whole build. It is what the memory
+            -- budget in perfbudgettest holds a full build to.
+            local timing = produced.timing as {[string]: any}?
+            if timing ~= nil then
+                timing.peakBytes = require("nupp.tools.peakmemory").bytes()
+            end
             reportMod.write({
                 ok = code == 0,
                 diagnostics = reportMod.diagnosticValues(diagnostics),
