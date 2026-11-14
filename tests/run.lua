@@ -546,9 +546,13 @@ if package.config:sub(1, 1) == "\\" then
         if not usesTestShell(source) then
             return rawExecute(command)
         end
-        local handled, a, b, c = routedExecute(command)
-        if handled then
-            return a, b, c
+        -- Only where pipes are allowed: a shared worker lane refuses them, and a
+        -- command the service ran would be one the lane never let start.
+        if nativePopen then
+            local handled, a, b, c = routedExecute(command)
+            if handled then
+                return a, b, c
+            end
         end
         local path = script(command)
         local result = rawExecute(invocation(path))

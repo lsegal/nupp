@@ -156,7 +156,7 @@ end
 -- runs it: the two answers come from the two routes.
 function M.anAnsweredCommandReadsAsTheShellsOwn()
     local counts = rawget(_G, "__NUPP_TEST_COMPILE_SERVICE_COUNTS")
-    if os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil or counts == nil then
+    if os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil or os.getenv("NUPP_TEST_COMPILE_SERVICE") == "0" or counts == nil then
         return
     end
     local dir = tempProject()
