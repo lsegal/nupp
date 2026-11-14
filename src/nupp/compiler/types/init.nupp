@@ -136,7 +136,7 @@ record types.Union
     id: string = ""
     tag: 'union'
 
-    --- Deduplicated and sorted by id.
+    --- Deduplicated and in canonical order; see `canonicalOrder`.
     members: {types.Type}
 
     --- Whether nil is among them, which is what makes a field optional and a pointer
@@ -149,7 +149,7 @@ record types.Intersection
     id: string = ""
     tag: 'intersection'
 
-    --- Deduplicated and sorted by id.
+    --- Deduplicated and in canonical order; see `canonicalOrder`.
     members: {types.Type}
 end
 
@@ -1215,6 +1215,26 @@ local function inheritedMarks(key: string): string
     return marks
 end
 
+--- What `orderSpelling` has worked out, by the type or pack it is for. Weak keys,
+--- so an entry goes with its type.
+local orderSpellings: {[any]: string} = setmetatable({}, {__mode = "k"})
+
+--- A digest of how `t` renders, which names a nominal by its name and nothing by a
+--- number this process issued, so it is the same in every process that builds the
+--- same structure.
+---
+--- @param pack whether `t` is a pack rather than a type
+local function orderSpelling(t: any, pack: boolean): string
+    local found = orderSpellings[t]
+    if found ~= nil then
+        return found
+    end
+    local spelled = keyDigest(pack and types.tostringPack(t as types.Pack) or types.tostring(t as types.Type))
+    orderSpellings[t] = spelled
+
+    return spelled
+end
+
 --- Orders the members of a union or an intersection.
 ---
 --- Canonical order is what makes `string | integer` and `integer | string` the same
@@ -1225,10 +1245,16 @@ end
 ---
 --- Tag first, which for a primitive is its name and for everything else groups by
 --- constructor -- the same first-level order the old structural ids gave, since those
---- began with the constructor too. Then a leaf's own spelling. Then the id, so that
---- two members that are alike this far still have some total order to fall into; an
---- id is a digest of the member's structure (see `stamp`), so that order is the same
---- whatever was built or collected first.
+--- began with the constructor too. Then a leaf's own spelling. Then the whole member's
+--- rendering (see `orderSpelling`), so that two members alike this far still have an
+--- order that is theirs. The id comes last, for two that also render alike.
+---
+--- Not the id before the rendering, though an id is no longer a serial either. An id
+--- is a digest of a key that spells a nominal by the number its declaration was given
+--- (see `types.nominal`), and two compilers that load a different number of
+--- declarations before checking the same source number them differently. That kept
+--- the self-hosting fixpoint's two stages from agreeing on the order of a record's
+--- overloads.
 local function canonicalOrder(a: types.Type, b: types.Type): boolean
     if a.tag ~= b.tag then
         return a.tag < b.tag
@@ -1245,6 +1271,21 @@ local function canonicalOrder(a: types.Type, b: types.Type): boolean
         if left ~= right then
             return left < right
         end
+    end
+    local left, right = orderSpelling(a, false), orderSpelling(b, false)
+    if left ~= right then
+        return left < right
+    end
+
+    return a.id < b.id
+end
+
+--- Orders the alternatives of a pack union, the way `canonicalOrder` orders a
+--- union's members and for the same reason.
+local function packOrder(a: types.Pack, b: types.Pack): boolean
+    local left, right = orderSpelling(a, true), orderSpelling(b, true)
+    if left ~= right then
+        return left < right
     end
 
     return a.id < b.id
@@ -2809,9 +2850,7 @@ function types.packUnion(alternatives: {types.Pack}): types.Pack
             end
         end
     end
-    table.sort(flat, function(a: types.Pack, b: types.Pack): boolean
-        return a.id < b.id
-    end)
+    table.sort(flat, packOrder)
     if #flat == 1 then
         return flat[1]
     end
