@@ -1806,6 +1806,58 @@ end}
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- A shell worker that kept one process across its pieces kept everything each of
+-- them left in it, and eight of those outgrew a hosted runner's memory (#261). What
+-- one piece leaves in its process is the observable part of that: the second suite
+-- must not see it.
+function M.shellQueuePiecesRunInFreshProcesses()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+
+    write(
+        dir .. "/tests/shellmutatortest.lua",
+        [[
+return {leavesStateInItsProcess = function()
+    assert(os.execute("exit 0") == 0)
+    math.__nupp_runner_shell_probe = true
+end}
+]]
+    )
+    write(
+        dir .. "/tests/shellobservetest.lua",
+        [[
+return {seesAProcessOfItsOwn = function()
+    assert(os.execute("exit 0") == 0)
+    assert(math.__nupp_runner_shell_probe == nil, "state crossed from one shell queue piece to the next")
+end}
+]]
+    )
+    write(
+        dir .. "/build/.nupp-test-times.json",
+        [[
+{"suites":{"shellmutatortest":2000,"shellobservetest":1000},
+ "cases":{"shellmutatortest":{"leavesStateInItsProcess":2000},
+          "shellobservetest":{"seesAProcessOfItsOwn":1000}}}
+]]
+    )
+    local output, invocation = capturedRun(
+        (
+            "cd %q && %sNUPP_TEST_BUILD=%q %q shellmutatortest shellobservetest --lane=shell --jobs=1 --json 2>/dev/null"
+        ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+    )
+    test.eq(invocation.status, 0, "shell queue pieces shared a process" .. evidence(invocation))
+    local report = require("testjson").decode(output)
+    test.eq(report.total, 2)
+    test.eq(report.passed, 2)
+    test.eq(#report.shards, 1, "one supervisor respected --jobs=1")
+    test.eq(#report.shards[1].specs, 2, "the supervisor claimed both pieces")
+    test.eq(report.shards[1].executionLane, "shell")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 -- One word to the shell, whatever it holds: nothing in it is expanded.
 local function shellWord(text)
     return "'" .. text:gsub("'", "'\\''") .. "'"

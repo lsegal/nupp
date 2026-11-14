@@ -189,7 +189,11 @@ local function run(options: any): integer
     if sampledRemarks then
         settings.remarks = false
     end
-    local projectEnv = require("nupp.compiler.project.env").new(".")
+    local envMod = require("nupp.compiler.project.env")
+    -- The program's dependencies are read back from what the last compile in this
+    -- project checked, rather than checked again: see
+    -- `nupp.compiler.project.projectimage`.
+    local projectEnv = envMod.new(".", {projectInterfaces = true})
     local chunk, err
     local watch: Session? = nil
     if watching then
@@ -202,6 +206,7 @@ local function run(options: any): integer
         chunk, err = loadstring(session.entryCode, "@" .. path)
     elseif path:find("%.nupp$") then
         local code = compile.module(path, projectEnv, settings)
+        envMod.persist(projectEnv)
         if not code then
             return 1
         end

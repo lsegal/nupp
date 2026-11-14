@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- `nupp bc`, `nupp run` and `nupp lsp artifact` of a file inside a project keep
+  the checked interfaces of the project modules it requires in the build
+  directory, and read them back on the next command instead of checking the
+  whole import graph from source again. A module is read back only while its
+  source, what it requires, and the project's declarations are unchanged. In
+  the compiler's own checkout, `nupp bc -O1 bench/aos.bench.nupp` went from
+  about 515 MB and 17 s to 157 MB and 6 s on Windows once warm, and `nupp lsp
+  artifact` of the same file from about 905 MB to 158 MB.
+  `NUPP_NO_INTERFACE_CACHE` turns the store off.
+- `nupp test` workers no longer keep every type of every project their tests
+  compiled. A test that builds a project in each of its cases used to add
+  about 45 MB to its worker per build, so a suite of them could peak past
+  2 GB; the worker now stays near what one build needs.
+- `nupp test` runs each suite that starts processes in a fresh worker
+  process, as it already did for isolated suites. Each worker used to keep
+  one process for every suite it took and kept growing. In this repository's
+  suite, eight such workers exhausted a 16 GB Linux CI runner partway through.
+- A native compile that `require`s a standard-library module keeps the checked
+  interfaces in its cache and reads them back on the next command, instead of
+  checking the module's whole graph from source every time. `nupp run` of a
+  program that requires `serde.json` went from about 300 MB and 24 s to about
+  110 MB and 5 s on Windows once warm. `NUPP_NO_STDLIB_CACHE` turns the cache
+  off.
+- A cold `nupp build` of a project that declares a const-generic function no
+  longer starts parallel check workers it then discards. The build used to
+  start up to six workers, have them parse every source, and only then decide
+  to build in one process; it now decides before starting any.
 - On ARM64, a 64-bit shift by a 64-bit constant count, such as
   `x ~ (x << 1ULL)`, keeps its count once LuaJIT traces it. The traced code
   shifted by zero instead, so `math.u64.prefixxor(1)` could answer `0ULL` on
@@ -28,6 +55,11 @@
   bit. Under a MinGW LuaJIT built against `msvcrt.dll`, `0.3 ^ 3` was
   `0.026999999999999996` compiled and `0.027` in Lua. A native build on
   Windows also no longer crashes now and then while it sets up LLVM.
+- `nupp build` and `nupp check` use a fraction of the memory they did. A build
+  kept every module's checked syntax tree until it finished, so a cold build of
+  this repository's test runner peaked at 4 to 6 GB; each tree is now let go
+  once its module is generated, and the same build peaks under 1 GB.
+  `nupp build --json` reports the build's peak in `timing.peakBytes`.
 - `nupp test` builds the code under test in a child process, so it no longer
   holds the build's memory while the tests run. For this repository's own
   suite the command used to stay at 6 to 7 GB resident for the whole run; it

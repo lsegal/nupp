@@ -83,9 +83,19 @@ export type CheckResult = {
     --- Set when the file was not found.
     missing: boolean?,
 
-    --- The parse this was checked from, kept so callers need not reparse.
-    result: any
+    --- The parse this was checked from, kept so callers need not reparse. Absent once
+    --- the build has released it; see `Inc.releaseCheck`.
+    result: any,
 
+    --- Set when the build released the parse; `checkFile` checks the module again
+    --- rather than hand this back.
+    released: boolean?,
+
+    --- The checked source and the optimizer facts the tree recorded, kept by a released
+    --- result because readers of the graph still ask for them.
+    source: string?,
+
+    optimizationDependencies: any?
 }
 
 --- The compiler's query graph, with the editor and build entry points that read it.
@@ -123,6 +133,20 @@ export record Inc
 
     --- Checks a module whose dependencies the caller has already made ready.
     checkReadyFile: function(path: string): CheckResult
+
+    --- Lets go of a checked module's parse once its caller is done with the tree.
+    ---
+    --- A module's parse, annotated by its check, is most of what checking it costs to
+    --- keep, and nothing in the graph reads it again: dependents read the interface
+    --- and the exports. A build that held every module's tree until it finished held
+    --- the whole program at once, which for this repository was several gigabytes.
+    --- The graph keeps the check's answer and what it depended on, so nothing
+    --- downstream is invalidated; `checkFile` checks the module again if a caller
+    --- asks for the tree afterwards.
+    releaseCheck: function(path: string)
+
+    --- A file's parse, unchecked.
+    parseFile: function(path: string): any
 
     --- The overlay-aware project declaration and module index.
     projectIndex: function(): any
@@ -214,6 +238,9 @@ export function new(rootDir: string, opts: table?): Inc
     opts.compilerServices = opts.compilerServices or hostServices
     local env = envMod.new(rootDir, opts)
     local traceInspection = opts.traceInspection == true
+    -- A build reads each tree once, so a parse made only for a header is let go
+    -- rather than kept until the module is checked; see `Inc.releaseCheck`.
+    local releaseTrees = opts.releaseTrees == true
     local q = query.new()
     local activeModules = {}
 
@@ -327,6 +354,34 @@ export function new(rootDir: string, opts: table?): Inc
         return parser.parse(text, path)
     end)
 
+    --- Recomputes a memo whose value was released, as of when the released value
+    --- last changed: the inputs are the ones it was computed from, so nothing that
+    --- read it has to be computed again.
+    local function recompute(name: string, path: string): any
+        local byPath = q.memo[name]
+        local released = byPath and byPath[path]
+        if byPath then
+            byPath[path] = nil
+        end
+        local value = q:get(name, path)
+        local fresh = byPath and byPath[path]
+        if fresh and released then
+            fresh.changedAt = released.changedAt
+        end
+
+        return value
+    end
+
+    --- A file's parse, parsing it again if a build released it.
+    local function parsed(self: any, path: string): any
+        local result = self:get("parse", path)
+        if type(result) == "table" and result.released == true then
+            return recompute("parse", path)
+        end
+
+        return result
+    end
+
     --- Whether two headers say the same thing, which is what decides that a reparse
     --- changed nothing a dependent could see.
 
@@ -403,8 +458,14 @@ export function new(rootDir: string, opts: table?): Inc
             end
             -- Depending on the parse only on a miss is the point: on a hit the header
             -- depends on the text alone, which is all it was ever computed from.
-            local header = envMod.projectHeader(env, path, self:get("parse", path))
+            local header = envMod.projectHeader(env, path, parsed(self, path))
             headerStore.put(key, header)
+            local parse = releaseTrees and q.memo.parse and q.memo.parse[path] or nil
+            if parse and not (q.memo.checkModule and q.memo.checkModule[path]) then
+                -- Checking the file parses it again, which costs less than keeping
+                -- every parse in the project alive until its module's turn.
+                parse.value = {released = true}
+            end
 
             return header
         end,
@@ -665,7 +726,7 @@ export function new(rootDir: string, opts: table?): Inc
 
     local checkModule = function(self: any, path: any): CheckResult
         checkpoint()
-        local result = self:get("parse", path)
+        local result = parsed(self, path)
         if not result then
             return {diags = {}, moduleType = nil, missing = true}
         end
@@ -720,7 +781,7 @@ export function new(rootDir: string, opts: table?): Inc
                     return {
                         path = target,
                         compatDiagnostics = checked.diags,
-                        source = checked.result and checked.result.source,
+                        source = checked.source or checked.result and checked.result.source,
                         declarationOnly = target:match("%.d%.nupp$") ~= nil
                     }
                 end,
@@ -1226,8 +1287,12 @@ export function new(rootDir: string, opts: table?): Inc
         if name ~= nil and modulePath(q, name as string) == path then
             q:get("moduleInterface", name as string)
         end
+        local checked = q:get("checkModule", path)
+        if checked ~= nil and checked.released then
+            return recompute("checkModule", path)
+        end
 
-        return q:get("checkModule", path)
+        return checked
     end
 
     -- Full result for a file: parse + check diagnostics, parse result.
@@ -1313,7 +1378,7 @@ export function new(rootDir: string, opts: table?): Inc
             or q:get("moduleInterface", name),
             exports = checked and checked.exports or q:get("moduleExports", name),
             diags = checked and checked.diags or {},
-            source = checked and checked.result and checked.result.source or nil,
+            source = checked and (checked.source or checked.result and checked.result.source) or nil,
             -- Checking an `@annotation` declaration registers it with the environment
             -- rather than exporting it, so a session that imports the module instead
             -- has to be handed the definitions as well.
@@ -1429,7 +1494,9 @@ export function new(rootDir: string, opts: table?): Inc
             end
         end
         local root = checked and checked.result and checked.result.root
-        for key in pairs(root and root.optimizationDependencies or {}) do
+        local optimizationDependencies = checked and checked.optimizationDependencies
+            or root and root.optimizationDependencies
+        for key in pairs(optimizationDependencies or {}) do
             local name = "moduleCallableFact"
             local identity = name .. "\0" .. key
             if not seen[identity] then
@@ -1492,6 +1559,31 @@ export function new(rootDir: string, opts: table?): Inc
         return inputs
     end
 
+    local function apiReleaseCheck(path: string): nil
+        local entry = q.memo.checkModule and q.memo.checkModule[path]
+        if entry == nil then
+            return
+        end
+        local checked = entry.value
+        if checked == nil or checked.released or checked.result == nil then
+            return
+        end
+        local tree = checked.result
+        entry.value = {
+            diags = checked.diags,
+            moduleType = checked.moduleType,
+            exports = checked.exports,
+            syntax = checked.syntax,
+            released = true,
+            source = tree.source,
+            optimizationDependencies = tree.root and tree.root.optimizationDependencies,
+        }
+        local parse = q.memo.parse and q.memo.parse[path]
+        if parse and parse.value == tree then
+            parse.value = {released = true}
+        end
+    end
+
     local function apiPersist()
         envMod.persist(env)
         if not env.cacheReadOnly then
@@ -1520,6 +1612,10 @@ export function new(rootDir: string, opts: table?): Inc
         diskChanged = apiDiskChanged,
         checkFile = apiCheckFile,
         checkReadyFile = apiCheckReadyFile,
+        releaseCheck = apiReleaseCheck,
+        parseFile = function(path: string): any
+            return parsed(q, path)
+        end,
         projectIndex = apiProjectIndex,
         projectFiles = apiProjectFiles,
         fileText = apiFileText,

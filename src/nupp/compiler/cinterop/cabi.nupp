@@ -13,6 +13,12 @@ local targetLayout = require("nupp.compiler.targetlayout")
 local reflection = require("nupp.compiler.reflection")
 local hash = require("nupp.compiler.hash")
 
+-- A named integer constant, written into a header as a `#define`.
+local type Constant = {
+    name: string,
+    value: integer
+}
+
 local record cabi
     ABI: integer
     identity: function(any): string
@@ -20,7 +26,7 @@ local record cabi
     functionRecord: function(string, {any}, any?, boolean?, string?): any
     declaration: function(any, string, string?): (string?, string?)
     prototype: function(any, boolean?): (string?, string?)
-    header: function({any}, {any}, string?, {{name: string, value: integer}}?): (string?, string?)
+    header: function({any}, {any}, string?, {Constant}?): (string?, string?)
 end
 
 cabi.ABI = 1
@@ -337,12 +343,7 @@ local function macroName(name: string): string
     return rendered
 end
 
-function cabi.header(
-    aggregates: {any},
-    functions: {any},
-    guard: string?,
-    constants: {{name: string, value: integer}}?
-): string?, string?
+function cabi.header(aggregates: {any}, functions: {any}, guard: string?, constants: {Constant}?): string?, string?
     local descriptions: {any} = {}
     local byType = {}
     local visiting, visited = {}, {}

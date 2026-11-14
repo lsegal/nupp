@@ -883,6 +883,10 @@ function preludecache.decode(image: any, origin: preludecache.Origin?): any?
         roots[name] = id ~= 0 and built[id as integer] or nil
     end
     roots.preludeRuntime = image.runtime
+    -- Every table by id, so an image written against this one can name what it
+    -- shares with it; see `nupp.compiler.project.stdlibimage`. The ids are this
+    -- image's, so such an image is true only beside the image it was written beside.
+    roots.arena = built
 
     return roots
 end

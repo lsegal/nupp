@@ -1421,7 +1421,9 @@ function checkMod.check(
             atFilename = atFilename or value.filename
             value = value.token
         end
-        local at = cst.firstToken(value)
+        -- A definition read back from an interface image keeps its token's position
+        -- but not its trivia, which is what tells a token from a node.
+        local at = value and type(value.text) == "string" and value.line and value or cst.firstToken(value)
         if not at then
             return nil
         end
