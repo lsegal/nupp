@@ -74,11 +74,13 @@ is not the nominal it is annotated with.
 "The first environment in a process" was meant to be that condition, and is not
 one: a module reloaded over a live `nupp.compiler.types` is a first environment
 again with a checked prelude already in the arena, which is what the test
-runner's lanes do between suites. So the image records its origin -- the three
-counters and a digest of every interned key and id, taken before the prelude was
-checked, after a full collection so that what the weak arenas still list does not
-depend on when the collector last ran -- and is read only into an arena whose own
-origin is the same. Every
+runner's lanes do between suites. So the image records its origin -- the two
+counters and a digest of every declaration they numbered, taken before the
+prelude was checked -- and is read only into an arena whose own origin is the
+same. Interned types need no listing of their own: their ids are spelled from
+structure and from those numbers, so arenas that agree on the numbers agree on
+every id. (They once had one, every interned key and id, which a weak arena
+would make depend on when the collector last ran.) Every
 command starts from the same one, which is the case the cache exists for; any
 other reader checks the prelude itself.
 
@@ -109,7 +111,6 @@ of them cover the whole prelude.
 ]]
 module nupp.compiler.project.preludecache
 
-local hash = require("nupp.compiler.hash")
 local triviaarena = require("nupp.compiler.syntax.triviaarena")
 local types = require("nupp.compiler.types")
 
@@ -136,13 +137,13 @@ local FORMAT = 4
 --- Where type identity stood when a prelude was about to be checked or read.
 ---
 --- The counters say how much had been issued, and `digest` says what: every
---- interned key with the id it was stamped with. See "Origin" above.
+--- declaration that was numbered, in order. See "Origin" above.
 export type preludecache.Origin = {
     capability: integer,
     nominal: integer,
 
-    --- Filled in by `preludecache.seal`, and only when it is needed: the counters
-    --- tell most origins apart, and the listing is as long as the arena.
+    --- Filled in by `preludecache.seal`, once the counters say the arena is still
+    --- the one the origin was taken from.
     digest: string?
 }
 
@@ -166,18 +167,7 @@ function preludecache.seal(origin: preludecache.Origin): string?
     if identity.capability ~= origin.capability or identity.nominal ~= origin.nominal then
         return nil
     end
-    -- The arenas are weak, so until a collection they still list types nothing
-    -- references, and which those are depends on when the collector last ran.
-    types.settle()
-    local lines: {string} = {}
-    for bucket, entries in pairs(identity.arenas) do
-        for key, value in pairs(entries) do
-            local id = type(value) == "table" and (value as any).id or nil
-            lines[#lines + 1] = bucket .. "\0" .. key .. "\0" .. tostring(id)
-        end
-    end
-    table.sort(lines)
-    origin.digest = hash.digest(table.concat(lines, "\n"))
+    origin.digest = identity.declarations
 
     return origin.digest
 end

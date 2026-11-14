@@ -3830,6 +3830,13 @@ end
 
 local nominalCounter: integer = 0
 
+--- A digest of every declaration numbered so far, in the order it was numbered.
+---
+--- What an interned id is spelled from is either structure or a nominal's number, so
+--- two processes that numbered the same declarations the same way give every type the
+--- same id. This is what says whether they did; see `types.Identity`.
+local declarationTrail = ""
+
 -- Keyed declarations by key, kept only once `setIdentityNamespace` has made this
 -- process a worker.
 local declaredNominals: {[string]: types.Nominal} = {}
@@ -3868,6 +3875,7 @@ function types.nominal(name: string, declKind: string, declarationKey: string?):
         declarationKey = declarationKey
     )
     t.id = "nominal#" .. identityNamespace .. nominalCounter .. "(" .. name .. ")"
+    declarationTrail = keyDigest(declarationTrail .. "\0" .. t.id .. "\0" .. (declarationKey or ""))
     if shared then
         declaredNominals[declarationKey as string] = t
     end
@@ -4306,14 +4314,18 @@ end
 ---
 --- The arenas are weak, so what they list is what is still alive, which depends on
 --- when the collector last ran. A caller that needs the listing to be the same
---- every time collects first.
+--- every time settles them first; see `types.settle`.
 export type types.Identity = {
     --- Each arena by name, holding its live contents.
     arenas: {[string]: {[string]: any}},
 
     --- What `flowIdentity` and `types.nominal` will issue next.
     capability: integer,
-    nominal: integer
+    nominal: integer,
+
+    --- A digest of every declaration `types.nominal` has numbered, which with the
+    --- counters says whether two arenas would give one structure one id.
+    declarations: string
 }
 
 local ARENAS: {
@@ -4326,6 +4338,7 @@ function types.identity(): types.Identity
         arenas = ARENAS as {[string]: {[string]: any}},
         capability = nextCapabilityIdentity,
         nominal = nominalCounter,
+        declarations = declarationTrail,
     }
 end
 
