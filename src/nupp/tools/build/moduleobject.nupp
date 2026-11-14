@@ -115,11 +115,7 @@ export function emit(path: string, parsed: any, header: any, index: any): any
     end
     table.sort(dependencies)
 
-    return {
-        path = path,
-        moduleName = header.moduleName,
-        dependencies = dependencies,
-    }
+    return {path = path, moduleName = header.moduleName, dependencies = dependencies,}
 end
 
 --- Links objects into strongly connected components, dependencies first, and the
