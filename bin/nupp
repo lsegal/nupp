@@ -11,10 +11,49 @@
 # pinned in the tree. Nothing here is committed, and nothing here is fetched
 # until a command finds no compiler to run -- which, in a built tree, is never.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# One test run is one build of this tree. `nupp test` checks the compiler, the
+# provider and the interpreter once, before anything runs, and says so to every
+# process beneath it by naming the tree here. A command a test starts in that
+# tree then goes straight to the compiler: it rebuilds nothing, and asks none
+# of the questions whose answers the run already has.
+#
+# Those questions were most of what a test's command cost. On Windows every
+# `uname`, `luajit -v` and `scripts/toolchain llvm --available` is a process
+# start, and together they took three and a half seconds of a command whose
+# compiler answered in two tenths. The suites run thousands of them.
+#
+# It also keeps the run to the one compiler it started with. A source edited
+# while the suites run is picked up by the next run rather than by whichever
+# test's command happened to notice it, rebuilding the compiler under every
+# other test still using it.
+#
+# Only a finished build counts: a build of this tree removes its stamp before
+# writing anything, and a command arriving then takes the ordinary path, which
+# waits for that build rather than loading a compiler halfway rewritten.
+# `build` and `clean` always take the ordinary path, since they are the writer.
+COMMAND=${1:-}
+RUN_READY=no
+if [ -n "${NUPP_LAUNCHER_RUN_ROOT:-}" ] && [ "$NUPP_LAUNCHER_RUN_ROOT" = "$ROOT" ] \
+    && [ -n "${NUPP_LAUNCHER_RUN_LUA_ROOT:-}" ] \
+    && [ -f "$ROOT/build/.nupp-complete" ] && [ -f "$ROOT/build/nupp/tools/main.lua" ]; then
+    case "${1:-}" in
+        build|clean) ;;
+        *) RUN_READY=yes ;;
+    esac
+fi
+
 LUA_ROOT="$ROOT"
-case "$(uname -s 2>/dev/null)" in
-    MINGW*|MSYS*|CYGWIN*) LUA_ROOT="$(cygpath -m "$ROOT")" ;;
-esac
+if [ "$RUN_READY" = yes ]; then
+    LUA_ROOT=$NUPP_LAUNCHER_RUN_LUA_ROOT
+    LAUNCHER_OS=${NUPP_LAUNCHER_OS:-}
+fi
+[ -n "${LAUNCHER_OS:-}" ] || LAUNCHER_OS=$(uname -s 2>/dev/null)
+if [ "$RUN_READY" = no ]; then
+    case "$LAUNCHER_OS" in
+        MINGW*|MSYS*|CYGWIN*) LUA_ROOT="$(cygpath -m "$ROOT")" ;;
+    esac
+fi
 BUILT="$ROOT/build/nupp/tools/main.lua"
 STAMP="$ROOT/build/.nupp-complete"
 LUA_BUILT="$LUA_ROOT/build/nupp/tools/main.lua"
@@ -68,7 +107,7 @@ if [ "${NUPP_LAUNCHER_TOOLCHAIN_KEY:-}" = "$TOOLCHAIN_CACHE_KEY" ] \
     TOOLCHAIN_PREFIX=$NUPP_LAUNCHER_TOOLCHAIN_PREFIX
 else
     TOOLCHAIN_PREFIX=$("$ROOT/scripts/toolchain" --prefix 2>/dev/null)
-    case "$(uname -s 2>/dev/null)" in
+    case "$LAUNCHER_OS" in
         MINGW*|MSYS*|CYGWIN*) TOOLCHAIN_PREFIX=$(cygpath -m "$TOOLCHAIN_PREFIX") ;;
     esac
 fi
@@ -128,7 +167,7 @@ TOOLCHAIN_LUAROCKS="$TOOLCHAIN_PREFIX/luarocks"
 if [ -f "$TOOLCHAIN_LUAROCKS/.complete" ] && [ -z "${NUPP_LUAROCKS:-}" ]; then
     NUPP_LUAROCKS=$(cat "$TOOLCHAIN_LUAROCKS/.executable")
     export NUPP_LUAROCKS
-    case "$(uname -s 2>/dev/null)" in
+    case "$LAUNCHER_OS" in
         MINGW*|MSYS*|CYGWIN*)
             TOOLCHAIN_LUAROCKS_BIN=$(cygpath -u "$TOOLCHAIN_LUAROCKS")
             ;;
@@ -143,7 +182,7 @@ elif [ -z "${NUPP_LUAROCKS:-}" ]; then
     # so a command that installs nothing costs nothing. Windows starts tools
     # natively and cannot run a shell script, so it keeps the PATH lookup; its
     # CI provisions the toolchain before any build.
-    case "$(uname -s 2>/dev/null)" in
+    case "$LAUNCHER_OS" in
         MINGW*|MSYS*|CYGWIN*) ;;
         *)
             NUPP_LUAROCKS="$ROOT/scripts/luarocks"
@@ -208,7 +247,7 @@ launcher_notice() {
 # Keep the launcher's broad development provider separate from the feature-matched
 # provider a build target stages. Otherwise rebuilding the compiler can replace the
 # library under a later `nupp run` with a narrower union.
-case "$(uname -s 2>/dev/null)" in
+case "$LAUNCHER_OS" in
     MINGW*|MSYS*|CYGWIN*)
         NATIVE_PROVIDER_FILENAME=nupp_native_dev.dll
         CODEGEN_FILENAME=nupp_codegen_dev.dll
@@ -312,7 +351,14 @@ build_native() {
 }
 
 . "$ROOT/scripts/luajit.sh"
-select_luajit "$ROOT" "$TOOLCHAIN_LUAJIT" || exit 1
+if [ "$RUN_READY" = yes ] && [ -n "${NUPP_LAUNCHER_RUN_LUAJIT_DIR:-}" ]; then
+    case "$PATH" in
+        "$NUPP_LAUNCHER_RUN_LUAJIT_DIR":*) ;;
+        *) PATH="$NUPP_LAUNCHER_RUN_LUAJIT_DIR:$PATH"; export PATH ;;
+    esac
+else
+    select_luajit "$ROOT" "$TOOLCHAIN_LUAJIT" || exit 1
+fi
 
 # The stamp is rewritten by every build, warm ones included, so one source
 # newer than it means the build has not seen that edit. Checking mtimes rather
@@ -605,7 +651,9 @@ native_is_current() {
 native_is_usable() {
     # The compiler building this checkout's provider runs on whichever one is
     # staged, since asking for a current one would build it again.
-    if [ "$worker" = yes ] || [ -n "${NUPP_NATIVE_PROVIDER_BUILD:-}" ]; then
+    # So does a command inside a test run, on the provider the run checked.
+    if [ "$worker" = yes ] || [ "$RUN_READY" = yes ] \
+        || [ -n "${NUPP_NATIVE_PROVIDER_BUILD:-}" ]; then
         [ -f "$NUPP_NATIVE_LIBRARY" ]
         return
     fi
@@ -625,7 +673,7 @@ fi
 # so an offline machine asks once rather than on every command; `nupp clean` or
 # a pin bump asks again.
 if [ -z "${NUPP_WGPU_LIBRARY:-}" ]; then
-    case "$(uname -s 2>/dev/null)" in
+    case "$LAUNCHER_OS" in
         MINGW*|MSYS*|CYGWIN*) WGPU_FILENAME=wgpu_native.dll ;;
         Darwin*)              WGPU_FILENAME=libwgpu_native.dylib ;;
         *)                    WGPU_FILENAME=libwgpu_native.so ;;
@@ -646,7 +694,7 @@ if [ -z "${NUPP_WGPU_LIBRARY:-}" ]; then
     export NUPP_WGPU_LIBRARY
 fi
 
-if [ "$rebuild" = yes ] && ! built_is_current; then
+if [ "$rebuild" = yes ] && [ "$RUN_READY" = no ] && ! built_is_current; then
     if ! build_now; then
         # Mid-edit the compiler often does not compile, and that is no reason
         # for the rest of the toolchain to stop working. The last compiler that
@@ -699,6 +747,23 @@ elif stage0_path >/dev/null; then
 else
     echo "nupp: no built compiler, and the stage-zero compiler is not available" >&2
     exit 1
+fi
+
+# The run beneath `nupp test` uses the build checked above, as the top of this
+# script describes. Only a finished one is handed down: a compiler that did not
+# build is still run, behind, but every test's command asking again is what
+# notices once it does.
+#
+# The interpreter goes with it. A test that puts its own directories first on
+# PATH still gets the LuaJIT this run selected, not an older one found there.
+if [ "$COMMAND" = test ] && [ "$using_stage0" = no ] && [ -f "$STAMP" ] \
+    && [ -f "$NUPP_NATIVE_LIBRARY" ] && run_luajit=$(command -v luajit); then
+    NUPP_LAUNCHER_RUN_ROOT=$ROOT
+    NUPP_LAUNCHER_RUN_LUA_ROOT=$LUA_ROOT
+    NUPP_LAUNCHER_RUN_LUAJIT_DIR=$(dirname "$run_luajit")
+    NUPP_LAUNCHER_OS=$LAUNCHER_OS
+    export NUPP_LAUNCHER_RUN_ROOT NUPP_LAUNCHER_RUN_LUA_ROOT \
+        NUPP_LAUNCHER_RUN_LUAJIT_DIR NUPP_LAUNCHER_OS
 fi
 
 # Holding the lock rules out `exec`: the trap that releases it belongs to this
