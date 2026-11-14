@@ -728,13 +728,23 @@ local queueDir = nil
 -- cross the suite boundary.
 local freshQueuePieces = os.getenv("NUPP_TEST_FRESH_QUEUE_PIECES") == "1"
 local supervisedPiece = os.getenv("NUPP_TEST_SUPERVISED_PIECE") == "1"
--- The Lua heap, in megabytes, past which a Nupp worker state stops taking work
--- once its suite is done. The parent replaces it with a fresh state on the same
--- queue. A state kept what every suite it ran left behind, so eight of them
--- outgrew a 7 GB macOS runner, and each suite after that ran slower than the
--- last (#287). `NUPP_TEST_WORKER_HEAP_MB` overrides it; 0 retires a state after
+-- The live Lua heap, in megabytes, past which a Nupp worker state stops taking
+-- work once its suite is done. The parent replaces it with a fresh state on the
+-- same queue. A state kept what every suite it ran left behind, so the shared
+-- lane's process outgrew a 7 GB macOS runner, and each suite after that ran
+-- slower than the last (#287). A state holds about 280 MB once the compiler is
+-- loaded and settled at 300-625 MB without a bound, so 256 retires it after a
+-- few suites. `NUPP_TEST_WORKER_HEAP_MB` overrides it; 0 retires a state after
 -- every suite.
-local workerHeapLimit = (tonumber(os.getenv("NUPP_TEST_WORKER_HEAP_MB") or "") or 512) * 1024
+local workerHeapLimit = (tonumber(os.getenv("NUPP_TEST_WORKER_HEAP_MB") or "") or 256) * 1024
+-- A worker state collects once its heap reaches 1.2 times what was live after the
+-- last collection, rather than LuaJIT's default of twice. Eight states each
+-- carrying a doubled heap of garbage is most of what the shared lane holds:
+-- measured at eight workers, this alone took the process from 8.8 GB to 6.3 GB
+-- for about 2% more time.
+if embedded then
+    collectgarbage("setpause", 120)
+end
 -- Set when this state stopped for that reason with work still queued.
 local retired = false
 local jobs = nil
