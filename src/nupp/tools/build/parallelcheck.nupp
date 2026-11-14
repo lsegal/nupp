@@ -70,7 +70,8 @@ end
 --- `state` (the new build state) and `reporter`. A build also sets `build`, the
 --- `constSelection` its modules generate against (as `constspecialize.describe`
 --- carries it, or `constSelectionProblem` saying why it could not be), and the
---- `linked` dependency modules it compiles from source. Returns `{records, codes}`
+--- `linked` dependency modules it compiles from source, and may set `beforeWorkers`,
+--- called once the run is going to start them. Returns `{records, codes}`
 --- -- the records by module name and, for a build, the Lua each generated -- or
 --- nil and why this process should do the work instead. Either way the reporter
 --- is told how the run used its workers.
@@ -139,6 +140,9 @@ function parallelcheck.run(input: any): (any?, string?)
         return declined(tostring(input.constSelectionProblem))
     end
 
+    if input.beforeWorkers ~= nil then
+        input.beforeWorkers()
+    end
     report:at(input.build and "parallel build" or "parallel check")
     local tasks = require("coroutine")
     local suspension = require("nupp.suspension")

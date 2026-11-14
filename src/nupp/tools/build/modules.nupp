@@ -1637,6 +1637,9 @@ local function buildModules(root: string, outDir: string, config: Config, target
     for position, item in ipairs(queue) do
         sourceQueue[position] = item
     end
+    -- The modules the plan below checked to take part, whose trees its selection
+    -- points into.
+    local planned: {[string]: boolean} = {}
     local specializationPlans: {any} = {}
     local acceptedSpecializations: {any} = {}
     local declinedSpecializations: {any} = {}
@@ -1697,6 +1700,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
 
         local function takePart(item: any): nil
             taking[item.path] = true
+            planned[item.path] = true
             local checked = inc.checkFile(item.path)
             if checked.result ~= nil and checked.missing ~= true and checked.syntax ~= true then
                 takingPart[#takingPart + 1] = {filename = item.path, module = item.name, result = checked.result,}
@@ -1841,6 +1845,16 @@ local function buildModules(root: string, outDir: string, config: Config, target
             constSelection = describedSelection,
             constSelectionProblem = selectionProblem,
             linked = linked,
+            -- Checking the planned modules here checked what they require too, and
+            -- the workers check all of it again. Only the planned trees are read
+            -- after this, so the rest are not held through the run.
+            beforeWorkers = function(): nil
+                for path in pairs(inc.q.memo.checkModule or {}) do
+                    if not planned[path] then
+                        inc.releaseCheck(path)
+                    end
+                end
+            end,
         })
         if produced ~= nil then
             for name in pairs(produced.records) do
