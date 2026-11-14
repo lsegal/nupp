@@ -44,7 +44,7 @@ end
 -- references any more, and which those are depends on when the collector last
 -- ran. Collecting first keeps the image the same from one run to the next.
 local types = require("nupp.compiler.types")
-collectgarbage("collect")
+types.settle()
 local identity = types.identity()
 
 -- Sorted, because the image is compared byte for byte and `pairs` is not an

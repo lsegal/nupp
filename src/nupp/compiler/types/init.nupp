@@ -4370,6 +4370,26 @@ function types.adopt(bucket: string, key: string, value: any): any
     return value
 end
 
+--- Collects until the arenas stop shrinking, so that what they list is what is
+--- still in use rather than what the collector has not got round to yet.
+---
+--- One full collection is not enough. A type held only as the value of a weak-keyed
+--- table is marked by the cycle that clears its key, and freed only by the next.
+function types.settle(): nil
+    local before: integer = -1
+    local after: integer = 0
+    while after ~= before do
+        before = after
+        collectgarbage("collect")
+        after = 0
+        for _, entries in pairs(ARENAS) do
+            for _ in pairs(entries as {[string]: any}) do
+                after = after + 1
+            end
+        end
+    end
+end
+
 --- What `bucket` holds under `key`, if anything.
 function types.interned(bucket: string, key: string): any
     local from = ARENAS[bucket]

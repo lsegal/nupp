@@ -168,7 +168,7 @@ function preludecache.seal(origin: preludecache.Origin): string?
     end
     -- The arenas are weak, so until a collection they still list types nothing
     -- references, and which those are depends on when the collector last ran.
-    collectgarbage("collect")
+    types.settle()
     local lines: {string} = {}
     for bucket, entries in pairs(identity.arenas) do
         for key, value in pairs(entries) do
