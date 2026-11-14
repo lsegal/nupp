@@ -4,6 +4,7 @@ module nupp.tools.build.moduleobject
 -- project modules it depends on. Workers emit these without checker identities, and
 -- the coordinator links them into the components it schedules.
 
+local builtinExtensions = require("nupp.compiler.builtinextensions")
 local cst = require("nupp.compiler.syntax.cst")
 local receiverIntrinsics = require("nupp.compiler.check.receiverintrinsics")
 
@@ -71,10 +72,36 @@ local function globalRequire(node): string?
     return ok and type(value) == "string" and value as string or nil
 end
 
+-- The segments of a qualified type name such as `a.b.T`, or nil for a plain one.
+local function typeSegments(node: any): {string}?
+    if node.base == nil or not cst.isToken(node.base) then
+        return nil
+    end
+    local segments: {string} = {node.base.text}
+    local expectName = false
+    for _, child in ipairs(node) do
+        if child ~= node.base then
+            if not cst.isToken(child) then
+                break
+            elseif expectName then
+                segments[#segments + 1] = child.text
+                expectName = false
+            elseif child.text == "." then
+                expectName = true
+            else
+                break
+            end
+        end
+    end
+
+    return #segments > 1 and segments or nil
+end
+
 --- The object for a parsed module. `index.declaredModules` names the modules a
 --- qualified reference can reach; `index.supportedModules` marks the ones this
---- target cannot load, which are never dependencies.
-export function emit(path: string, parsed: any, header: any, index: any): any
+--- target cannot load, which are never dependencies. `text` is the source, whose
+--- `@raises` lines name types too.
+export function emit(path: string, parsed: any, header: any, index: any, text: string?): any
     local supported = index.supportedModules
     local dependencySet: {[string]: boolean} = {}
     for _, name in ipairs(header.dependencies or {}) do
@@ -83,9 +110,49 @@ export function emit(path: string, parsed: any, header: any, index: any): any
         end
     end
 
+    -- Kept whether or not the project declares the module: one it does not is
+    -- checked wherever it is reached, and the coordinator follows it to what it
+    -- requires in turn.
+    local function depend(name: string?): nil
+        if name ~= nil and (not supported or supported[name] ~= false) then
+            dependencySet[name as string] = true
+        end
+    end
+
+    -- A builtin root a project implements, such as `io` or `assert`, is checked
+    -- the first time a module reads one of its members, with no require naming it.
+    for _, name in ipairs(header.dependencies or {}) do
+        depend(builtinExtensions.module(name))
+    end
+
+    -- A qualified type name, written in code or in an `@raises` line, is resolved
+    -- through the module it names -- or the sibling module of that name -- whether or
+    -- not anything requires it.
+    local currentDir = header.moduleName and (header.moduleName as string):match("^(.*)%.[^.]+$") or nil
+
+    local function qualifiedType(segments: {string}): nil
+        local moduleName = table.concat(segments, ".", 1, #segments - 1)
+        depend(moduleName)
+        depend(builtinExtensions.module(moduleName))
+        if currentDir ~= nil and not moduleName:find(".", 1, true) then
+            depend(currentDir .. "." .. moduleName)
+        end
+    end
+
     local function walk(node, insideDot)
         if node == nil or cst.isToken(node) then
             return
+        end
+        if node.kind == "name" and node.token and builtinExtensions.has(node.token.text) then
+            depend(builtinExtensions.module(node.token.text))
+        end
+        if node.kind == "tname" then
+            local segments = typeSegments(node)
+            if segments ~= nil then
+                qualifiedType(segments as {string})
+            elseif node.base ~= nil and cst.isToken(node.base) and builtinExtensions.has(node.base.text) then
+                depend(builtinExtensions.module(node.base.text))
+            end
         end
         if node.kind == "call" and node.obj and node.obj.kind == "dotIndex" and node.obj.name then
             local intrinsicModule = receiverIntrinsics[node.obj.name.text]
@@ -109,6 +176,15 @@ export function emit(path: string, parsed: any, header: any, index: any): any
     end
 
     walk(parsed.root, false)
+    for spelling in (text or ""):gmatch("@raises%s+([%w_%.]+)") do
+        local segments: {string} = {}
+        for part in (spelling .. "."):gmatch("([^%.]*)%.") do
+            segments[#segments + 1] = part
+        end
+        if #segments > 1 then
+            qualifiedType(segments)
+        end
+    end
     local dependencies: {string} = {}
     for name in pairs(dependencySet) do
         dependencies[#dependencies + 1] = name

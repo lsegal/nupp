@@ -75,6 +75,11 @@ process.Result = shared.Result
 -- two, small enough that a quiet one costs a small buffer rather than a large one.
 local READ_LIMIT: integer = 65536
 
+-- The most of a string one write is offered. A pipe takes a few kilobytes a
+-- write, and offering it the whole unwritten rest copied that rest every time:
+-- a frame of a few megabytes made gigabytes of garbage on its way into a pipe.
+local SEND_SLICE: integer = 65536
+
 -- The longest single wait a stream read asks for, which is the longest a timeout
 -- can be.
 local FOREVER_MS: integer = 2147483647
@@ -436,7 +441,7 @@ record process.Writer is byteio.Writer
                 return true
             end
             if valueType(data) == "string" then
-                sent = sent + self:offer((data as string):sub(sent + 1))
+                sent = sent + self:offer((data as string):sub(sent + 1, sent + SEND_SLICE))
             else
                 sent = sent + self:offer((data as span.Span<uint8>):slice(sent + 1))
             end

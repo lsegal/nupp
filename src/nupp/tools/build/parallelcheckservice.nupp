@@ -8,6 +8,7 @@ id back so the coordinator can tell an answer from a stale one.
 ]]
 module nupp.tools.build.parallelcheckservice
 
+local constspecialize = require("nupp.compiler.lua.constspecialize")
 local envMod = require("nupp.compiler.project.env")
 local fingerprint = require("nupp.compiler.project.fingerprint")
 local fs = require("nupp.compiler.fs")
@@ -45,7 +46,7 @@ local function scanBatch(request: any): any
             return {ok = false, problem = "parallel graph source disappeared: " .. tostring(readProblem or path),}
         end
         local parsed = parser.parse(text as string, path)
-        objects[#objects + 1] = moduleobject.emit(path, parsed, header.of(path, source.name, parsed), index)
+        objects[#objects + 1] = moduleobject.emit(path, parsed, header.of(path, source.name, parsed), index, text)
     end
 
     return {ok = true, objects = objects,}
@@ -173,6 +174,20 @@ local function checkBatch(request: any): any
             local result = session.inc.checkReadyFile(path)
             semanticMs = semanticMs + os.monotonic() - semanticStarted
             local recordStarted = os.monotonic()
+            -- The build's selection names this module's nodes by their place in
+            -- its source; it is bound to this session's tree before generation
+            -- rewrites anything, as the planner's was.
+            local described = context.constSelection
+            local selection: any? = nil
+            local specializationHash = emptySpecializationHash
+            if described ~= nil then
+                if result.result ~= nil then
+                    selection = constspecialize.rebind(described, result.result, path)
+                else
+                    selection = {accepted = {}, declined = {}}
+                end
+                specializationHash = described.hashes[path] or emptySpecializationHash
+            end
             for _, diagnostic in ipairs(result.diags or {}) do
                 diagnostics[#diagnostics + 1] = diagnostic
             end
@@ -189,8 +204,8 @@ local function checkBatch(request: any): any
                 checkOnly = not context.build,
                 external = path:match("%.d%.nupp$") ~= nil
                 or envMod.isDependencyTypePath(session.inc.env, path) and not context.linked[name],
-                constSelection = context.constSelection,
-                specializationHash = emptySpecializationHash,
+                constSelection = selection,
+                specializationHash = specializationHash,
                 rewritten = false,
                 authoredLints = nil,
                 aotRefusals = noRefusals,

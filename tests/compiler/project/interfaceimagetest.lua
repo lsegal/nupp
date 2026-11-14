@@ -516,6 +516,16 @@ function M.keepsDefaultsAfterAHole()
     testAssert.eq(got.paramDefaults[2], T.string, "default after a hole")
 end
 
+-- The stored fields, in the order they were declared. Read back off the reflected
+-- members instead, a method declared in the record's body became a stored field
+-- in every worker that imported the record rather than checked it.
+function M.keepsTheStoredFieldOrder()
+    local pair = indexed("Ordered", "/project/sample.nupp")
+    pair.fieldOrder = {"second", "first"}
+    local got = roundTrip(pair)
+    testAssert.deepeq(got.fieldOrder, {"second", "first"}, "stored fields in declaration order")
+end
+
 function M.keepsTransportStateOutOfThePublicDescriptor()
     local parser = require("nupp.compiler.syntax.parser")
     local gen = require("nupp.compiler.lua.gen")
