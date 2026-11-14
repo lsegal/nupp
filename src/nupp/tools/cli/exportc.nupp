@@ -7,6 +7,11 @@ local usageError = require("nupp.tools.cli.error").forCommand("export-c")
 local cliModule = require("io.cli")
 local report = require("nupp.tools.cli.report")
 
+local type Constant = {
+    name: string,
+    value: integer
+}
+
 local REPORT_SCHEMA = {
     type = "object",
     properties = {
@@ -496,7 +501,7 @@ local function run(options: any): integer
     end
     local cabi = require("nupp.compiler.cinterop.cabi")
     local aggregateDescriptions, functionSignatures = {}, {}
-    local definitions: {{name: string, value: integer}} = {}
+    local definitions: {Constant} = {}
     local described = {}
 
     local function describe(t: any, selection: string): boolean
@@ -577,10 +582,8 @@ local function run(options: any): integer
         if types[selection] then
             describe(types[selection], selection)
         elseif constants[selection] ~= nil then
-            definitions[#definitions + 1] = {
-                name = selection:match("([^.]+)$") as string,
-                value = constants[selection] as integer
-            }
+            local name = selection:match("([^.]+)$") as string
+            definitions[#definitions + 1] = {name = name, value = constants[selection] as integer}
         elseif functions[selection] then
             functionSignatures[#functionSignatures + 1] = functions[selection]
             for _, description in ipairs(functions[selection].elementStructs or {}) do
