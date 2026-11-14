@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `nupp test` workers no longer keep every type of every project their tests
+  compiled. A test that builds a project in each of its cases used to add
+  about 45 MB to its worker per build, so a suite of them could peak past
+  2 GB; the worker now stays near what one build needs.
 - On ARM64, a 64-bit shift by a 64-bit constant count, such as
   `x ~ (x << 1ULL)`, keeps its count once LuaJIT traces it. The traced code
   shifted by zero instead, so `math.u64.prefixxor(1)` could answer `0ULL` on
