@@ -95,6 +95,55 @@ function M.partialFailedSkippedAndRecentRunsCannotPopulateTheStore()
     end)
 end
 
+function M.partialSelectionsStoreTheirOwnPassesWithoutEvictingEachOther()
+    fixture(function(root, options, results, suites)
+        fs.writeFile(root .. "/tests/one/betatest.lua", "return {passes = function() end}\n")
+        options.catalog[2] = {name = "betatest", path = "one/betatest.lua"}
+        local beta = {suite = "betatest", name = "passes", id = "betatest/passes", status = "passed", durationMs = 1}
+        local alphaOnly = opened(options)
+        alphaOnly.save(results, suites)
+        options.selected = {{name = "betatest"}}
+        local betaOnly, betaEntry = opened(options)
+        test.eq(betaEntry.hit, nil, "another part of the package has no recorded pass yet")
+        betaOnly.save({beta}, {{suite = "betatest", tests = 1}})
+        assert(select(2, opened(options)).hit, "the second part keeps its own pass")
+        options.selected = {{name = "alphatest"}}
+        local _, alpha = opened(options)
+        assert(alpha.hit, "storing one part did not evict the other")
+        test.eq(alpha.members.betatest, nil)
+        options.selected = {{name = "alphatest"}, {name = "betatest"}}
+        test.eq(select(2, opened(options)).hit, nil, "the whole package is its own selection")
+        fs.writeFile(root .. "/tests/one/betatest.lua", "return {passes = function() assert(true) end}\n")
+        options.selected = {{name = "alphatest"}}
+        test.eq(select(2, opened(options)).hit, nil, "a sibling file in the package is an input of every part")
+    end)
+end
+
+function M.neverCachedSuitesExecuteDespiteAMatchingFingerprint()
+    fixture(function(root, options, results, suites)
+        fs.writeFile(root .. "/tests/one/timingtest.lua", "return {passes = function() end}\n")
+        options.catalog[2] = {name = "timingtest", path = "one/timingtest.lua"}
+        options.selected[2] = {name = "timingtest"}
+        results[2] = {suite = "timingtest", name = "passes", id = "timingtest/passes", status = "passed", durationMs = 1}
+        suites[2] = {suite = "timingtest", tests = 1}
+        options.neverCache = {timingtest = "depends on scheduling"}
+        local cache, entry = opened(options)
+        test.eq(cache.excluded.timingtest, "depends on scheduling")
+        test.eq(entry.members.timingtest, nil)
+        cache.save(results, suites)
+        local _, reused = opened(options)
+        assert(reused.hit, "the package's other suites still reuse their pass")
+        test.eq(reused.members.timingtest, nil, "a never-cached suite is never part of a stored pass")
+        for _, record in ipairs(reused.hit.tests) do
+            assert(record.suite ~= "timingtest", "a never-cached result was recorded")
+        end
+        options.selected = {{name = "timingtest"}}
+        local only = assert(cacheModule.open(options))
+        test.eq(only.packages.one, nil)
+        test.eq(only.reasons.one, "every selected suite is never cached")
+    end)
+end
+
 function M.opaqueInputsStayUncachedAndNestedPackagesAreIndependent()
     fixture(function(root, options)
         options.catalog[2] = {name = "betatest", path = "one/nested/betatest.lua"}
@@ -150,7 +199,9 @@ function M.environmentAndRuntimeArtifactChangesInvalidateResults()
             if command == "env -0" then
                 return {
                     read = function()
-                        return "NUPP_TEST_INPUT=" .. setting .. "\0CODEX_TOOL_CALL_ID=" .. transport .. "\0"
+                        return "NUPP_TEST_INPUT=" .. setting .. "\0CODEX_TOOL_CALL_ID=" .. transport
+                            .. "\0GITHUB_RUN_ID=" .. transport .. "\0GITHUB_SHA=" .. transport
+                            .. "\0ACTIONS_RUNTIME_TOKEN=" .. transport .. "\0RUNNER_OS=Linux\0"
                     end,
                     close = function()
                     end
@@ -164,7 +215,11 @@ function M.environmentAndRuntimeArtifactChangesInvalidateResults()
         local _, unchanged = opened(options)
         assert(unchanged.hit)
         transport = "another-call"
-        assert(select(2, opened(options)).hit, "tool-call bookkeeping does not invalidate a pass")
+        assert(select(2, opened(options)).hit, "tool-call and CI run bookkeeping does not invalidate a pass")
+        test.eq(cacheModule.transport("GITHUB_RUN_ID"), true)
+        test.eq(cacheModule.transport("ACTIONS_CACHE_URL"), true)
+        test.eq(cacheModule.transport("RUNNER_OS"), false, "the platform a CI job runs on is an input")
+        test.eq(cacheModule.transport("GITHUB_ACTIONS"), false)
         options.selected[1].path = options.catalog[1].path
         local restore = cache.audit()
         local messages, stderr = {}, io.stderr
@@ -176,10 +231,12 @@ function M.environmentAndRuntimeArtifactChangesInvalidateResults()
         local active = rawget(_G, "__NUPP_TEST_AUDIT_ACTIVE")
         rawset(_G, "__NUPP_TEST_AUDIT_ACTIVE", true)
         os.getenv("CODEX_TOOL_CALL_ID")
+        os.getenv("GITHUB_RUN_ID")
         rawset(_G, "__NUPP_TEST_AUDIT_ACTIVE", active)
         restore()
         io.stderr = stderr
         assert(table.concat(messages):find("audit: environment lookup CODEX_TOOL_CALL_ID", 1, true))
+        assert(table.concat(messages):find("audit: environment lookup GITHUB_RUN_ID", 1, true))
         setting = "after"
         local _, changed = opened(options)
         test.eq(changed.hit, nil)
@@ -322,9 +379,11 @@ function M.realRunnerReusesPackagesAcrossSelectionsAndRerunsOnlyChangedPackages(
         fs.writeFile(root .. "/tests/cache.lua", assert(fs.readFile("tests/cache.lua")))
         fs.writeFile(root .. "/tests/one/alphatest.lua", "return {passes = function() assert(true) end}\n")
         fs.writeFile(root .. "/tests/two/betatest.lua", "return {passes = function() assert(true) end}\n")
+        fs.writeFile(root .. "/tests/one/deltatest.lua", "return {passes = function() assert(true) end}\n")
         fs.writeFile(
             root .. "/tests/groups.lua",
-            'return {pair = {"alphatest", "betatest"}}, {packages = {one = {cache = true}, two = {cache = true}}}\n'
+            'return {pair = {"alphatest", "betatest", "deltatest"}}, {packages = {one = {cache = true}, '
+            .. 'two = {cache = true}}, neverCache = {deltatest = "measures scheduling"}}\n'
         )
 
         local function age(path)
@@ -334,8 +393,9 @@ function M.realRunnerReusesPackagesAcrossSelectionsAndRerunsOnlyChangedPackages(
         age(root .. "/tests/one/alphatest.lua")
         age(root .. "/tests/one/fixture")
         age(root .. "/tests/two/betatest.lua")
+        age(root .. "/tests/one/deltatest.lua")
 
-        local function run(arguments)
+        local function run(arguments, failing)
             local argv = {nupp, "test", "--internal-runner", "--json"}
             for _, value in ipairs(arguments) do
                 argv[#argv + 1] = value
@@ -346,27 +406,47 @@ function M.realRunnerReusesPackagesAcrossSelectionsAndRerunsOnlyChangedPackages(
                 env = {NUPP_TEST_BUILD = root .. "/build"}
             }) .. " >" .. process.quote(output) .. " 2>" .. process.quote(errors)
             local status = os.execute(command)
-            assert(status == 0 or status == true, fs.readFile(errors))
+            assert(failing or status == 0 or status == true, fs.readFile(errors))
 
             return json.decode(assert(fs.readFile(output)))
         end
 
         local cold = run({"--group=pair", "--jobs=1"})
-        test.eq(cold.passed, 2)
+        test.eq(cold.passed, 3)
         test.eq(cold.cached, 0)
-        local hit = run({"betatest", "alphatest", "--jobs=4", "--verbose"})
-        test.eq(hit.passed, 0)
+        test.eq(cold.cacheEligiblePackages, 2)
+        test.eq(cold.cacheHitRate, 0)
+        local hit = run({"betatest", "deltatest", "alphatest", "--jobs=4", "--verbose"})
+        test.eq(hit.passed, 1, "the never-cached suite executes beside two recorded passes")
         test.eq(hit.cached, 2)
         test.eq(hit.cachedPackages, 2)
+        test.eq(hit.cacheHitRate, 1)
+        for _, record in ipairs(hit.tests) do
+            test.eq(record.status, record.suite == "deltatest" and "passed" or "cached", record.id)
+        end
+        assert(
+            fs.readFile(root .. "/stderr"):find("result cache deltatest: never cached: measures scheduling", 1, true),
+            "--verbose names why a suite always executes"
+        )
         fs.writeFile(root .. "/tests/two/betatest.lua", "return {passes = function() assert(1 + 1 == 2) end}\n")
         age(root .. "/tests/two/betatest.lua")
         local changed = run({"--group=pair", "--jobs=1"})
-        test.eq(changed.passed, 1)
+        test.eq(changed.passed, 2)
         test.eq(changed.cached, 1)
         test.eq(changed.cachedPackages, 1)
-        local fresh = run({"--group=pair", "--jobs=1", "--fresh"})
+        test.eq(changed.cacheHitRate, 0.5)
+        fs.writeFile(root .. "/tests/two/betatest.lua", "return {passes = function() assert(1 + 1 == 3) end}\n")
+        age(root .. "/tests/two/betatest.lua")
+        local broken = run({"--group=pair", "--jobs=1"}, true)
+        test.eq(broken.ok, false, "a previously green suite whose file changed executes and fails")
+        test.eq(broken.failed, 1)
+        test.eq(broken.cached, 1)
+        local again = run({"--group=pair", "--jobs=1"}, true)
+        test.eq(again.failed, 1, "a failure is never recorded as a pass")
+        local fresh = run({"--group=pair", "--jobs=1", "--fresh"}, true)
         test.eq(fresh.passed, 2)
         test.eq(fresh.cached, 0)
+        test.eq(fresh.cacheHitRate, nil)
     end)
 end
 

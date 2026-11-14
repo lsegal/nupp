@@ -1,0 +1,83 @@
+--[[
+What the toolchain driver answered, remembered for the rest of one test run.
+
+Every build that stages a native provider, a host stub or a prebuilt asset asks
+`scripts/toolchain` where it is. The driver keys its answer by digests of its
+inputs and works those out again on every call: a second or more of shell on
+Windows for a path that cannot have moved, since nothing a run's tests do
+changes the checkout they are testing. A test suite asks it from hundreds of
+builds.
+
+`nupp test` names a directory for the run in `NUPP_TOOLCHAIN_ANSWERS`, and an
+answer recorded there is reused while the file it names is still there. Each is
+keyed by the request and by every variable the driver reads, so a test that
+points the driver somewhere else gets its own answer. Outside a run nothing is
+remembered.
+]]
+module nupp.tools.build.driveranswers
+
+local fs = require("nupp.compiler.fs")
+local fingerprint = require("nupp.compiler.project.fingerprint")
+
+--- The variables `driver` reads, worked out once per process from its text.
+local variablesMemo: {[string]: {string}} = {}
+
+local function variables(driver: string): {string}
+    local memo = variablesMemo[driver]
+    if memo then
+        return memo
+    end
+    local names: {string} = {}
+    local seen: {[string]: boolean} = {}
+    local text = fs.readFile(driver) or ""
+    for name in text:gmatch("%$%{?([%a_][%w_]*)") do
+        if not seen[name] then
+            seen[name] = true
+            names[#names + 1] = name
+        end
+    end
+    table.sort(names)
+    variablesMemo[driver] = names
+
+    return names
+end
+
+--- Where the answer to `request` would be recorded, or nil outside a test run.
+--- `directory` is the run's, `NUPP_TOOLCHAIN_ANSWERS` when not given.
+export function slot(driver: string, request: {string}, directory: string?): string?
+    directory = directory or os.getenv("NUPP_TOOLCHAIN_ANSWERS")
+    if directory == nil or directory == "" then
+        return nil
+    end
+    local parts: {string} = {driver}
+    for _, item in ipairs(request) do
+        parts[#parts + 1] = item
+    end
+    for _, name in ipairs(variables(driver)) do
+        parts[#parts + 1] = name .. "=" .. (os.getenv(name) or "")
+    end
+    local digest = fingerprint.contentDigest()(table.concat(parts, "\0"))
+
+    return fs.join(directory as string, digest)
+end
+
+--- The answer recorded at `place`, while the file it names is still there.
+export function recalled(place: string?): string?
+    if place == nil then
+        return nil
+    end
+    local answer = fs.readFile(place as string)
+    if answer == nil or answer == "" or not fs.exists(answer as string) then
+        return nil
+    end
+
+    return answer
+end
+
+--- Records `answer` at `place`. Best effort: a run that cannot write one asks the
+--- driver again next time, which is what it did before there was a record.
+export function remember(place: string?, answer: string): nil
+    if place ~= nil then
+        fs.writeFile(place as string, answer)
+    end
+end

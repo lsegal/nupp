@@ -9,6 +9,7 @@ module nupp.tools.build.prebuilt
 local envMod = require("nupp.compiler.project.env")
 local fs = require("nupp.compiler.fs")
 local process = require("nupp.compiler.process")
+local driverAnswers = require("nupp.tools.build.driveranswers")
 
 local prebuilt = {}
 
@@ -27,8 +28,13 @@ function prebuilt.fetch(what: string, platform: string?): (string?, string?)
     local driver = fs.join(compilerRoot as string, "scripts/toolchain")
     -- os.execute reaches cmd.exe on Windows, which does not interpret a
     -- shebang, so the driver's shell is named there.
-    local argv = windows and {"sh.exe", driver, "prebuilt-" .. what, platform or ""}
-        or {driver, "prebuilt-" .. what, platform or ""}
+    local request = {"prebuilt-" .. what, platform or ""}
+    local slot = driverAnswers.slot(driver, request)
+    local recalled = driverAnswers.recalled(slot)
+    if recalled then
+        return recalled, nil
+    end
+    local argv = windows and {"sh.exe", driver, request[1], request[2]} or {driver, request[1], request[2]}
     local code, text = process.capture(argv)
     -- Progress goes to standard error and the answer to standard output; the
     -- capture merges them, so either is the last line that says anything.
@@ -44,6 +50,7 @@ function prebuilt.fetch(what: string, platform: string?): (string?, string?)
     if last == nil then
         return nil, "the toolchain driver fetched the prebuilt " .. what .. " but named no file"
     end
+    driverAnswers.remember(slot, last as string)
 
     return last, nil
 end

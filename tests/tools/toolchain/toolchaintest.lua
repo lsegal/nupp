@@ -809,6 +809,110 @@ function M.thePrefixFollowsTheToolchain()
     assert(again == one, "the same toolchain answered two prefixes")
 end
 
+-- A test run is one build of the tree. The launcher checks the compiler, the
+-- provider and the interpreter once for `nupp test` and hands that down, so a
+-- command a test starts goes straight to the compiler: no toolchain query, no
+-- interpreter probe, no rebuild. `build` still takes the ordinary path, since it
+-- is the writer the others would have to wait for.
+function M.aTestRunsCommandsUseTheBuildTheRunChecked()
+    local directory = temporary()
+    local root = directory .. "/root"
+    local bin = directory .. "/bin"
+    assert(os.execute(
+        "mkdir -p " .. quote(root .. "/bin") .. " " .. quote(root .. "/scripts") .. " "
+            .. quote(root .. "/build/nupp/tools") .. " " .. quote(root .. "/build/lib") .. " "
+            .. quote(bin)
+    ) == 0)
+    write(root .. "/bin/nupp", read(ROOT .. "/bin/nupp"))
+    write(root .. "/build/nupp/tools/main.lua", "-- the compiler\n")
+    write(root .. "/build/.nupp-complete", "")
+    write(
+        root .. "/scripts/toolchain",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LOG/toolchain\"\n"
+            .. "case \"$1\" in\n"
+            .. "    --prefix) printf '%s\\n' \"$LOG/prefix\" ;;\n"
+            .. "    native-provider) printf '%s\\n' \"$LOG/provider\" ;;\n"
+            .. "    *) exit 1 ;;\n"
+            .. "esac\n"
+    )
+    write(directory .. "/provider", "fixture provider\n")
+    write(root .. "/scripts/rocks.sh", "link_development_rocks() { :; }\n")
+    write(
+        root .. "/scripts/luajit.sh",
+        "select_luajit() { printf 'selected\\n' >> \"$LOG/luajit\"; }\n"
+    )
+    -- The interpreter: for `test` it starts the commands a test would, beneath
+    -- the run, and every command records how it was reached.
+    write(
+        bin .. "/luajit",
+        "#!/bin/sh\nshift 2\nshift\n"
+            .. "printf '%s run=%s answers=%s\\n' \"$1\" \"${NUPP_LAUNCHER_RUN_ROOT:-}\" "
+            .. "\"${NUPP_TOOLCHAIN_ANSWERS:-}\" >> \"$LOG/commands\"\n"
+            .. "if [ \"$1\" = test ]; then\n"
+            .. "    : > \"$LOG/toolchain\"; : > \"$LOG/luajit\"\n"
+            .. "    \"$NUPP_ROOT/bin/nupp\" check || exit 1\n"
+            .. "    cp \"$LOG/toolchain\" \"$LOG/toolchain-check\"\n"
+            .. "    cp \"$LOG/luajit\" \"$LOG/luajit-check\"\n"
+            .. "    \"$NUPP_ROOT/bin/nupp\" build || exit 1\n"
+            .. "    cp \"$LOG/luajit\" \"$LOG/luajit-build\"\n"
+            .. "fi\n"
+    )
+    assert(os.execute("chmod +x " .. quote(root .. "/bin/nupp") .. " " .. quote(root .. "/scripts/toolchain")
+        .. " " .. quote(bin .. "/luajit")) == 0)
+    local status, output = run(
+        {
+            LOG = forPath(directory),
+            NUPP_ROOT = forPath(root),
+            PATH = forPath(bin) .. ":$PATH",
+            NUPP_LAUNCHER_RUN_ROOT = "",
+            NUPP_LAUNCHER_OS = "",
+            NUPP_LAUNCHER_TOOLCHAIN_KEY = "",
+            NUPP_LAUNCHER_ROCKS_ROOT = "",
+            NUPP_TOOLCHAIN_ANSWERS = "",
+            NUPP_WGPU_LIBRARY = "unused",
+        },
+        "test",
+        root .. "/bin/nupp"
+    )
+    assert(status == 0, output)
+    local commands = read(directory .. "/commands")
+    local runRoot, answers, checkRoot = commands:match("^test run=(%S+) answers=(%S+)\ncheck run=(%S+) answers=")
+    assert(runRoot and runRoot == checkRoot, "the run was not handed down:\n" .. commands)
+    assert(answers == runRoot .. "/build/.nupp-run-answers", "the run's toolchain answers are not the tree's:\n"
+        .. commands)
+    assert(read(directory .. "/toolchain-check") == "", "a test's command asked the toolchain again:\n"
+        .. read(directory .. "/toolchain-check"))
+    assert(read(directory .. "/luajit-check") == "", "a test's command probed the interpreter again")
+    assert(read(directory .. "/luajit-build") == "selected\n", "a build inside the run skipped the checks")
+    os.execute("rm -rf " .. quote(directory))
+end
+
+-- Inside a run, what the driver answered is remembered and asked again only
+-- when the request, a variable the driver reads, or the file it named changed.
+function M.theRunRemembersWhatTheDriverAnswered()
+    local answers = require("nupp.tools.build.driveranswers")
+    local directory = temporary()
+    local driver = directory .. "/toolchain"
+    write(driver, "#!/bin/sh\necho \"$NUPP_TOOLCHAIN_ANSWERS_FIXTURE_UNSET\"\n")
+    local built = directory .. "/provider"
+    write(built, "fixture provider\n")
+    local store = directory .. "/answers"
+
+    assert(answers.slot(driver, {"native-provider", "base"}, "") == nil, "an answer was remembered outside a run")
+    local slot = answers.slot(driver, {"native-provider", "base"}, store)
+    assert(slot ~= nil and slot:find(store, 1, true) == 1, "the answer is not kept in the run's directory")
+    assert(slot == answers.slot(driver, {"native-provider", "base"}, store), "one request has two places")
+    assert(slot ~= answers.slot(driver, {"native-provider", "workers"}, store), "two requests share an answer")
+
+    assert(answers.recalled(slot) == nil, "an answer was recalled before the driver gave one")
+    answers.remember(slot, built)
+    assert(answers.recalled(slot) == built, "the driver's answer was not remembered")
+    os.remove(built)
+    assert(answers.recalled(slot) == nil, "an answer naming a file that is gone was trusted")
+    assert(answers.recalled(nil) == nil)
+    os.execute("rm -rf " .. quote(directory))
+end
+
 function M.legacyNativeProviderComponentIsAbsent()
     local directory = temporary()
     local compiler = fakeCompiler(directory, "fake-cc", "fake")

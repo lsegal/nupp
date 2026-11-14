@@ -861,4 +861,35 @@ packages[
     "compiler/project/contracts/generators"
 ] = {cache = false, reason = "Local generator rocks also read external LuaRocks configuration."}
 
-return groups, {scopes = scopes, packages = packages}
+-- Suites whose result depends on timing, deadlines, machine load, process or
+-- collector lifecycle, the network or measurement. They always execute, even
+-- in a package whose contract is closed and whose fingerprint matches: a pass
+-- under one load says nothing about the next. Their package's other suites
+-- still reuse passes. Grow the cached set by auditing, not by trimming this.
+local neverCache = {}
+
+local function never(reason, names)
+    for name in names:gmatch("%S+") do
+        neverCache[name] = reason
+    end
+end
+
+never("Deadline and timer ordering depends on scheduling under load.", [[
+timerstest taskstest taskfailuretest sustest hostchanneltest
+parallelcheckprotocoltest
+]])
+never("Process and worker lifecycle depends on live host state.", [[
+processtest processprovidertest processnativetest parallelchecktest
+projectprocesstest runnertest
+]])
+never("Allocation and collector measurements vary with process history.", [[
+pooltest structpooltest eventstest perfbudgettest
+]])
+never("Measurement and budget suites time the current machine.", [[
+benchtest aotbudgettest simdpackbudgettest
+]])
+never("Live network and socket conformance.", [[
+stdlibtest nettest netnativetest tlstest httpnativetest
+]])
+
+return groups, {scopes = scopes, packages = packages, neverCache = neverCache}

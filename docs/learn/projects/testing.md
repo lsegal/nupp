@@ -168,7 +168,9 @@ an incomplete declaration can reuse an obsolete pass.
 ### Reusing passes
 
 Worker counts, group selection, and output options do not change a package's
-cache key. A package must still be selected completely to reuse its pass.
+cache key. The selected suites of a package are the unit a pass is stored for:
+a lane, group or suite list that runs part of a package keys and stores that
+part, so partial runs neither need the whole package nor evict each other.
 `--verbose` reports each package's cache hit, miss, or exclusion reason.
 
 ```bash
@@ -179,14 +181,39 @@ nupp test parsertest --audit --jobs=1
 
 `--fresh` executes tests without reading or writing the result cache. A cache hit
 has status `cached`, keeps its original duration, and is counted separately from
-fresh passes. Failed, skipped, incomplete, recently modified, and partially
-selected packages do not populate the cache. The store lives under
-`build/.nupp-test-results`; removing it costs another test run.
+executed passes: `passed` only ever counts cases that ran. The summary and the
+`--json` report give the cached count, the packages that hit out of those that
+were eligible, and the hit rate, so a run whose fingerprints mostly missed reads
+as a low hit rate rather than as an unexplained slow one. Failed, skipped,
+incomplete, and recently modified packages do not populate the cache. The store
+lives under `build/.nupp-test-results`; removing it costs another test run.
+
+Variables a CI service or tool call sets afresh for each invocation, such as
+`GITHUB_RUN_ID`, `GITHUB_SHA` and `ACTIONS_*`, are left out of the key so one CI
+run can reuse another's passes. Every other environment value stays in it.
+
+### Suites that are never cached
+
+Some suites check timing, deadlines, machine load, process or collector
+lifecycle, the network, or a measurement. A pass under one load says nothing
+about the next, so they execute every time however well they fingerprint.
+Name them in the policy's `neverCache` map, with the reason `--verbose` prints:
+
+```lua
+return {}, {
+   packages = {["unit/scheduler"] = {cache = true}},
+   neverCache = {timerstest = "Deadline ordering depends on host load."},
+}
+```
+
+The rest of the package still reuses its passes.
 
 `--audit` selects one test package and reports parent-process file and environment accesses
 outside the known inputs. It does not observe all native or child-process reads,
-and an empty audit does not establish cache eligibility. Authoritative CI uses
-`--fresh`.
+and an empty audit does not establish cache eligibility. CI restores the store
+per platform through the Actions cache, saves it from every run that completes,
+and runs the broad suite without `--fresh`; focused groups such as measurement
+stay fresh.
 
 ## Where the time went
 
@@ -449,8 +476,14 @@ the total.
 ```bash
 nupp test --jobs=4        # four shards
 nupp test --jobs=1        # one process
+nupp test --jobs=shell:2  # two workers for the shell lane, the default for the rest
 nupp test checktest       # one named suite, one process
 ```
+
+Every lane a run selects shares that run's one build of the compiler, the test
+runner and the native provider. `--lane=isolated,shell` keeps two lanes, and
+`--jobs=LANE:N` sizes one lane without splitting it into a run of its own, which
+would check and build all of that again.
 
 Work is ordered from measurement rather than guesswork: nothing about a suite
 says in advance how long it takes, so a run writes what every suite and every
