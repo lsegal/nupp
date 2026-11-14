@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `nupp fmt --check` over many files keeps only the interfaces of the modules
+  they require, not every module's checked tree, and collects garbage the way
+  `nupp build` does. A cold check of a quarter of this repository's tree went
+  from about 2 GB to about 500 MB on Windows, in the same time. `nupp check`
+  of files outside a project and `nupp migrate` get the same treatment.
 - `nupp bc`, `nupp run` and `nupp lsp artifact` of a file inside a project keep
   the checked interfaces of the project modules it requires in the build
   directory, and read them back on the next command instead of checking the
