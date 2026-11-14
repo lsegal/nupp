@@ -172,13 +172,17 @@ local function run(options: any): integer
     end
 
     local compile = require("nupp.tools.cli.compile")
-    local env = require("nupp.compiler.project.env").new(".")
+    local envMod = require("nupp.compiler.project.env")
+    -- The file's dependencies are read back from what the last compile in this project
+    -- checked, rather than checked again: see `nupp.compiler.project.projectimage`.
+    local env = envMod.new(".", {projectInterfaces = true})
     local settings = compile.settings(options)
     settings.diagnostics = collected
     local folding = (options.format or "text") == "text" and not options.prologue
     local boundary = folding and listing.BOUNDARY or nil
     settings.bytecodeBoundary = boundary
     local code, compileErr = compile.module(path, env, settings)
+    envMod.persist(env)
     if not code then
         -- What stopped it has been said, as diagnostics in the document or as text.
         return collected and fail() or fail(nil, tostring(compileErr))
