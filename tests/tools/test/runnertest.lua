@@ -1051,7 +1051,7 @@ function M.aWorkerThatGrewHandsItsQueueToAFreshOne()
     write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
     local names = {}
     for index = 1, 5 do
-        names[index] = "handovertest" .. index
+        names[index] = "handover" .. index .. "test"
         write(dir .. "/tests/" .. names[index] .. ".lua", "return {runs = function() end}\n")
     end
 
