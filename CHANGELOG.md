@@ -35,3 +35,12 @@
 - `nupp aot --emit llvm` and `--emit llvm-library` declare the C functions a
   native program calls in name order. The order used to change from run to
   run, so compiling the same source twice could give different IR.
+- `nupp test` reuses recorded passes for part of a package, so a run limited
+  to one lane, group or list of suites no longer re-runs a package just because
+  it did not select all of it. A test policy's new `neverCache` map names
+  suites that always execute, such as timing, process-lifecycle and
+  measurement suites, while the rest of their package is still reused. The
+  summary and the `--json` report now give the cache hit rate
+  (`cacheEligiblePackages`, `cacheHitRate`) beside the cached count, and CI
+  run IDs, the commit SHA and `ACTIONS_*` tokens no longer change a result's
+  fingerprint, so one CI run can reuse another's passes.
