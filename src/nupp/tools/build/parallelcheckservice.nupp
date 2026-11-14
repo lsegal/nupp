@@ -46,7 +46,7 @@ local function scanBatch(request: any): any
             return {ok = false, problem = "parallel graph source disappeared: " .. tostring(readProblem or path),}
         end
         local parsed = parser.parse(text as string, path)
-        objects[#objects + 1] = moduleobject.emit(path, parsed, header.of(path, source.name, parsed), index)
+        objects[#objects + 1] = moduleobject.emit(path, parsed, header.of(path, source.name, parsed), index, text)
     end
 
     return {ok = true, objects = objects,}

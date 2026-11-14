@@ -666,6 +666,101 @@ return {value = value}
     assert(os.remove(directory, true))
 end
 
+-- The checker reads some modules no require names: the project's own
+-- implementation of a builtin root such as `io` or `assert`, and the module a
+-- qualified type names, in code or in an `@raises` line. A worker checking a
+-- module before those would check them itself, which a worker refuses, so the
+-- graph scan orders them first.
+function M.theGraphScanOrdersModulesTheCheckerReadsUnasked()
+    local parser = require("nupp.compiler.syntax.parser")
+    local header = require("nupp.compiler.project.header")
+    local moduleobject = require("nupp.tools.build.moduleobject")
+    local path = "/project/app/reader.nupp"
+    local text = [[
+--- Reads a number.
+--- @raises codec.Error when the file is malformed
+local function read(path: io.Path): number
+    assert(path)
+    return math.floor(1.5)
+end
+
+return {read = read}
+]]
+    local parsed = parser.parse(text, path)
+    local declared = {
+        ["app.codec"] = true,
+        ["app.reader"] = true,
+        assert = true,
+        ["nupp.runtime.standardio"] = true,
+        ["nupp.runtime.standardmath"] = true,
+        ["nupp.runtime.standardos"] = true,
+    }
+    local object = moduleobject.emit(
+        path,
+        parsed,
+        header.of(path, "app.reader", parsed),
+        {declaredModules = declared},
+        text
+    )
+    testAssert.deepeq(object.dependencies, {
+        "app.codec",
+        "assert",
+        "nupp.runtime.standardio",
+        "nupp.runtime.standardmath",
+    })
+end
+
+-- An alias keeps its defaults as the syntax they were written in, and the module
+-- applying it resolves them. An interface image that dropped them left a worker
+-- reading `box.Packed<number>` with its const parameter unbound.
+function M.aliasDefaultsReachEveryWorker()
+    local directory = os.tmpname()
+    os.remove(directory)
+    write(directory .. "/nupp.lua", 'return {include = {"src"}}\n')
+    write(
+        directory .. "/src/lib/box.nupp",
+        [[
+module lib.box
+
+export interface Box<T, const Kind: string = "packed">
+    value: T
+end
+
+export type Packed<T, const Kind: string = "packed"> = Box<T, Kind>
+
+export function packed(value: number): Packed<number>
+    return {value = value}
+end
+]]
+    )
+    for index = 1, 4 do
+        write(
+            directory .. ("/src/user%d.nupp"):format(index),
+            (
+                [[
+local box = require("lib.box")
+
+local function value(item: box.Packed<number>): number
+    return item.value + %d
+end
+
+return {value = value, made = value(box.packed(%d))}
+]]
+            ):format(index, index)
+        )
+    end
+
+    local serialCode, serialReport, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
+    testAssert.eq(serialCode, 0, "serial fixture: " .. json.encode(serialReport.diagnostics))
+    local code, report, state = coldCheck(directory, {NUPP_CHECK_JOBS = "2"})
+    testAssert.eq(report.timing.parallel.mode, "parallel", "parallel timing mode")
+    testAssert.eq(stable(report.diagnostics), stable(serialReport.diagnostics), "parallel diagnostics")
+    testAssert.eq(code, 0, "parallel exit status")
+    testAssert.eq(state, serialState, "parallel check records")
+
+    assert(os.remove(directory, true))
+end
+
 function M.workerAndInterfaceFailuresFallBackWithoutPublishingPartialState()
     local directory = tempProject(false)
     local serialCode, _, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})

@@ -15,11 +15,12 @@ foreign-output contracts and the rest. None of it reaches the public descriptor.
 ]]
 module nupp.compiler.project.interfaceimage
 
+local cst = require("nupp.compiler.syntax.cst")
 local generics = require("nupp.compiler.types.generics")
 local reflection = require("nupp.compiler.reflection")
 local T = require("nupp.compiler.types")
 
-export const SCHEMA = 5
+export const SCHEMA = 6
 
 --- What `interfaceimage.encode` is told about the run it encodes for.
 export type EncodeOptions = {
@@ -177,6 +178,50 @@ local function arenaName(): string
     return "image-" .. processToken .. "-" .. tostring(nextArena)
 end
 
+--- A default as the syntax it was written in. The checker keeps an alias's defaults
+--- that way, because only the application site knows which evaluation a position
+--- needs, and resolves them where the alias is applied. The copy keeps the nodes,
+--- their tokens and the fields that name them, and none of the checker's notes.
+local function syntaxOf(node: any): any
+    if cst.isToken(node) then
+        return {
+            kind = node.kind,
+            text = node.text,
+            offset = node.offset,
+            line = node.line,
+            col = node.col,
+            trivia = {},
+            triviaFirst = 1,
+            triviaCount = 0,
+        }
+    end
+    local copy: any = {kind = node.kind}
+    local copies: {[any]: any} = {}
+    for position, child in ipairs(node as {any}) do
+        copy[position] = syntaxOf(child)
+        copies[child] = copy[position]
+    end
+    for key, value in pairs(node) do
+        if type(key) == "string" and key ~= "kind" then
+            if type(value) == "string" or type(value) == "number" or type(value) == "boolean" then
+                copy[key] = value
+            elseif copies[value] ~= nil then
+                copy[key] = copies[value]
+            elseif type(value) == "table" and #(value as {any}) > 0 then
+                local list: {any} = {}
+                for position, member in ipairs(value as {any}) do
+                    list[position] = copies[member]
+                end
+                if #list == #(value as {any}) then
+                    copy[key] = list
+                end
+            end
+        end
+    end
+
+    return copy
+end
+
 --- The positions of a defaults list, dense, so a reader never stops at a hole.
 local function encodeDefaults(values: any, intern: function(any): integer?): {any}
     local count: integer = 0
@@ -196,6 +241,8 @@ local function encodeDefaults(values: any, intern: function(any): integer?): {an
             encoded[position] = {kind = "const", value = intern(value)}
         elseif type(value) == "table" and value.tag then
             encoded[position] = {kind = "type", value = intern(value)}
+        elseif type(value) == "table" and type(value.kind) == "string" then
+            encoded[position] = {kind = "syntax", syntax = syntaxOf(value)}
         else
             encoded[position] = {kind = "none"}
         end
@@ -789,7 +836,9 @@ export function decode(image: any, options: DecodeOptions?): (any?, string?)
         local list = encoded or {}
         for position = 1, #list do
             local entry = list[position]
-            if entry.kind ~= "none" then
+            if entry.kind == "syntax" then
+                values[position] = entry.syntax
+            elseif entry.kind ~= "none" then
                 values[position] = edge(entry.value)
             end
         end
