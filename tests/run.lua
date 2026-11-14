@@ -288,6 +288,12 @@ end
 
 os.exit = function(code, close)
     cleanupTempNames()
+    -- A worker leaves through here rather than through the command line's own exit,
+    -- so it reports its peak itself when asked to (#250). A plain-LuaJIT run of this
+    -- file may not have the module, and that only means no number.
+    pcall(function()
+        require("nupp.tools.peakmemory").report({"test", unpack(arg or {})})
+    end)
     return rawExit(code, close)
 end
 
