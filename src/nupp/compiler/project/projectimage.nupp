@@ -68,6 +68,9 @@ export type Stored = {
     --- The images its types refer into, by arena name.
     prerequisites: {string},
 
+    --- The bundled modules whose declarations its types refer to.
+    bundled: {string},
+
     image: any
 }
 
@@ -113,7 +116,7 @@ export function attach(env: any, envMod: any, helpers: {
     local digest = env.compilerServices and env.compilerServices.hash and env.compilerServices.hash.digest
         or require("nupp.compiler.hash").digest
 
-    local value: any = nil
+    local entries: any = nil
     local key: string? = nil
     local surface: string? = nil
 
@@ -137,6 +140,7 @@ export function attach(env: any, envMod: any, helpers: {
             tostring(env.compat or ""),
             require("nupp.compiler.compat").VERSION,
             require("nupp.compiler.fs").absolute(env.rootDir or "."),
+            tostring(env.rootDir or "."),
             readFile((env.rootDir or ".") .. "/nupp.lua") or "",
         }
         for _, list in ipairs({env.roots or {}, env.typeRoots or {}, env.ambientTypeRoots or {}}) do
@@ -161,14 +165,19 @@ export function attach(env: any, envMod: any, helpers: {
         local parts: {string} = {}
         for _, path in ipairs(sortedKeys(index.byPath or {})) do
             for _, entry in ipairs(index.byPath[path]) do
-                parts[#parts + 1] = table.concat({
-                    path,
-                    tostring(entry.moduleName or ""),
-                    tostring(entry.name),
-                    tostring(entry.kind),
-                    tostring(entry.visibility),
-                    tostring(entry.signature or ""),
-                }, "\1")
+                parts[
+                    #parts + 1
+                ] = table.concat(
+                    {
+                        path,
+                        tostring(entry.moduleName or ""),
+                        tostring(entry.name),
+                        tostring(entry.kind),
+                        tostring(entry.visibility),
+                        tostring(entry.signature or ""),
+                    },
+                    "\1"
+                )
             end
         end
 
@@ -176,11 +185,14 @@ export function attach(env: any, envMod: any, helpers: {
     end
 
     local function open(): any
-        if value == nil then
+        if entries == nil then
             local storeMod: any = require("nupp.compiler.project.store")
             local fingerprintMod: any = require("nupp.compiler.project.fingerprint")
             local storeDir = helpers.outDir .. "/cache"
-            value = storeMod.openValue(
+            -- Keyed by how the environment spells its root as well as by settings: an
+            -- editor names the project by its absolute path and a command by `.`, and
+            -- every module path it stores is spelled from that root.
+            entries = storeMod.open(
                 storeDir .. "/interfaces.buf",
                 fingerprintMod.subsystemFingerprint(
                     {"nupp.compiler.check", "nupp.compiler.project.env", "nupp.compiler.project.projectimage"},
@@ -193,7 +205,7 @@ export function attach(env: any, envMod: any, helpers: {
             surface = surfaceDigest()
         end
 
-        return value
+        return entries
     end
 
     --- Trusted images, by arena name, worked out to a fixpoint.
@@ -206,16 +218,19 @@ export function attach(env: any, envMod: any, helpers: {
             end
         end
         local resolved: {[string]: string} = {}
+
         local function resolve(name: string): string
             local known = resolved[name]
-            if known == nil then
-                local path = envMod.findModulePath(env, name)
-                known = path and normalizePath(path) or ""
-                resolved[name] = known
+            if known ~= nil then
+                return known
             end
+            local path = envMod.findModulePath(env, name)
+            local found: string = path and normalizePath(path) or ""
+            resolved[name] = found
 
-            return known
+            return found
         end
+
         for _, stored in ipairs(images) do
             local ok = true
             for _, member in ipairs(stored.members) do
@@ -298,7 +313,7 @@ export function attach(env: any, envMod: any, helpers: {
                 origins[item] = {arena = PRELUDE_ARENA, node = index}
             end
         end
-        local current = open().value
+        local current = open().get(key as string)
         if type(current) ~= "table"
             or current.key ~= key
             or current.surface ~= surface
@@ -308,6 +323,36 @@ export function attach(env: any, envMod: any, helpers: {
         end
         local images = current.images as {Stored}
         local trust = trusted(images)
+        -- The project's own declarations by key, and those of every bundled module a
+        -- trusted image refers to, as this environment loads them.
+        local nominals: {[string]: any} = {}
+        for declaration, nominal in pairs(env.projectNominals or {}) do
+            nominals[declaration] = nominal
+        end
+        local loadedBundled: {[string]: boolean} = {}
+        for _, stored in ipairs(images) do
+            for _, name in ipairs(trust[stored.name] and stored.bundled or {}) do
+                if not loadedBundled[name] then
+                    loadedBundled[name] = true
+                    local record = env.bundled[name]
+                    local exports = record and record.exports or {}
+                    -- The module's own value can be a record, as `bit`'s is, beside
+                    -- what it exports by name and the witnesses of those.
+                    local candidates: {any} = {record and record.type or nil}
+                    for _, exported in pairs(exports.types or {}) do
+                        candidates[#candidates + 1] = exported
+                    end
+                    for _, exported in pairs(exports.values or {}) do
+                        candidates[#candidates + 1] = exported.tag == "typeobject" and exported.of or nil
+                    end
+                    for _, candidate in pairs(candidates) do
+                        if candidate.tag == "nominal" and type(candidate.declarationKey) == "string" then
+                            nominals[candidate.declarationKey] = candidate
+                        end
+                    end
+                end
+            end
+        end
         local mounted: {[string]: boolean} = {}
         local progressed = true
         while progressed do
@@ -320,7 +365,7 @@ export function attach(env: any, envMod: any, helpers: {
                     end
                     if ready then
                         local found = interfaceimage.decode(stored.image, {
-                            nominals = env.projectNominals,
+                            nominals = nominals,
                             arenas = arenas,
                             origins = origins,
                         })
@@ -383,21 +428,44 @@ export function attach(env: any, envMod: any, helpers: {
         end
     end
 
-    --- Whether every nominal `image` declares itself belongs to one of `owned`. One
-    --- declared elsewhere -- a bundled module's, a C header's -- would come back as a
-    --- second type of the same name.
-    local function selfContained(image: any, owned: {[string]: boolean}): boolean
+    --- The bundled modules `image` names declarations of, or nil when it names one
+    --- declared anywhere else it does not own.
+    ---
+    --- A declaration in a module of this image is filled in from the image. One in a
+    --- bundled module -- `bit`, or a standard-library module when the project does not
+    --- shadow it -- belongs to whatever loads that module in the reading environment,
+    --- so it is marked as a reference to be looked up there by key rather than declared
+    --- a second time. Anything else, a C header's struct for one, would come back as a
+    --- second type of the same name, so an image naming one is not kept.
+    local function bundledNames(image: any, owned: {[string]: boolean}): {string}?
+        local names: {string} = {}
+        local seen: {[string]: boolean} = {}
+        local bundled: {[string]: boolean} = {}
+        for _, name in ipairs(env.bundledModuleNames and env.bundledModuleNames() or {}) do
+            bundled[name] = true
+        end
         for _, node in ipairs(image.descriptor.types) do
             if node.nominal and not node.external and not node.instantiation then
                 local declaration = type(node.declarationKey) == "string" and node.declarationKey or ""
                 local path = declaration:match("^([^%z]+)%z")
-                if path == nil or not owned[path] then
-                    return false
+                if path == nil then
+                    return nil
+                end
+                if not owned[path] then
+                    if not bundled[path] then
+                        return nil
+                    end
+                    node.external = true
+                    if not seen[path] then
+                        seen[path] = true
+                        names[#names + 1] = path
+                    end
                 end
             end
         end
+        table.sort(names)
 
-        return true
+        return names
     end
 
     local function store(): nil
@@ -431,11 +499,13 @@ export function attach(env: any, envMod: any, helpers: {
         if not decoded then
             return
         end
-        local current = value.value
+        local current = entries.get(key as string)
         local previous = 0
-        if type(current) == "table" and current.key == key and current.surface == surface and type(
-            current.images
-        ) == "table" then
+        if type(current) == "table"
+            and current.key == key
+            and current.surface == surface
+            and type(current.images) == "table"
+        then
             previous = #(current.images as {any})
         end
         if #fresh == 0 and #kept == previous then
@@ -471,7 +541,10 @@ export function attach(env: any, envMod: any, helpers: {
                         name
                     ] = {
                         path = record.path,
-                        interface = {type = record.type, deriveInterfaceFingerprint = exports.deriveInterfaceFingerprint,},
+                        interface = {
+                            type = record.type,
+                            deriveInterfaceFingerprint = exports.deriveInterfaceFingerprint,
+                        },
                         exports = exports,
                         diags = record.compatDiagnostics or {},
                         annotations = env.annotations:definedBy(record.path),
@@ -504,10 +577,12 @@ export function attach(env: any, envMod: any, helpers: {
                     identity[#identity + 1] = record.path .. "\0" .. hash
                 end
             end
-            local image = #newMembers > 0
-                and interfaceimage.encode(encoded, {origins = origins, projectPaths = projectPaths})
-                or nil
-            if image ~= nil and selfContained(image, owned) then
+            local image = #newMembers > 0 and interfaceimage.encode(encoded, {
+                origins = origins,
+                projectPaths = projectPaths
+            }) or nil
+            local bundled = image ~= nil and bundledNames(image, owned) or nil
+            if image ~= nil and bundled ~= nil then
                 identity[#identity + 1] = tostring(os.time())
                 identity[#identity + 1] = tostring(require("nupp.compiler.fs").processId())
                 local name = "project-" .. digest(table.concat(identity, "\0"))
@@ -521,11 +596,19 @@ export function attach(env: any, envMod: any, helpers: {
                     end
                 end
                 table.sort(prerequisites)
-                images[#images + 1] = {name = name, members = newMembers, prerequisites = prerequisites, image = image,}
+                images[
+                    #images + 1
+                ] = {
+                    name = name,
+                    members = newMembers,
+                    prerequisites = prerequisites,
+                    bundled = bundled,
+                    image = image,
+                }
             end
         end
-        value.set({key = key, surface = surface, images = images})
-        value.save()
+        entries.put(key as string, {key = key, surface = surface, images = images})
+        entries.save()
     end
 
     --- Brackets one module's check, so what it asks for is charged to it.
