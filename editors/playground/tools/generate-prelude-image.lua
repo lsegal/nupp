@@ -32,14 +32,19 @@ else
 end
 
 -- The arenas `nupp.compiler.types` answers `==` out of, and the counters that
--- number what it interns next. A restored graph that is in no arena is equal to
+-- number the declarations it allocates next. A restored graph that is in no arena is equal to
 -- nothing: the checker asks for `lit(string:#)` when it sees `select("#", ...)`
 -- and builds a second literal under a key the image never filled, so the two
 -- `'#'`s in one program are different objects. Every interned table therefore
 -- goes out with the arena and key it was interned under, and the reader puts it
 -- back there. See `nupp.compiler.project.preludecache`, which keeps the same contract
 -- for the native compiler's own prelude cache.
+--
+-- The arenas are weak, so until a collection they also list types nothing
+-- references any more, and which those are depends on when the collector last
+-- ran. Collecting first keeps the image the same from one run to the next.
 local types = require("nupp.compiler.types")
+collectgarbage("collect")
 local identity = types.identity()
 
 -- Sorted, because the image is compared byte for byte and `pairs` is not an
@@ -302,7 +307,7 @@ for id, value in ipairs(tables) do
     end
 end
 
-assert(file:write("NUPP-PRELUDE-3\n"))
+assert(file:write("NUPP-PRELUDE-4\n"))
 writeInteger(#tables)
 writeInteger(#dictionary)
 for _, value in ipairs(dictionary) do
@@ -314,7 +319,6 @@ for _, entry in ipairs(internedAs) do
     writeValue(entry.where[1])
     writeValue(entry.where[2])
 end
-writeInteger(identity.serial)
 writeInteger(identity.capability)
 writeInteger(identity.nominal)
 for id, value in ipairs(tables) do
