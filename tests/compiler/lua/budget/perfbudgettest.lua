@@ -384,12 +384,12 @@ function M.aStampedHelloWorldStaysSmall()
     )
 end
 
--- What one compiler process holds compiling and running one test program. The test
--- lanes' worker counts are derived from this figure (#250), so it growing back is
--- what would make them wrong. A command reports its own peak resident set when
--- `NUPP_PEAK_MEMORY_FILE` names a file, which reads the same however busy the machine
--- is. About 80 MB on Windows when this was set, the largest of the three platforms;
--- the bound is the one the lanes were sized from, not a snapshot.
+-- What one compiler process holds compiling and running one test program (#250). The
+-- test lanes run at least eight workers wide on the strength of this bound (#252), so
+-- it growing back is what would make that unaffordable. A command reports its own
+-- peak resident set when `NUPP_PEAK_MEMORY_FILE` names a file, which reads the same
+-- however busy the machine is. It was 72-81 MB on the Linux, macOS and Windows
+-- runners when this was set; the bound is the requirement, not a snapshot.
 local SINGLE_COMPILE_PEAK_BYTES = 200 * 1024 * 1024
 
 function M.aSingleTestProgramCompileStaysUnderItsMemoryBudget()
