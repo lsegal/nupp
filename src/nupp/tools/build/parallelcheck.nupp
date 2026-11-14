@@ -131,6 +131,21 @@ function parallelcheck.run(input: any): (any?, string?)
     if jobCount == 1 then
         return declined(plan.reason)
     end
+    -- A build's const specialization is planned across every module at once, which
+    -- workers cannot do, so a build that has a candidate stays in this process. The
+    -- planner's own syntactic test decides it, before any worker is started: the
+    -- text filter leaves only the sources spelling a `const` parameter to parse.
+    if input.build and input.constSelection ~= nil then
+        local constspecialize = require("nupp.compiler.lua.constspecialize")
+        for _, source in ipairs(ordered) do
+            local text = inc.fileText(source.path) as string
+            if text:find("[<,]%s*const%s+[%a_]") ~= nil and constspecialize.declares(inc.parseFile(source.path)) then
+                return declined(
+                    source.path .. " declares a const-generic function, which a build specializes across modules"
+                )
+            end
+        end
+    end
 
     report:at(input.build and "parallel build" or "parallel check")
     local tasks = require("coroutine")
@@ -317,17 +332,6 @@ function parallelcheck.run(input: any): (any?, string?)
     local linkedOk, linked = pcall(moduleobject.link, objects)
     if not linkedOk then
         return abandon(linked)
-    end
-    if input.build and input.constSelection ~= nil then
-        for _, object in ipairs(objects) do
-            if object.constGenerics then
-                closeChildren(true)
-
-                return declined(
-                    object.path .. " declares a const-generic function, which a build specializes across modules"
-                )
-            end
-        end
     end
     local components = linked.components as {{string}}
     local componentDependencies = linked.dependencies as {{integer}}
