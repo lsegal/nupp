@@ -90,4 +90,35 @@ function M.constBindersRenameCanonicallyAndValuesStayDistinct()
     )
 end
 
+local function internedTypes()
+    local count = 0
+    for _ in pairs(types.identity().arenas.types) do
+        count = count + 1
+    end
+
+    return count
+end
+
+-- A process that compiles one project after another lets go of the types nothing
+-- holds any more, and a type something does hold stays the type its structure
+-- interns to (#266).
+function M.releasingTheArenasKeepsOnlyHeldTypes()
+    local held = types.func({types.typevar("T", "release:held")}, {types.typevar("T", "release:held")})
+    local heldId = held.id
+    types.releaseUnreferenced()
+    local before = internedTypes()
+    for index = 1, 200 do
+        types.func({types.typevar("T", "release:dropped:" .. index)}, {types.number})
+    end
+    assert(internedTypes() >= before + 200, "the throwaway types were not interned")
+    types.releaseUnreferenced()
+    assert(
+        internedTypes() <= before,
+        ("the arena kept %d types nothing holds"):format(internedTypes() - before)
+    )
+    local again = types.func({types.typevar("T", "release:held")}, {types.typevar("T", "release:held")})
+    assert(again == held, "a held type was not the one its structure interned to after a release")
+    assert(held.id == heldId, "a held type's id changed across a release")
+end
+
 return M

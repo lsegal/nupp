@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `nupp test` workers no longer keep every type of every project their tests
+  compiled. A test that builds a project in each of its cases used to add
+  about 45 MB to its worker per build, so a suite of them could peak past
+  2 GB; the worker now stays near what one build needs.
 - `nupp test` runs each suite that starts processes in a fresh worker
   process, as it already did for isolated suites. Each worker used to keep
   one process for every suite it took and kept growing. In this repository's
