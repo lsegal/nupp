@@ -926,7 +926,9 @@ local byGlobal: {[string]: string} = {}
 local byModule, byModuleMember = {}, {}
 local byName: {[string]: string} = {}
 for effect, feature in pairs(FEATURES) do
-    if feature.binary then
+    -- A target can force any native facility in or out, whether it stages an
+    -- artifact or is now written in Nupp, as time and uuid are.
+    if feature.binary or effect:sub(1, 7) == "native." then
         byName[feature.name] = effect
     end
     for _, path in ipairs(feature.globals or {}) do

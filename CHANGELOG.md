@@ -11,6 +11,14 @@
   about 515 MB and 17 s to 157 MB and 6 s on Windows once warm, and `nupp lsp
   artifact` of the same file from about 905 MB to 158 MB.
   `NUPP_NO_INTERFACE_CACHE` turns the store off.
+- `nupp test` workers no longer keep every type of every project their tests
+  compiled. A test that builds a project in each of its cases used to add
+  about 45 MB to its worker per build, so a suite of them could peak past
+  2 GB; the worker now stays near what one build needs.
+- `nupp test` runs each suite that starts processes in a fresh worker
+  process, as it already did for isolated suites. Each worker used to keep
+  one process for every suite it took and kept growing. In this repository's
+  suite, eight such workers exhausted a 16 GB Linux CI runner partway through.
 - A native compile that `require`s a standard-library module keeps the checked
   interfaces in its cache and reads them back on the next command, instead of
   checking the module's whole graph from source every time. `nupp run` of a

@@ -1798,8 +1798,9 @@ end
 
 -- Applying type arguments to a generic declaration yields a distinct nominal whose
 -- fields are substituted. Identical arguments give the identical type, so the
--- instantiations are kept rather than rebuilt.
-local instantiations: {[string]: T.Nominal} = {}
+-- instantiations are kept rather than rebuilt, for as long as anything holds them:
+-- `T.releaseUnreferenced` treats this table as one more arena.
+local instantiations: {[string]: T.Nominal} = T.releasable({})
 
 --- What one member map of an instantiation was filled from and with: the
 --- declaration's map and the entries read from it, and the instantiation's map and
@@ -1831,7 +1832,11 @@ local record InstantiationFill
     dependencies: {FillDependency}
 end
 
-local fills: {[T.Nominal]: InstantiationFill} = setmetatable({}, {__mode = "k"}) as {[T.Nominal]: InstantiationFill}
+--- A fill reaches its own instantiation through the members it wrote, so the weak
+--- key alone never lets an entry go; `T.releaseUnreferenced` empties the table.
+local fills: {[T.Nominal]: InstantiationFill} = T.forgettable(setmetatable({}, {
+    __mode = "k"
+}) as {[T.Nominal]: InstantiationFill})
 
 local function copyBindings(map: Bindings): (Bindings, integer)
     local copy: Bindings = {}
@@ -2877,7 +2882,11 @@ end
 --- the owner, so a nominal whose `selfType` is not set yet takes the branch above
 --- instead of leaving an entry behind that would be wrong once it is.
 ---
---- Weak throughout, so nothing here keeps a type alive.
+--- Weak throughout, so nothing here keeps a type alive. The innermost table is weak
+--- in its values too: an answer is usually the member type itself, and LuaJIT's weak
+--- keys are not ephemerons, so a value that reaches its own key held both forever and
+--- every type a test worker's builds had ever rebound with them (#266). An answer is
+--- interned, so the arena keeps it for as long as the compile that made it.
 local selfMemoRoot = setmetatable({}, {__mode = "k"})
 
 local function selfMemo(binder: Type, target: Type): {[Type]: Type}
@@ -2888,7 +2897,7 @@ local function selfMemo(binder: Type, target: Type): {[Type]: Type}
     end
     local byMember = byTarget[target]
     if not byMember then
-        byMember = setmetatable({}, {__mode = "k"})
+        byMember = setmetatable({}, {__mode = "kv"})
         byTarget[target] = byMember
     end
 

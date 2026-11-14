@@ -2210,6 +2210,33 @@ if not queueDir and #shard == 0 then
     end)
 end
 
+--- How far this state's heap may grow past where the last release left it before
+--- the next case pays for another, in kilobytes.
+local RELEASE_GROWTH_KB = 64 * 1024
+local releasedAtKb = nil
+
+--- Lets go of the types the compiles in finished cases interned.
+---
+--- The compiler's type arenas are kept for the life of the process, which suits one
+--- command and does not suit a worker that builds a project in case after case: every
+--- type of every one of them stayed, and the heaviest suites peaked past 2 GB in
+--- their own process while a shared lane of Nupp workers outgrew a 16 GB runner
+--- (#266). Releasing costs a full collection, so it waits until the heap has grown
+--- enough since the last one for the collection to be worth it; a case that compiles
+--- nothing never gets there. Between cases only, never inside one, because a type
+--- built again after its release is the same structure under a new id.
+local function releaseCompiledTypes()
+    local types = package.loaded["nupp.compiler.types"]
+    if type(types) ~= "table" or type(types.releaseUnreferenced) ~= "function" then
+        return
+    end
+    if releasedAtKb ~= nil and collectgarbage("count") < releasedAtKb + RELEASE_GROWTH_KB then
+        return
+    end
+    types.releaseUnreferenced()
+    releasedAtKb = collectgarbage("count")
+end
+
 -- afterEach gets a chance to clean up after a failed setup or test. If both
 -- phases fail, keep the original failure as the headline and retain the
 -- cleanup failure as the useful second half of the report.
@@ -3236,7 +3263,14 @@ then
                     local processProgressFd = progressFd and (package.config:sub(1, 1) == "\\" and 2 or progressFd)
                         or nil
                     local progress = processProgressFd and ("NUPP_TEST_PROGRESS_FD=%d "):format(processProgressFd) or ""
-                    local fresh = executionLane == "isolated" and "NUPP_TEST_FRESH_QUEUE_PIECES=1 " or ""
+                    -- Shell suites run each in a process of its own too (#261). One
+                    -- long-lived shell worker kept what every suite it claimed left
+                    -- behind, growing to 2-4 GB, and eight of them shut down a 16 GB
+                    -- Linux runner twelve minutes into the lane. A fresh process
+                    -- holds a worker to the suite it is running.
+                    local fresh = (executionLane == "isolated" or executionLane == "shell")
+                        and "NUPP_TEST_FRESH_QUEUE_PIECES=1 "
+                        or ""
                     local invocation = rawget(_G, "__NUPP_TEST_RUNNER_COMMAND") or ("luajit '%s'"):format(arg[0])
                     local worker = (
                         "%s%s%s%s --json %s --color=%s%s"
@@ -3737,6 +3771,7 @@ local function runSuite(suiteInfo, slices)
                 slowestCase, slowestCaseMs = name, caseElapsed
             end
             recordResult(suiteInfo.name, name, case, ok, err, stdout, stderr, caseElapsed, caseContext)
+            releaseCompiledTypes()
         end
     end
     local after = now()
@@ -3885,7 +3920,7 @@ local function recordPieceFailure(spec, message)
     reportFailure(results[#results])
 end
 
---- Runs one claimed isolated piece in a new process.
+--- Runs one claimed isolated or shell piece in a new process.
 ---
 --- The long-lived process owns only queue claims and aggregation. The child is
 --- handed a shard rather than the queue, so it cannot claim a second piece and
@@ -3907,7 +3942,7 @@ local function runFreshPiece(spec)
     local pipe = io.popen(command, "r")
     if not pipe then
         os.remove(errors)
-        recordPieceFailure(spec, "the isolated piece could not be started")
+        recordPieceFailure(spec, "the piece could not be started")
         mark("E")
         return
     end
@@ -3924,7 +3959,7 @@ local function runFreshPiece(spec)
     local decoded, report = pcall(testJson.decode, text)
     if not decoded or type(report) ~= "table" then
         local detail = {
-            "the isolated piece wrote no report",
+            "the piece wrote no report",
             status and ("exit " .. status) or "unreported exit status",
             #text .. " bytes on stdout",
         }
