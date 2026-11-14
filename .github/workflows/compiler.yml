@@ -522,7 +522,7 @@ jobs:
           test -f "$sh_path"
           NUPP_TEST_BASH=$(cygpath -w "$bash_path") \
           NUPP_TEST_SH=$(cygpath -w "$sh_path") \
-          ./bin/nupp test --fresh --scope=all --jobs=1 --group=windows-preflight
+          ./bin/nupp test --fresh --scope=all --group=windows-preflight
 
       # Keep the external corpus and the C importer explicit. A configured
       # corpus used to be absent and silently skipped, while an import-c failure
@@ -552,7 +552,7 @@ jobs:
             NUPP_TEST_SH=$(cygpath -w "$sh_path")
           fi
           ./bin/nupp build --target testRunner
-          ./tests/run --fresh --scope=all --jobs=1 --group=external-corpus
+          ./tests/run --fresh --scope=all --group=external-corpus
 
       # Three minutes of starting child processes, and the only thing that can
       # change what they answer is bench code. `measurement` is the surface every
@@ -569,11 +569,13 @@ jobs:
           runner.os == 'Linux'
           && contains(needs.classify.outputs.selection, '"measurement"')
         shell: bash
-        run: ./bin/nupp test --fresh --scope=all --jobs=1 --group=measurement
+        run: ./bin/nupp test --fresh --scope=all --group=measurement
 
-      # The runner defaults to one shard per core. On macOS and Windows, run
-      # shell suites with two workers: benchmark checks spawn their own children,
-      # and more concurrent cold AOT builds consume the platform timeout.
+      # No lane names `--jobs`: the runner's default, one worker per core and
+      # never fewer than eight, is the binding setting on every platform. The
+      # hosted runners report three or four cores, so every lane runs eight wide
+      # (#252). A lane that cannot hold eight workers in the runner's memory is a
+      # per-worker footprint to fix (#250), not a reason to name fewer here.
       #
       # `--exclude-group` names what earlier steps in this job already ran, and
       # `wasm-conformance`, which the SIMD conformance workflow runs sharded.
@@ -603,7 +605,7 @@ jobs:
           if [ "$RUNNER_OS" != Linux ]; then
             ./bin/nupp test --fresh --scope=all --lane=shared \
               --exclude-group=external-corpus,measurement,wasm-conformance
-            ./bin/nupp test --fresh --scope=all --lane=shell --jobs=2 \
+            ./bin/nupp test --fresh --scope=all --lane=shell \
               --exclude-group=external-corpus,measurement,wasm-conformance
           fi
 
@@ -683,7 +685,7 @@ jobs:
             --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
           ./bin/nupp test --fresh --scope=all --lane=shared \
             --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
-          ./bin/nupp test --fresh --scope=all --lane=shell --jobs=2 \
+          ./bin/nupp test --fresh --scope=all --lane=shell \
             --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
 
       # What the suite saved, named in the log so a reader knows what the

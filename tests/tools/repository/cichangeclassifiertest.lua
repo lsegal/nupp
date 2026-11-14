@@ -330,6 +330,24 @@ function M.theCoverageMapAgreesWithTheWorkflow()
     test(jobs > 0, "the workflow should define at least one job")
 end
 
+-- Every lane runs at least eight tests at once (#252), and the only way a lane
+-- runs narrower is a step naming a smaller `--jobs`, so that is what is refused.
+function M.noTestRunNamesFewerThanEightWorkers()
+    local validator = dofile(".github/scripts/validate-ci-coverage.lua")
+    test.eq(validator.minimumJobs, 8)
+    local found = validator.narrowTestRuns(table.concat({
+        "        run: ./bin/nupp test --fresh --lane=shell --jobs=2 \\",
+        "          ./tests/run --jobs=1 --group=external-corpus",
+        "          ./bin/nupp test --jobs=8 --group=measurement",
+        "          ./bin/nupp test --jobs=12 --lane=isolated",
+        "          ./bin/nupp test --lane=shared",
+    }, "\r\n"))
+    test.eq(table.concat(found, "; "), table.concat({
+        "line 1: run: ./bin/nupp test --fresh --lane=shell --jobs=2 \\",
+        "line 2: ./tests/run --jobs=1 --group=external-corpus",
+    }, "; "))
+end
+
 -- A group naming a suite that has been renamed fails at the point the group is
 -- finally used, on whichever platform reaches it first, which is as late as a
 -- rename can be found. Ask here instead. Globs are left alone: they track new
