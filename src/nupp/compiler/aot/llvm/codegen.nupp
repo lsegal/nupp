@@ -1112,6 +1112,16 @@ end
 --- does not.
 local unexitable = false
 
+--- Whether this process has run lld at all. lld keeps state in the library that
+--- only a process exit sheds, so a process that answers several commands -- the
+--- test run's compile service -- ends itself rather than unload one that has.
+local linkedOnce = false
+
+--- Whether lld has run in this process.
+function codegen.hasLinked(): boolean
+    return linkedOnce
+end
+
 local windowsDeclared = false
 
 --- Ends this process with `code` when a link left it unable to exit through
@@ -1210,6 +1220,7 @@ end
 function codegen.link(argv: {string}): (string?, string?)
     local ok, result = pcall(function(): string
         local backend = reach()
+        linkedOnce = true
         local arguments: {string} = {}
         for position, argument in ipairs(argv) do
             arguments[position] = argument
