@@ -93,14 +93,30 @@ local WRITERS: {[string]: boolean} = {build = true, clean = true}
 
 local HELP: {[string]: boolean} = {["--help"] = true, ["-h"] = true}
 
+--- Whether a command asks for its report's schema, which it prints in place of
+--- running. `run`'s words after its file are the program's.
+local function asksSchema(argv: {string}): boolean
+    for index = 2, #argv do
+        local word = argv[index]
+        if word == "--schema" then
+            return true
+        elseif argv[1] == "run" and word:sub(1, 1) ~= "-" then
+            return false
+        end
+    end
+
+    return false
+end
+
 --- Whether a command line is one the service answers, whether it is a request
---- for help, which writes nothing whatever command it names, and whether it
---- starts a program, which the service starts as a process of its own. `run` is
---- the one command whose later words can belong to the program it runs.
+--- for help or a schema, which writes nothing whatever command it names, and
+--- whether it starts a program, which the service starts as a process of its
+--- own. `run` is the one command whose later words can belong to the program it
+--- runs.
 local function answered(argv: {string}): (boolean, boolean, boolean)
     local name = argv[1] or ""
     local second, third = argv[2] or "", argv[3] or ""
-    local help = HELP[second] or (name ~= "run" and second:sub(1, 1) ~= "-" and HELP[third] == true)
+    local help = HELP[second] or (name ~= "run" and second:sub(1, 1) ~= "-" and HELP[third] == true) or asksSchema(argv)
     if help or ANSWERED[name] then
         return true, help == true, false
     end
@@ -450,7 +466,9 @@ end
 --- `mode` is `"pipe"` for a command whose standard output the caller reads and
 --- `"out"` for one whose output goes where the caller's does.
 function compileservice.parse(command: string, mode: string): compileservice.Command?
-    if command:find("[\r\n%z]") then
+    -- A newline inside quotes is part of a word, as in `printf '\n%s' $?`; one
+    -- outside them ends the command, and the words refuse it.
+    if command:find("[\r%z]") then
         return nil
     end
     local list = tokens(command)

@@ -71,6 +71,7 @@ function M.aTrailingReportOfTheStatusIsKept()
         {"/repo/bin/nupp check 2>&1; printf ' __status__:%s' $?", " __status__:" .. S, "pipe"},
         {[[/repo/bin/nupp check > out 2>&1; printf '%s\n' "$?" > status]], S .. "\n", "file:status"},
         {"/repo/bin/nupp check; echo $? >/dev/null", S .. "\n", "null"},
+        {"/repo/bin/nupp check 2>&1; printf '\n__status__:%s' $?", "\n__status__:" .. S, "pipe"},
     }
     for _, form in ipairs(forms) do
         local command = parse(form[1])
@@ -155,6 +156,11 @@ function M.onlyThisCheckoutsCompilerCommandsAreAnswered()
     test.ne(request("/repo/bin/nupp lsp inspect --json main.nupp 1 1"), nil)
     test.ne(request("/repo/bin/nupp task --list --json"), nil)
     test.ne(request("/repo/bin/nupp __complete bash 2 check --js"), nil)
+    -- So does asking for a report's schema.
+    test.ne(request("/repo/bin/nupp build --schema", "/repo"), nil)
+    test.ne(request("/repo/bin/nupp bench --list --file x.bench.nupp --schema"), nil)
+    test.eq(request("/repo/bin/nupp bench --list --json"), nil)
+    test.eq(request("/repo/bin/nupp run main.nupp --schema").spawn, true)
     test.eq(request("/repo/bin/nupp lsp serve"), nil)
     test.eq(request("/repo/bin/nupp lsp --stdio"), nil)
     test.eq(request("/repo/bin/nupp task build"), nil)
