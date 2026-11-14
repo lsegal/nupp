@@ -330,7 +330,7 @@ function M.testBuildReuseSurvivesSeparateCliProcessesAndToolCallIds()
             env = {CODEX_TOOL_CALL_ID = id, NUPP_TEST_REUSE_INPUT = setting}
         })
         testAssert.eq(code, 0, output)
-        testAssert.eq(output, "ok\n")
+        testAssert.eq((output:gsub("\r\n", "\n")), "ok\n")
 
         return select(3, require("io.internal.files").stat(dir .. "/out/tests.lua"))
     end

@@ -1,7 +1,7 @@
 -- Require the explicit local Wasmtime launcher to execute both compact packs
 -- and all three portable owned algorithms.
 -- An ordinary broad test run may instead record them as not executed when the
--- Rust or Emscripten toolchain is unavailable.
+-- Wasmtime C API or the Wasm code generator is unavailable.
 local report = require("tests.integration.simd.runner").json(assert(arg[1], "harness report required"))
 assert(report.failed == 0, "Wasmtime harness reported failures")
 assert(report.notExecuted == 0, "Wasmtime harness did not execute on this machine")

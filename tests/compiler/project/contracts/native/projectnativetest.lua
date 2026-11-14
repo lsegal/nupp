@@ -47,10 +47,10 @@ function M.nativeFacilitiesSharingAProviderBuildAsOneUnion()
     testAssert.eq(#copies, 4, "the shared library and the path, URI and AOT runtimes are staged")
     local command = "\n" .. table.concat(calls[1], "\n") .. "\n"
     -- The path provider asks the operating system itself and URI parsing is
-    -- Nupp, so only the AOT runtime reaches the Rust union.
-    assert(command:find("\nnative%-rust\nbase\n"), "only the AOT runtime selects a Rust feature")
-    testAssert.eq(copies[1][1], "/built/libnupp_native.dylib", "the Rust provider union has one source artifact")
-    assert(copies[1][2]:find("out/lib/nupp_native", 1, true), "the Rust provider union keeps its stable sidecar name")
+    -- Nupp, so only the AOT runtime reaches the provider union.
+    assert(command:find("\nnative%-provider\nbase\n"), "only the AOT runtime selects a provider feature")
+    testAssert.eq(copies[1][1], "/built/libnupp_native.dylib", "the provider union has one source artifact")
+    assert(copies[1][2]:find("out/lib/nupp_native", 1, true), "the provider union keeps its stable sidecar name")
 end
 
 function M.gpuNeverChangesTheHost()

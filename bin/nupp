@@ -86,18 +86,18 @@ LUA_CPATH="$LUA_ROCKS/lib/lua/5.1/?.so;$LUA_ROCKS/lib/lua/5.1/?.dll;${LUA_CPATH:
 # development source when it exists.
 # Worked out once per process tree rather than once per command.
 #
-# The prefix is a hash of the compiler pair, their version output, the machine
-# and the provisioning rules, so asking for it runs both compilers and hashes
-# two files: about sixty milliseconds, which is a third of what checking a small
+# The prefix is a hash of the C compiler, its version output, the machine and
+# the provisioning rules, so asking for it runs the compiler and hashes two
+# files: about sixty milliseconds, which is a third of what checking a small
 # project costs. Every nested command pays it again for an answer that cannot
 # have changed, and the test suite runs this launcher thousands of times.
 #
 # Carried in the environment, since that is what a child inherits and a shell
 # variable is not. Keyed by everything the answer depends on that a caller can
-# move -- the checkout and the four variables `scripts/toolchain` reads -- so a
+# move -- the checkout and the variables `scripts/toolchain` keys it by -- so a
 # command run under a different compiler works its own answer out rather than
 # being handed somebody else's.
-TOOLCHAIN_CACHE_KEY="$LUA_ROOT|${NUPP_CC:-}|${NUPP_CXX:-}|${NUPP_TOOLCHAIN_DIR:-}"
+TOOLCHAIN_CACHE_KEY="$LUA_ROOT|${NUPP_CC:-}|${NUPP_TOOLCHAIN_DIR:-}"
 if [ "${NUPP_LAUNCHER_TOOLCHAIN_KEY:-}" = "$TOOLCHAIN_CACHE_KEY" ] \
     && [ -n "${NUPP_LAUNCHER_TOOLCHAIN_PREFIX:-}" ]; then
     TOOLCHAIN_PREFIX=$NUPP_LAUNCHER_TOOLCHAIN_PREFIX
@@ -639,8 +639,7 @@ native_is_current() {
 # same reasons it runs that command's compiler. Its parent may still be in the
 # first compiler build, the one the AOT runtime then waits for, so to the test
 # above that provider is stale; rebuilding it from the worker replaced the
-# library under the parent, and inside a worker's address-space ceiling rustc
-# could not even load.
+# library under the parent.
 native_is_usable() {
     # The compiler building this checkout's provider runs on whichever one is
     # staged, since asking for a current one would build it again.

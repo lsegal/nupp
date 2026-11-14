@@ -214,10 +214,7 @@ jobs:
   fast-checks:
     name: Fast checks
     needs: classify
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    # Restore this condition when #1/#8 make it Rust-free:
-    # if: needs.classify.outputs.fast-checks == 'true'
-    if: false
+    if: needs.classify.outputs.fast-checks == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -331,13 +328,10 @@ jobs:
   integration:
     name: ${{ matrix.name }} / LuaJIT 2.1 rolling
     needs: [classify, fast-checks]
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    # Restore this condition when #1/#8 make it Rust-free:
-    # if: >-
-    #   !cancelled() && needs.classify.result == 'success'
-    #   && needs.fast-checks.result == 'success'
-    #   && needs.classify.outputs.integration-matrix != '[]'
-    if: false
+    if: >-
+      !cancelled() && needs.classify.result == 'success'
+      && needs.fast-checks.result == 'success'
+      && needs.classify.outputs.integration-matrix != '[]'
     runs-on: ${{ matrix.os }}
     # A timeout is here to end a hang, so it has to sit above the work rather
     # than across it. A cold runner builds the native provider before the
@@ -399,22 +393,6 @@ jobs:
           restore-keys: |
             nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
 
-      # One identity for the Rust artifacts, shared by every job that builds
-      # them: the lock file, the toolchain file and the native sources. The
-      # feature sets differ between the GPU jobs and the platform gate, and the
-      # store is content-addressed, so a job that asked for a different set
-      # rebuilds what it needs and reuses the rest rather than starting empty.
-      - name: Restore the Rust build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
-          restore-keys: |
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-
-
       - name: Restore the content-validated compiler cache
         uses: actions/cache/restore@v4
         with:
@@ -453,13 +431,6 @@ jobs:
             nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           restore-keys: |
             nupp-test-times-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Install the ABI-compatible Windows Rust toolchain
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal
 
       # The AOT code generator is LLVM, linked into nupp. Fetched once per pin
       # and platform, so a run never builds it unless the pin moved.
@@ -544,8 +515,8 @@ jobs:
         shell: bash
         run: ./bin/nupp check
 
-      # The Windows host ABI is selected through rustup, then shared by the
-      # application host and embedding SDK. Exercise that
+      # The Windows host ABI is MinGW's, shared by the application host and
+      # embedding SDK. Exercise that
       # contract before the expensive native and full-suite gates so a test
       # fixture cannot accidentally model Windows as an invented Unix host.
       #
@@ -633,9 +604,9 @@ jobs:
       # The shared lane is excluded on Linux only, where the fast gate this job
       # depends on has already run it against the same revision.
       # hostbinarytest stamps this binary once and reuses it while it is newer
-      # than its sources. Stamped here, its host build -- a cargo build with
-      # LLVM linked in whenever the Rust cache is cold -- does not hold the
-      # checkout's build lock while every other test's nupp waits on it.
+      # than its sources. Stamped here, its host build -- a link with LLVM in
+      # it -- does not hold the checkout's build lock while every other test's
+      # nupp waits on it.
       - name: Stamp the compiler binary
         if: runner.os != 'Linux'
         shell: bash
@@ -803,13 +774,10 @@ jobs:
   fixpoint:
     name: Self-hosting fixpoint
     needs: [classify, fast-checks]
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    # Restore this condition when #1/#8 make it Rust-free:
-    # if: >-
-    #   !cancelled() && needs.classify.result == 'success'
-    #   && needs.fast-checks.result == 'success'
-    #   && needs.classify.outputs.fixpoint == 'true'
-    if: false
+    if: >-
+      !cancelled() && needs.classify.result == 'success'
+      && needs.fast-checks.result == 'success'
+      && needs.classify.outputs.fixpoint == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -845,13 +813,10 @@ jobs:
   portable-compiler:
     name: LuaJIT browser compiler
     needs: [classify, fast-checks]
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    # Restore this condition when #1/#8 make it Rust-free:
-    # if: >-
-    #   !cancelled() && needs.classify.result == 'success'
-    #   && needs.fast-checks.result == 'success'
-    #   && needs.classify.outputs.portable-compiler == 'true'
-    if: false
+    if: >-
+      !cancelled() && needs.classify.result == 'success'
+      && needs.fast-checks.result == 'success'
+      && needs.classify.outputs.portable-compiler == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -906,10 +871,7 @@ jobs:
   docs-site:
     name: Documentation and site
     needs: classify
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    # Restore this condition when #1/#8 make it Rust-free:
-    # if: needs.classify.outputs.docs-site == 'true'
-    if: false
+    if: needs.classify.outputs.docs-site == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -958,22 +920,16 @@ jobs:
   browser-wasm:
     name: Browser and Wasm
     needs: [classify, fast-checks]
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    # Restore this condition when #1/#8 make it Rust-free:
-    # if: >-
-    #   !cancelled() && needs.classify.result == 'success'
-    #   && needs.fast-checks.result == 'success'
-    #   && needs.classify.outputs.browser-wasm == 'true'
-    if: false
+    if: >-
+      !cancelled() && needs.classify.result == 'success'
+      && needs.fast-checks.result == 'success'
+      && needs.classify.outputs.browser-wasm == 'true'
     uses: ./.github/workflows/wasm-playground.yml
 
   gpu-conformance:
     name: GPU conformance / CI Lavapipe Vulkan
     needs: classify
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    # Restore this condition when #1/#8 make it Rust-free:
-    # if: needs.classify.outputs.gpu-linux == 'true'
-    if: false
+    if: needs.classify.outputs.gpu-linux == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -989,22 +945,6 @@ jobs:
             hashFiles('scripts/toolchain.pins', 'scripts/toolchain') }}
           restore-keys: |
             nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
-
-      # One identity for the Rust artifacts, shared by every job that builds
-      # them: the lock file, the toolchain file and the native sources. The
-      # feature sets differ between the GPU jobs and the platform gate, and the
-      # store is content-addressed, so a job that asked for a different set
-      # rebuilds what it needs and reuses the rest rather than starting empty.
-      - name: Restore the Rust build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
-          restore-keys: |
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install the software Vulkan adapter
         run: |
@@ -1026,35 +966,12 @@ jobs:
 
       - name: Run exact GPU dispatch and readback
         id: gpu_conformance
-        continue-on-error: true
         run: .github/scripts/test-gpu-conformance.sh
-
-      # A failed conformance step would otherwise skip actions/cache's post
-      # save the toolchain for every diagnostic commit. Preserve the expensive
-      # compiler build before turning the captured outcome back
-      # into the job's verdict.
-      - name: Save a failed conformance build
-        if: steps.gpu_conformance.outcome == 'failure'
-        uses: actions/cache/save@v4
-        continue-on-error: true
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
-
-      - name: Report GPU conformance failure
-        if: steps.gpu_conformance.outcome == 'failure'
-        run: exit 1
 
   gpu-conformance-windows:
     name: GPU conformance / Windows DX12
     needs: classify
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    # Restore this condition when #1/#8 make it Rust-free:
-    # if: needs.classify.outputs.gpu-windows == 'true'
-    if: false
+    if: needs.classify.outputs.gpu-windows == 'true'
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -1070,28 +987,6 @@ jobs:
             hashFiles('scripts/toolchain.pins', 'scripts/toolchain') }}
           restore-keys: |
             nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
-
-      # One identity for the Rust artifacts, shared by every job that builds
-      # them: the lock file, the toolchain file and the native sources. The
-      # feature sets differ between the GPU jobs and the platform gate, and the
-      # store is content-addressed, so a job that asked for a different set
-      # rebuilds what it needs and reuses the rest rather than starting empty.
-      - name: Restore the Rust build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
-          restore-keys: |
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Install the ABI-compatible Windows Rust toolchain
-        shell: bash
-        run: |
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal
 
       # The bench's CPU twins are compiled by the AOT code generator, which is
       # LLVM linked into nupp.
@@ -1111,31 +1006,37 @@ jobs:
         shell: bash
         run: .github/scripts/test-gpu-conformance-windows.sh
 
-  # The one job that bootstraps the compiler today: with Cargo unusable, so the
-  # compiler's own provider and the code generator both come from the pinned
-  # prebuilt release (`scripts/toolchain`, "the prebuilt native provider"), and
-  # a native program is linked with the prebuilt kit. `cargo` and `rustc` on
-  # PATH are replaced by shims that record being run, so a step that reaches
-  # Cargo anyway fails here rather than quietly building Rust (#139, #172).
+  # The product has no Rust and no C++ of its own (#8), and this job holds it
+  # to that. The tree is refused if a Rust or C++ source, a Cargo manifest or a
+  # Rust toolchain file comes back. Then a clean checkout bootstraps the
+  # compiler and links a native program with `cargo`, `rustc`, `rustup` and
+  # every C++ compiler on PATH replaced by shims that record being run: the
+  # compiler's provider and code generator come from the pinned prebuilt release
+  # (`scripts/toolchain`, "the prebuilt native provider"), the native program is
+  # linked with the prebuilt kit, and a step that reaches Rust or C++ anyway
+  # fails here rather than quietly building it (#139, #172).
   prebuilt-native-program:
-    name: Native program without Cargo
+    name: Native program without Rust or C++
     needs: classify
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      NUPP_CARGO: /nonexistent
-      NUPP_RUSTC: /nonexistent
     steps:
       - name: Check out the repository
         uses: actions/checkout@v5
 
-      - name: Shadow Cargo and rustc
+      - name: Refuse Rust and C++ sources
+        run: .github/scripts/check-no-rust-or-cpp.sh
+
+      # A version probe compiles nothing, so it is refused without being
+      # recorded: `scripts/toolchain` keys a from-source LLVM by the C++
+      # compiler's version, and asks for that key to see whether one is built.
+      - name: Shadow Rust and C++
         run: |
           set -eu
           shims="$RUNNER_TEMP/no-rust"
           mkdir -p "$shims"
-          for tool in cargo rustc rustup; do
-            printf '#!/bin/sh\necho "%s $*" >> "%s/ran"\nexit 1\n' "$tool" "$shims" > "$shims/$tool"
+          for tool in cargo rustc rustup c++ g++ clang++; do
+            printf '#!/bin/sh\n[ "${1:-}" = --version ] && exit 1\necho "%s $*" >> "%s/ran"\nexit 1\n' "$tool" "$shims" > "$shims/$tool"
             chmod +x "$shims/$tool"
           done
           echo "$shims" >> "$GITHUB_PATH"
@@ -1164,11 +1065,11 @@ jobs:
           echo "$output"
           [ "$output" = "hello from native Nupp" ]
 
-      - name: Require that Cargo never ran
+      - name: Require that Rust and C++ never ran
         if: always()
         run: |
           if [ -f "$RUNNER_TEMP/no-rust/ran" ]; then
-            echo "Cargo or rustc ran:" >&2
+            echo "Rust or C++ ran:" >&2
             cat "$RUNNER_TEMP/no-rust/ran" >&2
             exit 1
           fi
@@ -1202,17 +1103,11 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v5
 
-      # Every job the classifier can select is turned off until #1/#8 make it
-      # Rust-free (#139), so none is required: a turned-off job is skipped, and
-      # a skipped selected job would otherwise fail this. Drop the override
-      # with the `if: false` lines above.
       - name: Require every selected job to have succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
-          CLASSIFIED: ${{ needs.classify.outputs.selection }}
-        run: |
-          SELECTION=$(jq -c 'with_entries(if (.value | type) == "boolean" then .value = false else . end)' <<< "$CLASSIFIED") \
-            .github/scripts/require-selected-jobs.py
+          SELECTION: ${{ needs.classify.outputs.selection }}
+        run: .github/scripts/require-selected-jobs.py
 
       # One row per required run, so queue delay, execution time and the failed
       # step are answerable from retained data rather than from whichever run

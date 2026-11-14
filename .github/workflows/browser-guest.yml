@@ -63,8 +63,6 @@ concurrency:
   cancel-in-progress: true
 jobs:
   guest:
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -108,10 +106,6 @@ jobs:
       # The code generator the packaged applications' AOT is compiled with.
       - name: Fetch the pinned LLVM
         uses: ./.github/actions/pinned-llvm
-      - name: Install the pinned Rust guest target
-        run: |
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$channel" --profile minimal --target i686-unknown-linux-musl
       - name: Build the pinned guest and matching sources
         run: |
           guest=$(./scripts/toolchain browser-guest)
