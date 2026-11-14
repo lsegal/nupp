@@ -82,6 +82,30 @@ function M.warmingBundledMetadataPreservesProjectModulePrecedence()
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+function M.releasedModuleTreesKeepTheInterfaceDependentsRead()
+    local files = {
+        ["nupp.lua"] = 'return {include = {"."}}\n',
+        ["dep.nupp"] = "module dep\nexport const value: integer = 1\n",
+    }
+    local dir = tempProject(files)
+    local kept = compilerEnv.new(dir, {cache = false})
+    assert(kept.resolveModule(kept, "dep"))
+    assert(kept.loaded.dep.result ~= nil, "an ordinary environment keeps a required module's tree")
+    local env = compilerEnv.new(dir, {cache = false, releaseModuleTrees = true})
+    local resolved = assert(env.resolveModule(env, "dep"))
+    local record = assert(env.loaded.dep)
+    assert(record.result == nil, "a released environment drops a required module's tree")
+    assert(record.type == resolved and record.exports.values.value, "and keeps the interface a dependent reads")
+    assert(record.source and not record.inProgress, "the completed record stays selected")
+    testAssert.eq(env.resolveModule(env, "dep"), resolved, "a repeated lookup reuses the released record")
+    local checker = require("nupp.compiler.check")
+    local parser = require("nupp.compiler.syntax.parser")
+    local source = 'local dep = require("dep")\nlocal n: integer = dep.value\nreturn n\n'
+    local diagnostics = checker.check(parser.parse(source, dir .. "/main.nupp"), dir .. "/main.nupp", env)
+    testAssert.eq(#diagnostics, 0, diagnostics[1] and diagnostics[1].msg or "a dependent checks against it")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 function M.malformedBundledDeclarationsAreRefusedInBothProfiles()
     local parser = require("nupp.compiler.syntax.parser")
     local dir = tempProject({["nupp.lua"] = 'return {include = {"."}}\n'})

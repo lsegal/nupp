@@ -78,7 +78,10 @@ local function run(options: any): integer
     local diagnosticMod = require("nupp.compiler.diagnostics")
     local reportMod = require("nupp.tools.cli.report")
     local asJson = values.format == "json"
-    local env = envMod.new(".")
+    -- Each file is checked for its imports against the modules it requires, and only
+    -- their interfaces are read back, so a run over the whole tree need not keep every
+    -- module's checked tree alive until it ends.
+    local env = envMod.new(".", {releaseModuleTrees = true})
     -- The manifest's default, unless --no-method-parens overrides it for this run;
     -- there is no flag to force it back on over a manifest that turned it off, the same
     -- one-way shape as --no-color over --color.
