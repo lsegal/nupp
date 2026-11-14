@@ -1630,6 +1630,13 @@ local function buildModules(root: string, outDir: string, config: Config, target
     local suppliedConstSelection = (target as any)._constSelection
     local constEnabled = not checkOnly and (config._optLevel or 0) >= 1 and not (config._disabledPasses or {})["OPT-8"]
 
+    -- The work list as the source set gave it. Planning below seeds the
+    -- dependencies it reaches, which the workers leave to the build driver as they
+    -- did when nothing was planned before them.
+    local sourceQueue: {any} = {}
+    for position, item in ipairs(queue) do
+        sourceQueue[position] = item
+    end
     local specializationPlans: {any} = {}
     local acceptedSpecializations: {any} = {}
     local declinedSpecializations: {any} = {}
@@ -1821,7 +1828,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
             )
         end
         local produced = parallelcheck.run({
-            queue = queue,
+            queue = sourceQueue,
             inc = inc,
             root = root,
             outDir = outDir,

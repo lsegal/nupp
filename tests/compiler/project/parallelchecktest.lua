@@ -644,14 +644,17 @@ return {value = value}
         testAssert.eq(outputs, serialOutputs, level .. " build outputs")
         testAssert.eq(state, serialState, level .. " build state")
         if level == "-O2" then
-            local declaration = outputs["./scaled.lua"] or ""
-            assert(declaration:find("local function __nuppConst_doubled_", 1, true), "the declaration owns its bodies")
+            local built = buildOutputs(directory)
             assert(
-                (outputs["./scaled_user1.lua"] or ""):find("__nuppConstSpecializations[", 1, true),
+                built["./scaled.lua"]:find("local function __nuppConst_doubled_", 1, true),
+                "the declaration owns its bodies"
+            )
+            assert(
+                built["./scaled_user1.lua"]:find("__nuppConstSpecializations[", 1, true),
                 "a caller reaches a body in another module"
             )
             local declined = false
-            for _, record in pairs(state.modules) do
+            for _, record in pairs(json.decode(built["./.nupp-state.json"]).modules) do
                 for _, remark in ipairs(record.optimizationRemarks or {}) do
                     declined = declined or remark.status == "declined"
                 end
