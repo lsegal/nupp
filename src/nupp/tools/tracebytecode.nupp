@@ -333,11 +333,21 @@ local function childrenOf(util: any, fn: any): {any}
     end
 end
 
-local function collect(util: any, bc: any, fn: any, depth: integer, into: {any}, seen: any, slot: integer?): nil
+local function collect(
+    util: any,
+    bc: any,
+    fn: any,
+    depth: integer,
+    into: {any},
+    protos: {any},
+    seen: any,
+    slot: integer?
+): nil
     if seen[fn] then
         return
     end
     seen[fn] = true
+    protos[#protos + 1] = fn
     local info = util.funcinfo(fn)
     local instructions = instructionsOf(util, bc, fn)
     local findings = classify(instructions)
@@ -353,15 +363,85 @@ local function collect(util: any, bc: any, fn: any, depth: integer, into: {any},
         slot = slot,
     }
     for _, child in ipairs(childrenOf(util, fn)) do
-        collect(util, bc, child.proto, depth + 1, into, seen, child.slot)
+        collect(util, bc, child.proto, depth + 1, into, protos, seen, child.slot)
     end
+end
+
+local function encodeScalar(value: any): string
+    local text = tostring(value)
+    return type(value):sub(1, 1) .. #text .. ":" .. text
+end
+
+local function encodeConstant(constant: any): string
+    if type(constant) ~= "table" then
+        return encodeScalar(constant)
+    end
+    -- A template table's hash part is laid out by string hash, which LuaJIT
+    -- seeds per process. Sorting its entries is what keeps them out of the
+    -- fingerprint.
+    local entries = {}
+    for key, value in pairs(constant) do
+        entries[#entries + 1] = encodeScalar(key) .. "=" .. encodeScalar(value)
+    end
+    table.sort(entries)
+
+    return "t" .. #entries .. "{" .. table.concat(entries, ",") .. "}"
+end
+
+--- A digest of what the functions do, stable across processes.
+---
+--- Hashing `string.dump(chunk)` is not: the dump writes template-table constants
+--- in hash-node order, and string hashes are seeded per process. This encodes the
+--- same facts instead (each function's shape, raw instruction words, line numbers
+--- and constants) with template-table entries sorted. Child functions are left to
+--- their own entry in the walk order `collect` produced.
+local function fingerprint(util: any, functions: {any}, protos: {any}): string
+    local parts: {string} = {}
+    for position, fn in ipairs(functions) do
+        local proto = protos[position]
+        local info = util.funcinfo(proto)
+        local shape: {
+            any
+        } = {
+            fn.depth,
+            tostring(fn.slot),
+            info.params,
+            tostring(info.isvararg),
+            info.stackslots,
+            info.upvalues,
+            info.linedefined,
+            info.lastlinedefined,
+        }
+        parts[#parts + 1] = "f" .. table.concat(shape, ":")
+        for _, ins in ipairs(fn.instructions) do
+            local raw = util.funcbc(proto, ins.pc)
+            parts[#parts + 1] = "i" .. raw .. ":" .. tostring(ins.line)
+        end
+        for index = 0, info.nconsts - 1 do
+            parts[#parts + 1] = "n" .. encodeScalar(util.funck(proto, index))
+        end
+        for index = 1, info.gcconsts do
+            local constant = util.funck(proto, -index)
+            if type(constant) == "proto" or type(constant) == "function" then
+                parts[#parts + 1] = "kp"
+            else
+                parts[#parts + 1] = "k" .. encodeConstant(constant)
+            end
+        end
+        for index = 0, info.upvalues - 1 do
+            parts[#parts + 1] = "u" .. encodeScalar(util.funcuvname(proto, index))
+        end
+    end
+
+    return hash.sha256(table.concat(parts, "\n"))
 end
 
 export function analyze(chunk: function(): any): Analysis
     local util = require("jit.util")
     local bc = require("jit.bc")
     local functions: {any} = {}
-    collect(util, bc, chunk, 0, functions, {})
+    local protos: {any} = {}
+    collect(util, bc, chunk, 0, functions, protos, {})
     local blockers: integer = 0
     local mustBlockers: integer = 0
     local risks: integer = 0
@@ -381,7 +461,7 @@ export function analyze(chunk: function(): any): Analysis
     return {
         profile = profile.recorder(),
         reasonCatalog = {id = profile.catalogid, version = profile.catalogversion},
-        bytecodeFingerprint = hash.sha256(string.dump(chunk)),
+        bytecodeFingerprint = fingerprint(util, functions, protos),
         functions = functions,
         blockers = blockers,
         mustBlockers = mustBlockers,

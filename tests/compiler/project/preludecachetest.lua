@@ -209,9 +209,9 @@ end
 
 -- A stored prelude is true only of the type identity it was written from.
 --
--- An arena key spells a type by its parts' serials, and serials are issued per
--- process. So an image restored over an arena that already holds other types
--- under those serials gives two objects one id, and every key built from that id
+-- An arena key spells a type by its parts' ids, and a nominal's id is a number
+-- issued per process. So an image restored over an arena that already holds
+-- other declarations under those numbers gives two objects one id, and every key built from that id
 -- afterwards finds whichever the arena met first. The test runner's process lanes
 -- made exactly that arena: after each suite they unload the modules it loaded,
 -- which takes `nupp.compiler.project.env` and keeps `nupp.compiler.types`, so the
@@ -308,8 +308,7 @@ end
 
 -- The same, the other way round and across processes: an image written by a
 -- process that had interned types of its own before the prelude, read by one
--- that had not. The reader's serials for its own first types are the writer's
--- for something else, and the image arrives carrying both.
+-- that had not. Neither may end up with two interned types under one id.
 function M.aStoredPreludeFromAnotherIdentityIsNotRestored()
     local dir = project()
     local store = dir .. "/store"
@@ -365,7 +364,7 @@ end
 -- need not happen to contain, especially binary strings and IEEE negative zero.
 local function imageFixture()
     local text = string.rep("dictionary\0\255", 30)
-    local shared = {text = text, serial = 17}
+    local shared = {text = text, count = 17}
     shared.self = shared
     setmetatable(shared, {description = "fixture metatable", owner = shared})
 
@@ -395,7 +394,7 @@ local function imageFixture()
             positiveInfinity = math.huge,
             negativeInfinity = -math.huge,
         },
-    }, {arenas = {types = {["compact-fixture"] = shared}}, serial = 127, capability = 128, nominal = 16384}
+    }, {arenas = {types = {["compact-fixture"] = shared}}, capability = 128, nominal = 16384}
 end
 
 local function writeImageFixture(roots, identity)
@@ -480,12 +479,10 @@ function M.portableImageKeepsBinaryNumericAndGraphIdentity()
     assert(values.left == values.right and values.left == decoded.stringLib and values.left == adopted)
     assert(values.left.self == values.left and values.byTable[values.left] == values.left)
     assert(getmetatable(values.left).owner == values.left)
-    test.eq(resumed.serial, identity.serial)
     test.eq(resumed.capability, identity.capability)
     test.eq(resumed.nominal, identity.nominal)
     local roundtripIdentity = {
         arenas = {types = {["compact-fixture"] = values.left}},
-        serial = resumed.serial,
         capability = resumed.capability,
         nominal = resumed.nominal
     }
@@ -545,17 +542,18 @@ function M.portableImageExcludesRuntimeWitnessCachesOnly()
 end
 
 function M.portableImageRejectsMalformedCompactData()
-    local magic = "NUPP-PRELUDE-3\n"
+    local magic = "NUPP-PRELUDE-4\n"
     -- No tables/dictionary/interns, followed by zero counters and eight nil roots.
-    local empty = magic .. string.rep("\0", 6) .. string.rep("z", 8)
+    local empty = magic .. string.rep("\0", 5) .. string.rep("z", 8)
     readImageFixture(empty)
     local cases = {
         "NUPP-PRELUDE-2\n",
+        "NUPP-PRELUDE-3\n",
         magic .. "\128", -- truncated varint
         magic .. string.rep("\255", 8), -- overflowing varint
         magic .. "\0\1\4a", -- truncated dictionary string
-        magic .. string.rep("\0", 6) .. "d\1" .. string.rep("z", 7),
-        magic .. string.rep("\0", 6) .. "r\1" .. string.rep("z", 7),
+        magic .. string.rep("\0", 5) .. "d\1" .. string.rep("z", 7),
+        magic .. string.rep("\0", 5) .. "r\1" .. string.rep("z", 7),
         empty:sub(1, -2),
         empty .. "trailing",
     }
@@ -577,7 +575,7 @@ function M.portableImageRejectsMalformedCompactData()
     -- bytes were noticed, poisoning the process even though loading failed.
     local internedThenTrailing = magic .. "\1\0\1\1s\5typess\1x" .. string.rep(
         "\0",
-        5
+        4
     ) .. string.rep("z", 8) .. "trailing"
     local types = require("nupp.compiler.types")
     local oldInterned, oldAdopt, oldResume = types.interned, types.adopt, types.resumeIdentity
@@ -603,7 +601,7 @@ local function emptyNativeImage()
     local origin = cache.origin()
     assert(cache.seal(origin), "the arena has not moved since its origin was taken")
     return {
-        format = 3,
+        format = 4,
         origin = origin,
         counts = {},
         cells = {},
@@ -614,7 +612,7 @@ local function emptyNativeImage()
         arenas = {},
         triviaOf = {},
         internedAs = {},
-        identity = {serial = 0, capability = 0, nominal = 0},
+        identity = {capability = 0, nominal = 0},
         roots = {0, 0, 0, 0, 0, 0, 0},
         runtime = "",
     }
@@ -651,11 +649,11 @@ function M.nativeCacheRejectsMalformedPlainData()
             image.metas = {[2] = 1}
         end,
         function(image)
-            image.identity.serial = math.huge
+            image.identity.nominal = math.huge
         end,
         -- Written from an arena that had issued something this one has not.
         function(image)
-            image.origin.serial = image.origin.serial + 1
+            image.origin.nominal = image.origin.nominal + 1
         end,
         function(image)
             image.origin.digest = string.rep("0", #image.origin.digest)
