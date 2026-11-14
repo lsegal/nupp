@@ -31,7 +31,9 @@
 - `nupp build` and `nupp check` use a fraction of the memory they did. A build
   kept every module's checked syntax tree until it finished, so a cold build of
   this repository's test runner peaked at 4 to 6 GB; each tree is now let go
-  once its module is generated, and the same build peaks under 1 GB.
+  once its module is generated, and the same build peaks under 1 GB. Types
+  nothing references any more are let go of too, rather than kept for the life
+  of the process, which takes that build from about 800 MB to about 700 MB.
   `nupp build --json` reports the build's peak in `timing.peakBytes`.
 - `nupp test` builds the code under test in a child process, so it no longer
   holds the build's memory while the tests run. For this repository's own
