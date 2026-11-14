@@ -806,6 +806,7 @@ local function openSession(
         -- Workers may load compiler products prepared by the coordinator, but never
         -- publish to those stores. Their project semantics arrive in requests.
         cacheReadOnly = isolated or nil,
+        releaseTrees = true,
     })
 
     local staged: {any} = {}
@@ -1163,6 +1164,53 @@ function modules.compileChecked(job: modules.CompileJob): modules.Compiled
     }
 
     return {record = record, code = code, said = mine, generated = generated, generateMs = generateMs,}
+end
+
+--- `items` reordered so each comes after the items it requires, read off the project
+--- headers. Items outside the list are not followed, and a cycle is broken where the
+--- walk first meets it; otherwise the list keeps the order it was given in.
+local function bottomUp(inc: Inc, items: {any}): {any}
+    local first: {[string]: integer} = {}
+    for position, item in ipairs(items) do
+        first[item.path] = first[item.path] or position
+    end
+    local ordered: {any} = {}
+    local visited: {[string]: boolean} = {}
+    for position, start in ipairs(items) do
+        if first[start.path] ~= position then
+            -- The same path queued twice is processed once; the copy keeps its place.
+            ordered[#ordered + 1] = start
+        elseif not visited[start.path] then
+            visited[start.path] = true
+            local frames: {any} = {{item = start, at = 0}}
+            while #frames > 0 do
+                local frame = frames[#frames]
+                if frame.requires == nil then
+                    local requires: {any} = {}
+                    local header = inc.projectHeader(frame.item.path)
+                    for _, name in ipairs(header and header.dependencies or {}) do
+                        local path = inc.modulePath(name)
+                        local at = path and first[normalize(path as string)] or nil
+                        if at ~= nil then
+                            requires[#requires + 1] = items[at]
+                        end
+                    end
+                    frame.requires = requires
+                end
+                frame.at = frame.at + 1
+                local required = frame.requires[frame.at]
+                if required == nil then
+                    frames[#frames] = nil
+                    ordered[#ordered + 1] = frame.item
+                elseif not visited[required.path] then
+                    visited[required.path] = true
+                    frames[#frames + 1] = {item = required, at = 0}
+                end
+            end
+        end
+    end
+
+    return ordered
 end
 
 local function buildModules(root: string, outDir: string, config: Config, target: Target, oldState: State, newState: State, checkOnly: boolean?, stats: modules.Stats?, diagnostics: {
@@ -1611,27 +1659,94 @@ local function buildModules(root: string, outDir: string, config: Config, target
     -- they were there to do.
     local selectorMs = 0
     if mayPlan then
-        -- Check the deliverable once before emission so incoming calls can request a
-        -- body from the module that declares it.  This is emission dependency
-        -- discovery, not a reverse type dependency: the incremental checker memoizes
-        -- these answers and a caller tuple enters only the declaring module's
-        -- specialization hash below.
-        local checkedForSpecialization: {any} = {}
-        local specializationCursor = 1
-        while specializationCursor <= #queue do
-            local item = queue[specializationCursor]
-            specializationCursor = specializationCursor + 1
-            local checked = inc.checkFile(item.path)
-            if checked.result ~= nil and checked.missing ~= true and checked.syntax ~= true then
-                checkedForSpecialization[
-                    #checkedForSpecialization + 1
-                ] = {filename = item.path, module = item.name, result = checked.result,}
+        -- Check the modules that take part before emission so incoming calls can
+        -- request a body from the module that declares it. This is emission
+        -- dependency discovery, not a reverse type dependency: a caller tuple enters
+        -- only the declaring module's specialization hash below.
+        --
+        -- Only a module that declares a candidate, or spells a name one is reached
+        -- by, can take part. Checking the whole deliverable here instead held every
+        -- module's tree at once, before the first was generated.
+        local closure: {any} = {}
+        local inClosure: {[string]: boolean} = {}
+
+        local function reach(name: string, path: string): nil
+            path = normalize(path)
+            if not inClosure[path] then
+                inClosure[path] = true
+                closure[#closure + 1] = {name = name, path = path}
             end
-            for _, dependency in ipairs(inc.moduleDependencies(item.path)) do
+        end
+
+        for _, item in ipairs(queue) do
+            reach(item.name, item.path)
+        end
+        local reaching: integer = 1
+        while reaching <= #closure do
+            local header = inc.projectHeader(closure[reaching].path)
+            reaching = reaching + 1
+            for _, dependency in ipairs(header and header.dependencies or {}) do
                 local dependencyPath = inc.modulePath(dependency)
                 if dependencyPath ~= nil and not packagedCheckSources[dependency] then
+                    reach(dependency, dependencyPath as string)
                     seed(dependency, dependencyPath)
                 end
+            end
+        end
+        local taking: {[string]: boolean} = {}
+        local takingPart: {any} = {}
+
+        local function takePart(item: any): nil
+            taking[item.path] = true
+            local checked = inc.checkFile(item.path)
+            if checked.result ~= nil and checked.missing ~= true and checked.syntax ~= true then
+                takingPart[#takingPart + 1] = {filename = item.path, module = item.name, result = checked.result,}
+            end
+        end
+
+        for _, item in ipairs(closure) do
+            local text = inc.fileText(item.path)
+            if text ~= nil
+                and (text as string):find("[<,]%s*const%s+[%a_]") ~= nil
+                and constspecialize.declares(inc.parseFile(item.path))
+            then
+                takePart(item)
+            end
+        end
+        local names: {[string]: boolean} = {}
+        local widened = #takingPart > 0
+        while widened do
+            widened = false
+            local fresh: {string} = {}
+            for name in pairs(constspecialize.candidateNames(takingPart)) do
+                if not names[name] then
+                    names[name] = true
+                    fresh[#fresh + 1] = name
+                end
+            end
+            for _, item in ipairs(closure) do
+                local text = not taking[item.path] and inc.fileText(item.path) or nil
+                if text ~= nil then
+                    for _, name in ipairs(fresh) do
+                        if (text as string):find(name, 1, true) ~= nil then
+                            takePart(item)
+                            widened = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        -- In the deliverable's own order, which is the order the calls are collected
+        -- in.
+        local checkedForSpecialization: {any} = {}
+        local takenAt: {[string]: any} = {}
+        for _, module in ipairs(takingPart) do
+            takenAt[module.filename] = module
+        end
+        for _, item in ipairs(closure) do
+            if takenAt[item.path] ~= nil then
+                checkedForSpecialization[#checkedForSpecialization + 1] = takenAt[item.path]
             end
         end
         if suppliedConstSelection ~= nil then
@@ -1971,6 +2086,12 @@ local function buildModules(root: string, outDir: string, config: Config, target
         records[name] = compiled.record
         codeFor[name] = compiled.code
         reused[name] = nil
+        -- Generated, so nothing reads this module's tree again: its dependents read
+        -- its interface. Kept, every module's tree stayed alive until the build
+        -- ended, and the program's whole checked graph was most of the build's
+        -- memory. A specialization plan keeps its own reference to the trees it
+        -- rewrites.
+        inc.releaseCheck(path)
         linkCompiled(name, compiled.record)
     end
 
@@ -2203,6 +2324,23 @@ local function buildModules(root: string, outDir: string, config: Config, target
         return reached
     end
 
+    -- Dependencies first, so a module's check finds what it requires already checked,
+    -- generated and released. In the order the source set lists them, the first
+    -- module checked its whole require closure underneath itself, and every tree in
+    -- that closure stayed alive until the queue reached its module. The answers do
+    -- not depend on the order; the report below still lists modules as they were
+    -- reached.
+    local reachedAt: {[string]: integer} = {}
+    local pending: {any} = {}
+    local unprocessed: integer = cursor as integer
+    for position = unprocessed, #queue do
+        local item = queue[position]
+        reachedAt[item.name] = reachedAt[item.name] or position
+        pending[#pending + 1] = item
+    end
+    for offset, item in ipairs(bottomUp(inc, pending)) do
+        queue[unprocessed + offset - 1] = item
+    end
     processQueue()
     local invalidated = true
     while invalidated do
@@ -2460,7 +2598,23 @@ local function buildModules(root: string, outDir: string, config: Config, target
     -- a whole is well typed is what `nupp check` with no files means.
     local errors: {any} = {}
     local aotScope = aotApplies and refusalScope() or nil
-    for _, name in ipairs(order) do
+    local reported: {string} = {}
+    local processedAt: {[string]: integer} = {}
+    for position, name in ipairs(order) do
+        reported[position] = name
+        processedAt[name] = position
+    end
+    table.sort(reported, function(left: string, right: string): boolean
+        local leftAt, rightAt = reachedAt[left], reachedAt[right]
+        if leftAt ~= nil and rightAt ~= nil then
+            return leftAt < rightAt
+        elseif leftAt ~= nil or rightAt ~= nil then
+            return leftAt ~= nil
+        end
+
+        return processedAt[left] < processedAt[right]
+    end)
+    for _, name in ipairs(reported) do
         if not asked or asked[name] then
             for _, diag in ipairs(said[name] or {}) do
                 errors[#errors + 1] = diag
