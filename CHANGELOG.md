@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `nupp test` runs the shared lane's eight workers at once, each in a Lua state
+  of its own that is replaced once its heap passes 256 MB
+  (`NUPP_TEST_WORKER_HEAP_MB`). The workers used to share a pool as wide as
+  the machine's cores, so a 3-core runner ran three. Each of those states kept
+  what every suite it ran left behind. On the 7 GB macOS CI runner, this
+  repository's shared lane went from about 10,350 s to about 820 s, and peak
+  memory fell from more than the runner holds to 3.3 GB.
 - `nupp test` runs each suite that starts processes in a fresh worker
   process, as it already did for isolated suites. Each worker used to keep
   one process for every suite it took and kept growing. In this repository's
