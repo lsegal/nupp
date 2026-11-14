@@ -1171,6 +1171,54 @@ jobs:
             exit 1
           fi
 
+  # The full build's own memory, held to a budget on every platform (#257). A
+  # cold build of the test runner checks and generates every module in the
+  # repository and stamps the native provider; it used to peak at 4-6 GB
+  # because every module's checked tree stayed alive until the build ended.
+  # Built Cargo-free from the pinned prebuilt provider, so it runs while the
+  # Rust-building jobs above are off.
+  build-memory:
+    name: Full build memory / ${{ matrix.name }}
+    needs: classify
+    if: needs.classify.outputs.fixpoint == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: Linux x64, os: ubuntu-24.04}
+          - {name: macOS arm64, os: macos-15}
+          - {name: Windows x64, os: windows-2022}
+    defaults:
+      run:
+        shell: bash
+    env:
+      NUPP_CARGO: /nonexistent
+      NUPP_RUSTC: /nonexistent
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Restore the provisioned toolchain
+        uses: actions/cache@v4
+        with:
+          path: .nupp-cache/toolchain
+          key: >-
+            nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('scripts/toolchain.pins', 'scripts/toolchain') }}
+          restore-keys: |
+            nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Provision the pinned toolchain
+        run: ./scripts/toolchain --all
+
+      - name: Bootstrap the compiler
+        run: ./bin/nupp --version
+
+      - name: Hold the full build to its memory budget
+        run: ./scripts/build-memory-budget
+
   # The one status a ruleset should require. Its meaning does not change when
   # the jobs above are reorganized, renamed, or split, and it cannot pass by a
   # job being skipped: a job the classifier selected and that did not succeed
@@ -1189,6 +1237,7 @@ jobs:
       - gpu-conformance
       - gpu-conformance-windows
       - prebuilt-native-program
+      - build-memory
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # The run's queue delay and its per-job durations are only on the API, and

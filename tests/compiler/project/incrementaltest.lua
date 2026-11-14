@@ -178,6 +178,92 @@ function M.interfaceCutoffAcrossModules()
     os.execute("rm -rf '" .. dir .. "'")
 end
 
+-- A build releases each module's tree once it is generated (#257). The graph keeps
+-- the answer and what it depended on, so a dependent checked afterwards reads the
+-- interface without checking the released module again, an edit still reaches it,
+-- and asking for the tree again checks the module once more rather than handing
+-- back nothing.
+function M.aReleasedCheckKeepsItsAnswerAndChecksAgainOnlyWhenAsked()
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p '" .. dir .. "'")
+    local depPath = dir .. "/dep.nupp"
+    local mainPath = dir .. "/main.nupp"
+    local otherPath = dir .. "/other.nupp"
+
+    local function write(path, text)
+        local f = assert(io.open(path, "wb"))
+        f:write(text)
+        f:close()
+    end
+
+    local dep = "local function scale(n: number): number\n   return n * 2\nend\nreturn { scale = scale }"
+    write(depPath, dep)
+    write(mainPath, "local dep = require('dep')\nlocal x: number = dep.scale(21)\nreturn x")
+    write(otherPath, "local dep = require('dep')\nlocal y: string = dep.scale(2)\nreturn y")
+
+    local inc = incremental.new(dir, {releaseTrees = true, cache = false})
+    local depChecked = inc.checkFile(depPath)
+    testAssert.eq(#depChecked.diags, 0, "dep checks clean")
+    local moduleType = depChecked.moduleType
+    inc.releaseCheck(depPath)
+    testAssert.eq(inc.q.memo.checkModule[depPath].value.result, nil, "the tree is released")
+    testAssert.eq(inc.q.memo.parse[depPath].value.root, nil, "the parse is released with it")
+
+    local checks = inc.q.stats.checkModule
+    testAssert.eq(#inc.checkFile(mainPath).diags, 0, "a dependent reads the released interface")
+    testAssert.eq(inc.q.stats.checkModule, checks + 1, "only the dependent was checked")
+
+    -- Staging any input moves the revision, and validating the released memo against
+    -- it must not need the tree either.
+    write(otherPath, "local dep = require('dep')\nlocal y: string = dep.scale(2)\nreturn y")
+    inc.openDocument(otherPath, "local dep = require('dep')\nlocal y: string = dep.scale(2)\nreturn y")
+    local other = inc.checkFile(otherPath)
+    testAssert.eq(other.diags[1] and other.diags[1].code, "NUPP2001", "a later dependent sees the interface")
+    testAssert.eq(inc.q.stats.checkModule, checks + 2, "the released module was not checked again")
+
+    local again = inc.checkFile(depPath)
+    testAssert.eq(inc.q.stats.checkModule, checks + 3, "asking for the tree checks the module again")
+    assert(again.result ~= nil and again.result.root ~= nil, "and hands the tree back")
+    testAssert.eq(again.moduleType, moduleType, "with the same interned interface")
+    testAssert.eq(#inc.checkFile(mainPath).diags, 0, "dependents are still current")
+    testAssert.eq(inc.q.stats.checkModule, checks + 3, "and were not checked again")
+
+    inc.releaseCheck(mainPath)
+    testAssert.eq(inc.moduleDependencies(mainPath)[1], "dep", "a released check keeps its dependencies")
+
+    -- An edit to the released module still reaches its dependents.
+    inc.releaseCheck(depPath)
+    inc.changeDocument(depPath, (dep:gsub("%): number", "): string"):gsub("n %* 2", "tostring(n)")))
+    local edited = inc.checkFile(mainPath)
+    testAssert.eq(edited.diags[1] and edited.diags[1].code, "NUPP2001", "the edit reaches the dependent")
+
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
+-- A build reads a parse made only for a project header once more, when the module
+-- is checked, so it does not keep every file's parse alive until then (#257).
+function M.aBuildSessionLetsGoOfAParseMadeOnlyForItsHeader()
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p '" .. dir .. "'")
+    local path = dir .. "/lib.nupp"
+    local file = assert(io.open(path, "wb"))
+    file:write("export function answer(): integer return 42 end\n")
+    file:close()
+
+    local inc = incremental.new(dir, {releaseTrees = true, cache = false})
+    local header = inc.projectHeader(path)
+    testAssert.eq(header.declarations[1].name, "answer", "the header still says what the file declares")
+    local parse = inc.q.memo.parse[path]
+    testAssert.eq(parse and parse.value.released, true, "the parse made for the header is released")
+    local checked = inc.checkFile(path)
+    testAssert.eq(#checked.diags, 0, "the file checks from a fresh parse")
+    assert(checked.result.root ~= nil, "with its tree")
+
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
 -- A check reaches each import through the query graph, so a long require chain
 -- used to be checked by recursion as deep as the chain, and past about a thousand
 -- modules the Lua stack ran out. A deep graph is now checked from the bottom.

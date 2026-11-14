@@ -1,0 +1,44 @@
+#!/bin/sh
+# Builds the test runner from nothing -- the compiler's whole source set and the
+# native provider, the largest build this repository does -- and fails when the
+# build process's peak resident memory passes the budget.
+#
+# The build used to peak at 4-6 GB, almost all of it every module's checked tree
+# held until the build finished (#257). Releasing each tree once its module is
+# generated brought it to a few hundred megabytes, and this holds it there: a
+# change that starts keeping trees, or anything else per module, alive again
+# grows the peak with the project and fails here rather than on a runner that
+# runs out of memory.
+#
+# The peak is the build's own (`timing.peakBytes`, read by the process from the
+# operating system), so children it starts are neither counted nor able to hide
+# memory it holds. The output directory is fresh, so nothing is reused.
+#
+# Usage: scripts/build-memory-budget [BUDGET_MB]
+set -eu
+
+budget_mb=${1:-${NUPP_BUILD_MEMORY_BUDGET_MB:-900}}
+root=$(cd "$(dirname "$0")/.." && pwd)
+out="build/memory-budget"
+report="$root/$out.json"
+rm -rf "${root:?}/$out" "$report"
+trap 'rm -rf "${root:?}/$out" "$report"' EXIT
+
+(cd "$root" && ./bin/nupp build --json --target testRunner --output "$out") > "$report" || {
+    echo "build-memory-budget: the test runner did not build" >&2
+    cat "$report" >&2
+    exit 1
+}
+
+peak=$(jq -r '.timing.peakBytes // empty' "$report")
+total=$(jq -r '.timing.totalMs // empty' "$report")
+if [ -z "$peak" ]; then
+    echo "build-memory-budget: the build reported no peak memory on this platform" >&2
+    exit 1
+fi
+peak_mb=$((peak / 1048576))
+echo "full build: peak ${peak_mb} MB (budget ${budget_mb} MB), ${total} ms"
+if [ "$peak_mb" -gt "$budget_mb" ]; then
+    echo "build-memory-budget: the full build peaked at ${peak_mb} MB, over its budget of ${budget_mb} MB" >&2
+    exit 1
+fi
