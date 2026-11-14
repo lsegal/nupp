@@ -917,8 +917,6 @@ function M.storedProjectInterfacesCompileTheSameAsTheirSource()
     local function compile(prefix)
         local outputs = {}
         for _, command in ipairs({
-            -- The listing rather than `--json`, whose `bytecodeFingerprint` digests a
-            -- `string.dump` that differs between runs over the same source.
             "bc -O1 src/main.nupp",
             "lsp artifact --kind lua -O1 src/main.nupp",
             "bc src/bad.nupp",

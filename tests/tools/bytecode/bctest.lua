@@ -424,6 +424,34 @@ function M.jsonCarriesTheFindingAndItsCount()
     assert(found, "json names the instruction, not only the count")
 end
 
+-- The fingerprint names the bytecode, so every process that compiles the same
+-- source must agree on it. LuaJIT seeds string hashing per process, which moves
+-- the entries of a constant table around in a raw dump; a table of string keys is
+-- the case that tells a digest of the dump from a digest of the bytecode. The
+-- trailing `| cat` keeps the test runner's compile service from answering every
+-- run inside one process, where the seed would never change.
+function M.fingerprintIsTheSameInEveryProcess()
+    local keys = {}
+    for index = 1, 24 do
+        keys[#keys + 1] = ("key%d = %d"):format(index, index)
+    end
+    local dir = project{["table.nupp"] = "local t = {" .. table.concat(keys, ", ") .. "}\nprint(t.key1)\n"}
+    local seen
+    for attempt = 1, 4 do
+        local pipe = assert(
+            io.popen(("cd %q && NO_COLOR= '%s' bc --json -O1 table.nupp 2>&1 | cat"):format(dir, NUPP))
+        )
+        local out = pipe:read("*a")
+        pipe:close()
+        local fingerprint = require("testjson").decode(out).bytecodeFingerprint
+        assert(type(fingerprint) == "string" and #fingerprint == 64, "a sha256 fingerprint:\n" .. out)
+        if seen then
+            test.eq(fingerprint, seen, "run " .. attempt .. " fingerprints the same bytecode")
+        end
+        seen = fingerprint
+    end
+end
+
 -- Colour is a second rendering of the same listing, never a different one. The
 -- escapes go inside lines, so a listing stripped of them is the listing a pipe
 -- got -- which is what keeps the line numbering an editor maps against true of
