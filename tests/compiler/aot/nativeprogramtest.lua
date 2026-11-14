@@ -1653,7 +1653,7 @@ end
 ]]
     local ir = assert(lowerData(source))
     local declared = {}
-    for name in ir:gmatch("\ndeclare i32 @(%l+)%(i32") do
+    for name in ("\n" .. ir):gmatch("\ndeclare [^@\n]*@(%l+)%(") do
         declared[#declared + 1] = name
     end
     test.eq(table.concat(declared, " "), "alpha beta delta kappa mu omega sigma zeta")

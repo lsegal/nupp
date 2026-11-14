@@ -29,3 +29,6 @@
   branch instead of six. A long function that LuaJIT refused once instrumented,
   with NUPP3005 "function too long for return fixup", now loads, which is what
   stopped coverage runs over this repository from running any tests.
+- `nupp aot --emit llvm` and `--emit llvm-library` declare the C functions a
+  native program calls in name order. The order used to change from run to
+  run, so compiling the same source twice could give different IR.
