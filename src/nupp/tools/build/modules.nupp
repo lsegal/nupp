@@ -1630,61 +1630,6 @@ local function buildModules(root: string, outDir: string, config: Config, target
     local suppliedConstSelection = (target as any)._constSelection
     local constEnabled = not checkOnly and (config._optLevel or 0) >= 1 and not (config._disabledPasses or {})["OPT-8"]
 
-    -- Modules workers checked, the generated code of the ones they built, and the
-    -- ones whose records this build then accepted.
-    local parallelChecked: {[string]: boolean} = {}
-    local parallelCode: {[string]: string} = {}
-    local parallelAccepted: {[string]: boolean} = {}
-
-    -- A cold whole-project check or build may be done by workers. Their records become
-    -- the cache candidate the validator below consumes, as an earlier run's would. It
-    -- runs before runtime linking, which then reads the dependencies those records
-    -- carry instead of checking each runtime module here to discover them.
-    --
-    -- A build's const specialization is planned across every module at once, which
-    -- workers cannot do. Workers build only a project that gives that planner nothing
-    -- to plan, so the selection each of them generates against is the empty one this
-    -- process would have reached; a project declaring a const-generic function is
-    -- built here.
-    if narrow == nil
-        and next(oldState.modules or {}) == nil
-        and next(overlays or {}) == nil
-        and suppliedConstSelection == nil
-    then
-        local parallelcheck = require("nupp.tools.build.parallelcheck")
-        local linked: {string} = {}
-        for name in pairs(linkedModules) do
-            linked[#linked + 1] = name
-        end
-        table.sort(linked)
-        local produced = parallelcheck.run({
-            queue = queue,
-            inc = inc,
-            root = root,
-            outDir = outDir,
-            config = config,
-            target = target,
-            state = newState,
-            staged = opened.staged,
-            reporter = report,
-            build = not checkOnly,
-            constSelection = constEnabled and {accepted = {}, declined = {}} or nil,
-            linked = linked,
-        })
-        if produced ~= nil then
-            for name in pairs(produced.records) do
-                parallelChecked[name] = true
-            end
-            for name, code in pairs(produced.codes) do
-                parallelCode[name] = code
-            end
-            oldState.modules = produced.records
-            oldState.moduleCompilerHash = newState.moduleCompilerHash
-            oldState.configHash = newState.configHash
-            cacheCompatible = true
-        end
-    end
-
     local specializationPlans: {any} = {}
     local acceptedSpecializations: {any} = {}
     local declinedSpecializations: {any} = {}
@@ -1693,7 +1638,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
     -- a project without one -- warm ones included -- does not check every module
     -- just to find that out. Over-approximated: any `const` parameter counts.
     local mayPlan = false
-    if constEnabled and next(parallelChecked) == nil then
+    if constEnabled then
         for _, item in ipairs(queue) do
             local text = inc.fileText(item.path)
             if text == nil or (text as string):find("[<,]%s*const%s+[%a_]") ~= nil then
@@ -1702,9 +1647,8 @@ local function buildModules(root: string, outDir: string, config: Config, target
             end
         end
     end
-    -- Workers built only a project with nothing to specialize, so there is nothing
-    -- to plan, and checking every module here to find that out again is the work
-    -- they were there to do.
+    -- Planned before any worker starts, so the workers generate against the
+    -- selection this process would have.
     local selectorMs = 0
     if mayPlan then
         -- Check the modules that take part before emission so incoming calls can
@@ -1841,6 +1785,69 @@ local function buildModules(root: string, outDir: string, config: Config, target
         specializationHashes[path] = contentDigest(table.concat(keys, "\0"))
     end
     local emptySpecializationHash = contentDigest("")
+
+    -- Modules workers checked, the generated code of the ones they built, and the
+    -- ones whose records this build then accepted.
+    local parallelChecked: {[string]: boolean} = {}
+    local parallelCode: {[string]: string} = {}
+    local parallelAccepted: {[string]: boolean} = {}
+
+    -- A cold whole-project check or build may be done by workers. Their records become
+    -- the cache candidate the validator below consumes, as an earlier run's would. It
+    -- runs before runtime linking, which then reads the dependencies those records
+    -- carry instead of checking each runtime module here to discover them.
+    --
+    -- A build's const specialization is planned above, across every module at
+    -- once. The workers are handed it as plain data and rebind it to their own
+    -- trees, so each module generates against the selection this process holds.
+    if narrow == nil
+        and next(oldState.modules or {}) == nil
+        and next(overlays or {}) == nil
+        and suppliedConstSelection == nil
+    then
+        local parallelcheck = require("nupp.tools.build.parallelcheck")
+        local linked: {string} = {}
+        for name in pairs(linkedModules) do
+            linked[#linked + 1] = name
+        end
+        table.sort(linked)
+        local describedSelection: any? = nil
+        local selectionProblem: string? = nil
+        if constEnabled then
+            describedSelection, selectionProblem = constspecialize.describe(
+                acceptedSpecializations,
+                declinedSpecializations,
+                specializationHashes
+            )
+        end
+        local produced = parallelcheck.run({
+            queue = queue,
+            inc = inc,
+            root = root,
+            outDir = outDir,
+            config = config,
+            target = target,
+            state = newState,
+            staged = opened.staged,
+            reporter = report,
+            build = not checkOnly,
+            constSelection = describedSelection,
+            constSelectionProblem = selectionProblem,
+            linked = linked,
+        })
+        if produced ~= nil then
+            for name in pairs(produced.records) do
+                parallelChecked[name] = true
+            end
+            for name, code in pairs(produced.codes) do
+                parallelCode[name] = code
+            end
+            oldState.modules = produced.records
+            oldState.moduleCompilerHash = newState.moduleCompilerHash
+            oldState.configHash = newState.configHash
+            cacheCompatible = true
+        end
+    end
 
     local reused, codeFor, paths = {}, {}, {}
     local order: {string} = {}

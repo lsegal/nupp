@@ -68,11 +68,12 @@ end
 --- `input` carries `queue` (the build's `{name, path}` work list), `inc` (the
 --- coordinator's session), `root`, `outDir`, `config`, `target`,
 --- `state` (the new build state) and `reporter`. A build also sets `build`, the
---- `constSelection` its modules generate against, and the `linked` dependency
---- modules it compiles from source. Returns `{records, codes}` -- the records
---- by module name and, for a build, the Lua each generated -- or nil and why
---- this process should do the work instead. Either way the reporter is told how
---- the run used its workers.
+--- `constSelection` its modules generate against (as `constspecialize.describe`
+--- carries it, or `constSelectionProblem` saying why it could not be), and the
+--- `linked` dependency modules it compiles from source. Returns `{records, codes}`
+--- -- the records by module name and, for a build, the Lua each generated -- or
+--- nil and why this process should do the work instead. Either way the reporter
+--- is told how the run used its workers.
 function parallelcheck.run(input: any): (any?, string?)
     local report = input.reporter
     local inc = input.inc
@@ -131,20 +132,11 @@ function parallelcheck.run(input: any): (any?, string?)
     if jobCount == 1 then
         return declined(plan.reason)
     end
-    -- A build's const specialization is planned across every module at once, which
-    -- workers cannot do, so a build that has a candidate stays in this process. The
-    -- planner's own syntactic test decides it, before any worker is started: the
-    -- text filter leaves only the sources spelling a `const` parameter to parse.
-    if input.build and input.constSelection ~= nil then
-        local constspecialize = require("nupp.compiler.lua.constspecialize")
-        for _, source in ipairs(ordered) do
-            local text = inc.fileText(source.path) as string
-            if text:find("[<,]%s*const%s+[%a_]") ~= nil and constspecialize.declares(inc.parseFile(source.path)) then
-                return declined(
-                    source.path .. " declares a const-generic function, which a build specializes across modules"
-                )
-            end
-        end
+    -- A build's const selection reaches the workers as plain data naming nodes by
+    -- their place in the source. One that names a node without a place cannot be
+    -- carried, so that build stays in this process.
+    if input.build and input.constSelectionProblem ~= nil then
+        return declined(tostring(input.constSelectionProblem))
     end
 
     report:at(input.build and "parallel build" or "parallel check")

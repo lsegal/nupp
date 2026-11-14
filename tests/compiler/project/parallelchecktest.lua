@@ -583,11 +583,11 @@ function M.parallelBuildsWriteWhatSerialBuildsWrite()
     assert(os.remove(directory, true))
 end
 
--- Const specialization is planned across every module of a build at once. A
--- project declaring a const-generic function is built in one process, and says so,
--- without starting a worker to find that out; its check, which plans nothing, still
--- uses workers.
-function M.constGenericProjectsBuildSerially()
+-- Const specialization is planned across every module of a build at once, before
+-- any worker starts, and each worker generates against that plan. A const-generic
+-- function called locally and from other modules, with more tuples than its
+-- module keeps bodies for, builds what the serial build writes, byte for byte.
+function M.constGenericProjectsBuildInParallel()
     local directory = tempProject(false)
     write(
         directory .. "/src/scaled.nupp",
@@ -601,32 +601,64 @@ local function doubled<const N: integer>(value: number, count: N): number
 end
 
 local function four(): number
-    return doubled(1, 2)
+    return doubled(1, 2) + doubled(1, 2)
 end
 
-return {four = four}
+return {doubled = doubled, four = four}
 ]]
     )
-    local buildPids = directory .. "/build-workers.pid"
-    local code, report = coldBuild(directory, {
-        NUPP_CHECK_JOBS = "2",
-        NUPP_TEST_PARALLEL_CHECK_PID_FILE = buildPids,
-    }, {"-O2"})
-    testAssert.eq(code, 0, "const-generic build: " .. json.encode(report.diagnostics))
-    testAssert.eq(report.timing.parallel.mode, "serial", "the build stays in one process")
-    assert(
-        tostring(report.timing.parallel.reason):find("const-generic", 1, true),
-        "the build says why: " .. tostring(report.timing.parallel.reason)
-    )
-    testAssert.eq(countKeys(workerPids(buildPids)), 0, "the declined build started no worker")
-    local checkPids = directory .. "/check-workers.pid"
-    local checkCode, checkReport = coldCheck(directory, {
-        NUPP_CHECK_JOBS = "2",
-        NUPP_TEST_PARALLEL_CHECK_PID_FILE = checkPids,
-    })
-    testAssert.eq(checkCode, 0, "const-generic check")
-    testAssert.eq(checkReport.timing.parallel.mode, "parallel", "a check plans no specialization")
-    testAssert.eq(countKeys(workerPids(checkPids)), 2, "the check started its workers")
+    for index = 1, 5 do
+        write(
+            directory .. ("/src/scaled_user%d.nupp"):format(index),
+            (
+                [[
+local scaled = require("scaled")
+
+local function value(): number
+    return scaled.doubled(1, %d) + scaled.doubled(2, %d) + scaled.four()
+end
+
+return {value = value}
+]]
+            ):format(index, index + 5)
+        )
+    end
+    for _, level in ipairs({"-O0", "-O2"}) do
+        local serialCode, serialReport, serialOutputs, serialState = coldBuild(directory, {NUPP_CHECK_JOBS = "1"}, {
+            level
+        })
+        testAssert.eq(serialCode, 0, level .. " serial build: " .. json.encode(serialReport.diagnostics))
+        local buildPids = directory .. "/build-workers" .. level .. ".pid"
+        local code, report, outputs, state = coldBuild(directory, {
+            NUPP_CHECK_JOBS = "2",
+            NUPP_TEST_PARALLEL_CHECK_PID_FILE = buildPids,
+        }, {level})
+        testAssert.eq(code, 0, level .. " parallel build: " .. json.encode(report.diagnostics))
+        testAssert.eq(
+            report.timing.parallel.mode,
+            "parallel",
+            level .. " parallel timing mode: " .. tostring(report.timing.parallel.reason)
+        )
+        testAssert.eq(countKeys(workerPids(buildPids)), 2, level .. " the build started its workers")
+        testAssert.eq(report.timing.parallel.rechecked, 0, level .. " worker records survive validation")
+        testAssert.eq(outputs, serialOutputs, level .. " build outputs")
+        testAssert.eq(state, serialState, level .. " build state")
+        if level == "-O2" then
+            local declaration = outputs["./scaled.lua"] or ""
+            assert(declaration:find("local function __nuppConst_doubled_", 1, true), "the declaration owns its bodies")
+            assert(
+                (outputs["./scaled_user1.lua"] or ""):find("__nuppConstSpecializations[", 1, true),
+                "a caller reaches a body in another module"
+            )
+            local declined = false
+            for _, record in pairs(state.modules) do
+                for _, remark in ipairs(record.optimizationRemarks or {}) do
+                    declined = declined or remark.status == "declined"
+                end
+            end
+            assert(declined, "the module's body budget declines some tuples")
+        end
+    end
 
     assert(os.remove(directory, true))
 end
