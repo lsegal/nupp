@@ -17,6 +17,7 @@ local parser = require("nupp.compiler.syntax.parser")
 local fs = require("nupp.compiler.fs")
 local process = require("nupp.compiler.process")
 local deps = require("nupp.tools.build.deps")
+local driverAnswers = require("nupp.tools.build.driveranswers")
 
 local stage = {}
 
@@ -47,8 +48,13 @@ local function driven(compilerRoot: string, what: string, features: {string}): (
     -- os.execute reaches cmd.exe on Windows, which does not interpret a
     -- shebang. The driver belongs to the Git Bash environment used to launch
     -- Nupp, so name its shell explicitly there.
-    local argv = windows and {"sh.exe", driver, what, table.concat(features, ",")}
-        or {driver, what, table.concat(features, ",")}
+    local request = {what, table.concat(features, ",")}
+    local slot = driverAnswers.slot(driver, request)
+    local recalled = driverAnswers.recalled(slot)
+    if recalled then
+        return recalled, ""
+    end
+    local argv = windows and {"sh.exe", driver, request[1], request[2]} or {driver, request[1], request[2]}
     local code, text = process.capture(argv)
     if code ~= 0 then
         return nil, text
@@ -62,6 +68,7 @@ local function driven(compilerRoot: string, what: string, features: {string}): (
     if not answer then
         return nil, "the toolchain driver built " .. what .. " but named no file"
     end
+    driverAnswers.remember(slot, answer)
 
     return answer, ""
 end

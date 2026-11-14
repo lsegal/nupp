@@ -449,8 +449,14 @@ the total.
 ```bash
 nupp test --jobs=4        # four shards
 nupp test --jobs=1        # one process
+nupp test --jobs=shell:2  # two workers for the shell lane, the default for the rest
 nupp test checktest       # one named suite, one process
 ```
+
+Every lane a run selects shares that run's one build of the compiler, the test
+runner and the native provider. `--lane=isolated,shell` keeps two lanes, and
+`--jobs=LANE:N` sizes one lane without splitting it into a run of its own, which
+would check and build all of that again.
 
 Work is ordered from measurement rather than guesswork: nothing about a suite
 says in advance how long it takes, so a run writes what every suite and every

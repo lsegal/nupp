@@ -462,8 +462,9 @@ end
 --- Coverage options belong to Nupp. Every other argument is preserved in
 --- order for the bundled runner or the project's configured test command.
 --- The bundled runner accepts suite names, `--json`, `--verbose`, `--jobs=N`,
---- repeated `--group=NAME`, `--exclude=SUITE`, `--exclude-group=NAME`, one of
---- `--lane=shared|shell|isolated`, `--list-suites`, `--list-cases`,
+--- `--jobs=LANE:N`, repeated `--group=NAME`, `--exclude=SUITE`,
+--- `--exclude-group=NAME`, `--lane=shared|shell|isolated` or several of them
+--- separated by commas, `--list-suites`, `--list-cases`,
 --- `--list-groups`, `--case=SUITE/CASE`, `--rerun=REPORT`, and
 --- `--scope=unit|component|integration|delivery|all`, `--fresh`, `--audit`, and
 --- `--timings[=N]`. Those remain forwarded arguments rather than fields of this

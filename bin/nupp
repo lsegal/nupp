@@ -33,25 +33,20 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # waits for that build rather than loading a compiler halfway rewritten.
 # `build` and `clean` always take the ordinary path, since they are the writer.
 COMMAND=${1:-}
+[ -n "${NUPP_LAUNCHER_OS:-}" ] && LAUNCHER_OS=$NUPP_LAUNCHER_OS || LAUNCHER_OS=$(uname -s 2>/dev/null)
+LUA_ROOT="$ROOT"
+case "$LAUNCHER_OS" in
+    MINGW*|MSYS*|CYGWIN*) LUA_ROOT="$(cygpath -m "$ROOT")" ;;
+esac
+# Named by its drive-letter spelling on Windows. A native program passing the
+# environment on rewrites a value spelled `/c/...` as `C:/...`, so the POSIX
+# spelling never matched again by the time a test's command read it.
 RUN_READY=no
-if [ -n "${NUPP_LAUNCHER_RUN_ROOT:-}" ] && [ "$NUPP_LAUNCHER_RUN_ROOT" = "$ROOT" ] \
-    && [ -n "${NUPP_LAUNCHER_RUN_LUA_ROOT:-}" ] \
+if [ -n "${NUPP_LAUNCHER_RUN_ROOT:-}" ] && [ "$NUPP_LAUNCHER_RUN_ROOT" = "$LUA_ROOT" ] \
     && [ -f "$ROOT/build/.nupp-complete" ] && [ -f "$ROOT/build/nupp/tools/main.lua" ]; then
-    case "${1:-}" in
+    case "$COMMAND" in
         build|clean) ;;
         *) RUN_READY=yes ;;
-    esac
-fi
-
-LUA_ROOT="$ROOT"
-if [ "$RUN_READY" = yes ]; then
-    LUA_ROOT=$NUPP_LAUNCHER_RUN_LUA_ROOT
-    LAUNCHER_OS=${NUPP_LAUNCHER_OS:-}
-fi
-[ -n "${LAUNCHER_OS:-}" ] || LAUNCHER_OS=$(uname -s 2>/dev/null)
-if [ "$RUN_READY" = no ]; then
-    case "$LAUNCHER_OS" in
-        MINGW*|MSYS*|CYGWIN*) LUA_ROOT="$(cygpath -m "$ROOT")" ;;
     esac
 fi
 BUILT="$ROOT/build/nupp/tools/main.lua"
@@ -62,11 +57,12 @@ LUAPATH="package.path=\"$LUA_ROOT/build/?.lua;\" .. package.path"
 # Worked out once per process tree. The check is a `test` in a provisioned
 # checkout and costs a `git rev-parse` only where there is no tree to find,
 # but the suites run this launcher thousands of times and an answer that
-# cannot change should be reached for once.
-if [ "${NUPP_LAUNCHER_ROCKS_ROOT:-}" != "$ROOT" ]; then
+# cannot change should be reached for once. Keyed by the drive-letter spelling
+# for the reason the run above is.
+if [ "$RUN_READY" = no ] && [ "${NUPP_LAUNCHER_ROCKS_ROOT:-}" != "$LUA_ROOT" ]; then
     . "$ROOT/scripts/rocks.sh"
     link_development_rocks "$ROOT"
-    NUPP_LAUNCHER_ROCKS_ROOT=$ROOT
+    NUPP_LAUNCHER_ROCKS_ROOT=$LUA_ROOT
     export NUPP_LAUNCHER_ROCKS_ROOT
 fi
 
@@ -101,7 +97,7 @@ LUA_CPATH="$LUA_ROCKS/lib/lua/5.1/?.so;$LUA_ROCKS/lib/lua/5.1/?.dll;${LUA_CPATH:
 # move -- the checkout and the four variables `scripts/toolchain` reads -- so a
 # command run under a different compiler works its own answer out rather than
 # being handed somebody else's.
-TOOLCHAIN_CACHE_KEY="$ROOT|${NUPP_CC:-}|${NUPP_CXX:-}|${NUPP_TOOLCHAIN_DIR:-}"
+TOOLCHAIN_CACHE_KEY="$LUA_ROOT|${NUPP_CC:-}|${NUPP_CXX:-}|${NUPP_TOOLCHAIN_DIR:-}"
 if [ "${NUPP_LAUNCHER_TOOLCHAIN_KEY:-}" = "$TOOLCHAIN_CACHE_KEY" ] \
     && [ -n "${NUPP_LAUNCHER_TOOLCHAIN_PREFIX:-}" ]; then
     TOOLCHAIN_PREFIX=$NUPP_LAUNCHER_TOOLCHAIN_PREFIX
@@ -351,12 +347,9 @@ build_native() {
 }
 
 . "$ROOT/scripts/luajit.sh"
-if [ "$RUN_READY" = yes ] && [ -n "${NUPP_LAUNCHER_RUN_LUAJIT_DIR:-}" ]; then
-    case "$PATH" in
-        "$NUPP_LAUNCHER_RUN_LUAJIT_DIR":*) ;;
-        *) PATH="$NUPP_LAUNCHER_RUN_LUAJIT_DIR:$PATH"; export PATH ;;
-    esac
-else
+# Inside a run the interpreter the run selected is first on the PATH it handed
+# down, so asking which one to use again is a `luajit -v` for the same answer.
+if [ "$RUN_READY" = no ] || ! command -v luajit >/dev/null 2>&1; then
     select_luajit "$ROOT" "$TOOLCHAIN_LUAJIT" || exit 1
 fi
 
@@ -754,16 +747,21 @@ fi
 # build is still run, behind, but every test's command asking again is what
 # notices once it does.
 #
-# The interpreter goes with it. A test that puts its own directories first on
-# PATH still gets the LuaJIT this run selected, not an older one found there.
-if [ "$COMMAND" = test ] && [ "$using_stage0" = no ] && [ -f "$STAMP" ] \
-    && [ -f "$NUPP_NATIVE_LIBRARY" ] && run_luajit=$(command -v luajit); then
-    NUPP_LAUNCHER_RUN_ROOT=$ROOT
-    NUPP_LAUNCHER_RUN_LUA_ROOT=$LUA_ROOT
-    NUPP_LAUNCHER_RUN_LUAJIT_DIR=$(dirname "$run_luajit")
+# A `nupp test` a test runs inside the run is part of it, and keeps the run's.
+if [ "$COMMAND" = test ] && [ "$RUN_READY" = no ] && [ "$using_stage0" = no ] \
+    && [ -f "$STAMP" ] && [ -f "$NUPP_NATIVE_LIBRARY" ]; then
+    NUPP_LAUNCHER_RUN_ROOT=$LUA_ROOT
     NUPP_LAUNCHER_OS=$LAUNCHER_OS
-    export NUPP_LAUNCHER_RUN_ROOT NUPP_LAUNCHER_RUN_LUA_ROOT \
-        NUPP_LAUNCHER_RUN_LUAJIT_DIR NUPP_LAUNCHER_OS
+    export NUPP_LAUNCHER_RUN_ROOT NUPP_LAUNCHER_OS
+    # Where the run's builds remember what `scripts/toolchain` answered
+    # (nupp.tools.build.driveranswers). An answer is only known not to have
+    # moved for as long as one run lasts, so each run starts with none. The
+    # name stays the same from run to run: the test build and the passing-result
+    # cache are both keyed by the whole environment, and a name per run would
+    # have rebuilt the one and emptied the other every time.
+    rm -rf "$ROOT/build/.nupp-run-answers"
+    NUPP_TOOLCHAIN_ANSWERS="$LUA_ROOT/build/.nupp-run-answers"
+    export NUPP_TOOLCHAIN_ANSWERS
 fi
 
 # Holding the lock rules out `exec`: the trap that releases it belongs to this
