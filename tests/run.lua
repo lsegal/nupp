@@ -3029,9 +3029,9 @@ then
                     local progress = processProgressFd and ("NUPP_TEST_PROGRESS_FD=%d "):format(processProgressFd) or ""
                     -- Shell suites run each in a process of its own too (#261). One
                     -- long-lived shell worker kept what every suite it claimed left
-                    -- behind, and eight of them on a hosted runner added up to more
-                    -- memory than it has: Linux runners were shut down half an hour
-                    -- into the lane and macOS swapped until the job timed out.
+                    -- behind, growing to 2-4 GB, and eight of them shut down a 16 GB
+                    -- Linux runner twelve minutes into the lane. A fresh process
+                    -- holds a worker to the suite it is running.
                     local fresh = (executionLane == "isolated" or executionLane == "shell")
                         and "NUPP_TEST_FRESH_QUEUE_PIECES=1 "
                         or ""

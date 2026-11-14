@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `nupp test` runs each suite that starts processes in a fresh worker
+  process, as it already did for isolated suites. Each worker used to keep
+  one process for every suite it took and kept growing. In this repository's
+  suite, eight such workers exhausted a 16 GB Linux CI runner partway through.
 - `nupp test` starts at least eight workers by default, one per processor on
   machines with more. A four-core machine used to run four suites at once and
   now runs eight. `--jobs=N` still sets the count explicitly.
