@@ -136,7 +136,7 @@ record types.Union
     id: string = ""
     tag: 'union'
 
-    --- Deduplicated and sorted by id.
+    --- Deduplicated and in canonical order; see `canonicalOrder`.
     members: {types.Type}
 
     --- Whether nil is among them, which is what makes a field optional and a pointer
@@ -149,7 +149,7 @@ record types.Intersection
     id: string = ""
     tag: 'intersection'
 
-    --- Deduplicated and sorted by id.
+    --- Deduplicated and in canonical order; see `canonicalOrder`.
     members: {types.Type}
 end
 
@@ -1075,16 +1075,28 @@ type types.Predicate = {
     type: types.Type
 }
 
---- Every structural type built so far, keyed by its canonical string.
-local arena: {[string]: types.Type} = {}
+--- Every structural type still in use, keyed by its canonical string.
+---
+--- Weak-valued, so a type nothing else references leaves the arena when it is
+--- collected. That is safe for identity: an entry goes only once no parent, cache or
+--- caller can reach the type, so nothing is left to compare a second copy against,
+--- and building the same structure again gets the same `id` (see `stamp`). Holding
+--- them strongly kept every type a process ever built: 172 MB of a 490 MB heap at the
+--- end of a cold `testRunner` build, nearly all of it function bodies of modules
+--- generated long before.
+local arena: {[string]: types.Type} = setmetatable({}, {__mode = "v"})
 
-local packArena: {[string]: types.Pack} = {}
-local packVarArena: {[string]: types.PackVar} = {}
-local capabilityArena: {[string]: types.Capability} = {}
+local packArena: {[string]: types.Pack} = setmetatable({}, {__mode = "v"})
+local packVarArena: {[string]: types.PackVar} = setmetatable({}, {__mode = "v"})
+local capabilityArena: {[string]: types.Capability} = setmetatable({}, {__mode = "v"})
 local capabilityIdentity = setmetatable({}, {__mode = "k"})
 local nextCapabilityIdentity: integer = 0
 local identityNamespace = ""
-local constArena: {[string]: types.ConstTerm} = {}
+local constArena: {[string]: types.ConstTerm} = setmetatable({}, {__mode = "v"})
+
+--- Every id `stamp` has issued to something still alive, so that two keys whose
+--- digests collide are still told apart.
+local issued: {[string]: any} = setmetatable({}, {__mode = "v"})
 
 local function flowIdentity(value: any): integer
     if value == nil then
@@ -1100,28 +1112,79 @@ local function flowIdentity(value: any): integer
     return nextCapabilityIdentity
 end
 
---- The serial an interned thing is known by.
+--- The digits a key digest is written in: 64 of them, none a delimiter a key uses
+--- and none the `!` that starts a mark.
+const DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$"
+
+--- Six digits of a value below 2^36.
+local function digits(value: number): string
+    local out = ""
+    for _ = 1, 6 do
+        local digit = value % 64
+        out = out .. DIGITS:sub(digit + 1, digit + 1)
+        value = (value - digit) / 64
+    end
+
+    return out
+end
+
+--- A 62-bit digest of `key`, as twelve digits.
 ---
---- An arena key still spells the structure, but it spells it with its parts' serials
+--- Two polynomial hashes under different primes below 2^31. Every intermediate stays
+--- below 2^53, so the arithmetic is exact in a double and the answer is the same in
+--- LuaJIT and in the Lua 5.1 compiler, which has neither 64-bit integers nor a bit
+--- library to lean on. It runs once per arena miss, over a key that is already short
+--- (see `stamp`).
+local function keyDigest(key: string): string
+    local a: number, b: number = #key, 0
+    for at = 1, #key do
+        local byte = key:byte(at)
+        a = (a * 1000003 + byte) % 2147483647
+        b = (b * 999983 + byte) % 2147483629
+    end
+
+    return digits(a) .. digits(b)
+end
+
+--- The id an interned thing is known by, a digest of the key it is interned under.
+---
+--- An arena key still spells the structure, but it spells it with its parts' ids
 --- rather than with their keys, so a key is proportional to what it was built from
 --- rather than to the size of everything beneath it. Spelling it the other way made a
 --- key as long as the type was deep: checking one 791-line module built 527 MB of key
 --- bytes, and its longest single key ran to 132 KB.
 ---
---- Which means an `id` identifies and does not describe. Nothing may read structure
---- back out of one, and nothing may keep one past the process that issued it: the
---- number says only which thing this is, and only here. The build cache's structural
---- digest is `typeFingerprint` in `nupp.tools.build.modules`, which is computed from
---- the type itself and is the same in every process.
-local nextSerial: integer = 0
+--- A digest rather than a serial, because the arenas are weak. A serial says when a
+--- type was built, and a type the arena let go of and that was then built again would
+--- come back with a later one -- so every key and id spelled from it, and any order
+--- that falls back on one, would depend on when the collector ran. A digest of the key
+--- is the same however often and in whatever order the type is built, and since a key
+--- spells its parts by their ids, the same structure always comes to the same id.
+---
+--- Still, an `id` identifies and does not describe. Nothing may read structure back
+--- out of one, and nothing may keep one past the process that issued it: a worker's
+--- ids carry its namespace, and the rare digest collision is told apart by a suffix
+--- that depends on what is alive. The build cache's structural digest is
+--- `typeFingerprint` in `nupp.tools.build.modules`, which is computed from the type
+--- itself and is the same in every process.
+---
+--- @param prefix the marks the key inherits and the arena's letter
+--- @param key the canonical key `made` is interned under
+--- @param made what the id is for, recorded so a colliding key is told apart
+local function stamp(prefix: string, key: string, made: any): string
+    local base = prefix .. identityNamespace .. keyDigest(key)
+    local id = base
+    local suffix: integer = 1
+    while issued[id] ~= nil do
+        suffix = suffix + 1
+        id = base .. "~" .. suffix
+    end
+    issued[id] = made
 
-local function serial(prefix: string): string
-    nextSerial = nextSerial + 1
-
-    return prefix .. identityNamespace .. nextSerial
+    return id
 end
 
---- Marks a serial carries, so the questions that used to be asked of a structural id
+--- Marks an id carries, so the questions that used to be asked of a structural id
 --- can still be asked of a short one.
 ---
 --- `hasTypevar` and `hasProjection` read their answer off the id rather than walking
@@ -1152,6 +1215,26 @@ local function inheritedMarks(key: string): string
     return marks
 end
 
+--- What `orderSpelling` has worked out, by the type or pack it is for. Weak keys,
+--- so an entry goes with its type.
+local orderSpellings: {[any]: string} = setmetatable({}, {__mode = "k"})
+
+--- A digest of how `t` renders, which names a nominal by its name and nothing by a
+--- number this process issued, so it is the same in every process that builds the
+--- same structure.
+---
+--- @param pack whether `t` is a pack rather than a type
+local function orderSpelling(t: any, pack: boolean): string
+    local found = orderSpellings[t]
+    if found ~= nil then
+        return found
+    end
+    local spelled = keyDigest(pack and types.tostringPack(t as types.Pack) or types.tostring(t as types.Type))
+    orderSpellings[t] = spelled
+
+    return spelled
+end
+
 --- Orders the members of a union or an intersection.
 ---
 --- Canonical order is what makes `string | integer` and `integer | string` the same
@@ -1162,8 +1245,16 @@ end
 ---
 --- Tag first, which for a primitive is its name and for everything else groups by
 --- constructor -- the same first-level order the old structural ids gave, since those
---- began with the constructor too. Then a leaf's own spelling. Then the serial, so that
---- two members that are alike this far still have some total order to fall into.
+--- began with the constructor too. Then a leaf's own spelling. Then the whole member's
+--- rendering (see `orderSpelling`), so that two members alike this far still have an
+--- order that is theirs. The id comes last, for two that also render alike.
+---
+--- Not the id before the rendering, though an id is no longer a serial either. An id
+--- is a digest of a key that spells a nominal by the number its declaration was given
+--- (see `types.nominal`), and two compilers that load a different number of
+--- declarations before checking the same source number them differently. That kept
+--- the self-hosting fixpoint's two stages from agreeing on the order of a record's
+--- overloads.
 local function canonicalOrder(a: types.Type, b: types.Type): boolean
     if a.tag ~= b.tag then
         return a.tag < b.tag
@@ -1181,6 +1272,21 @@ local function canonicalOrder(a: types.Type, b: types.Type): boolean
             return left < right
         end
     end
+    local left, right = orderSpelling(a, false), orderSpelling(b, false)
+    if left ~= right then
+        return left < right
+    end
+
+    return a.id < b.id
+end
+
+--- Orders the alternatives of a pack union, the way `canonicalOrder` orders a
+--- union's members and for the same reason.
+local function packOrder(a: types.Pack, b: types.Pack): boolean
+    local left, right = orderSpelling(a, true), orderSpelling(b, true)
+    if left ~= right then
+        return left < right
+    end
 
     return a.id < b.id
 end
@@ -1194,7 +1300,7 @@ local function intern(key: string, made: types.Type): types.Type
     if found then
         return found
     end
-    made.id = inheritedMarks(key) .. serial("t")
+    made.id = stamp(inheritedMarks(key) .. "t", key, made)
     arena[key] = made
 
     return made
@@ -2587,7 +2693,7 @@ function types.pack(head: {types.Type}?, tail: types.PackTail?, modes: {string}?
     if named then
         made.names = copiedNames
     end
-    made.id = inheritedMarks(key) .. serial("p")
+    made.id = stamp(inheritedMarks(key) .. "p", key, made)
     packArena[key] = made
 
     return made
@@ -2600,7 +2706,7 @@ function types.packvar(name: string, identity: string?): types.PackVar
         return found
     end
     local made = types.PackVar(tag = "packvar", name = name, identity = identity)
-    made.id = "!p" .. serial("pv")
+    made.id = stamp("!ppv", key, made)
     packVarArena[key] = made
 
     return made
@@ -2625,7 +2731,7 @@ function types.constLiteral(domain: string, value: string | boolean | integer): 
         return found as types.ConstLiteral
     end
     local made = types.ConstLiteral(tag = "constLiteral", domain = domain, value = value)
-    made.id = serial("c")
+    made.id = stamp("c", key, made)
     constArena[key] = made
 
     return made
@@ -2638,7 +2744,7 @@ function types.constvar(name: string, domain: string, identity: string?): types.
         return found as types.ConstVar
     end
     local made = types.ConstVar(tag = "constVar", name = name, domain = domain, identity = identity)
-    made.id = "!c" .. serial("c")
+    made.id = stamp("!cc", key, made)
     constArena[key] = made
 
     return made
@@ -2655,7 +2761,7 @@ function types.constOp(operation: string, operands: {types.ConstTerm}): types.Co
         return found as types.ConstOp
     end
     local made = types.ConstOp(tag = "constOp", operation = operation, operands = operands)
-    made.id = inheritedMarks(key) .. serial("c")
+    made.id = stamp(inheritedMarks(key) .. "c", key, made)
     constArena[key] = made
 
     return made
@@ -2744,9 +2850,7 @@ function types.packUnion(alternatives: {types.Pack}): types.Pack
             end
         end
     end
-    table.sort(flat, function(a: types.Pack, b: types.Pack): boolean
-        return a.id < b.id
-    end)
+    table.sort(flat, packOrder)
     if #flat == 1 then
         return flat[1]
     end
@@ -3765,6 +3869,13 @@ end
 
 local nominalCounter: integer = 0
 
+--- A digest of every declaration numbered so far, in the order it was numbered.
+---
+--- What an interned id is spelled from is either structure or a nominal's number, so
+--- two processes that numbered the same declarations the same way give every type the
+--- same id. This is what says whether they did; see `types.Identity`.
+local declarationTrail = ""
+
 -- Keyed declarations by key, kept only once `setIdentityNamespace` has made this
 -- process a worker.
 local declaredNominals: {[string]: types.Nominal} = {}
@@ -3803,6 +3914,7 @@ function types.nominal(name: string, declKind: string, declarationKey: string?):
         declarationKey = declarationKey
     )
     t.id = "nominal#" .. identityNamespace .. nominalCounter .. "(" .. name .. ")"
+    declarationTrail = keyDigest(declarationTrail .. "\0" .. t.id .. "\0" .. (declarationKey or ""))
     if shared then
         declaredNominals[declarationKey as string] = t
     end
@@ -4229,27 +4341,30 @@ end
 
 --- Everything above that decides whether two types are the same one.
 ---
---- Five arenas and three counters, and that is the whole of it. A type is the
---- object its arena holds under its key, and an `id` is the serial it was stamped
---- with when it went in.
+--- Five arenas and two counters, and that is the whole of it. A type is the
+--- object its arena holds under its key, and an `id` is the digest of that key it
+--- was stamped with when it went in.
 ---
 --- This exists for `nupp.compiler.project.preludecache`, which keeps the checked
 --- prelude between commands. Keeping a graph of types is keeping their identity, so a
 --- reader has to be given the arenas that hold them and the counters that will number
---- what comes next -- restore the objects without the counters and the next type this
---- process interns is stamped with a serial one of them already has.
+--- what comes next -- restore the objects without the counters and the next
+--- declaration this process allocates is given a number one of them already has.
 ---
---- Which is the same rule `serial` states, read the other way round. An id may
---- not be carried into a process that would issue it again; it may be carried
---- into one that has been told not to.
+--- The arenas are weak, so what they list is what is still alive, which depends on
+--- when the collector last ran. A caller that needs the listing to be the same
+--- every time settles them first; see `types.settle`.
 export type types.Identity = {
     --- Each arena by name, holding its live contents.
     arenas: {[string]: {[string]: any}},
 
-    --- What `serial`, `flowIdentity` and `types.nominal` will issue next.
-    serial: integer,
+    --- What `flowIdentity` and `types.nominal` will issue next.
     capability: integer,
-    nominal: integer
+    nominal: integer,
+
+    --- A digest of every declaration `types.nominal` has numbered, which with the
+    --- counters says whether two arenas would give one structure one id.
+    declarations: string
 }
 
 local ARENAS: {
@@ -4260,17 +4375,17 @@ local ARENAS: {
 function types.identity(): types.Identity
     return {
         arenas = ARENAS as {[string]: {[string]: any}},
-        serial = nextSerial,
         capability = nextCapabilityIdentity,
         nominal = nominalCounter,
+        declarations = declarationTrail,
     }
 end
 
 --- Gives newly allocated checker identities a worker-specific namespace.
 ---
 --- Compiler-owned types allocated before this call keep their shared identities.
---- A worker calls this once before it opens a project environment, so a serial or a
---- nominal id it issues can never be mistaken for one another worker issued.
+--- A worker calls this once before it opens a project environment, so an interned
+--- or a nominal id it issues can never be mistaken for one another worker issued.
 ---
 --- @raises string when the namespace is invalid or changes after being set
 function types.setIdentityNamespace(namespace: string, lane: integer): nil
@@ -4300,8 +4415,31 @@ function types.adopt(bucket: string, key: string, value: any): any
         return found
     end
     into[key] = value
+    if type(value) == "table" and type(value.id) == "string" and issued[value.id] == nil then
+        issued[value.id] = value
+    end
 
     return value
+end
+
+--- Collects until the arenas stop shrinking, so that what they list is what is
+--- still in use rather than what the collector has not got round to yet.
+---
+--- One full collection is not enough. A type held only as the value of a weak-keyed
+--- table is marked by the cycle that clears its key, and freed only by the next.
+function types.settle(): nil
+    local before: integer = -1
+    local after: integer = 0
+    while after ~= before do
+        before = after
+        collectgarbage("collect")
+        after = 0
+        for _, entries in pairs(ARENAS) do
+            for _ in pairs(entries as {[string]: any}) do
+                after = after + 1
+            end
+        end
+    end
 end
 
 --- What `bucket` holds under `key`, if anything.
@@ -4313,18 +4451,14 @@ end
 
 --- Moves the counters forward to `identity`, never back.
 ---
---- Never back, because a serial this process has already handed out is spoken for
---- whatever an image says. That keeps what this process issues next clear of the
---- image; it does nothing for what it issued before, whose serials the image may
---- use for other types. So an image is only restored into an arena that issued
---- the same ones -- see "Origin" in `nupp.compiler.project.preludecache`.
+--- Never back, because a number this process has already handed out is spoken for
+--- whatever an image says. That keeps what this process issues next clear of the image;
+--- it does nothing for what it issued before, whose numbers the image may use for other
+--- declarations. So an image is only restored into an arena that issued the same ones
+--- -- see "Origin" in `nupp.compiler.project.preludecache`.
 function types.resumeIdentity(identity: any): nil
     if type(identity) ~= "table" then
         return
-    end
-    local serialAt = tonumber(identity.serial) or 0
-    if serialAt > nextSerial then
-        nextSerial = serialAt as integer
     end
     local capabilityAt = tonumber(identity.capability) or 0
     if capabilityAt > nextCapabilityIdentity then
@@ -4333,6 +4467,60 @@ function types.resumeIdentity(identity: any): nil
     local nominalAt = tonumber(identity.nominal) or 0
     if nominalAt > nominalCounter then
         nominalCounter = nominalAt as integer
+    end
+end
+
+local releasable: {{[string]: any}} = {}
+for _, into in pairs(ARENAS) do
+    releasable[#releasable + 1] = into
+end
+
+local forgettable: {{[any]: any}} = {}
+
+--- Adds another module's table of interned things, keyed by spelling, to the ones
+--- `releaseUnreferenced` lets go of. Returns the table.
+function types.releasable<V>(into: {[string]: V}): {[string]: V}
+    releasable[#releasable + 1] = into as {[string]: any}
+
+    return into
+end
+
+--- Adds a cache that `releaseUnreferenced` empties. Returns the table.
+---
+--- For a weakly keyed cache whose values reach their own keys. LuaJIT's weak keys
+--- are not ephemerons, so such an entry outlives every other reference to its key,
+--- and only a cache whose answers can be worked out again may be emptied.
+function types.forgettable<K, V>(cache: {[K]: V}): {[K]: V}
+    forgettable[#forgettable + 1] = cache as {[any]: any}
+
+    return cache
+end
+
+--- Drops every interned thing nothing outside the arenas still holds.
+---
+--- The arenas are strong because an id is a serial: a type built again after its
+--- entry went would be the same structure under a new id, and a compile whose ids
+--- depended on when the collector ran would not be repeatable. One command never
+--- needs more than that. A process that compiles project after project -- a test
+--- worker -- kept every type of every one of them, about 45 MB a build (#266).
+---
+--- So this is for that process, between compiles, never during one: every arena is
+--- weak in its values for exactly one full collection, which keeps what anything
+--- still reaches and frees the rest. Nothing reached can be asked for again under
+--- a different id, and serials only ever move forward, so none is issued twice.
+function types.releaseUnreferenced(): nil
+    for _, cache in ipairs(forgettable) do
+        for key in pairs(cache) do
+            cache[key] = nil
+        end
+    end
+    local weak = {__mode = "v"}
+    for _, into in ipairs(releasable) do
+        setmetatable(into, weak)
+    end
+    collectgarbage("collect")
+    for _, into in ipairs(releasable) do
+        setmetatable(into, nil)
     end
 end
 

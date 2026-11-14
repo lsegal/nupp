@@ -9,7 +9,25 @@
   what every suite it ran left behind. Where each worker has less than 1.5 GB
   of memory, its states also collect garbage sooner. On the 7 GB macOS CI
   runner, this repository's shared lane went from about 10,350 s to about
-  820 s, and peak memory fell from more than the runner holds to 3.3 GB.
+  1,300 s, and peak memory fell from more than the runner holds to 3.5 GB.
+- `nupp bc --json`'s `bytecodeFingerprint`, and `nupp lsp artifact --kind
+  bytecode`'s `metadata.fingerprint`, are now the same on every run over the
+  same source. They hashed LuaJIT's raw dump, which lays out constant tables
+  by a string hash LuaJIT seeds per process, so the same bytecode could get a
+  different fingerprint each run.
+- `nupp bc`, `nupp run` and `nupp lsp artifact` of a file inside a project keep
+  the checked interfaces of the project modules it requires in the build
+  directory, and read them back on the next command instead of checking the
+  whole import graph from source again. A module is read back only while its
+  source, what it requires, and the project's declarations are unchanged. In
+  the compiler's own checkout, `nupp bc -O1 bench/aos.bench.nupp` went from
+  about 515 MB and 17 s to 157 MB and 6 s on Windows once warm, and `nupp lsp
+  artifact` of the same file from about 905 MB to 158 MB.
+  `NUPP_NO_INTERFACE_CACHE` turns the store off.
+- `nupp test` workers no longer keep every type of every project their tests
+  compiled. A test that builds a project in each of its cases used to add
+  about 45 MB to its worker per build, so a suite of them could peak past
+  2 GB; the worker now stays near what one build needs.
 - `nupp test` runs each suite that starts processes in a fresh worker
   process, as it already did for isolated suites. Each worker used to keep
   one process for every suite it took and kept growing. In this repository's
@@ -53,7 +71,9 @@
 - `nupp build` and `nupp check` use a fraction of the memory they did. A build
   kept every module's checked syntax tree until it finished, so a cold build of
   this repository's test runner peaked at 4 to 6 GB; each tree is now let go
-  once its module is generated, and the same build peaks under 1 GB.
+  once its module is generated, and the same build peaks under 1 GB. Types
+  nothing references any more are let go of too, rather than kept for the life
+  of the process, which takes that build from about 800 MB to about 700 MB.
   `nupp build --json` reports the build's peak in `timing.peakBytes`.
 - `nupp test` builds the code under test in a child process, so it no longer
   holds the build's memory while the tests run. For this repository's own

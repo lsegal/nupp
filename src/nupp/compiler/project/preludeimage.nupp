@@ -34,7 +34,7 @@ local ROOT_NAMES = {
 
 function image.new(): any
     local data = assert(bundled.source("/preludeimage.bin"), "portable prelude image is absent")
-    local magic = "NUPP-PRELUDE-3\n"
+    local magic = "NUPP-PRELUDE-4\n"
     assert(data:sub(1, #magic) == magic, "portable prelude image has an unsupported format")
     local cursor: integer = #magic + 1
 
@@ -133,7 +133,7 @@ function image.new(): any
         keys[key as string] = true
         internedAs[id] = {bucket as string, key as string}
     end
-    local identity = {serial = readInteger(), capability = readInteger(), nominal = readInteger(),}
+    local identity = {capability = readInteger(), nominal = readInteger(),}
 
     -- A key this process already interned answers with the type it is already
     -- using, and that type is left exactly as it stands. Writing the image's

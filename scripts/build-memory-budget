@@ -10,6 +10,10 @@
 # grows the peak with the project and fails here rather than on a runner that
 # runs out of memory.
 #
+# The type interner's arenas were the next largest owner, keeping every type the
+# build ever made (#271). Letting them release what nothing references took the
+# peak from about 800 MB to about 700, and the budget moved down with it.
+#
 # The peak is the build's own (`timing.peakBytes`, read by the process from the
 # operating system), so children it starts are neither counted nor able to hide
 # memory it holds. The output directory is fresh, so nothing is reused.
@@ -17,7 +21,7 @@
 # Usage: scripts/build-memory-budget [BUDGET_MB]
 set -eu
 
-budget_mb=${1:-${NUPP_BUILD_MEMORY_BUDGET_MB:-1000}}
+budget_mb=${1:-${NUPP_BUILD_MEMORY_BUDGET_MB:-900}}
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="build/memory-budget"
 report="$root/$out.json"

@@ -894,4 +894,72 @@ function M.aStoredStandardLibraryInterfaceChecksTheSameAsItsSource()
     assert(bypassed == fromSource, "bypassing the store reported differently:\n" .. bypassed .. "\n" .. fromSource)
 end
 
+-- A single-file compile inside a project reads its dependencies' checked interfaces
+-- back from the build directory (#277). What it says and what it generates are the
+-- same as checking the graph from source, with `NUPP_NO_INTERFACE_CACHE`, and an
+-- edited dependency is checked again rather than read back.
+function M.storedProjectInterfacesCompileTheSameAsTheirSource()
+    local dir = tempProject({
+        ["nupp.lua"] = 'return {include = {"src"}}\n',
+        ["src/shapes.nupp"] = "module shapes\n\n"
+            .. "export record Point\n    x: number\n    y: number\nend\n\n"
+            .. "export function length(p: Point): number\n    return math.sqrt(p.x * p.x + p.y * p.y)\nend\n",
+        ["src/geometry.nupp"] = 'module geometry\n\nconst shapes = require("shapes")\n\n'
+            .. "export function distance(a: shapes.Point, b: shapes.Point): number\n"
+            .. "    return shapes.length(shapes.Point(x = a.x - b.x, y = a.y - b.y))\nend\n",
+        ["src/main.nupp"] = 'local geometry = require("geometry")\nlocal shapes = require("shapes")\n\n'
+            .. "local d: number = geometry.distance(shapes.Point(x = 0, y = 0), shapes.Point(x = 3, y = 4))\n"
+            .. "print(d)\n",
+        ["src/bad.nupp"] = 'local geometry = require("geometry")\n\nprint(geometry.distance(1, 2))\n',
+    })
+    local shared = dir .. "/cache"
+
+    local function compile(prefix)
+        local outputs = {}
+        for _, command in ipairs({
+            "bc -O1 src/main.nupp",
+            "lsp artifact --kind lua -O1 src/main.nupp",
+            "bc src/bad.nupp",
+            "run src/main.nupp",
+        }) do
+            local pipe = assert(
+                io.popen(("cd '%s' && %sNUPP_CACHE_DIR='%s' '%s' %s 2>&1"):format(dir, prefix, shared, NUPP, command))
+            )
+            outputs[#outputs + 1] = "$ " .. command .. "\n" .. pipe:read("*a"):gsub("\r", "")
+            pipe:close()
+        end
+
+        return table.concat(outputs, "\n")
+    end
+
+    -- The first round keeps the prelude, the second the interfaces checked against it,
+    -- and the third reads both back.
+    local fromSource = compile("NUPP_NO_INTERFACE_CACHE=1 ")
+    compile("")
+    compile("")
+    local stored = exists(dir .. "/build/cache/interfaces.buf")
+    local hydrated = compile("")
+    editFixture(
+        dir,
+        "src/geometry.nupp",
+        'module geometry\n\nconst shapes = require("shapes")\n\n'
+            .. "export function distance(a: shapes.Point, b: shapes.Point): string\n"
+            .. "    return tostring(shapes.length(shapes.Point(x = a.x - b.x, y = a.y - b.y)))\nend\n"
+    )
+    local edited = compile("")
+    local editedFromSource = compile("NUPP_NO_INTERFACE_CACHE=1 ")
+    os.execute("rm -rf '" .. dir .. "'")
+
+    assert(stored, "the checked project interfaces were not stored")
+    assert(fromSource:find('"geometry"', 1, true), "main did not compile: " .. fromSource)
+    assert(fromSource:find("\n5\n", 1, true), "main did not run: " .. fromSource)
+    assert(
+        fromSource:find("called function is declared here", 1, true) and fromSource:find("geometry.nupp", 1, true),
+        "bad has to report its call error and where the callee is: " .. fromSource
+    )
+    assert(hydrated == fromSource, "the stored interfaces compiled differently:\n" .. hydrated .. "\n" .. fromSource)
+    assert(edited ~= fromSource, "the edited dependency was not checked again:\n" .. edited)
+    assert(edited == editedFromSource, "an edited dependency compiled differently:\n" .. edited .. "\n" .. editedFromSource)
+end
+
 return M
