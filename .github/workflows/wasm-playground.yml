@@ -1,0 +1,19 @@
+name: Test LuaJIT browser
+
+# Which changes reach this is decided by `.github/scripts/classify-changes.lua`
+# and expressed by the `browser-wasm` job of the Compiler matrix. The reusable
+# guest workflow owns the runtime, archive, browser and packaged-app matrix.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  # The browser guest it calls fetches the pinned LLVM artifact.
+  actions: read
+
+jobs:
+  candidate:
+    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
+    if: false
+    uses: ./.github/workflows/browser-guest.yml

@@ -1,0 +1,177 @@
+name: Publish the prebuilt code generator with stage zero
+
+# A clean checkout links native programs (`nupp aot --emit executable`,
+# `kind = "program"`) with the previous release's code generator and link kit
+# rather than building LLVM and Cargo first. This adds them, per platform, to a
+# stage-zero release the owner has already published, next to its
+# `nupp-stage0-TAG.lua.gz`, and appends their digests to its notes. The
+# `PREBUILT_*` pins in scripts/toolchain.pins then move to that release.
+#
+# The code generator archive holds the code generator library (LLVM and lld,
+# which the compiler drives through LuaJIT's FFI) and the release's native
+# provider (`base`), so a checkout without Cargo bootstraps the compiler on it
+# too.
+#
+# Run by hand only. It builds the provider with Cargo and LLVM, which is why it
+# never runs on a pull request or on main (#139): nothing a checkout or CI does
+# afterwards builds them again.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stage-zero release tag to add the assets to
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage0-assets-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            os: ubuntu-24.04
+            platform: x86_64-unknown-linux-gnu
+          - name: macOS arm64
+            os: macos-15
+            platform: aarch64-apple-darwin
+          - name: Windows x86-64
+            os: windows-2022
+            platform: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    # A cold LLVM cache means building LLVM before anything else.
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    # The code generator is the asset; one built without it is refused.
+    env:
+      NUPP_REQUIRE_CODEGEN: '1'
+    steps:
+      - name: Check out the release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Select the Windows GNU toolchain
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal
+          echo "NUPP_CC=gcc" >> "$GITHUB_ENV"
+          echo "NUPP_CXX=g++" >> "$GITHUB_ENV"
+
+      - name: Fetch or build the pinned LLVM
+        uses: ./.github/actions/pinned-llvm
+
+      # The AOT runtime the provider links is a Nupp program, so the provider
+      # carries it only once the checkout has a compiler to build it with.
+      - name: Build the compiler
+        run: ./bin/nupp --version
+
+      - name: Build the code generator and the link kit
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          ./scripts/toolchain codegen-archive "release/nupp-codegen-${{ matrix.platform }}.tar.gz"
+          ./scripts/toolchain kit-archive \
+            lpeg,native-checksum,native-compression,native-files,native-net,native-process,native-time,native-tls,workers \
+            "release/nupp-kit-${{ matrix.platform }}.tar.gz"
+
+      - name: Upload the assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage0-assets-${{ matrix.platform }}
+          path: |
+            release/nupp-codegen-${{ matrix.platform }}.tar.gz
+            release/nupp-kit-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Add the assets to the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Download the assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: stage0-assets-*
+          merge-multiple: true
+
+      # Assets are immutable: one already there is never replaced, and the
+      # release must be the stage zero these sit beside.
+      - name: Upload the assets and record their digests
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > release.json
+          jq -e --arg stage0 "nupp-stage0-$TAG.lua.gz" \
+            '[.assets[] | select(.name == $stage0)] | length == 1' release.json \
+            || { echo "$TAG has no nupp-stage0-$TAG.lua.gz" >&2; exit 1; }
+          for asset in release/*.tar.gz; do
+            name=$(basename "$asset")
+            if jq -e --arg name "$name" '[.assets[] | select(.name == $name)] | length > 0' release.json >/dev/null; then
+              echo "$TAG already has $name; immutable assets are not replaced" >&2
+              exit 1
+            fi
+          done
+
+          digest() { sha256sum "$1" | cut -d' ' -f1; }
+          suffix() {
+            case "$1" in
+              x86_64-unknown-linux-gnu) echo LINUX_X86_64 ;;
+              aarch64-apple-darwin) echo MACOS_AARCH64 ;;
+              x86_64-pc-windows-msvc) echo WINDOWS_X86_64 ;;
+            esac
+          }
+          {
+            echo
+            echo '## Prebuilt code generator and link kits'
+            echo
+            echo '| Asset | SHA-256 |'
+            echo '| --- | --- |'
+            for asset in release/*.tar.gz; do
+              echo "| \`$(basename "$asset")\` | \`$(digest "$asset")\` |"
+            done
+          } > digests.md
+          {
+            echo "PREBUILT_TAG=$TAG"
+            for asset in release/nupp-codegen-*.tar.gz; do
+              platform=$(basename "$asset" .tar.gz); platform=${platform#nupp-codegen-}
+              echo "PREBUILT_CODEGEN_SHA256_$(suffix "$platform")=$(digest "$asset")"
+            done
+            for asset in release/nupp-kit-*.tar.gz; do
+              platform=$(basename "$asset" .tar.gz); platform=${platform#nupp-kit-}
+              echo "PREBUILT_KIT_SHA256_$(suffix "$platform")=$(digest "$asset")"
+            done
+          } > pins.txt
+
+          gh release upload "$TAG" release/*.tar.gz --repo "$GITHUB_REPOSITORY"
+          jq -r '.body // ""' release.json > notes.md
+          cat digests.md >> notes.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+
+          {
+            cat digests.md
+            echo
+            echo 'Pins for `scripts/toolchain.pins`:'
+            echo
+            echo '```sh'
+            cat pins.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat pins.txt

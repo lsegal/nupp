@@ -11,11 +11,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-24.04, lane: shell, variant: fixed, timeout: 150, limit: 7800}
-          - {os: ubuntu-24.04, lane: shell, variant: baseline, timeout: 120, limit: 6000}
-          - {os: macos-15, lane: shell, variant: fixed, timeout: 330, limit: 18000}
-          - {os: ubuntu-24.04, lane: shared, variant: fixed, timeout: 120, limit: 6000}
-          - {os: macos-15, lane: shared, variant: fixed, timeout: 300, limit: 15600}
+          - {os: ubuntu-24.04, lane: suites, variant: fixed, timeout: 120, limit: 6000}
+          - {os: ubuntu-24.04, lane: suites, variant: baseline, timeout: 120, limit: 6000}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -58,7 +55,8 @@ jobs:
           set +e
           bash .github/diag261/sampler.sh >&2 & spid=$!
           s=$(date +%s)
-          perl -e 'alarm(shift); exec(@ARGV)' ${{ matrix.limit }} ./bin/nupp test --scope=all --lane=${{ matrix.lane }} \
+          if [ "${{ matrix.lane }}" = suites ]; then sel="benchprojectstest browserhosttest fmttree2test projectbinarytest projectmanifesttest projectnativetest simdnativealgorithmdifferentialtest toolchaintest worktreetest fleettest rusttoolchaintest cichangeclassifiertest"; else sel="--lane=${{ matrix.lane }}"; fi
+          perl -e 'alarm(shift); exec(@ARGV)' ${{ matrix.limit }} ./bin/nupp test --scope=all $sel \
             --exclude-group=external-corpus,measurement,wasm-conformance --json > "$RUNNER_TEMP/lane.json"
           echo "LANE exit=$? wall=$(( $(date +%s) - s ))s"
           kill $spid
