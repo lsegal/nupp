@@ -503,10 +503,19 @@ function M.aotHelpNamesArtifactsAndShowsHighlightedExamples()
     -- help formatter's business rather than this test's. What is asserted is that
     -- every accepted artifact is named.
     local flowed = plain:gsub("%s+", " ")
+    local described = flowed:match("Artifact to print: (.-%.) ")
+    assert(described, "--emit describes its artifacts: " .. plain)
+    -- The accepted artifacts come from the command itself, through the same
+    -- choices completion offers, so a new artifact cannot go unnamed.
+    local accepted = completeAt(HERE .. "/..", 3, {"aot", "--emit", ""})
     assert(
-        flowed:find("Artifact to print: ir, llvm, spirv, wgsl, asm, binding, or a native program linked as an executable, static-library or shared-library.", 1, true),
-        "--emit names every accepted artifact: " .. plain
+        table.concat(accepted, " "):find("executable", 1, true),
+        "--emit completes its artifacts: " .. table.concat(accepted, " ")
     )
+    for _, artifact in ipairs(accepted) do
+        local word = "%f[%w%-]" .. artifact:gsub("%-", "%%-") .. "%f[^%w%-]"
+        assert(described:find(word), "--emit names the accepted artifact " .. artifact .. ": " .. described)
+    end
     assert(
         plain:find("nupp aot --emit asm --function scale src/kernel.nupp", 1, true),
         "the help includes an assembly example: " .. plain
