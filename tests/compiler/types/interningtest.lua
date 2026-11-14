@@ -42,23 +42,35 @@ end
 -- serial each was stamped with, which says only which one the process built first.
 -- Two processes that built the same two arrays in opposite orders then rendered
 -- one union two ways, and anything generated from it differed with them.
+--
+-- The functions mention a record, and the second process numbers more records
+-- before it. An id spells a record by that number, so ordering on ids alone kept
+-- the self-hosting fixpoint's two stages from agreeing on a record's overloads.
 function M.unionOrderDoesNotDependOnConstructionOrder()
     local template = [[
 local types = require("nupp.compiler.types")
+for index = 1, %d do
+    types.nominal("Earlier" .. index, "record")
+end
+local subject = types.nominal("Subject", "record")
 local function member(name)
     return types.array(types.literal("issue-271-" .. name))
 end
+local function overload(name)
+    return types.func({subject, types.literal("issue-271-" .. name)}, {types.string})
+end
 local first, second = "%s", "%s"
-local built = {}
-built[first] = member(first)
-built[second] = member(second)
+local built, overloads = {}, {}
+built[first], overloads[first] = member(first), overload(first)
+built[second], overloads[second] = member(second), overload(second)
 print("union: " .. types.tostring(types.union({built.a, built.b})))
 print("intersection: " .. types.tostring(types.intersection({built.a, built.b})))
+print("overloads: " .. types.tostring(types.intersection({overloads.a, overloads.b})))
 ]]
-    local forward = runFresh(template:format("a", "b"))
-    local reverse = runFresh(template:format("b", "a"))
-    test.truthy(forward:find("union: ", 1, true), "the probe ran:\n" .. forward)
-    test.eq(reverse, forward, "building the members the other way round reordered them")
+    local forward = runFresh(template:format(0, "a", "b"))
+    local reverse = runFresh(template:format(2, "b", "a"))
+    test.truthy(forward:find("overloads: ", 1, true), "the probe ran:\n" .. forward)
+    test.eq(reverse, forward, "building the members another way reordered them")
 end
 
 -- The arenas keep only what something else still references. A type nothing
