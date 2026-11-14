@@ -3683,7 +3683,7 @@ local function recordPieceFailure(spec, message)
     reportFailure(results[#results])
 end
 
---- Runs one claimed isolated piece in a new process.
+--- Runs one claimed isolated or shell piece in a new process.
 ---
 --- The long-lived process owns only queue claims and aggregation. The child is
 --- handed a shard rather than the queue, so it cannot claim a second piece and
@@ -3705,7 +3705,7 @@ local function runFreshPiece(spec)
     local pipe = io.popen(command, "r")
     if not pipe then
         os.remove(errors)
-        recordPieceFailure(spec, "the isolated piece could not be started")
+        recordPieceFailure(spec, "the piece could not be started")
         mark("E")
         return
     end
@@ -3722,7 +3722,7 @@ local function runFreshPiece(spec)
     local decoded, report = pcall(testJson.decode, text)
     if not decoded or type(report) ~= "table" then
         local detail = {
-            "the isolated piece wrote no report",
+            "the piece wrote no report",
             status and ("exit " .. status) or "unreported exit status",
             #text .. " bytes on stdout",
         }
