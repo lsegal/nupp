@@ -80,7 +80,7 @@ function M.theStepLineSaysHowFarThroughTheSourceSetItIs()
     report:resolved()
     -- Painting is throttled, and a file gets a line per step rather than a
     -- rewrite, so the second line only arrives once the interval has passed.
-    report.paintedAt = 0
+    report.paintedAt = -math.huge
     report:step("checking three.nupp")
     -- The queue grows when a module pulls in a dependency the source set did not
     -- already hold; neither the count nor the percentage goes past the total.
@@ -88,7 +88,7 @@ function M.theStepLineSaysHowFarThroughTheSourceSetItIs()
     report:resolved()
     report:resolved()
     report:resolved()
-    report.paintedAt = 0
+    report.paintedAt = -math.huge
     report:step("checking extra.nupp")
     stream:close()
     local text = readAll(path)

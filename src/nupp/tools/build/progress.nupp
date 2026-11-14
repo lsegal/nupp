@@ -521,7 +521,10 @@ export function new(mode: string?, stream: io.File?): Reporter
         aotFacts = nil,
         parallelFacts = nil,
         checking = "check",
-        paintedAt = 0,
+        -- Never, so the first step paints however early in the process it comes. The
+        -- clock falls back to CPU time where the platform has no wall clock (Windows),
+        -- and a fresh process is not 500 ms into that.
+        paintedAt = -math.huge,
         onScreen = false,
         columns = width()
     )

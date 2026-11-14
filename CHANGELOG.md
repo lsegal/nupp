@@ -6,6 +6,14 @@
   process, as it already did for isolated suites. Each worker used to keep
   one process for every suite it took and kept growing. In this repository's
   suite, eight such workers exhausted a 16 GB Linux CI runner partway through.
+- A cold `nupp build` of a project that declares a const-generic function no
+  longer starts parallel check workers it then discards. The build used to
+  start up to six workers, have them parse every source, and only then decide
+  to build in one process; it now decides before starting any.
+- On ARM64, a 64-bit shift by a 64-bit constant count, such as
+  `x ~ (x << 1ULL)`, keeps its count once LuaJIT traces it. The traced code
+  shifted by zero instead, so `math.u64.prefixxor(1)` could answer `0ULL` on
+  Apple silicon and ARM64 Linux.
 - `nupp test` starts at least eight workers by default, one per processor on
   machines with more. A four-core machine used to run four suites at once and
   now runs eight. `--jobs=N` still sets the count explicitly.
@@ -28,6 +36,11 @@
   bit. Under a MinGW LuaJIT built against `msvcrt.dll`, `0.3 ^ 3` was
   `0.026999999999999996` compiled and `0.027` in Lua. A native build on
   Windows also no longer crashes now and then while it sets up LLVM.
+- `nupp build` and `nupp check` use a fraction of the memory they did. A build
+  kept every module's checked syntax tree until it finished, so a cold build of
+  this repository's test runner peaked at 4 to 6 GB; each tree is now let go
+  once its module is generated, and the same build peaks under 1 GB.
+  `nupp build --json` reports the build's peak in `timing.peakBytes`.
 - `nupp test` builds the code under test in a child process, so it no longer
   holds the build's memory while the tests run. For this repository's own
   suite the command used to stay at 6 to 7 GB resident for the whole run; it
@@ -48,3 +61,7 @@
   (`cacheEligiblePackages`, `cacheHitRate`) beside the cached count, and CI
   run IDs, the commit SHA and `ACTIONS_*` tokens no longer change a result's
   fingerprint, so one CI run can reuse another's passes.
+- Every `nupp` process appends its peak resident memory and its arguments to
+  the file `NUPP_PEAK_MEMORY_FILE` names, when it is set.
+- On Windows, the first progress line of a build is no longer dropped when the
+  build starts early in its process.
