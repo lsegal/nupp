@@ -870,6 +870,9 @@ function M.aTestRunsCommandsUseTheBuildTheRunChecked()
             NUPP_LAUNCHER_ROCKS_ROOT = "",
             NUPP_TOOLCHAIN_ANSWERS = "",
             NUPP_WGPU_LIBRARY = "unused",
+            -- CI names its pinned LLVM, which would send the launcher to the
+            -- fixture's toolchain for a code generator it does not answer for.
+            NUPP_LLVM_PREFIX = "",
         },
         "test",
         root .. "/bin/nupp"
