@@ -146,6 +146,19 @@ function M.onlyThisCheckoutsCompilerCommandsAreAnswered()
     test.eq(request("/repo/bin/nupp clean", "/repo/tests"), nil)
     test.ne(request("/repo/bin/nupp check", "/repo"), nil)
     test.ne(request("/repo/bin/nupp --version"), nil)
+    -- Help writes nothing, whichever command it names; a one-shot `lsp` query
+    -- and a task listing compile and answer.
+    test.ne(request("/repo/bin/nupp build --help", "/repo"), nil)
+    test.ne(request("/repo/bin/nupp rock pack --help"), nil)
+    test.ne(request("/repo/bin/nupp test -h"), nil)
+    test.ne(request("/repo/bin/nupp lsp inspect --json main.nupp 1 1"), nil)
+    test.ne(request("/repo/bin/nupp task --list --json"), nil)
+    test.ne(request("/repo/bin/nupp __complete bash 2 check --js"), nil)
+    test.eq(request("/repo/bin/nupp lsp serve"), nil)
+    test.eq(request("/repo/bin/nupp lsp --stdio"), nil)
+    test.eq(request("/repo/bin/nupp task build"), nil)
+    -- The words after `run`'s file are the program's.
+    test.eq(request("/repo/bin/nupp run main.nupp --help"), nil)
 end
 
 function M.windowsGetsTheWordsANativeProgramWouldHave()

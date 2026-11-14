@@ -21,13 +21,16 @@ at the descriptor level so that what the compiler, and anything it starts,
 writes lands where the shell would have put it.
 
 Only commands that are plainly a compiler invocation are taken: an optional `cd`,
-assignments, this checkout's `bin/nupp`, words, and redirections of standard output
-and error to the pipe or to the null device. Anything else the shell would have to
-interpret -- a pipe, a list, an expansion -- still goes to the shell. So do the
+assignments, this checkout's `bin/nupp`, words, redirections of standard output
+and error to the pipe, a file or the null device, and a trailing `; echo ...$?` or
+`; printf FORMAT $?` that reports the status, which the service writes. Anything
+else the shell would have to interpret -- a pipe, a group, another expansion --
+still goes to the shell. So do the
 commands that are about the process rather than the compilation: `run` and `test`
-run programs, `lsp` and `watch` stay up, `bench`, `task`, `fixpoint` and `rock`
-start their own processes to measure or fetch. `build` and `clean` of this
-checkout itself are its own writers and keep the launcher's lock.
+run programs, `lsp serve` and `watch` stay up, `bench`, `task`, `fixpoint` and
+`rock` start their own processes to measure or fetch. `build` and `clean` of this
+checkout itself are its own writers and keep the launcher's lock. Asking any of
+them for `--help`, listing tasks and a one-shot `lsp` query are still answered.
 
 A service that dies or stops answering mid-request is stopped, and the request is
 answered by the shell after all, so a compiler crash is still attributed to the
@@ -74,10 +77,40 @@ local ANSWERED: {
     migrate = true,
     ["export-c"] = true,
     version = true,
+    -- Shell completion's own entry: it reads the command tree and answers.
+    ["__complete"] = true,
 }
 
 --- Commands that write this checkout's own build, and so hold its lock.
 local WRITERS: {[string]: boolean} = {build = true, clean = true}
+
+local HELP: {[string]: boolean} = {["--help"] = true, ["-h"] = true}
+
+--- Whether a command line is one the service answers, and whether it is a request
+--- for help, which writes nothing whatever command it names. `run` is the one
+--- command whose later words can belong to the program it runs.
+local function answered(argv: {string}): (boolean, boolean)
+    local name = argv[1] or ""
+    local second, third = argv[2] or "", argv[3] or ""
+    local help = HELP[second] or (name ~= "run" and second:sub(1, 1) ~= "-" and HELP[third] == true)
+    if help or ANSWERED[name] then
+        return true, help == true
+    end
+    -- One answer each, unlike the server `lsp` and `lsp serve` start.
+    if name == "lsp" then
+        return second ~= "" and second ~= "serve" and second:sub(1, 1) ~= "-", false
+    end
+    -- Listing the tasks runs none of them.
+    if name == "task" then
+        for _, word in ipairs(argv) do
+            if word == "--list" or word == "-l" then
+                return true, false
+            end
+        end
+    end
+
+    return false, false
+end
 
 --- Joins strings into one frame body, each as its length, a colon and its bytes.
 function compileservice.pack(items: {string}): string
@@ -534,7 +567,8 @@ function compileservice.request(command: compileservice.Command, root: string, c
         return nil
     end
     local name = command.argv[1] or ""
-    if not ANSWERED[name] then
+    local taken, help = answered(command.argv)
+    if not taken then
         return nil
     end
     local directory = cwd
@@ -543,7 +577,7 @@ function compileservice.request(command: compileservice.Command, root: string, c
         directory = absolute(target, forWindows) and compileservice.normalize(target, forWindows)
             or compileservice.normalize(cwd .. "/" .. target, forWindows)
     end
-    if WRITERS[name] and within(directory, root, forWindows) then
+    if WRITERS[name] and not help and within(directory, root, forWindows) then
         return nil
     end
     local argv: {string} = {}
