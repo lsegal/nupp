@@ -1041,6 +1041,33 @@ return M
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- A Nupp worker that has grown past its share stops taking work and the parent starts
+-- fresh ones for what is left (#250). At a one-byte share every worker hands over after
+-- each suite, and every suite still runs exactly once.
+function M.aWorkerThatGrewHandsItsQueueToAFreshOne()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+    local names = {}
+    for index = 1, 5 do
+        names[index] = "handovertest" .. index
+        write(dir .. "/tests/" .. names[index] .. ".lua", "return {runs = function() end}\n")
+    end
+
+    local command = (
+        "cd %q && NUPP_TEST_WORKER_HEAP_BYTES=1 %sNUPP_TEST_BUILD=%q %q %s --jobs=2 --json --timings=0 --no-color 2>/dev/null"
+    ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test", table.concat(names, " "))
+    local output, invocation = capturedRun(command)
+    local report = require("testjson").decode(output)
+
+    test.eq(invocation.status, 0, "the handed-over run succeeded" .. evidence(invocation))
+    test.eq(report.total, 5, "every suite ran once")
+    test.eq(report.passed, 5, "nothing was left unrun")
+    test(#report.shards > 2, "workers handed over rather than running the whole queue")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 function M.processAndNuppWorkersRunAtTheSameTime()
     local dir = os.tmpname()
     os.remove(dir)

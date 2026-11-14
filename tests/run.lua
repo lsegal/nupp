@@ -2110,12 +2110,15 @@ end
 --- so run order swamped the effect. One per core is the setting that does not
 --- oversubscribe, and `--jobs=N` is there for a machine that wants otherwise.
 ---
---- Memory caps it too, from measurement rather than from fear (#250). A worker and the
---- one compiler child it has running at a time peak together at the figure below, on
---- every platform, so a machine runs as many as fit its physical memory with a quarter
---- left over. The hosted runners have the cores to spare long before they run short of
---- memory, so in practice this only binds on a small machine.
-local WORKER_PEAK_BYTES = 512 * 1024 * 1024
+--- Memory caps it too, from measurement rather than from fear (#250). The compiler is
+--- not what a worker spends memory on: one compiling a test program peaked at 72-81 MB
+--- on all three hosted platforms, and an AOT build child at 97-160 MB. A worker's peak
+--- is the largest suite it runs, and since workers run each suite in a fresh process
+--- or hand their queue on once they have grown (see `takeWork`), that is one suite: 2.25
+--- GB at most, measured. So a machine runs as many as fit three quarters of its
+--- physical memory at the figure below. That is every core on the 16 GB Linux and
+--- Windows runners and two of three on the 7 GB macOS one.
+local WORKER_PEAK_BYTES = 2.5 * 1024 * 1024 * 1024
 
 local function commandLine(command)
     local handle = io.popen(command .. " 2>/dev/null")
