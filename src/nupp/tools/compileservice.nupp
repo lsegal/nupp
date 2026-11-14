@@ -1,0 +1,1273 @@
+@!internal
+
+--[[
+One compiler process answering the compiler commands a test run starts.
+
+A suite that drives the real command line starts `bin/nupp check`, `bin/nupp
+build` and the rest through the shell, dozens of times a suite. Each of those was
+a cold process: a shell, the launcher script, an interpreter, and the compiler
+loaded from nothing. On Windows the launcher alone cost about a second of a
+command whose compiler answered in a tenth.
+
+The test runner hands those commands here instead. `__compile-service` is started
+once per test process, the first time a case starts a compiler command, and
+answers each command over a framed pipe (`nupp.compiler.workerchannel`). What it
+runs a command in is still a fresh interpreter: a new Lua state, made for the
+request and closed after it, so no module, cache or global one command loaded is
+there for the next. What the process does share is set per request to what a
+cold process would have had: the working directory, the environment variables the
+command line assigned, and standard input, output and error, which are redirected
+at the descriptor level so that what the compiler, and anything it starts,
+writes lands where the shell would have put it.
+
+Only commands that are plainly a compiler invocation are taken: an optional `cd`,
+assignments, this checkout's `bin/nupp`, words, redirections of standard output
+and error to the pipe, a file or the null device, and a trailing `; echo ...$?` or
+`; printf FORMAT $?` that reports the status, which the service writes. Anything
+else the shell would have to interpret -- a pipe, a group, another expansion --
+still goes to the shell. So do the
+commands that are about the process rather than the compilation: `run` and `test`
+run programs, `lsp serve` and `watch` stay up, `bench`, `task`, `fixpoint` and
+`rock` start their own processes to measure or fetch. `build` and `clean` of this
+checkout itself are its own writers and keep the launcher's lock. Asking any of
+them for `--help`, listing tasks and a one-shot `lsp` query are still answered.
+
+A service that dies or stops answering mid-request is stopped, and the request is
+answered by the shell after all, so a compiler crash is still attributed to the
+case that caused it, by a process of its own.
+]]
+module nupp.tools.compileservice
+
+local workerchannel = require("nupp.compiler.workerchannel")
+local ffiLibrary: any = require("ffi")
+
+local compileservice = {}
+
+local windows = package.config:sub(1, 1) == "\\"
+
+-- Requests and responses are a handful of short strings; a megabyte of argv is
+-- not a command anybody's test writes.
+local MAX_FRAME: integer = 1048576
+
+--- Commands the service answers. Everything else keeps its own process.
+local ANSWERED: {[string]: boolean} = {
+    [""] = true,
+    ["-h"] = true,
+    ["--help"] = true,
+    ["--version"] = true,
+    help = true,
+    init = true,
+    ast = true,
+    aot = true,
+    bc = true,
+    check = true,
+    duplicates = true,
+    fmt = true,
+    build = true,
+    clean = true,
+    lints = true,
+    ["ownership-audit"] = true,
+    explain = true,
+    reference = true,
+    completions = true,
+    doc = true,
+    ["import-c"] = true,
+    migrate = true,
+    ["export-c"] = true,
+    version = true,
+    -- Shell completion's own entry: it reads the command tree and answers.
+    ["__complete"] = true,
+}
+
+--- Commands that write this checkout's own build, and so hold its lock.
+local WRITERS: {[string]: boolean} = {build = true, clean = true}
+
+local HELP: {[string]: boolean} = {["--help"] = true, ["-h"] = true}
+
+--- Whether a command line is one the service answers, and whether it is a request
+--- for help, which writes nothing whatever command it names. `run` is the one
+--- command whose later words can belong to the program it runs.
+local function answered(argv: {string}): (boolean, boolean)
+    local name = argv[1] or ""
+    local second, third = argv[2] or "", argv[3] or ""
+    local help = HELP[second] or (name ~= "run" and second:sub(1, 1) ~= "-" and HELP[third] == true)
+    if help or ANSWERED[name] then
+        return true, help == true
+    end
+    if name == "lsp" then
+        -- One answer each, unlike the server `lsp` and `lsp serve` start.
+        return second ~= "" and second ~= "serve" and second:sub(1, 1) ~= "-", false
+    elseif name == "task" then
+        -- Listing the tasks runs none of them.
+        for _, word in ipairs(argv) do
+            if word == "--list" or word == "-l" then
+                return true, false
+            end
+        end
+    end
+
+    return false, false
+end
+
+--- Joins strings into one frame body, each as its length, a colon and its bytes.
+function compileservice.pack(items: {string}): string
+    local parts: {string} = {}
+    for _, item in ipairs(items) do
+        parts[#parts + 1] = tostring(#item) .. ":" .. item
+    end
+
+    return table.concat(parts)
+end
+
+--- Splits a body `pack` made, or answers nil for one it did not.
+function compileservice.unpack(text: string): {string}?
+    local items: {string} = {}
+    local at: integer = 1
+    while at <= #text do
+        local colon = text:find(":", at, true)
+        if colon == nil then
+            return nil
+        end
+        local length = tonumber(text:sub(at, colon - 1)) as integer?
+        if length == nil or colon + length > #text then
+            return nil
+        end
+        items[#items + 1] = text:sub(colon + 1, colon + length)
+        at = colon + length + 1
+    end
+
+    return items
+end
+
+--- A compiler command read off a shell command line.
+---
+--- `stdout` and `stderr` say where each stream went once every redirection was
+--- applied: `"pipe"`, the pipe the caller reads; `"out"` and `"err"`, the
+--- caller's own standard output and error; `"null"`, the null device; or
+--- `"file:"` and the path a redirection named, relative to `cwd`.
+type compileservice.Command = {
+    cwd: string?,
+    env: {{string}},
+    executable: string,
+    argv: {string},
+    stdout: string,
+    stderr: string,
+
+    --- What a trailing `; echo ...$?` or `; printf FORMAT $?` writes: its text,
+    --- with `compileservice.STATUS` where the command's status goes, and where
+    --- it goes, in the same terms as `stdout`. The shell then answers the
+    --- status of that report, 0.
+    report: {
+        text: string,
+        target: string
+    }?
+}
+
+--- Where a status report's text carries the status.
+compileservice.STATUS = "\0?\0"
+
+-- Unquoted characters the shell gives no meaning to.
+local function plain(char: string): boolean
+    return char:match("^[%w%-_%./:=,+@%%^]$") ~= nil
+end
+
+--- The words and operators of a command line, or nil for one that needs more of a
+--- shell than this reads. A word carries whether its leading name and `=` were
+--- unquoted, which is what makes it an assignment. `$?` is the one expansion
+--- read, and becomes `compileservice.STATUS`.
+local function tokens(command: string): {any}?
+    local list: {any} = {}
+    local index: integer = 1
+    local length = #command
+    while index <= length do
+        local char = command:sub(index, index)
+        if char == " " or char == "\t" then
+            index = index + 1
+        elseif command:sub(index, index + 1) == "&&" then
+            list[#list + 1] = {op = "&&"}
+            index = index + 2
+        elseif char == ";" then
+            list[#list + 1] = {op = ";"}
+            index = index + 1
+        elseif command:sub(index, index + 3) == "2>&1" then
+            list[#list + 1] = {op = "2>&1"}
+            index = index + 4
+        elseif command:sub(index, index + 1) == "2>" or command:sub(index, index + 1) == "1>" or char == ">" then
+            local op = char == ">" and ">" or command:sub(index, index + 1)
+            index = index + #op
+            op = op == "1>" and ">" or op
+            if command:sub(index, index) == ">" or command:sub(index, index) == "&" then
+                return nil
+            end
+            list[#list + 1] = {op = op}
+        else
+            local text: {string} = {}
+            -- How many characters of the word were read before the first quote.
+            local unquoted: integer? = nil
+            while index <= length do
+                char = command:sub(index, index)
+                if char == " " or char == "\t" or char == ";" or char == ">" then
+                    break
+                elseif char == "$" then
+                    if command:sub(index + 1, index + 1) ~= "?" then
+                        return nil
+                    end
+                    unquoted = unquoted or #text
+                    text[#text + 1] = compileservice.STATUS
+                    index = index + 2
+                elseif char == "'" then
+                    unquoted = unquoted or #text
+                    local close = command:find("'", index + 1, true)
+                    if close == nil then
+                        return nil
+                    end
+                    text[#text + 1] = command:sub(index + 1, close - 1)
+                    index = close + 1
+                elseif char == "\"" then
+                    unquoted = unquoted or #text
+                    index = index + 1
+                    local closed = false
+                    while index <= length do
+                        local inner = command:sub(index, index)
+                        if inner == "\"" then
+                            closed = true
+                            index = index + 1
+                            break
+                        elseif inner == "$" and command:sub(index + 1, index + 1) == "?" then
+                            text[#text + 1] = compileservice.STATUS
+                            index = index + 2
+                        elseif inner == "$" or inner == "`" then
+                            return nil
+                        elseif inner == "\\" then
+                            local escaped = command:sub(index + 1, index + 1)
+                            if escaped == "$" or escaped == "`" or escaped == "\"" or escaped == "\\" then
+                                text[#text + 1] = escaped
+                                index = index + 2
+                            elseif escaped == "\n" then
+                                index = index + 2
+                            else
+                                text[#text + 1] = "\\"
+                                index = index + 1
+                            end
+                        else
+                            text[#text + 1] = inner
+                            index = index + 1
+                        end
+                    end
+                    if not closed then
+                        return nil
+                    end
+                elseif char == "\\" then
+                    local escaped = command:sub(index + 1, index + 1)
+                    if escaped == "" or escaped == "\n" then
+                        return nil
+                    end
+                    unquoted = unquoted or #text
+                    text[#text + 1] = escaped
+                    index = index + 2
+                elseif plain(char) then
+                    text[#text + 1] = char
+                    index = index + 1
+                else
+                    return nil
+                end
+            end
+            local word = table.concat(text)
+            list[#list + 1] = {word = word, unquoted = unquoted or #word}
+        end
+    end
+
+    return list
+end
+
+--- A status report's text with the status written in.
+function compileservice.withStatus(text: string, status: integer): string
+    local parts: {string} = {}
+    local at: integer = 1
+    while true do
+        local first, last = text:find(compileservice.STATUS, at, true)
+        if first == nil then
+            parts[#parts + 1] = text:sub(at)
+            break
+        end
+        parts[#parts + 1] = text:sub(at, first - 1)
+        parts[#parts + 1] = tostring(status)
+        at = (last as integer) + 1
+    end
+
+    return table.concat(parts)
+end
+
+-- Whether a word carries the status, which only a report may.
+local function hasStatus(word: string): boolean
+    return word:find(compileservice.STATUS, 1, true) ~= nil
+end
+
+-- Where a redirection to `word` sends its stream.
+local function redirectTarget(word: string): string
+    return word == "/dev/null" and "null" or "file:" .. word
+end
+
+-- The text `printf FORMAT $?` writes, for the formats a status report uses: one
+-- `%s` and the escapes `\n` and `\\`.
+local function printed(format: string): string?
+    local _, conversions = format:gsub("%%", "")
+    local _, strings = format:gsub("%%s", "")
+    if conversions ~= 1 or strings ~= 1 then
+        return nil
+    end
+    local text: {string} = {}
+    local index: integer = 1
+    while index <= #format do
+        local char = format:sub(index, index)
+        if char == "\\" then
+            local escaped = format:sub(index + 1, index + 1)
+            if escaped == "n" then
+                text[#text + 1] = "\n"
+            elseif escaped == "\\" then
+                text[#text + 1] = "\\"
+            else
+                return nil
+            end
+            index = index + 2
+        elseif char == "%" then
+            text[#text + 1] = compileservice.STATUS
+            index = index + 2
+        else
+            text[#text + 1] = char
+            index = index + 1
+        end
+    end
+
+    return table.concat(text)
+end
+
+-- The report a trailing `echo` or `printf` makes of the status, from the words
+-- after the `;`, or nil for anything else.
+local function readReport(list: {any}, first: integer, mode: string): {
+    text: string,
+    target: string
+}?
+    local name = list[first] and list[first].word or nil
+    local words: {string} = {}
+    local target = mode
+    local at: integer = first + 1
+    while list[at] ~= nil do
+        local token = list[at]
+        if token.word ~= nil then
+            words[#words + 1] = token.word
+        elseif token.op == ">" and list[at + 1] ~= nil and list[at + 1].word ~= nil and list[at + 2] == nil then
+            if hasStatus(list[at + 1].word as string) then
+                return nil
+            end
+            target = redirectTarget(list[at + 1].word as string)
+            at = at + 1
+        else
+            return nil
+        end
+        at = at + 1
+    end
+    if name == "echo" and list[first].unquoted == 4 then
+        if words[1] ~= nil and words[1]:sub(1, 1) == "-" then
+            return nil
+        end
+
+        return {text = table.concat(words, " ") .. "\n", target = target}
+    elseif name == "printf"
+        and list[first].unquoted == 6
+        and #words == 2
+        and words[2] == compileservice.STATUS
+        and not hasStatus(words[1])
+    then
+        local text = printed(words[1])
+
+        return text and {text = text as string, target = target} or nil
+    end
+
+    return nil
+end
+
+--- Reads a shell command line as a compiler command, or answers nil when it is
+--- anything else.
+---
+--- `mode` is `"pipe"` for a command whose standard output the caller reads and
+--- `"out"` for one whose output goes where the caller's does.
+function compileservice.parse(command: string, mode: string): compileservice.Command?
+    if command:find("[\r\n%z]") then
+        return nil
+    end
+    local list = tokens(command)
+    if list == nil or #list == 0 then
+        return nil
+    end
+    local at: integer = 1
+    local cwd: string? = nil
+    if list[1].word == "cd" and list[1].unquoted == 2 then
+        local target = list[2]
+        if target == nil or target.word == nil or hasStatus(target.word) or list[3] == nil or list[3].op ~= "&&" then
+            return nil
+        end
+        cwd = target.word
+        at = 4
+    end
+    local env: {{string}} = {}
+    while list[at] ~= nil and list[at].word ~= nil do
+        local word = list[at].word as string
+        local name = word:match("^([%a_][%w_]*)=")
+        if name == nil or list[at].unquoted < #name + 1 then
+            break
+        end
+        if hasStatus(word) then
+            return nil
+        end
+        env[#env + 1] = {name, word:sub(#name + 2)}
+        at = at + 1
+    end
+    local executable = list[at] and list[at].word or nil
+    if executable == nil or hasStatus(executable) then
+        return nil
+    end
+    at = at + 1
+    local argv: {string} = {}
+    local stdout, stderr = mode, "err"
+    local report: {
+        text: string,
+        target: string
+    }? = nil
+    while list[at] ~= nil do
+        local token = list[at]
+        if token.word ~= nil then
+            if hasStatus(token.word) then
+                return nil
+            end
+            argv[#argv + 1] = token.word
+        elseif token.op == "2>&1" then
+            stderr = stdout
+        elseif token.op == ">" or token.op == "2>" then
+            local target = list[at + 1]
+            if target == nil or target.word == nil or hasStatus(target.word) then
+                return nil
+            end
+            if token.op == ">" then
+                stdout = redirectTarget(target.word as string)
+            else
+                stderr = redirectTarget(target.word as string)
+            end
+            at = at + 1
+        elseif token.op == ";" then
+            report = readReport(list, at + 1, mode)
+            if report == nil then
+                return nil
+            end
+            break
+        else
+            return nil
+        end
+        at = at + 1
+    end
+
+    return {
+        cwd = cwd,
+        env = env,
+        executable = executable,
+        argv = argv,
+        stdout = stdout,
+        stderr = stderr,
+        report = report
+    }
+end
+
+--- A path with `.` and `..` resolved, separators made forward, and on Windows the
+--- Git Bash `/c/...` spelling turned into the drive-letter one.
+function compileservice.normalize(path: string, forWindows: boolean?): string
+    local text = path:gsub("\\", "/")
+    if forWindows then
+        text = text:gsub("^/(%a)/", function(drive: string): string
+            return drive:upper() .. ":/"
+        end)
+        text = text:gsub("^/(%a)$", function(drive: string): string
+            return drive:upper() .. ":/"
+        end)
+    end
+    local prefix = text:match("^%a:/") or text:match("^/") or ""
+    local parts: {string} = {}
+    for part in text:sub(#prefix + 1):gmatch("[^/]+") do
+        if part == ".." then
+            if #parts > 0 and parts[#parts] ~= ".." then
+                parts[#parts] = nil
+            elseif prefix == "" then
+                parts[#parts + 1] = part
+            end
+        elseif part ~= "." then
+            parts[#parts + 1] = part
+        end
+    end
+    if forWindows and prefix ~= "" and prefix ~= "/" then
+        prefix = prefix:upper()
+    end
+
+    return prefix .. table.concat(parts, "/")
+end
+
+local function absolute(path: string, forWindows: boolean?): boolean
+    if forWindows then
+        return path:match("^%a:[/\\]") ~= nil or path:match("^[/\\]") ~= nil
+    end
+
+    return path:sub(1, 1) == "/"
+end
+
+--- Whether `path` is `root` or lies beneath it.
+local function within(path: string, root: string, forWindows: boolean?): boolean
+    local left, right = path, root
+    if forWindows then
+        left, right = left:lower(), right:lower()
+    end
+
+    return left == right or left:sub(1, #right + 1) == right .. "/"
+end
+
+-- What a native program started from Git Bash receives for a word written in
+-- POSIX spelling. Only the drive-letter form converts predictably; any other
+-- absolute POSIX path is the shell's to translate.
+local function windowsWord(word: string): string?
+    local converted = word:gsub("^/(%a)/", function(drive: string): string
+        return drive:upper() .. ":/"
+    end)
+    converted = converted:gsub("=/(%a)/", function(drive: string): string
+        return "=" .. drive:upper() .. ":/"
+    end)
+    if converted:match("^/") or converted:match("=/") then
+        return nil
+    end
+
+    return converted
+end
+
+--- The request a command makes of the service: the working directory, argv and
+--- environment, ready for the platform the compiler runs on. Nil when the command
+--- is not one the service answers.
+---
+--- `root` is the checkout whose `bin/nupp` the service runs, and `cwd` the
+--- caller's own working directory, both normalized.
+function compileservice.request(command: compileservice.Command, root: string, cwd: string, forWindows: boolean?): any?
+    local executable = compileservice.normalize(command.executable, forWindows)
+    if not absolute(executable, forWindows) then
+        executable = compileservice.normalize(cwd .. "/" .. executable, forWindows)
+    end
+    local expected = root .. "/bin/nupp"
+    if forWindows then
+        if executable:lower() ~= expected:lower() then
+            return nil
+        end
+    elseif executable ~= expected then
+        return nil
+    end
+    local name = command.argv[1] or ""
+    local taken, help = answered(command.argv)
+    if not taken then
+        return nil
+    end
+    local directory = cwd
+    if command.cwd ~= nil then
+        local target = command.cwd as string
+        directory = absolute(target, forWindows) and compileservice.normalize(target, forWindows)
+            or compileservice.normalize(cwd .. "/" .. target, forWindows)
+    end
+    if WRITERS[name] and not help and within(directory, root, forWindows) then
+        return nil
+    end
+    local argv: {string} = {}
+    for index, word in ipairs(command.argv) do
+        if forWindows then
+            local converted = windowsWord(word)
+            if converted == nil then
+                return nil
+            end
+            argv[index] = converted
+        else
+            argv[index] = word
+        end
+    end
+    local env: {{string}} = {}
+    for index, pair in ipairs(command.env) do
+        local value = pair[2]
+        if forWindows then
+            local converted = windowsWord(value)
+            if converted == nil then
+                return nil
+            end
+            value = converted
+        end
+        env[index] = {pair[1], value}
+    end
+
+    -- A redirection's file is a word like any other.
+    local function target(disposition: string): string?
+        if forWindows and disposition:sub(1, 5) == "file:" then
+            local converted = windowsWord(disposition:sub(6))
+
+            return converted and "file:" .. converted or nil
+        end
+
+        return disposition
+    end
+
+    local stdout, stderr = target(command.stdout), target(command.stderr)
+    local report: any = nil
+    if command.report ~= nil then
+        local reported = target(command.report.target)
+        if reported == nil then
+            return nil
+        end
+        report = {text = command.report.text, target = reported}
+    end
+    if stdout == nil or stderr == nil then
+        return nil
+    end
+
+    return {cwd = directory, argv = argv, env = env, stdout = stdout, stderr = stderr, report = report}
+end
+
+-- The C library calls both halves use, declared under names of their own so a
+-- module that declares the same functions under their usual names never collides
+-- with these.
+local ffiDeclared = false
+
+local function C(): any
+    local library: any = ffiLibrary
+    if not ffiDeclared then
+        ffiDeclared = true
+        if windows then
+            pcall(
+                library.cdef,
+                [[
+int nuppcs_dup(int) __asm__("_dup");
+int nuppcs_dup2(int, int) __asm__("_dup2");
+int nuppcs_open(const char *, int, int) __asm__("_open");
+int nuppcs_close(int) __asm__("_close");
+int nuppcs_read(int, void *, unsigned int) __asm__("_read");
+int nuppcs_write(int, const void *, unsigned int) __asm__("_write");
+int nuppcs_fflush(void *) __asm__("fflush");
+int nuppcs_chdir(const char *) __asm__("_chdir");
+char *nuppcs_getcwd(char *, int) __asm__("_getcwd");
+int nuppcs_putenv(const char *, const char *) __asm__("_putenv_s");
+intptr_t nuppcs_osfhandle(int) __asm__("_get_osfhandle");
+void *nuppcs_GetStdHandle(uint32_t) __asm__("GetStdHandle");
+int nuppcs_SetStdHandle(uint32_t, void *) __asm__("SetStdHandle");
+void *nuppcs_GetCurrentProcess(void) __asm__("GetCurrentProcess");
+int nuppcs_TerminateProcess(void *, unsigned int) __asm__("TerminateProcess");
+]]
+            )
+        else
+            pcall(
+                library.cdef,
+                [[
+int nuppcs_dup(int) __asm__("dup");
+int nuppcs_dup2(int, int) __asm__("dup2");
+int nuppcs_open(const char *, int, int) __asm__("open");
+int nuppcs_close(int) __asm__("close");
+long nuppcs_read(int, void *, unsigned long) __asm__("read");
+long nuppcs_write(int, const void *, unsigned long) __asm__("write");
+int nuppcs_fflush(void *) __asm__("fflush");
+int nuppcs_chdir(const char *) __asm__("chdir");
+char *nuppcs_getcwd(char *, unsigned long) __asm__("getcwd");
+int nuppcs_setenv(const char *, const char *, int) __asm__("setenv");
+int nuppcs_unsetenv(const char *) __asm__("unsetenv");
+void nuppcs_exit(int) __asm__("_exit");
+]]
+            )
+        end
+        pcall(
+            library.cdef,
+            [[
+void *nuppcs_newstate(void) __asm__("luaL_newstate");
+void nuppcs_openlibs(void *) __asm__("luaL_openlibs");
+int nuppcs_loadbuffer(void *, const char *, size_t, const char *) __asm__("luaL_loadbuffer");
+int nuppcs_pcall(void *, int, int, int) __asm__("lua_pcall");
+ptrdiff_t nuppcs_tointeger(void *, int) __asm__("lua_tointeger");
+int nuppcs_toboolean(void *, int) __asm__("lua_toboolean");
+const char *nuppcs_tolstring(void *, int, size_t *) __asm__("lua_tolstring");
+void nuppcs_close_state(void *) __asm__("lua_close");
+]]
+        )
+    end
+
+    return library.C
+end
+
+--- The working directory of this process.
+function compileservice.cwd(): string?
+    local library: any = ffiLibrary
+    local c = C()
+    local buffer = library.new("char[?]", 4096)
+    local got = c.nuppcs_getcwd(buffer, 4096)
+    if got == nil then
+        return nil
+    end
+
+    return compileservice.normalize(library.string(buffer) as string, windows)
+end
+
+-- Descriptor flags: write-only, created, truncated, and on Windows binary.
+local function writeFlags(): integer
+    local library: any = ffiLibrary
+    if windows then
+        return 0x0001 + 0x0100 + 0x0200 + 0x8000
+    elseif library.os == "OSX" then
+        return 0x0001 + 0x0200 + 0x0400
+    end
+
+    return 0x0001 + 0x0040 + 0x0200
+end
+
+local function nullDevice(): string
+    return windows and "NUL" or "/dev/null"
+end
+
+-- --------------------------------------------------------------------------
+-- The service
+-- --------------------------------------------------------------------------
+
+-- Reads exactly `count` bytes of standard input, or nil at its end. The service
+-- reads its protocol through the descriptor rather than the C stream, because a
+-- request is free to read the C stream to its end and leave it marked so.
+local function readExactly(count: integer): string?
+    local library: any = ffiLibrary
+    local c = C()
+    local parts: {string} = {}
+    local remaining = count
+    local buffer = library.new("char[?]", 65536)
+    while remaining > 0 do
+        local got = tonumber(c.nuppcs_read(0, buffer, math.min(remaining, 65536))) as integer
+        if got <= 0 then
+            return nil
+        end
+        parts[#parts + 1] = library.string(buffer, got) as string
+        remaining = remaining - got
+    end
+
+    return table.concat(parts)
+end
+
+local function readHeader(): string?
+    local library: any = ffiLibrary
+    local c = C()
+    local digits: {string} = {}
+    local byte = library.new("char[1]")
+    while #digits <= 20 do
+        local got = tonumber(c.nuppcs_read(0, byte, 1)) as integer
+        if got <= 0 then
+            return nil
+        end
+        local char = library.string(byte, 1) as string
+        if char == "\n" then
+            return table.concat(digits)
+        end
+        digits[#digits + 1] = char
+    end
+
+    return nil
+end
+
+local function writeAll(text: string): boolean
+    local c = C()
+    local at = 0
+    while at < #text do
+        local chunk = text:sub(at + 1)
+        local wrote = tonumber(c.nuppcs_write(1, chunk, #chunk)) as integer
+        if wrote <= 0 then
+            return false
+        end
+        at = at + wrote
+    end
+
+    return true
+end
+
+-- The native provider, held for the life of the service.
+local keptProvider: any = nil
+
+-- What a cold `bin/nupp` runs, as one chunk for a fresh state: the interpreter's
+-- own start (`LUA_INIT`, then each `-e`), then `nupp.tools.main` up to the point
+-- where it would end the process. Keep the second half in step with
+-- `src/nupp/tools/main.nupp`.
+local ENTRY = [==[
+local MAIN, INTERPRETER, ARGV = ...
+arg = {[0] = MAIN}
+for index, value in ipairs(INTERPRETER) do
+    arg[index - #INTERPRETER - 1] = value
+end
+for index, value in ipairs(ARGV) do
+    arg[index] = value
+end
+local EXITED = {}
+local exitCode = nil
+os.exit = function(status)
+    if status == nil or status == true then
+        exitCode = 0
+    elseif status == false then
+        exitCode = 1
+    else
+        exitCode = tonumber(status) or 0
+    end
+    error(EXITED, 0)
+end
+local progname = INTERPRETER[1] or "luajit"
+local function report(problem)
+    if problem == EXITED then
+        return problem
+    end
+    if type(problem) ~= "string" and type(problem) ~= "number" then
+        problem = "(error object is a " .. type(problem) .. " value)"
+    end
+    return debug.traceback(tostring(problem), 2)
+end
+local ok, result = xpcall(function()
+    local init = os.getenv("LUA_INIT")
+    if init ~= nil then
+        if init:sub(1, 1) == "@" then
+            dofile(init:sub(2))
+        else
+            assert(loadstring(init, "=LUA_INIT"))()
+        end
+    end
+    local index = 2
+    while index <= #INTERPRETER do
+        if INTERPRETER[index] == "-e" then
+            assert(loadstring(INTERPRETER[index + 1], "=(command line)"))()
+            index = index + 2
+        else
+            index = index + 1
+        end
+    end
+    if package.config:sub(1, 1) == "\\" then
+        local ffi = require("ffi")
+        pcall(ffi.cdef, 'int nuppcs_setmode(int, int) __asm__("_setmode");')
+        ffi.C.nuppcs_setmode(0, 0x8000)
+        ffi.C.nuppcs_setmode(1, 0x8000)
+        ffi.C.nuppcs_setmode(2, 0x8000)
+    end
+    require("nupp.tools.jitlimits").apply()
+    require("nupp.tools.bytecodecache").install()
+    local arguments = require("io.cli").args
+    return require("nupp.tools.cli").main(arguments)
+end, report)
+local status
+if exitCode ~= nil then
+    status = exitCode
+elseif ok then
+    status = tonumber(result) or 0
+else
+    io.stderr:write(progname, ": ", tostring(result), "\n")
+    status = 1
+end
+pcall(io.stdout.flush, io.stdout)
+pcall(io.stderr.flush, io.stderr)
+local codegen = package.loaded["nupp.compiler.aot.llvm.codegen"]
+return status, codegen ~= nil and codegen.hasLinked ~= nil and codegen.hasLinked()
+]==]
+
+-- The interpreter arguments this service was started with, and the entry it ran:
+-- what every request's fresh state is started as.
+local function startup(): ({string}, string)
+    local hostArgs: any = rawget(_G, "arg") or {}
+    local lowest = 0
+    while hostArgs[lowest - 1] ~= nil do
+        lowest = lowest - 1
+    end
+    local interpreter: {string} = {}
+    for index = lowest, -1 do
+        interpreter[#interpreter + 1] = tostring(hostArgs[index])
+    end
+
+    return interpreter, tostring(hostArgs[0] or "")
+end
+
+-- Sets this process's environment variable, nil to remove it.
+local function setEnvironment(name: string, value: string?): nil
+    local c = C()
+    if windows then
+        c.nuppcs_putenv(name, value or "")
+    elseif value == nil then
+        c.nuppcs_unsetenv(name)
+    else
+        c.nuppcs_setenv(name, value, 1)
+    end
+end
+
+-- Points standard input, output and error at what a request asked for, returning
+-- how to put them back. `out` and `err` are paths, `"null"`, or for `err`,
+-- `"stdout"` to share standard output's open file the way `2>&1` does.
+local function redirect(out: string, err: string): function(): nil
+    local library: any = ffiLibrary
+    local c = C()
+    pcall(io.stdout.flush, io.stdout)
+    pcall(io.stderr.flush, io.stderr)
+    c.nuppcs_fflush(nil)
+    local saved = {c.nuppcs_dup(0), c.nuppcs_dup(1), c.nuppcs_dup(2)}
+    local handles: {any} = {}
+    if windows then
+        handles = {
+            c.nuppcs_GetStdHandle(0xFFFFFFF6),
+            c.nuppcs_GetStdHandle(0xFFFFFFF5),
+            c.nuppcs_GetStdHandle(0xFFFFFFF4)
+        }
+    end
+
+    local function openFor(target: string): integer
+        local path = target == "null" and nullDevice() or target
+
+        return c.nuppcs_open(path, writeFlags(), 438) as integer
+    end
+
+    local input = c.nuppcs_open(nullDevice(), windows and 0x8000 or 0, 0) as integer
+    local output = openFor(out)
+    local errors = err == "stdout" and output or openFor(err)
+    c.nuppcs_dup2(input, 0)
+    c.nuppcs_dup2(output, 1)
+    c.nuppcs_dup2(errors, 2)
+    c.nuppcs_close(input)
+    if errors ~= output then
+        c.nuppcs_close(errors)
+    end
+    c.nuppcs_close(output)
+    if windows then
+        for fd = 0, 2 do
+            c.nuppcs_SetStdHandle(0xFFFFFFF6 - fd, library.cast("void *", c.nuppcs_osfhandle(fd)))
+        end
+    end
+
+    return function(): nil
+        pcall(io.stdout.flush, io.stdout)
+        pcall(io.stderr.flush, io.stderr)
+        c.nuppcs_fflush(nil)
+        for fd = 0, 2 do
+            c.nuppcs_dup2(saved[fd + 1], fd)
+            c.nuppcs_close(saved[fd + 1])
+        end
+        if windows then
+            for fd = 0, 2 do
+                c.nuppcs_SetStdHandle(0xFFFFFFF6 - fd, handles[fd + 1])
+            end
+        end
+    end
+end
+
+-- Runs one command in a fresh state, answering its exit status and whether the
+-- state ran lld, whose library a process cannot unload once it has (see
+-- `nupp.compiler.aot.llvm.codegen.hasLinked`). Such a state is left open and
+-- the service ends after answering.
+local function runFresh(interpreter: {string}, main: string, argv: {string}): (integer, boolean)
+    local library: any = ffiLibrary
+    local c = C()
+    local state = c.nuppcs_newstate()
+    if state == nil then
+        io.stderr:write("nupp: the compile service could not create a Lua state\n")
+        return 1, false
+    end
+    c.nuppcs_openlibs(state)
+
+    local function quoted(list: {string}): string
+        local parts: {string} = {}
+        for _, value in ipairs(list) do
+            parts[#parts + 1] = ("%q"):format(value)
+        end
+
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+
+    local chunk = ("return (function(...) %s end)(%q, %s, %s)"):format(ENTRY, main, quoted(interpreter), quoted(argv))
+    local status: integer = 1
+    local codegen = false
+    if c.nuppcs_loadbuffer(state, chunk, #chunk, "=nupp compile service") ~= 0
+        or c.nuppcs_pcall(state, 0, 2, 0) ~= 0
+    then
+        local size = library.new("size_t[1]")
+        local message = c.nuppcs_tolstring(state, -1, size)
+        local text = message ~= nil and library.string(message, size[0]) or "unknown error"
+        io.stderr:write("nupp: the compile service could not run the command: ", text, "\n")
+    else
+        status = tonumber(c.nuppcs_tointeger(state, -2)) as integer
+        codegen = c.nuppcs_toboolean(state, -1) ~= 0
+    end
+    if not codegen then
+        -- Whatever its finalizers say is said after the process would have
+        -- exited, so it goes nowhere.
+        local restore = redirect("null", "null")
+        c.nuppcs_close_state(state)
+        restore()
+    end
+
+    return status, codegen
+end
+
+-- Ends this process now, without static destructors or finalizers.
+local function endNow(code: integer): nil
+    local c = C()
+    c.nuppcs_fflush(nil)
+    if windows then
+        c.nuppcs_TerminateProcess(c.nuppcs_GetCurrentProcess(), code)
+    else
+        c.nuppcs_exit(code)
+    end
+end
+
+--- Serves requests from standard input until it closes.
+---
+--- A request is `cwd`, the stdout and stderr targets, a status report's text,
+--- file and `io.open` mode (all empty for none), the argument count and the
+--- arguments, then name and value pairs to set in the environment for the
+--- request. The response is the exit status, and `"end"` when the service
+--- ends after answering.
+function compileservice.serviceMain(): integer
+    local library: any = ffiLibrary
+    local c = C()
+    local interpreter, main = startup()
+    -- Held for the life of the service, so the native provider every request loads
+    -- is loaded once rather than unloaded behind each state that closes.
+    local provider = os.getenv("NUPP_NATIVE_LIBRARY")
+    if provider ~= nil and provider ~= "" then
+        local loaded, opened = pcall(library.load, provider)
+        keptProvider = loaded and opened or nil
+    end
+    local home = compileservice.cwd()
+    while true do
+        local header = readHeader()
+        if header == nil or not header:match("^%d+$") then
+            return 0
+        end
+        local body = readExactly(tonumber(header) as integer)
+        if body == nil then
+            return 0
+        end
+        local items = compileservice.unpack(body as string)
+        if items == nil or #items < 7 then
+            return 2
+        end
+        local cwd, out, err = items[1], items[2], items[3]
+        local reportText, reportPath, reportMode = items[4], items[5], items[6]
+        local count = (tonumber(items[7]) or 0) as integer
+        local argv: {string} = {}
+        for index = 1, count do
+            argv[index] = items[7 + index]
+        end
+        local assignments: {{any}} = {}
+        local at: integer = 8 + count
+        while items[at] ~= nil do
+            assignments[#assignments + 1] = {items[at], items[at + 1]}
+            at = at + 2
+        end
+        local previous: {{any}} = {}
+        for index, pair in ipairs(assignments) do
+            previous[index] = {pair[1], os.getenv(pair[1] as string)}
+            setEnvironment(pair[1] as string, pair[2] as string?)
+        end
+        local status: integer = 1
+        local codegen = false
+        if c.nuppcs_chdir(cwd) ~= 0 then
+            local restore = redirect(out, err)
+            io.stderr:write("cd: ", cwd, ": No such file or directory\n")
+            restore()
+        else
+            local restore = redirect(out, err)
+            status, codegen = runFresh(interpreter, main, argv)
+            restore()
+        end
+        -- The status report, in the command's directory as the shell would have
+        -- written it.
+        if reportPath ~= "" then
+            local file = io.open(reportPath, reportMode)
+            if file ~= nil then
+                file:write(compileservice.withStatus(reportText, status))
+                file:close()
+            end
+        end
+        for index = #previous, 1, -1 do
+            setEnvironment(previous[index][1] as string, previous[index][2] as string?)
+        end
+        if home ~= nil then
+            c.nuppcs_chdir(home)
+        end
+        if not writeAll(workerchannel.frame(compileservice.pack({tostring(status), codegen and "end" or ""}))) then
+            return 0
+        end
+        if codegen then
+            endNow(0)
+        end
+    end
+end
+
+-- --------------------------------------------------------------------------
+-- The client
+-- --------------------------------------------------------------------------
+
+--- How long a request may take before the service is taken to have hung. A
+--- command that really takes this long is retried in a process of its own.
+local function timeoutMs(): integer
+    local configured = tonumber(os.getenv("NUPP_TEST_COMPILE_SERVICE_TIMEOUT_MS") or "")
+
+    return (configured or 600000) as integer
+end
+
+local function readFile(path: string, mode: string): string
+    local file = io.open(path, mode)
+    if file == nil then
+        return ""
+    end
+    local text = file:read("*a") or ""
+    file:close()
+
+    return text
+end
+
+--- A client for one test process: starts the service the first time a command
+--- is routed to it, restarts it after a failure.
+---
+--- `options.root` is the checkout (normalized), `options.tmpname` makes the names
+--- of the files a request's output goes through, and `options.remove` deletes one.
+function compileservice.client(options: any): any
+    local process = require("nupp.compiler.process")
+    local self: any = {root = options.root, tmpname = options.tmpname, remove = options.remove or os.remove}
+    local channel: any = nil
+    local routed: integer = 0
+    local fallen: integer = 0
+
+    local function stop(force: boolean?): nil
+        local current = channel
+        channel = nil
+        workerchannel.close(current, force)
+    end
+
+    local function start(): any?
+        if channel ~= nil and channel.child:isrunning() then
+            return channel
+        end
+        stop(true)
+        local child = process.startIsolated({self.root .. "/bin/nupp", "__compile-service"}, {})
+        if not child or not child.stdin or not child.stdout then
+            if child then
+                child:close()
+            end
+            return nil
+        end
+        channel = workerchannel.open(@unsafe own.release(child), {maxFrame = MAX_FRAME, waitMs = 50})
+
+        return channel
+    end
+
+    -- Sends one request and answers its status, or nil when the service failed it.
+    local function ask(request: any, out: string, err: string, report: {string}): integer?
+        local items: {string} = {request.cwd, out, err, report[1], report[2], report[3], tostring(#request.argv)}
+        for _, word in ipairs(request.argv) do
+            items[#items + 1] = word
+        end
+        for _, pair in ipairs(request.env) do
+            items[#items + 1] = pair[1]
+            items[#items + 1] = pair[2]
+        end
+        local current = start()
+        if current == nil then
+            return nil
+        end
+        local text, _ = workerchannel.request(current, compileservice.pack(items), os.monotonic() + timeoutMs())
+        if text == nil then
+            stop(true)
+            return nil
+        end
+        local answer = compileservice.unpack(text as string)
+        local status = answer and tonumber(answer[1]) or nil
+        if status == nil then
+            stop(true)
+            return nil
+        end
+        -- A service that ends itself after answering (see `endNow`) is let go
+        -- now, so the next request starts a new one rather than reaching this.
+        if answer ~= nil and answer[2] == "end" then
+            stop(false)
+        end
+
+        return status as integer
+    end
+
+    --- Runs a parsed command through the service. Answers the status the shell
+    --- would have and the files holding what was written to the caller's pipe,
+    --- standard output and standard error, or nil when the caller should run the
+    --- command itself.
+    function self:run(command: compileservice.Command): (integer?, string?, string?, string?)
+        local cwd = compileservice.cwd()
+        if cwd == nil then
+            return nil, nil, nil, nil
+        end
+        local request = compileservice.request(command, self.root, cwd as string, windows)
+        if request == nil then
+            return nil, nil, nil, nil
+        end
+        -- The caller's own streams go through files this client makes; a named
+        -- file is the service's to open, in the command's directory.
+        local files: {[string]: string} = {}
+
+        local function target(disposition: string): string
+            if disposition == "null" then
+                return "null"
+            elseif disposition:sub(1, 5) == "file:" then
+                return disposition:sub(6)
+            end
+            local path = files[disposition] or self.tmpname() as string
+            files[disposition] = path
+
+            return path
+        end
+
+        local out = target(request.stdout)
+        local err = target(request.stderr)
+        if err == out and err ~= "null" then
+            err = "stdout"
+        end
+        local report: {string} = {"", "", ""}
+        if request.report ~= nil and request.report.target ~= "null" then
+            local named = request.report.target:sub(1, 5) == "file:"
+            report = {request.report.text, target(request.report.target), named and "wb" or "ab"}
+        end
+        local status = ask(request, out, err, report)
+        if status == nil then
+            for _, path in pairs(files) do
+                self.remove(path)
+            end
+            fallen = fallen + 1
+            return nil, nil, nil, nil
+        end
+        routed = routed + 1
+        if request.report ~= nil then
+            status = 0
+        end
+
+        return status, files.pipe, files.out, files.err
+    end
+
+    --- How many commands the service answered and how many it gave back.
+    function self:counts(): (integer, integer)
+        return routed, fallen
+    end
+
+    --- Stops the service.
+    function self:close(): nil
+        stop(false)
+    end
+
+    --- Forwards what an inheriting command wrote to the caller's own streams.
+    function self:forward(stdoutPath: string?, stderrPath: string?): nil
+        if stdoutPath ~= nil then
+            io.stdout:write(readFile(stdoutPath as string, "rb"))
+            self.remove(stdoutPath)
+        end
+        if stderrPath ~= nil then
+            io.stderr:write(readFile(stderrPath as string, "rb"))
+            self.remove(stderrPath)
+        end
+    end
+
+    return self
+end
+
+export = compileservice

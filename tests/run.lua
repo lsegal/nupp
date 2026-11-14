@@ -286,7 +286,12 @@ local function cleanupTempNames()
     end
 end
 
+local compileService = nil
+
 os.exit = function(code, close)
+    if compileService then
+        compileService:close()
+    end
     cleanupTempNames()
     -- A worker leaves through here rather than through the command line's own exit,
     -- so it reports its peak itself when asked to (#250). A plain-LuaJIT run of this
@@ -309,6 +314,188 @@ os.tmpname = function()
     reservedTempNames[#reservedTempNames + 1] = named
 
     return named
+end
+
+-- Whether a call came from the suites or this runner, rather than from compiler
+-- or runtime code a suite runs in this process: only theirs are shell commands
+-- written for the test shell. The Windows route below asks the same question of
+-- its own; its block is loaded on its own by runnertest.
+local function startedByTests(source)
+    return source == "@nupp:test-runner"
+        or source == "@nupp:test-cache"
+        or source:find("/tests/", 1, true) ~= nil
+        or source:match("^@?tests/") ~= nil
+end
+
+-- A compiler command a case starts through the shell -- `cd dir && bin/nupp
+-- check main.nupp 2>&1` -- is answered by one compiler process this runner
+-- keeps for the whole run (`nupp.tools.compileservice`), instead of a shell,
+-- the launcher and a cold compiler of its own. Each command still runs in a
+-- fresh interpreter state, in its own working directory, with its own
+-- assignments and redirections; only a command that is plainly a compiler
+-- invocation is taken, and the rest go to the shell as before. Only inside a
+-- run the launcher started (`NUPP_LAUNCHER_RUN_ROOT`), whose compiler is the
+-- one the service runs; `NUPP_TEST_COMPILE_SERVICE=0` turns it off.
+local compileServiceModule = nil
+local rawOsExecute = os.execute
+local windowsHost = package.config:sub(1, 1) == "\\"
+
+local function compileServiceClient()
+    if compileService == nil then
+        compileService = false
+        local runRoot = os.getenv("NUPP_LAUNCHER_RUN_ROOT")
+        if runRoot and runRoot ~= "" and os.getenv("NUPP_TEST_COMPILE_SERVICE") ~= "0" then
+            local loaded, module = pcall(require, "nupp.tools.compileservice")
+            if loaded then
+                compileServiceModule = module
+                compileService = module.client({root = module.normalize(runRoot, windowsHost), tmpname = os.tmpname})
+            end
+        end
+    end
+
+    return compileService or nil
+end
+
+-- How many commands the service has answered, for its own suite to tell which
+-- route a command took.
+rawset(_G, "__NUPP_TEST_COMPILE_SERVICE_COUNTS", function()
+    return compileService and (compileService:counts()) or 0
+end)
+
+-- What `os.execute` itself answers for an exit status: Lua 5.2's triple when the
+-- interpreter was built for it, otherwise the C library's `system` status,
+-- which on POSIX is a wait status.
+local executeStyle = nil
+local function executeResult(status)
+    if executeStyle == nil then
+        executeStyle = type(rawOsExecute()) == "boolean" and "lua52" or (windowsHost and "code" or "wait")
+    end
+    if executeStyle == "lua52" then
+        return status == 0 or nil, "exit", status
+    elseif executeStyle == "wait" then
+        return status * 256
+    end
+
+    return status
+end
+
+-- Where `NUPP_TEST_COMPILE_SERVICE_LOG` names a file, each compiler command a
+-- case started that the service did not answer is appended to it: what is left
+-- of the run's cold compiler processes, and the place to look for the next one
+-- worth taking.
+local declinedLog = os.getenv("NUPP_TEST_COMPILE_SERVICE_LOG")
+local function declined(command)
+    if declinedLog and declinedLog ~= "" and command:find("bin/nupp", 1, true) then
+        local file = io.open(declinedLog, "ab")
+        if file then
+            file:write((command:gsub("[\r\n]", " ")), "\n")
+            file:close()
+        end
+    end
+end
+
+-- Answers true and `os.execute`'s results when the service ran the command.
+local function routedExecute(command)
+    local client = compileServiceClient()
+    if not client then
+        return false
+    end
+    local parsed = compileServiceModule.parse(command, "out")
+    local status, _, out, err
+    if parsed then
+        status, _, out, err = client:run(parsed)
+    end
+    if status == nil then
+        declined(command)
+        return false
+    end
+    client:forward(out, err)
+
+    return true, executeResult(status)
+end
+
+-- A finished pipe for a command the service ran, closing with the status a
+-- process's `close` reports; nil when the shell has to run it.
+local function routedPopen(command, mode)
+    local client = compileServiceClient()
+    if not client then
+        return nil
+    end
+    local parsed = (mode == nil or mode == "r" or mode == "rb") and compileServiceModule.parse(command, "pipe")
+    local status, pipe, out, err
+    if parsed then
+        status, pipe, out, err = client:run(parsed)
+    end
+    if status == nil then
+        declined(command)
+        return nil
+    end
+    client:forward(out, err)
+    local file = assert(io.open(pipe or (windowsHost and "NUL" or "/dev/null"), mode == "rb" and "rb" or "r"))
+    local proxy = {}
+    function proxy:read(...)
+        return file:read(...)
+    end
+
+    function proxy:lines(...)
+        return file:lines(...)
+    end
+
+    function proxy:close()
+        file:close()
+        if pipe then
+            os.remove(pipe)
+        end
+
+        return status == 0 or nil, "exit", status
+    end
+
+    return proxy
+end
+
+-- POSIX suites reach the shell through the interpreter's own functions, which the
+-- runtime's I/O module replaces the first time anything loads it. So the route is
+-- put back in front before every case rather than once, and only over the
+-- runtime's `popen`, whose processes close with the status `routedPopen` gives.
+local routeCompileCommands = function() end
+if not windowsHost then
+    local popenRoute, executeRoute
+    routeCompileCommands = function()
+        if rawget(_G, "__NUPP_TEST_EMBEDDED") or os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil then
+            return
+        end
+        local standardIO = package.loaded["nupp.runtime.standardio"]
+        if standardIO and io.popen == standardIO.popen then
+            local underlying = io.popen
+            popenRoute = function(command, mode)
+                local caller = debug.getinfo(2, "S")
+                if type(command) == "string" and caller and startedByTests(caller.source) then
+                    local pipe = routedPopen(command, mode)
+                    if pipe then
+                        return pipe
+                    end
+                end
+
+                return underlying(command, mode)
+            end
+            io.popen = popenRoute
+        end
+        if os.execute ~= executeRoute then
+            local underlying = os.execute
+            executeRoute = function(command)
+                local caller = debug.getinfo(2, "S")
+                if type(command) == "string" and caller and startedByTests(caller.source) then
+                    local handled, a, b, c = routedExecute(command)
+                    if handled then
+                        return a, b, c
+                    end
+                end
+
+                return underlying(command)
+            end
+            os.execute = executeRoute
+        end
+    end
 end
 
 -- The suites predate Windows support and deliberately exercise shell-facing
@@ -393,6 +580,15 @@ if package.config:sub(1, 1) == "\\" then
         if not usesTestShell(source) then
             return rawExecute(command)
         end
+        -- Only where pipes are allowed: a shared worker lane refuses them, and a
+        -- command the service ran would be one the lane never let start. The route
+        -- is absent when runnertest loads this block on its own.
+        if nativePopen and routedExecute then
+            local handled, a, b, c = routedExecute(command)
+            if handled then
+                return a, b, c
+            end
+        end
         local path = script(command)
         local result = rawExecute(invocation(path))
         os.remove(path)
@@ -437,6 +633,12 @@ if package.config:sub(1, 1) == "\\" then
                     return true
                 end,
             }
+        end
+        if nativePopen and routedPopen then
+            local pipe = routedPopen(command, mode)
+            if pipe then
+                return pipe
+            end
         end
         local path = script(command)
         -- The public process API takes argv directly. Sending its Bash launch
@@ -2012,6 +2214,7 @@ end
 -- phases fail, keep the original failure as the headline and retain the
 -- cleanup failure as the useful second half of the report.
 local function runCase(hooks, fn)
+    routeCompileCommands()
     local ok, problem = call(hooks.beforeEach)
     if ok then
         ok, problem = call(fn)
