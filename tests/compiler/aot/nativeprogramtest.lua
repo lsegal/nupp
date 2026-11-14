@@ -1631,6 +1631,35 @@ local function contains(ir, fragmentText)
     assert(ir:find(fragmentText, 1, true), "expected `" .. fragmentText .. "` in:\n" .. ir)
 end
 
+-- The C functions a module calls are declared by name, not in the order of the
+-- hash table that holds them, which differs from run to run: lowering the same
+-- program gives the same text.
+function M.foreignDeclarationsAreInNameOrder()
+    local source = [[
+module host
+
+cdef function zeta(n: int32): int32
+cdef function mu(n: int32): int32
+cdef function alpha(n: int32): int32
+cdef function omega(n: int32): int32
+cdef function kappa(n: int32): int32
+cdef function beta(n: int32): int32
+cdef function sigma(n: int32): int32
+cdef function delta(n: int32): int32
+
+export function nupp_native_sum(n: int32): int32
+    return math.i32.wrap(zeta(n) + mu(n) + alpha(n) + omega(n) + kappa(n) + beta(n) + sigma(n) + delta(n))
+end
+]]
+    local ir = assert(lowerData(source))
+    local declared = {}
+    for name in ("\n" .. ir):gmatch("\ndeclare [^@\n]*@(%l+)%(") do
+        declared[#declared + 1] = name
+    end
+    test.eq(table.concat(declared, " "), "alpha beta delta kappa mu omega sigma zeta")
+    test.eq(assert(lowerData(source)), ir)
+end
+
 local ARRAYS = [[
 module host
 
