@@ -1654,6 +1654,50 @@ function M.workersDivideAQueueBetweenThem()
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- A Nupp worker state past its heap bound hands the rest of its queue to a fresh
+-- state (#287). At a bound of 0 every suite gets a state of its own, and each lane
+-- still reports once: one state per suite it ran, plus the last, which found the
+-- queue empty.
+function M.nuppWorkerStatesRetireAtTheirHeapBound()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+    local names = {"alpha", "beta", "gamma", "delta", "epsilon"}
+    for _, name in ipairs(names) do
+        write(
+            ("%s/tests/%stest.lua"):format(dir, name),
+            ("local M = {}\nfunction M.only%s() end\nreturn M\n"):format(name)
+        )
+    end
+
+    local output, invocation = capturedRun(
+        (
+            "cd %q && %sNUPP_TEST_BUILD=%q NUPP_TEST_WORKER_HEAP_MB=0 %q --jobs=2 --json 2>/dev/null"
+        ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+    )
+    test.eq(invocation.status, 0, "the recycled lanes did not pass" .. evidence(invocation))
+    local report = require("testjson").decode(output)
+    test.eq(report.total, #names, evidence(invocation))
+    test.eq(report.passed, #names, evidence(invocation))
+    test.eq(#report.shards, 2, "each lane reports once however many states it went through")
+    local seen, states = {}, 0
+    for _, shard in ipairs(report.shards) do
+        test.eq(shard.executionLane, "shared")
+        for _, spec in ipairs(shard.specs) do
+            test.eq(seen[spec], nil, spec .. " ran twice")
+            seen[spec] = true
+        end
+        states = states + shard.states
+    end
+    for _, name in ipairs(names) do
+        assert(seen[name .. "test"], name .. "test never ran")
+    end
+    test.eq(states, #names + 2, "every suite ran in a state of its own")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 function M.processQueueRestoresModuleGlobalsBetweenPieces()
     local dir = os.tmpname()
     os.remove(dir)
