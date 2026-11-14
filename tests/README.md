@@ -51,11 +51,12 @@ The default base is `origin/main`; working-tree and untracked files count too.
 `tests/groups.lua` returns named groups and repository policy. Its scope map
 assigns every suite a coverage obligation; `--scope=NAME` selects that obligation,
 while `--lane=NAME` selects its execution constraints. Delivery is explicit and
-CI uses `--scope=all --fresh` to keep its coverage.
+CI uses `--scope=all`, reusing recorded passes restored per platform.
 
 Package result caching is opt-in. Add `cache = true` only after its complete
 inputs are covered, and declare shared files with `inputs`. Dynamic loads,
-subprocesses and unresolved modules remain uncached. See
-[testing.md](../docs/learn/projects/testing.md#passing-result-cache) for the flags
-and cache contract. Timing output reports packages over 60 seconds of aggregate
+subprocesses and unresolved modules remain uncached. Suites that check timing,
+process lifecycle, the network or a measurement belong in `neverCache` and
+always execute. See [testing.md](../docs/learn/projects/testing.md#passing-result-cache)
+for the flags and cache contract. Timing output reports packages over 60 seconds of aggregate
 suite wall time; that is a splitting signal, not a CPU measurement.

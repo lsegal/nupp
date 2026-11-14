@@ -586,7 +586,7 @@ function M.open(options)
                     local ok, old = pcall(json.decode, text or "")
                     if ok
                         and type(old) == "table"
-                        and old.key == hash
+                        and old.key == item.key
                         and type(old.tests) == "table"
                         and type(old.suites) == "table"
                         and #old.tests > 0
