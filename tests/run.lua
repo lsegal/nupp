@@ -2105,15 +2105,47 @@ end
 --- full runs drifted from 70s to 120s at settings that should not have differed,
 --- so run order swamped the effect. One per core is the setting that does not
 --- oversubscribe, and `--jobs=N` is there for a machine that wants otherwise.
-local function defaultJobs()
-    local handle = io.popen("getconf _NPROCESSORS_ONLN 2>/dev/null")
+---
+--- Memory caps it too, from measurement rather than from fear (#250). A worker and the
+--- one compiler child it has running at a time peak together at the figure below, on
+--- every platform, so a machine runs as many as fit its physical memory with a quarter
+--- left over. The hosted runners have the cores to spare long before they run short of
+--- memory, so in practice this only binds on a small machine.
+local WORKER_PEAK_BYTES = 512 * 1024 * 1024
+
+local function commandLine(command)
+    local handle = io.popen(command .. " 2>/dev/null")
     local text = handle and handle:read("*l") or nil
     if handle then
         handle:close()
     end
-    local found = tonumber(text or "")
 
-    return found and found >= 1 and math.floor(found) or 4
+    return text
+end
+
+--- Physical memory in bytes, or nil where nothing answers.
+---
+--- `/proc/meminfo` is Linux's, and Git Bash on Windows provides one too; macOS says
+--- through `sysctl`. Read through the shell, because on Windows the file is Git Bash's
+--- and LuaJIT cannot open it.
+local function physicalMemory()
+    local kilobytes = tonumber((commandLine("cat /proc/meminfo") or ""):match("MemTotal:%s*(%d+)") or "")
+    if kilobytes then
+        return kilobytes * 1024
+    end
+
+    return tonumber(commandLine("sysctl -n hw.memsize") or "")
+end
+
+local function defaultJobs()
+    local found = tonumber(commandLine("getconf _NPROCESSORS_ONLN") or "")
+    local cores = found and found >= 1 and math.floor(found) or 4
+    local memory = physicalMemory()
+    if not memory then
+        return cores
+    end
+
+    return math.max(1, math.min(cores, math.floor(memory * 0.75 / WORKER_PEAK_BYTES)))
 end
 
 --- What the last run measured, so this one can start the slow work first.
