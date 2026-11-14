@@ -55,7 +55,7 @@ local REPORT_SCHEMA = {
     required = {"ok", "diagnostics", "unformatted", "written", "failed"},
 }
 
-local function run(options: any): integer
+local function format(options: any): integer
     local positional: {string} = options.files
     local values = options
     local write, asking = values.write, values.check
@@ -282,6 +282,20 @@ local function run(options: any): integer
     end
 
     return finish(failed and 1 or 0, unformatted)
+end
+
+--- How far the heap may grow past what the last collection kept before the next one
+--- starts, as a percentage, the way a build runs (#257). Checking a file's imports
+--- makes several times the file's size in garbage, and at LuaJIT's default of 200 a run
+--- over a quarter of this repository's tree peaked at about twice what it kept (#286).
+const FMT_GC_PAUSE = 100
+
+local function run(options: any): integer
+    local pause = collectgarbage("setpause", FMT_GC_PAUSE)
+    local code = format(options)
+    collectgarbage("setpause", pause)
+
+    return code
 end
 
 --- Format Nupp source.
