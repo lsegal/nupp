@@ -248,7 +248,7 @@ export function attach(env: any, envMod: any, helpers: {
                     ok = false
                     break
                 end
-                for name, path in pairs(member.requires) do
+                for name, path in pairs(member.requires or {}) do
                     if resolve(name) ~= path then
                         ok = false
                         break
@@ -257,7 +257,7 @@ export function attach(env: any, envMod: any, helpers: {
                     -- has not moved; anything else could have checked differently
                     -- because of something it requires in turn.
                     if path ~= "" and owner[path] == nil then
-                        local leaf = member.leaves[path]
+                        local leaf = (member.leaves or {})[path]
                         local text = leaf and (sources[path] or readFile(path)) or nil
                         if text == nil or digest(text) ~= leaf then
                             ok = false
@@ -278,11 +278,11 @@ export function attach(env: any, envMod: any, helpers: {
             for _, stored in ipairs(images) do
                 if trust[stored.name] then
                     local ok = true
-                    for _, prerequisite in ipairs(stored.prerequisites) do
+                    for _, prerequisite in ipairs(stored.prerequisites or {}) do
                         ok = ok and trust[prerequisite] == true
                     end
                     for _, member in ipairs(stored.members) do
-                        for _, path in pairs(member.requires) do
+                        for _, path in pairs(member.requires or {}) do
                             local other = path ~= "" and owner[path] or nil
                             ok = ok and (other == nil or trust[other] == true)
                         end
@@ -360,7 +360,7 @@ export function attach(env: any, envMod: any, helpers: {
             for _, stored in ipairs(images) do
                 if trust[stored.name] and not mounted[stored.name] then
                     local ready = true
-                    for _, prerequisite in ipairs(stored.prerequisites) do
+                    for _, prerequisite in ipairs(stored.prerequisites or {}) do
                         ready = ready and mounted[prerequisite] == true
                     end
                     if ready then
@@ -498,6 +498,42 @@ export function attach(env: any, envMod: any, helpers: {
         -- to add.
         if not decoded then
             return
+        end
+        -- A module that requires a project module no image will hold could not be
+        -- trusted next time, and would take every module stored beside it down with
+        -- it, so it is left out, and so is anything requiring it in turn.
+        local willHold: {[string]: boolean} = {}
+        for path in pairs(imaged) do
+            willHold[path] = true
+        end
+        for _, record in ipairs(fresh) do
+            willHold[record.path] = true
+        end
+        local dropped = true
+        while dropped do
+            dropped = false
+            local remaining: {any} = {}
+            for _, record in ipairs(fresh) do
+                local holdable = true
+                for required in pairs(record.requires or {}) do
+                    local found = envMod.findModulePath(env, required)
+                    local path = found and normalizePath(found) or ""
+                    if path ~= ""
+                        and not willHold[path]
+                        and not path:match("%.lua$")
+                        and not path:match("%.d%.nupp$")
+                    then
+                        holdable = false
+                    end
+                end
+                if holdable then
+                    remaining[#remaining + 1] = record
+                else
+                    willHold[record.path] = nil
+                    dropped = true
+                end
+            end
+            fresh = remaining
         end
         local current = entries.get(key as string)
         local previous = 0

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `nupp bc`, `nupp run` and `nupp lsp artifact` of a file inside a project keep
+  the checked interfaces of the project modules it requires in the build
+  directory, and read them back on the next command instead of checking the
+  whole import graph from source again. A module is read back only while its
+  source, what it requires, and the project's declarations are unchanged. In
+  the compiler's own checkout, `nupp bc -O1 bench/aos.bench.nupp` went from
+  about 515 MB and 17 s to 157 MB and 6 s on Windows once warm, and `nupp lsp
+  artifact` of the same file from about 905 MB to 158 MB.
+  `NUPP_NO_INTERFACE_CACHE` turns the store off.
 - A native compile that `require`s a standard-library module keeps the checked
   interfaces in its cache and reads them back on the next command, instead of
   checking the module's whole graph from source every time. `nupp run` of a

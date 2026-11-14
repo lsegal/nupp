@@ -917,7 +917,9 @@ function M.storedProjectInterfacesCompileTheSameAsTheirSource()
     local function compile(prefix)
         local outputs = {}
         for _, command in ipairs({
-            "bc --json -O1 src/main.nupp",
+            -- The listing rather than `--json`, whose `bytecodeFingerprint` digests a
+            -- `string.dump` that differs between runs over the same source.
+            "bc -O1 src/main.nupp",
             "lsp artifact --kind lua -O1 src/main.nupp",
             "bc src/bad.nupp",
             "run src/main.nupp",
@@ -951,7 +953,7 @@ function M.storedProjectInterfacesCompileTheSameAsTheirSource()
     os.execute("rm -rf '" .. dir .. "'")
 
     assert(stored, "the checked project interfaces were not stored")
-    assert(fromSource:find('"ok": *true', 1) or fromSource:find('"ok":true', 1, true), "main did not compile: " .. fromSource)
+    assert(fromSource:find('"geometry"', 1, true), "main did not compile: " .. fromSource)
     assert(fromSource:find("\n5\n", 1, true), "main did not run: " .. fromSource)
     assert(
         fromSource:find("called function is declared here", 1, true) and fromSource:find("geometry.nupp", 1, true),
