@@ -43,8 +43,9 @@ local function variables(driver: string): {string}
 end
 
 --- Where the answer to `request` would be recorded, or nil outside a test run.
-export function slot(driver: string, request: {string}): string?
-    local directory = os.getenv("NUPP_TOOLCHAIN_ANSWERS")
+--- `directory` is the run's, `NUPP_TOOLCHAIN_ANSWERS` when not given.
+export function slot(driver: string, request: {string}, directory: string?): string?
+    directory = directory or os.getenv("NUPP_TOOLCHAIN_ANSWERS")
     if directory == nil or directory == "" then
         return nil
     end
