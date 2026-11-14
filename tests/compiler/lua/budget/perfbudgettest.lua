@@ -448,4 +448,47 @@ function M.aSingleTestProgramCompileStaysUnderItsMemoryBudget()
     )
 end
 
+-- What a build may leave behind in a process that builds again, once the types nothing
+-- holds have been released.
+local REBUILD_RETAINED_KB = 8 * 1024
+
+-- A test worker builds project after project in one process. Every type each build
+-- interned used to stay -- the arenas kept them, and weakly keyed caches whose answers
+-- reached their own keys kept them past the arenas -- so the heaviest suites grew by
+-- about 45 MB a build and peaked past 2 GB (#266). Released between builds, the heap
+-- after the last of several builds is where it was after the first.
+function M.repeatedBuildsInOneProcessKeepAFlatHeap()
+    local fs = require("nupp.compiler.fs")
+    local project = require("nupp.tools.build.project")
+    local types = require("nupp.compiler.types")
+    local function buildOnce(index)
+        local dir = temporary()
+        assert(fs.writeFile(dir .. "/nupp.lua", [[return {include = {"src"}, build = {
+            kind = "bundle", outDir = "out", output = "out/app.lua", entries = {"main"}
+        }}]]))
+        assert(fs.mkdir(dir .. "/src"))
+        assert(fs.writeFile(dir .. "/src/main.nupp", ("module main\nlocal x = %d\nprint(x)\n"):format(index)))
+        local status = project.build(dir)
+        os.execute("rm -rf '" .. dir .. "'")
+        assert(status == 0, "a fixture project did not build")
+        types.releaseUnreferenced()
+
+        return collectgarbage("count")
+    end
+    -- The first build loads and checks what every later one reuses.
+    buildOnce(1)
+    local settled = buildOnce(2)
+    local last = settled
+    for index = 3, 5 do
+        last = buildOnce(index)
+    end
+    assert(
+        last - settled <= REBUILD_RETAINED_KB,
+        ("three more builds left %.1f MB behind, over the budget of %.1f MB"):format(
+            (last - settled) / 1024,
+            REBUILD_RETAINED_KB / 1024
+        )
+    )
+end
+
 return M
