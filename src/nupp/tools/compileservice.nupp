@@ -120,7 +120,12 @@ type compileservice.Command = {
     executable: string,
     argv: {string},
     stdout: string,
-    stderr: string
+    stderr: string,
+
+    --- A trailing `; echo TEXT$?` that reports the status: the text before and
+    --- after the status, which the caller writes where the shell would have,
+    --- answering the shell's own status, 0.
+    echo: {string}?
 }
 
 -- Unquoted characters the shell gives no meaning to.
@@ -234,6 +239,19 @@ function compileservice.parse(command: string, mode: string): compileservice.Com
     if command:find("[\r\n]") then
         return nil
     end
+    local echo: {string}? = nil
+    local rest, before, after = command:match('^(.-)%s*;%s*echo%s+"([^"$`\\]*)%$%?([^"$`\\]*)"%s*$')
+    if rest == nil then
+        rest, before = command:match("^(.-)%s*;%s*echo%s+'([^']*)'%$%?%s*$")
+        after = ""
+    end
+    if rest == nil then
+        rest, before, after = command:match("^(.-)%s*;%s*echo%s+([%w_:=,.+-]*)%$%?([%w_:=,.+-]*)%s*$")
+    end
+    if rest ~= nil then
+        echo = {before as string, after as string}
+        command = rest as string
+    end
     local list = tokens(command)
     if list == nil or #list == 0 then
         return nil
@@ -288,7 +306,7 @@ function compileservice.parse(command: string, mode: string): compileservice.Com
         at = at + 1
     end
 
-    return {cwd = cwd, env = env, executable = executable, argv = argv, stdout = stdout, stderr = stderr}
+    return {cwd = cwd, env = env, executable = executable, argv = argv, stdout = stdout, stderr = stderr, echo = echo}
 end
 
 --- A path with `.` and `..` resolved, separators made forward, and on Windows the

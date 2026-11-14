@@ -58,6 +58,28 @@ function M.redirectionsApplyInOrder()
     test.eq(parse("/repo/bin/nupp check", "out").stderr, "err")
 end
 
+-- The suites' usual way of reading a status beside merged output.
+function M.aTrailingEchoOfTheStatusIsKept()
+    local forms = {
+        {[[/repo/bin/nupp check 2>&1; echo "__exit__:$?"]], "__exit__:", ""},
+        {"/repo/bin/nupp check 2>&1; echo '__exit__:'$?", "__exit__:", ""},
+        {"/repo/bin/nupp check; echo rc=$?", "rc=", ""},
+        {"/repo/bin/nupp check ; echo $?", "", ""},
+        {[[/repo/bin/nupp check; echo "[$?]"]], "[", "]"},
+    }
+    for _, form in ipairs(forms) do
+        local command = parse(form[1])
+        test.ne(command, nil, form[1])
+        test.eq(command.argv[1], "check", form[1])
+        test.eq(command.echo[1], form[2], form[1])
+        test.eq(command.echo[2], form[3], form[1])
+    end
+    test.eq(parse("/repo/bin/nupp check").echo, nil)
+    test.eq(parse([[/repo/bin/nupp check; echo "$HOME$?"]]), nil)
+    test.eq(parse("/repo/bin/nupp check; echo $? > status"), nil)
+    test.eq(parse("/repo/bin/nupp check; echo done; echo $?"), nil)
+end
+
 function M.anythingNeedingMoreOfAShellIsLeftToIt()
     local refused = {
         "/repo/bin/nupp check | head -1",
@@ -152,8 +174,8 @@ local function capture(command)
     return output, ok, how, code
 end
 
--- `exec` makes the same command one the service does not take, so the shell
--- runs it: the two answers come from the two routes.
+-- A leading `true &&` makes the same command one the service does not take, so
+-- the shell runs it: the two answers come from the two routes.
 function M.anAnsweredCommandReadsAsTheShellsOwn()
     local counts = rawget(_G, "__NUPP_TEST_COMPILE_SERVICE_COUNTS")
     if os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil or os.getenv("NUPP_TEST_COMPILE_SERVICE") == "0" or counts == nil then
@@ -166,12 +188,13 @@ function M.anAnsweredCommandReadsAsTheShellsOwn()
         ("cd '%s' && '%s' check nosuch.nupp 2>&1"):format(dir, NUPP),
         ("'%s' --version"):format(NUPP),
         ("'%s' explain NUPP2004"):format(NUPP),
+        ("cd '%s' && NO_COLOR= '%s' check 2>&1; echo \"__exit__:$?\""):format(dir, NUPP),
     }
     for _, command in ipairs(commands) do
         local before = counts()
         local routed, ok, how, code = capture(command)
         test.eq(counts(), before + 1, "answered by the service: " .. command)
-        local direct = command:match("^cd ") and command:gsub("&& '", "&& exec '", 1) or "exec " .. command
+        local direct = "true && " .. command
         local shell, shellOk, shellHow, shellCode = capture(direct)
         test.eq(counts(), before + 1, "answered by the shell: " .. command)
         -- How long a check took is the one thing two runs of it do not agree on.

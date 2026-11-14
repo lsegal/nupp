@@ -384,6 +384,12 @@ local function routedExecute(command)
         return false
     end
     client:forward(out, err)
+    -- A trailing `echo` of the status writes to the shell's own output, and its
+    -- success is what the shell answers.
+    if parsed.echo then
+        io.stdout:write(parsed.echo[1], tostring(status), parsed.echo[2], "\n")
+        status = 0
+    end
 
     return true, executeResult(status)
 end
@@ -404,6 +410,13 @@ local function routedPopen(command, mode)
         return nil
     end
     client:forward(out, err)
+    if parsed.echo then
+        pipe = pipe or os.tmpname()
+        local tail = assert(io.open(pipe, "ab"))
+        tail:write(parsed.echo[1], tostring(status), parsed.echo[2], "\n")
+        tail:close()
+        status = 0
+    end
     local file = assert(io.open(pipe or (windowsHost and "NUL" or "/dev/null"), mode == "rb" and "rb" or "r"))
     local proxy = {}
     function proxy:read(...)
