@@ -42,12 +42,11 @@
   run IDs, the commit SHA and `ACTIONS_*` tokens no longer change a result's
   fingerprint, so one CI run can reuse another's passes.
 - `nupp test` sizes each lane from the machine's memory as well as its cores,
-  and keeps its workers from growing across suites: shell suites run each in a
-  fresh process, and a Nupp worker that has grown past 1 GB of live heap hands
-  the rest of its queue to a fresh one. On this repository's suite a shell
-  worker used to grow to 5-7 GB, which ran a 16 GB Linux runner out of memory
-  at two workers. It now stays near 100 MB, and four workers finish the
-  Windows shell lane in about two thirds of the time two did.
+  and runs shell suites each in a fresh process, so a worker no longer grows
+  across suites. On this repository's suite a shell worker used to grow to 5-7
+  GB, which ran a 16 GB Linux runner out of memory at two workers. It now
+  stays near 100 MB, and four workers finish the Windows shell lane in about
+  two thirds of the time two did.
 - Every `nupp` process appends its peak resident memory and its arguments to
   the file `NUPP_PEAK_MEMORY_FILE` names, when it is set.
 - On Windows, the first progress line of a build is no longer dropped when the

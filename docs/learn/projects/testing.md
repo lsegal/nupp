@@ -484,10 +484,8 @@ Without `--jobs`, a lane gets one worker per core, but no more than fit in
 three quarters of physical memory at 2.5 GB a worker. A worker's peak is the
 largest suite it runs, not the compiler: compiling one test program peaks
 under 200 MB, which `perfbudgettest` holds. Shell and isolated suites run each
-in a process of their own, so a worker never carries one suite's memory into
-the next. A Nupp worker whose live heap passes 1 GB
-(`NUPP_TEST_WORKER_HEAP_BYTES`) stops taking work once its suite finishes,
-and the run starts a fresh one for whatever is left.
+in a process of their own, so a process worker never carries one suite's
+memory into the next.
 
 `NUPP_PEAK_MEMORY_FILE` names a file that every `nupp` process, including each
 test worker, appends its peak resident memory to as it exits: bytes, a tab, and

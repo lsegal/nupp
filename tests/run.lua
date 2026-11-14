@@ -525,10 +525,6 @@ local queueDir = nil
 -- but runs every claimed piece in a new process so process-global state cannot
 -- cross the suite boundary.
 local freshQueuePieces = os.getenv("NUPP_TEST_FRESH_QUEUE_PIECES") == "1"
---- The live Lua heap past which a queue worker stops taking work (#250). See
---- `takeWork`; `NUPP_TEST_WORKER_HEAP_BYTES` moves it, which is how a test makes a
---- worker hand over after every piece.
-local workerHeapBytes = tonumber(os.getenv("NUPP_TEST_WORKER_HEAP_BYTES") or "") or 1024 * 1024 * 1024
 local supervisedPiece = os.getenv("NUPP_TEST_SUPERVISED_PIECE") == "1"
 local jobs = nil
 -- Workers for one lane only, from `--jobs=shell:2`. A lane whose suites start
@@ -2136,11 +2132,12 @@ end
 --- Memory caps it too, from measurement rather than from fear (#250). The compiler is
 --- not what a worker spends memory on: one compiling a test program peaked at 72-81 MB
 --- on all three hosted platforms, and an AOT build child at 97-160 MB. A worker's peak
---- is the largest suite it runs, and since workers run each suite in a fresh process
---- or hand their queue on once they have grown (see `takeWork`), that is one suite: 2.25
---- GB at most, measured. So a machine runs as many as fit three quarters of its
---- physical memory at the figure below. That is every core on the 16 GB Linux and
---- Windows runners and two of three on the 7 GB macOS one.
+--- is the suite it is running. Process workers run each suite in a fresh process, and
+--- the largest one measured on its own was 2.25 GB; four Nupp workers share one
+--- process, which peaked at 8.8-9.3 GB, about 2.3 GB each. So a machine runs as many
+--- as fit three quarters of its physical memory at the figure below. That is every
+--- core on the 16 GB Linux and Windows runners and two of three on the 7 GB macOS one,
+--- where three Nupp workers swapped until the job timed out.
 local WORKER_PEAK_BYTES = 2.5 * 1024 * 1024 * 1024
 
 local function commandLine(command)
@@ -3302,37 +3299,11 @@ then
             }
         end
 
-        -- Pieces nobody has claimed yet.
-        local function unclaimed(queue)
-            local left = 0
-            for index = 1, #queue.order do
-                local piece = io.open(("%s/piece-%d"):format(queue.path, index), "rb")
-                if piece then
-                    piece:close()
-                    left = left + 1
-                end
-            end
-
-            return left
-        end
-
-        -- Collects a queue's workers, and starts fresh ones for whatever is left while
-        -- any of them handed work back (see `takeWork`) rather than finishing it.
-        local function collectQueue(queue, collect, again)
+        local function collectQueue(queue, collect)
             if not queue then
                 return
             end
             absorb(collect())
-            while again do
-                local left = unclaimed(queue)
-                if left == 0 then
-                    break
-                end
-                os.execute("rm -f '" .. queue.path .. "'/recycled-*")
-                local count = math.min(left, #queue.lanes)
-                beginPhase(("%d suites handed back, continuing across %d fresh workers"):format(left, count))
-                absorb(again(count)())
-            end
             os.execute("rm -rf '" .. queue.path .. "'")
 
             -- Work nobody reported having run. A worker that dies holding a piece
@@ -3412,44 +3383,34 @@ then
             beginPhase(("%d suites across %d Nupp workers"):format(sharedQueue.count, #sharedQueue.lanes))
         end
         local collectShared = sharedQueue and startFanOut(sharedQueue.lanes, true, false, "shared") or nil
-        local function againShared(count)
-            local lanes = {}
-            for index = 1, count do
-                lanes[index] = sharedQueue.lanes[index]
-            end
-
-            return startFanOut(lanes, true, false, "shared")
-        end
         local collectShell
         if shellQueue then
             if sharedQueue and pauseBriefly then
                 local waiting = true
                 local tail = math.max(1, math.floor(#sharedQueue.lanes / 4))
                 while waiting do
-                    -- Every worker having handed its work back means nobody takes the
-                    -- rest until the shared queue is collected and more are started.
-                    local recycled = 0
+                    local pieces = 0
                     for index = 1, #sharedQueue.order do
-                        local marker = io.open(("%s/recycled-%d"):format(sharedQueue.path, index), "rb")
-                        if marker then
-                            marker:close()
-                            recycled = recycled + 1
+                        local piece = io.open(("%s/piece-%d"):format(sharedQueue.path, index), "rb")
+                        if piece then
+                            piece:close()
+                            pieces = pieces + 1
                         end
                     end
-                    waiting = unclaimed(sharedQueue) > tail and recycled < #sharedQueue.lanes
+                    waiting = pieces > tail
                     if waiting then
                         pauseBriefly()
                     end
                 end
                 beginPhase(("%d shell suites joining across %d process workers"):format(#shelling, #shellQueue.lanes))
             elseif sharedQueue then
-                collectQueue(sharedQueue, collectShared, againShared)
+                collectQueue(sharedQueue, collectShared)
                 sharedQueue, collectShared = nil, nil
                 beginPhase(("%d shell suites across %d process workers"):format(#shelling, #shellQueue.lanes))
             end
             collectShell = startFanOut(shellQueue.lanes, true, true, "shell")
         end
-        collectQueue(sharedQueue, collectShared, againShared)
+        collectQueue(sharedQueue, collectShared)
         collectQueue(shellQueue, collectShell)
 
         -- Workers mark completed cases without a newline because none can know
@@ -3853,25 +3814,7 @@ local function takeWork()
     file:close()
 
     local cursor = 0
-    local first = nil
     while true do
-        -- A worker that has grown past its share hands the rest of the queue to a fresh
-        -- one (#250). What suites leave behind in a long-lived worker adds up: the
-        -- shared lane's threads took one process to 9 GB on a Linux runner, and on a
-        -- 7 GB macOS runner swapped until the job timed out. Only after a piece, so
-        -- every worker takes at least one, and on the live heap, so garbage that a
-        -- collection would return does not count. The marker tells a parent still
-        -- waiting on this queue that nobody is taking from it until it starts more.
-        if first and not freshQueuePieces and collectgarbage("count") * 1024 > workerHeapBytes then
-            collectgarbage("collect")
-            if collectgarbage("count") * 1024 > workerHeapBytes then
-                local marker = io.open(("%s/recycled-%d"):format(queueDir, first), "wb")
-                if marker then
-                    marker:close()
-                end
-                return
-            end
-        end
         local took = nil
         for step = 1, #specs do
             local index = (cursor + step - 1) % #specs + 1
@@ -3894,7 +3837,6 @@ local function takeWork()
         if not took then
             return
         end
-        first = first or took
         local spec = specs[took]
         claimed[#claimed + 1] = spec
         if freshQueuePieces then
