@@ -38,6 +38,30 @@ function M.flags(arguments)
     return table.concat(flags, "\0")
 end
 
+-- Bookkeeping a tool call or CI job sets afresh for every invocation: run and
+-- step IDs, the revision being built, per-step file paths and service tokens.
+-- Keyed on, no CI run could ever reuse another's pass. None is a test input,
+-- and `--audit` reports a suite that reads one like any undeclared lookup.
+local transportNames = {}
+for name in ([[
+CODEX_TOOL_CALL_ID
+GITHUB_ACTION GITHUB_ACTION_PATH GITHUB_ACTION_REF GITHUB_ACTION_REPOSITORY
+GITHUB_ACTOR GITHUB_ACTOR_ID GITHUB_BASE_REF GITHUB_ENV GITHUB_EVENT_NAME
+GITHUB_EVENT_PATH GITHUB_HEAD_REF GITHUB_JOB GITHUB_OUTPUT GITHUB_PATH
+GITHUB_REF GITHUB_REF_NAME GITHUB_REF_PROTECTED GITHUB_REF_TYPE
+GITHUB_RETENTION_DAYS GITHUB_RUN_ATTEMPT GITHUB_RUN_ID GITHUB_RUN_NUMBER
+GITHUB_SHA GITHUB_STATE GITHUB_STEP_SUMMARY GITHUB_TRIGGERING_ACTOR
+GITHUB_WORKFLOW GITHUB_WORKFLOW_REF GITHUB_WORKFLOW_SHA
+INVOCATION_ID JOURNAL_STREAM MEMORY_PRESSURE_WATCH MEMORY_PRESSURE_WRITE
+RUNNER_NAME RUNNER_TRACKING_ID SYSTEMD_EXEC_PID
+]]):gmatch("%S+") do
+    transportNames[name] = true
+end
+
+function M.transport(name)
+    return transportNames[name] == true or name:match("^ACTIONS_") ~= nil
+end
+
 -- `command -v` answers in the shell's spelling. Under Git Bash on Windows that
 -- is `/c/...` or `/usr/bin/sh`, without the `.exe`, which no native file API
 -- opens: every lookup then read as a missing executable.
@@ -101,7 +125,7 @@ function M.open(options)
     end
     for item in values:gmatch("([^%z]+)") do
         local name = item:match("^([^=]+)=")
-        if name and name ~= "CODEX_TOOL_CALL_ID" then
+        if name and not M.transport(name) then
             environment[#environment + 1] = item;
             environmentNames[name] = true
         end
@@ -510,29 +534,47 @@ function M.open(options)
         return complete
     end
 
+    -- A suite on the never-cache list executes every time, however well its
+    -- package fingerprints: what it checks is timing, load or lifecycle, which
+    -- no input hash describes. Its package still reuses its other suites.
+    local neverCache = options.neverCache or {}
+    cache.excluded = {}
+    for _, suite in ipairs(options.selected) do
+        if neverCache[suite.name] then
+            cache.excluded[suite.name] = neverCache[suite.name]
+        end
+    end
+
     for directory in pairs(activeDirectories) do
         local policy = (options.policies or {})[directory] or {}
         cache.reasons[directory] = policy.reason or "no input contract"
         if policy.cache == true then
-            local complete = true
-            local members = {}
+            -- The selected, cacheable suites are the unit a result is stored
+            -- for. A lane or group that runs part of a package keys and stores
+            -- its own part, so separate partial runs never evict each other.
+            local members, names = {}, {}
             for _, suite in ipairs(options.catalog) do
-                if (suite.path:match("^(.*)/") or ".") == directory then
+                if (suite.path:match("^(.*)/") or ".") == directory
+                    and selected[suite.name]
+                    and not neverCache[suite.name]
+                then
                     members[suite.name] = true
-                    if not selected[suite.name] then
-                        complete = false
-                    end
+                    names[#names + 1] = suite.name
                 end
             end
-            if complete then
+            table.sort(names)
+            local memberList = table.concat(names, "\0")
+            if #names > 0 then
                 local hash, recent, inputs, reason = key(directory, policy)
                 cache.reasons[directory] = reason or "input contract could not be resolved"
                 if hash then
                     cache.reasons[directory] = recent and "recent input; execute without storing"
                         or "no matching passing result"
-                    local path = store .. "/" .. digest(directory) .. ".json"
+                    local path = store .. "/" .. digest(directory .. "\0" .. options.flags .. "\0" .. memberList)
+                        .. ".json"
                     local item = {
-                        key = hash,
+                        key = digest(hash .. "\0" .. memberList),
+                        memberList = memberList,
                         path = path,
                         recent = recent,
                         inputs = inputs,
@@ -591,7 +633,7 @@ function M.open(options)
                     end
                 end
             else
-                cache.reasons[directory] = "partial package selection"
+                cache.reasons[directory] = "every selected suite is never cached"
             end
         end
     end
@@ -622,6 +664,7 @@ function M.open(options)
                     end
                 end
                 local after, recent = key(directory, item.policy)
+                after = after and digest(after .. "\0" .. item.memberList)
                 if ok and #tests > 0 and after == item.key and not recent then
                     files.mkdir(store)
                     fs.writeFile(item.path, json.encode({key = item.key, tests = tests, suites = rows}))
