@@ -869,12 +869,19 @@ function M.aTestRunsCommandsUseTheBuildTheRunChecked()
             NUPP_LAUNCHER_TOOLCHAIN_KEY = "",
             NUPP_LAUNCHER_ROCKS_ROOT = "",
             NUPP_TOOLCHAIN_ANSWERS = "",
+            -- A job with the pinned LLVM exports its prefix, and the launcher
+            -- would then ask this driver for a code generator it cannot give.
+            NUPP_LLVM_PREFIX = "",
             NUPP_WGPU_LIBRARY = "unused",
         },
         "test",
         root .. "/bin/nupp"
     )
-    assert(status == 0, output)
+    -- The launcher stops quietly when the driver fails, so say what it asked.
+    local asked = io.open(directory .. "/toolchain", "rb")
+    assert(status == 0, ("the launcher exited %s:\n%s\nit asked the toolchain:\n%s"):format(
+        tostring(status), output, asked and asked:read("*a") or "nothing"
+    ))
     local commands = read(directory .. "/commands")
     local runRoot, answers, checkRoot = commands:match("^test run=(%S+) answers=(%S+)\ncheck run=(%S+) answers=")
     assert(runRoot and runRoot == checkRoot, "the run was not handed down:\n" .. commands)
