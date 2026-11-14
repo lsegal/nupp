@@ -446,6 +446,10 @@ first changes nothing. A shard that cannot start, or that writes no report, is
 counted as a failure of its own rather than quietly removing its suites from
 the total.
 
+By default a run makes one worker per processor and never fewer than eight, so
+a small machine still runs eight suites at once; `--jobs=N` names a different
+count.
+
 ```bash
 nupp test --jobs=4        # four shards
 nupp test --jobs=1        # one process
