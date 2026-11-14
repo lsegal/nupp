@@ -249,12 +249,23 @@ end
 ---
 --- All of them are inside the payload or the trailer. Rewriting the stub's own
 --- machine code would be fuzzing the linker.
+---
+--- A case says how to damage the binary rather than holding the damaged copy, and
+--- `make` builds that copy when the case runs: twenty whole copies of a stamped
+--- binary held at once were most of this suite's 2.85 GB peak (#266).
 local function damage(bytes, pick)
     local offset, trailerAt = payloadOffset(bytes)
     local cases = {}
 
     local function mutate(name, at, byte)
-        cases[#cases + 1] = {name = name, bytes = bytes:sub(1, at - 1) .. string.char(byte) .. bytes:sub(at + 1),}
+        cases[
+            #cases + 1
+        ] = {
+            name = name,
+            make = function()
+                return bytes:sub(1, at - 1) .. string.char(byte) .. bytes:sub(at + 1)
+            end,
+        }
     end
 
     for _ = 1, 8 do
@@ -272,14 +283,30 @@ local function damage(bytes, pick)
     end
     for _ = 1, 4 do
         local at = offset + pick(trailerAt - offset)
-        cases[#cases + 1] = {name = "a file truncated at " .. at, bytes = bytes:sub(1, at)}
+        cases[
+            #cases + 1
+        ] = {
+            name = "a file truncated at " .. at,
+            make = function()
+                return bytes:sub(1, at)
+            end,
+        }
     end
-    cases[#cases + 1] = {name = "bytes appended after the trailer", bytes = bytes .. string.rep("\0", 32),}
+    cases[
+        #cases + 1
+    ] = {
+        name = "bytes appended after the trailer",
+        make = function()
+            return bytes .. string.rep("\0", 32)
+        end,
+    }
     cases[
         #cases + 1
     ] = {
         name = "a trailer with its magic removed",
-        bytes = bytes:sub(1, trailerAt) .. "XXXXXXXX" .. bytes:sub(trailerAt + 9),
+        make = function()
+            return bytes:sub(1, trailerAt) .. "XXXXXXXX" .. bytes:sub(trailerAt + 9)
+        end,
     }
 
     return cases
@@ -304,10 +331,11 @@ function M.damageIsDiagnosedRatherThanRun()
     local cases = damage(bytes, sequence(20260811))
     assert(#cases >= 20, "the sweep stopped generating cases")
     for _, case in ipairs(cases) do
-        writeFile(copy, case.bytes)
+        local damaged = case.make()
+        writeFile(copy, damaged)
         assert(os.execute("chmod +x '" .. copy .. "'") == 0)
         local out, status = persistently(("'%s' explain NUPP2001"):format(copy))
-        corrupted(case.name, case.bytes, out, status)
+        corrupted(case.name, damaged, out, status)
     end
     os.execute("rm -rf '" .. dir .. "'")
 end
