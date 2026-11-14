@@ -670,7 +670,8 @@ end
 -- implementation of a builtin root such as `io` or `assert`, and the module a
 -- qualified type names, in code or in an `@raises` line. A worker checking a
 -- module before those would check them itself, which a worker refuses, so the
--- graph scan orders them first.
+-- graph scan orders them first. A module the project does not check as its own is
+-- followed by the coordinator to what it requires, so the scan keeps those too.
 function M.theGraphScanOrdersModulesTheCheckerReadsUnasked()
     local parser = require("nupp.compiler.syntax.parser")
     local header = require("nupp.compiler.project.header")
@@ -702,12 +703,79 @@ return {read = read}
         {declaredModules = declared},
         text
     )
-    testAssert.deepeq(object.dependencies, {
-        "app.codec",
-        "assert",
-        "nupp.runtime.standardio",
-        "nupp.runtime.standardmath",
-    })
+    local found = {}
+    for _, name in ipairs(object.dependencies) do
+        found[name] = true
+    end
+    for _, name in ipairs({"app.codec", "assert", "nupp.runtime.standardio", "nupp.runtime.standardmath"}) do
+        assert(found[name], name .. " is a dependency: " .. table.concat(object.dependencies, ", "))
+    end
+    testAssert.eq(found["nupp.runtime.standardos"], nil, "a root the module never reads is not")
+end
+
+-- A target's sources need not be everything they require. A module outside them is
+-- checked by whichever worker reaches it, and a source it requires in turn has to
+-- be checked before that worker gets there.
+function M.sourcesReachedThroughAnUncheckedModuleAreCheckedFirst()
+    local directory = os.tmpname()
+    os.remove(directory)
+    write(
+        directory .. "/nupp.lua",
+        'return {include = {"src"}, build = {targets = {app = {kind = "modules", entries = {"app.main"}, '
+        .. 'sources = {"src/app/**.nupp"}}}, default = "app"}}\n'
+    )
+    write(
+        directory .. "/src/app/core.nupp",
+        [[
+module app.core
+
+export function base(): number
+    return 40
+end
+]]
+    )
+    write(
+        directory .. "/src/lib/mid.nupp",
+        [[
+module lib.mid
+
+local core = require("app.core")
+
+export function value(): number
+    return core.base() + 1
+end
+]]
+    )
+    for index = 1, 4 do
+        write(
+            directory .. ("/src/app/user%d.nupp"):format(index),
+            (
+                [[
+module app.user%d
+
+local mid = require("lib.mid")
+
+export function value(): number
+    return mid.value() + %d
+end
+]]
+            ):format(index, index)
+        )
+    end
+    write(directory .. "/src/app/main.nupp", 'local user1 = require("app.user1")\nreturn user1.value()\n')
+
+    local serialCode, serialReport, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
+    testAssert.eq(serialCode, 0, "serial fixture: " .. json.encode(serialReport.diagnostics))
+    local code, report, state = coldCheck(directory, {NUPP_CHECK_JOBS = "3"})
+    testAssert.eq(
+        report.timing.parallel.mode,
+        "parallel",
+        "parallel timing mode: " .. tostring(report.timing.parallel.reason)
+    )
+    testAssert.eq(code, 0, "parallel exit status")
+    testAssert.eq(state, serialState, "parallel check records")
+
+    assert(os.remove(directory, true))
 end
 
 -- An alias keeps its defaults as the syntax they were written in, and the module

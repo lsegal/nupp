@@ -110,12 +110,11 @@ export function emit(path: string, parsed: any, header: any, index: any, text: s
         end
     end
 
+    -- Kept whether or not the project declares the module: one it does not is
+    -- checked wherever it is reached, and the coordinator follows it to what it
+    -- requires in turn.
     local function depend(name: string?): nil
-        if name ~= nil
-            and index.declaredModules
-            and index.declaredModules[name]
-            and (not supported or supported[name] ~= false)
-        then
+        if name ~= nil and (not supported or supported[name] ~= false) then
             dependencySet[name as string] = true
         end
     end
