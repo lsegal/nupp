@@ -283,8 +283,37 @@ jobs:
       - name: Check the compiler
         run: ./bin/nupp check
 
+      # Passing results keyed by each suite's content fingerprint: its files and
+      # everything they load, the built compiler, the platform, the lane and the
+      # flags. A fingerprint that cannot be fully accounted for is a miss and
+      # executes, so an approximate restore can only save time, never reuse a
+      # stale pass. Never-cache suites (timing, process lifecycle, measurement)
+      # execute regardless; see `neverCache` in tests/groups.lua.
+      - name: Restore the recorded test results
+        uses: actions/cache/restore@v4
+        with:
+          path: build/.nupp-test-results
+          key: >-
+            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
+            github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Run the shared-process suites
-        run: ./bin/nupp test --fresh --scope=all --lane=shared
+        run: ./bin/nupp test --scope=all --lane=shared
+
+      # Only from a run that completed: a cancelled or timed-out run skips this.
+      # A failing run still saves, because the store only ever holds packages
+      # that executed and passed under an unchanged fingerprint.
+      - name: Save the recorded test results
+        if: success() || failure()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: build/.nupp-test-results
+          key: >-
+            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
+            github.run_id }}-${{ github.run_attempt }}
 
       # Saved explicitly rather than through the action's post step, so a run
       # that fails a suite still keeps the compiler build the next run would
@@ -395,6 +424,22 @@ jobs:
             hashFiles('src/**', 'nupp.lua', 'scripts/toolchain.pins') }}
           restore-keys: |
             nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-
+
+      # Passing results keyed by each suite's content fingerprint: its files and
+      # everything they load, the built compiler, the platform, the lane and the
+      # flags. A fingerprint that cannot be fully accounted for is a miss and
+      # executes, so an approximate restore can only save time, never reuse a
+      # stale pass. Never-cache suites (timing, process lifecycle, measurement)
+      # execute regardless; see `neverCache` in tests/groups.lua.
+      - name: Restore the recorded test results
+        uses: actions/cache/restore@v4
+        with:
+          path: build/.nupp-test-results
+          key: >-
+            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
+            github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-
 
       # Suite durations are what the process lanes are packed from. A clean
       # runner without them packs blind and the busiest shard decides the wall
@@ -605,10 +650,10 @@ jobs:
           set -euo pipefail
           ulimit -c unlimited || true
           if [ "$RUNNER_OS" = Linux ]; then
-            ./bin/nupp test --fresh --scope=all --lane=isolated \
+            ./bin/nupp test --scope=all --lane=isolated \
               --exclude-group=external-corpus,measurement,wasm-conformance
           else
-            ./bin/nupp test --fresh --scope=all --jobs=shell:2 \
+            ./bin/nupp test --scope=all --jobs=shell:2 \
               --exclude-group=external-corpus,measurement,wasm-conformance
           fi
 
@@ -684,7 +729,7 @@ jobs:
           NUPP_TEST_BASH=$(cygpath -w "$bash_path")
           NUPP_TEST_SH=$(cygpath -w "$sh_path")
           export NUPP_TEST_BASH NUPP_TEST_SH
-          ./bin/nupp test --fresh --scope=all --jobs=shell:2 \
+          ./bin/nupp test --scope=all --jobs=shell:2 \
             --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
 
       # What the suite saved, named in the log so a reader knows what the
@@ -710,6 +755,19 @@ jobs:
           path: ${{ runner.temp }}/nupp-worker-dumps
           if-no-files-found: ignore
           retention-days: 7
+
+      # Only from a run that completed: a cancelled or timed-out run skips this.
+      # A failing run still saves, because the store only ever holds packages
+      # that executed and passed under an unchanged fingerprint.
+      - name: Save the recorded test results
+        if: success() || failure()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: build/.nupp-test-results
+          key: >-
+            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
+            github.run_id }}-${{ github.run_attempt }}
 
       # Saved whatever the suite concluded. A failing run still measured every
       # suite that ran, and the next run's shard packing is better for having

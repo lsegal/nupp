@@ -2784,7 +2784,7 @@ local sharded = nil
 local coverageFile = os.getenv("NUPP_COVERAGE_FILE")
 local coverage = coverageFile and rawget(_G, "__nuppCoverage") or nil
 local resultCache, restoreAudit = nil, nil
-local cachedCount, cachedPackages = 0, 0
+local cachedCount, cachedPackages, cacheEligiblePackages = 0, 0, 0
 if not listing
     and #shard == 0
     and not queueDir
@@ -2811,6 +2811,7 @@ then
             root = dir,
             build = buildRoot,
             policies = repositoryPolicy.packages,
+            neverCache = repositoryPolicy.neverCache,
             catalog = discovered,
             selected = suites,
             runner = runnerSource .. source .. (require("nupp.compiler.fs").readFile(dir .. "/groups.lua") or ""),
@@ -2829,6 +2830,14 @@ then
             for _, name in ipairs(names) do
                 io.stderr:write("result cache " .. name .. ": " .. resultCache.reasons[name] .. "\n")
             end
+            names = {}
+            for name in pairs(resultCache.excluded or {}) do
+                names[#names + 1] = name
+            end
+            table.sort(names)
+            for _, name in ipairs(names) do
+                io.stderr:write("result cache " .. name .. ": never cached: " .. resultCache.excluded[name] .. "\n")
+            end
         end
         if resultCache and audit then
             local ok, restore = pcall(resultCache.audit)
@@ -2843,7 +2852,7 @@ then
             for _, info in ipairs(suites) do
                 local packageName = info.path:match("^(.*)/") or "."
                 local package = resultCache.packages[packageName]
-                if not package or not package.hit then
+                if not package or not package.hit or not package.members[info.name] then
                     kept[#kept + 1] = info
                 end
             end
@@ -3892,6 +3901,7 @@ end
 if resultCache and not audit then
     pcall(resultCache.save, results, suiteRecords)
     for _, package in pairs(resultCache.packages) do
+        cacheEligiblePackages = cacheEligiblePackages + 1
         if package.hit then
             cachedPackages = cachedPackages + 1
             for _, record in ipairs(package.hit.tests) do
@@ -4120,12 +4130,19 @@ local function timingReport()
     return table.concat(out)
 end
 
+-- Over the packages that could have hit, so a run whose fingerprints mostly
+-- missed -- a compiler change invalidates nearly everything -- reads as a low
+-- hit rate rather than as an unexplained slow run.
+local cacheHitRate = cacheEligiblePackages > 0 and cachedPackages / cacheEligiblePackages or nil
+
 local report = {
     ok = failed == 0,
     total = total,
     passed = passed,
     cached = cachedCount,
     cachedPackages = cachedPackages,
+    cacheEligiblePackages = cacheEligiblePackages,
+    cacheHitRate = cacheHitRate,
     skipped = skipped,
     notExecuted = notExecutedCount,
     failed = failed,
@@ -4151,6 +4168,8 @@ elseif asJson then
             passed = passed,
             cached = cachedCount,
             cachedPackages = cachedPackages,
+            cacheEligiblePackages = cacheEligiblePackages,
+            cacheHitRate = cacheHitRate,
             skipped = skipped,
             notExecuted = notExecutedCount,
             failed = failed,
@@ -4192,8 +4211,11 @@ else
             "%d tests, %d passed, %d skipped, %d not executed, %d failed (%.1fms)"
         ):format(total, passed, skipped, notExecutedCount, failed, duration)
         or ("%d tests, %d passed, %d skipped, %d failed (%.1fms)"):format(total, passed, skipped, failed, duration)
-    if cachedCount > 0 then
-        summary = summary .. (", %d cached (%d packages)"):format(cachedCount, cachedPackages)
+    -- `passed` counts only cases that executed; a cached pass is never one.
+    if cacheEligiblePackages > 0 then
+        summary = summary .. (
+            ", %d cached (%d of %d packages, %d%% hit rate)"
+        ):format(cachedCount, cachedPackages, cacheEligiblePackages, math.floor(cacheHitRate * 100 + 0.5))
     end
     io.write("\n" .. paint(failed == 0 and "1;32" or "1;31", summary) .. "\n")
     if timingRows > 0 and #suiteRecords > 0 then
