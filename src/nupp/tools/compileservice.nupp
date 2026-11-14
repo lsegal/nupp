@@ -50,9 +50,7 @@ local windows = package.config:sub(1, 1) == "\\"
 local MAX_FRAME: integer = 1048576
 
 --- Commands the service answers. Everything else keeps its own process.
-local ANSWERED: {
-    [string]: boolean
-} = {
+local ANSWERED: {[string]: boolean} = {
     [""] = true,
     ["-h"] = true,
     ["--help"] = true,
@@ -96,12 +94,11 @@ local function answered(argv: {string}): (boolean, boolean)
     if help or ANSWERED[name] then
         return true, help == true
     end
-    -- One answer each, unlike the server `lsp` and `lsp serve` start.
     if name == "lsp" then
+        -- One answer each, unlike the server `lsp` and `lsp serve` start.
         return second ~= "" and second ~= "serve" and second:sub(1, 1) ~= "-", false
-    end
-    -- Listing the tasks runs none of them.
-    if name == "task" then
+    elseif name == "task" then
+        -- Listing the tasks runs none of them.
         for _, word in ipairs(argv) do
             if word == "--list" or word == "-l" then
                 return true, false
