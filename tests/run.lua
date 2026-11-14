@@ -506,7 +506,11 @@ local excludedGroups = {}
 -- shares reusable process workers, and `isolated` needs a process boundary
 -- around its runtime state. A full run combines the latter two on one process
 -- worker queue, but they remain separate answers to `--lane`.
-local lane = nil
+--
+-- Several may be named at once, `--lane=isolated,shell`. One run of several
+-- lanes is one build of the compiler, runner and provider they all use, where a
+-- run per lane repeated it for each.
+local chosenLanes = nil
 local scope = nil
 local fresh = false
 local audit = false
@@ -527,6 +531,11 @@ local freshQueuePieces = os.getenv("NUPP_TEST_FRESH_QUEUE_PIECES") == "1"
 local workerHeapBytes = tonumber(os.getenv("NUPP_TEST_WORKER_HEAP_BYTES") or "") or 1024 * 1024 * 1024
 local supervisedPiece = os.getenv("NUPP_TEST_SUPERVISED_PIECE") == "1"
 local jobs = nil
+-- Workers for one lane only, from `--jobs=shell:2`. A lane whose suites start
+-- children of their own -- the shell lane's cold native builds -- can want fewer
+-- than the rest, and saying so here keeps it in the same run rather than a run
+-- of its own that builds everything again.
+local laneJobs = {}
 local colorMode = "auto"
 local colorSeen = false
 local colorProblem = nil
@@ -579,7 +588,18 @@ for _, argument in ipairs(arg) do
     elseif argument:match("^%-%-timings=") then
         timingRows = tonumber(argument:match("^%-%-timings=(%d+)$")) or timingRows
     elseif argument:match("^%-%-jobs=") then
-        jobs = tonumber(argument:match("^%-%-jobs=(%d+)$"))
+        for spec in argument:sub(#"--jobs=" + 1):gmatch("[^,]+") do
+            local named, count = spec:match("^(%a+):(%d+)$")
+            if named then
+                if named ~= "shared" and named ~= "shell" and named ~= "isolated" then
+                    io.stderr:write("nupp: --jobs=LANE:N needs a lane of shared, shell, or isolated\n")
+                    os.exit(2)
+                end
+                laneJobs[named] = tonumber(count)
+            else
+                jobs = tonumber(spec:match("^(%d+)$"))
+            end
+        end
     elseif argument:match("^%-%-queue=") then
         queueDir = argument:sub(#"--queue=" + 1)
     elseif argument:match("^%-%-shard=") then
@@ -599,10 +619,13 @@ for _, argument in ipairs(arg) do
             excludedGroups[#excludedGroups + 1] = name
         end
     elseif argument:match("^%-%-lane=") then
-        lane = argument:sub(#"--lane=" + 1)
-        if lane ~= "shared" and lane ~= "shell" and lane ~= "isolated" then
-            io.stderr:write("nupp: --lane must be shared, shell, or isolated\n")
-            os.exit(2)
+        chosenLanes = chosenLanes or {}
+        for named in argument:sub(#"--lane=" + 1):gmatch("[^,]+") do
+            if named ~= "shared" and named ~= "shell" and named ~= "isolated" then
+                io.stderr:write("nupp: --lane must be shared, shell, or isolated\n")
+                os.exit(2)
+            end
+            chosenLanes[named] = true
         end
     elseif argument == "--list-suites" then
         listing = "suites"
@@ -2725,10 +2748,10 @@ local function suiteLane(suiteInfo)
     return usesShell(suiteInfo) and "shell" or "shared"
 end
 
-if lane then
+if chosenLanes then
     local kept = {}
     for _, suiteInfo in ipairs(suites) do
-        if lane == suiteLane(suiteInfo) then
+        if chosenLanes[suiteLane(suiteInfo)] then
             kept[#kept + 1] = suiteInfo
         end
     end
@@ -2806,7 +2829,7 @@ local sharded = nil
 local coverageFile = os.getenv("NUPP_COVERAGE_FILE")
 local coverage = coverageFile and rawget(_G, "__nuppCoverage") or nil
 local resultCache, restoreAudit = nil, nil
-local cachedCount, cachedPackages = 0, 0
+local cachedCount, cachedPackages, cacheEligiblePackages = 0, 0, 0
 if not listing
     and #shard == 0
     and not queueDir
@@ -2833,6 +2856,7 @@ then
             root = dir,
             build = buildRoot,
             policies = repositoryPolicy.packages,
+            neverCache = repositoryPolicy.neverCache,
             catalog = discovered,
             selected = suites,
             runner = runnerSource .. source .. (require("nupp.compiler.fs").readFile(dir .. "/groups.lua") or ""),
@@ -2851,6 +2875,14 @@ then
             for _, name in ipairs(names) do
                 io.stderr:write("result cache " .. name .. ": " .. resultCache.reasons[name] .. "\n")
             end
+            names = {}
+            for name in pairs(resultCache.excluded or {}) do
+                names[#names + 1] = name
+            end
+            table.sort(names)
+            for _, name in ipairs(names) do
+                io.stderr:write("result cache " .. name .. ": never cached: " .. resultCache.excluded[name] .. "\n")
+            end
         end
         if resultCache and audit then
             local ok, restore = pcall(resultCache.audit)
@@ -2865,7 +2897,7 @@ then
             for _, info in ipairs(suites) do
                 local packageName = info.path:match("^(.*)/") or "."
                 local package = resultCache.packages[packageName]
-                if not package or not package.hit then
+                if not package or not package.hit or not package.members[info.name] then
                     kept[#kept + 1] = info
                 end
             end
@@ -3331,32 +3363,35 @@ then
         end
 
         local workerCount = jobs or defaultJobs()
+        local isolatedCount = laneJobs.isolated or workerCount
+        local sharedCount = laneJobs.shared or workerCount
+        local shellCount = laneJobs.shell or workerCount
         local isolatedQueue = prepareQueue(
             alone,
             true,
-            math.min(workerCount, #alone),
+            math.min(isolatedCount, #alone),
             "isolated",
             nil,
             nil,
-            workerCount
+            isolatedCount
         )
         local sharedQueue = prepareQueue(
             shareable,
             false,
-            math.min(workerCount, #shareable),
+            math.min(sharedCount, #shareable),
             "shared",
             nil,
             nil,
-            workerCount
+            sharedCount
         )
         local shellQueue = prepareQueue(
             shelling,
             true,
-            math.min(workerCount, #shelling),
+            math.min(shellCount, #shelling),
             "shell",
             nil,
             nil,
-            workerCount
+            shellCount
         )
         if isolatedQueue then
             beginPhase(("%d isolated suites across %d process workers"):format(#alone, #isolatedQueue.lanes))
@@ -3973,6 +4008,7 @@ end
 if resultCache and not audit then
     pcall(resultCache.save, results, suiteRecords)
     for _, package in pairs(resultCache.packages) do
+        cacheEligiblePackages = cacheEligiblePackages + 1
         if package.hit then
             cachedPackages = cachedPackages + 1
             for _, record in ipairs(package.hit.tests) do
@@ -4201,12 +4237,19 @@ local function timingReport()
     return table.concat(out)
 end
 
+-- Over the packages that could have hit, so a run whose fingerprints mostly
+-- missed -- a compiler change invalidates nearly everything -- reads as a low
+-- hit rate rather than as an unexplained slow run.
+local cacheHitRate = cacheEligiblePackages > 0 and cachedPackages / cacheEligiblePackages or nil
+
 local report = {
     ok = failed == 0,
     total = total,
     passed = passed,
     cached = cachedCount,
     cachedPackages = cachedPackages,
+    cacheEligiblePackages = cacheEligiblePackages,
+    cacheHitRate = cacheHitRate,
     skipped = skipped,
     notExecuted = notExecutedCount,
     failed = failed,
@@ -4232,6 +4275,8 @@ elseif asJson then
             passed = passed,
             cached = cachedCount,
             cachedPackages = cachedPackages,
+            cacheEligiblePackages = cacheEligiblePackages,
+            cacheHitRate = cacheHitRate,
             skipped = skipped,
             notExecuted = notExecutedCount,
             failed = failed,
@@ -4273,8 +4318,11 @@ else
             "%d tests, %d passed, %d skipped, %d not executed, %d failed (%.1fms)"
         ):format(total, passed, skipped, notExecutedCount, failed, duration)
         or ("%d tests, %d passed, %d skipped, %d failed (%.1fms)"):format(total, passed, skipped, failed, duration)
-    if cachedCount > 0 then
-        summary = summary .. (", %d cached (%d packages)"):format(cachedCount, cachedPackages)
+    -- `passed` counts only cases that executed; a cached pass is never one.
+    if cacheEligiblePackages > 0 then
+        summary = summary .. (
+            ", %d cached (%d of %d packages, %d%% hit rate)"
+        ):format(cachedCount, cachedPackages, cacheEligiblePackages, math.floor(cacheHitRate * 100 + 0.5))
     end
     io.write("\n" .. paint(failed == 0 and "1;32" or "1;31", summary) .. "\n")
     if timingRows > 0 and #suiteRecords > 0 then

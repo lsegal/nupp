@@ -201,6 +201,31 @@ function M.classifiesNestedSuitesFromTheirActualSources()
     test.eq(run(dir .. "/run.lua", "--lane=shared --list-suites"), "puretest\n")
     test.eq(run(dir .. "/run.lua", "--lane=shell --list-suites"), "shelltest\n")
     test.eq(run(dir .. "/run.lua", "--lane=isolated --list-suites"), "isolatedtest\n")
+    -- Lanes named together are one run, which is one build for all of them.
+    local together = {}
+    for name in run(dir .. "/run.lua", "--lane=shell,isolated --list-suites"):gmatch("[^\n]+") do
+        together[#together + 1] = name
+    end
+    table.sort(together)
+    test.eq(table.concat(together, " "), "isolatedtest shelltest")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
+-- `--jobs=LANE:N` sizes one lane and leaves the others at `--jobs=N` or the
+-- default; a lane it does not know is refused rather than ignored.
+function M.sizesOneLaneWithoutAnotherRun()
+    local dir = os.tmpname()
+    os.remove(dir)
+    local fs = require("nupp.compiler.fs")
+    assert(fs.mkdir(dir .. "/nested"))
+    write(dir .. "/run.lua", read(ROOT .. "/tests/run.lua"))
+    write(dir .. "/nested/puretest.lua", "return {passes = function() end}\n")
+    test.eq(run(dir .. "/run.lua", "--jobs=4,shell:2 --list-suites"), "puretest\n")
+    local output, invocation = capturedRun(
+        (MODULES .. "NUPP_TEST_BUILD=build luajit %q --jobs=gpu:2 --list-suites 2>&1"):format(dir .. "/run.lua")
+    )
+    test.eq(invocation.status, 2, "an unknown lane was accepted" .. evidence(invocation))
+    test.matches(output, "%-%-jobs=LANE:N needs a lane of shared, shell, or isolated")
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 

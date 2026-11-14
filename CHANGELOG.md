@@ -32,3 +32,23 @@
 - `nupp aot --emit llvm` and `--emit llvm-library` declare the C functions a
   native program calls in name order. The order used to change from run to
   run, so compiling the same source twice could give different IR.
+- `nupp test` reuses recorded passes for part of a package, so a run limited
+  to one lane, group or list of suites no longer re-runs a package just because
+  it did not select all of it. A test policy's new `neverCache` map names
+  suites that always execute, such as timing, process-lifecycle and
+  measurement suites, while the rest of their package is still reused. The
+  summary and the `--json` report now give the cache hit rate
+  (`cacheEligiblePackages`, `cacheHitRate`) beside the cached count, and CI
+  run IDs, the commit SHA and `ACTIONS_*` tokens no longer change a result's
+  fingerprint, so one CI run can reuse another's passes.
+- `nupp test` sizes each lane from the machine's memory as well as its cores,
+  and keeps its workers from growing across suites: shell suites run each in a
+  fresh process, and a Nupp worker that has grown past 1 GB of live heap hands
+  the rest of its queue to a fresh one. On this repository's suite a shell
+  worker used to grow to 5-7 GB, which ran a 16 GB Linux runner out of memory
+  at two workers. It now stays near 100 MB, and four workers finish the
+  Windows shell lane in about two thirds of the time two did.
+- Every `nupp` process appends its peak resident memory and its arguments to
+  the file `NUPP_PEAK_MEMORY_FILE` names, when it is set.
+- On Windows, the first progress line of a build is no longer dropped when the
+  build starts early in its process.

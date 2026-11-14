@@ -49,9 +49,17 @@ local REPORT_SCHEMA = {
         },
         ok = {type = "boolean"},
         total = {type = "integer"},
-        passed = {type = "integer"},
-        cached = {type = "integer", description = "Cases reused from complete passing packages."},
+        passed = {type = "integer", description = "Cases that executed in this run and passed."},
+        cached = {type = "integer", description = "Cases reused from a recorded pass; never counted in `passed`."},
         cachedPackages = {type = "integer"},
+        cacheEligiblePackages = {
+            type = "integer",
+            description = "Packages whose fingerprint resolved, so a recorded pass could have been reused."
+        },
+        cacheHitRate = {
+            type = "number",
+            description = "cachedPackages over cacheEligiblePackages, from 0 to 1. Absent when nothing was eligible."
+        },
         skipped = {type = "integer"},
         notExecuted = {type = "integer"},
         failed = {type = "integer"},
@@ -462,8 +470,9 @@ end
 --- Coverage options belong to Nupp. Every other argument is preserved in
 --- order for the bundled runner or the project's configured test command.
 --- The bundled runner accepts suite names, `--json`, `--verbose`, `--jobs=N`,
---- repeated `--group=NAME`, `--exclude=SUITE`, `--exclude-group=NAME`, one of
---- `--lane=shared|shell|isolated`, `--list-suites`, `--list-cases`,
+--- `--jobs=LANE:N`, repeated `--group=NAME`, `--exclude=SUITE`,
+--- `--exclude-group=NAME`, `--lane=shared|shell|isolated` or several of them
+--- separated by commas, `--list-suites`, `--list-cases`,
 --- `--list-groups`, `--case=SUITE/CASE`, `--rerun=REPORT`, and
 --- `--scope=unit|component|integration|delivery|all`, `--fresh`, `--audit`, and
 --- `--timings[=N]`. Those remain forwarded arguments rather than fields of this
