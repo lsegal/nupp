@@ -1167,44 +1167,92 @@ function modules.compileChecked(job: modules.CompileJob): modules.Compiled
 end
 
 --- `items` reordered so each comes after the items it requires, read off the project
---- headers. Items outside the list are not followed, and a cycle is broken where the
---- walk first meets it; otherwise the list keeps the order it was given in.
+--- headers. Items outside the list are not followed. The members of a require cycle
+--- stay in the order they were given in, because the member checked first is the one
+--- whose interface the cycle reads on its re-entrant edge: which one that is decides
+--- what the others see, and has to be the one it always was.
 local function bottomUp(inc: Inc, items: {any}): {any}
     local first: {[string]: integer} = {}
     for position, item in ipairs(items) do
         first[item.path] = first[item.path] or position
     end
+    local requiresOf: {[integer]: {integer}} = {}
+
+    local function requires(position: integer): {integer}
+        local found = requiresOf[position]
+        if found == nil then
+            local reached: {integer} = {}
+            local header = inc.projectHeader(items[position].path)
+            for _, name in ipairs(header and header.dependencies or {}) do
+                local path = inc.modulePath(name)
+                local at = path and first[normalize(path as string)] or nil
+                if at ~= nil then
+                    reached[#reached + 1] = at
+                end
+            end
+            requiresOf[position] = reached
+            found = reached
+        end
+
+        return found
+    end
+
+    -- Tarjan's walk, without recursion: a component is finished only after every
+    -- component it requires, so finishing order is dependency order.
     local ordered: {any} = {}
-    local visited: {[string]: boolean} = {}
+    local index: {[integer]: integer} = {}
+    local low: {[integer]: integer} = {}
+    local open: {integer} = {}
+    local isOpen: {[integer]: boolean} = {}
+    local counter: integer = 0
+
+    local function enter(position: integer): any
+        counter = counter + 1
+        index[position], low[position] = counter, counter
+        open[#open + 1] = position
+        isOpen[position] = true
+
+        return {at = position, next = 0}
+    end
+
     for position, start in ipairs(items) do
         if first[start.path] ~= position then
             -- The same path queued twice is processed once; the copy keeps its place.
             ordered[#ordered + 1] = start
-        elseif not visited[start.path] then
-            visited[start.path] = true
-            local frames: {any} = {{item = start, at = 0}}
+        elseif index[position] == nil then
+            local frames: {any} = {enter(position)}
             while #frames > 0 do
                 local frame = frames[#frames]
-                if frame.requires == nil then
-                    local requires: {any} = {}
-                    local header = inc.projectHeader(frame.item.path)
-                    for _, name in ipairs(header and header.dependencies or {}) do
-                        local path = inc.modulePath(name)
-                        local at = path and first[normalize(path as string)] or nil
-                        if at ~= nil then
-                            requires[#requires + 1] = items[at]
+                local at = frame.at as integer
+                frame.next = frame.next + 1
+                local target = requires(at)[frame.next as integer]
+                if target ~= nil then
+                    local reachedAt = index[target]
+                    if reachedAt == nil then
+                        frames[#frames + 1] = enter(target)
+                    elseif isOpen[target] and reachedAt < (low[at] or 0) then
+                        low[at] = reachedAt
+                    end
+                else
+                    frames[#frames] = nil
+                    local parent = frames[#frames]
+                    local lowest = low[at] or 0
+                    if parent ~= nil and lowest < (low[parent.at as integer] or 0) then
+                        low[parent.at as integer] = lowest
+                    end
+                    if low[at] == index[at] then
+                        local members: {integer} = {}
+                        repeat
+                            local member = open[#open]
+                            open[#open] = nil
+                            isOpen[member] = nil
+                            members[#members + 1] = member
+                        until member == at
+                        table.sort(members)
+                        for _, member in ipairs(members) do
+                            ordered[#ordered + 1] = items[member]
                         end
                     end
-                    frame.requires = requires
-                end
-                frame.at = frame.at + 1
-                local required = frame.requires[frame.at]
-                if required == nil then
-                    frames[#frames] = nil
-                    ordered[#ordered + 1] = frame.item
-                elseif not visited[required.path] then
-                    visited[required.path] = true
-                    frames[#frames + 1] = {item = required, at = 0}
                 end
             end
         end
