@@ -3943,6 +3943,16 @@ function types.nominal(name: string, declKind: string, declarationKey: string?):
     return t
 end
 
+--- Keeps a nominal a stored prelude restored as the compiler-owned declaration of
+--- its key, as it would have been had this process checked the prelude. The last
+--- one restored is the one the environment being opened uses.
+function types.adoptNominal(t: types.Nominal): nil
+    local key = t.declarationKey
+    if key ~= nil then
+        compilerNominals[key] = t
+    end
+end
+
 --- The compiler-owned declaration under `declarationKey`, in a worker.
 ---
 --- Such a declaration was made before the worker had a namespace, so another

@@ -134,6 +134,12 @@ local function checkBatch(request: any): any
         if image == nil or image.fingerprint ~= import.fingerprint then
             return {ok = false, problem = "interface bundle: " .. tostring(problem or "fingerprint mismatch")}
         end
+        -- What checking the bundle's modules declared to the FFI is declared here
+        -- too, as checking them in this process would have. Bundles arrive
+        -- dependencies first, so a block naming another module's C types follows it.
+        for _, block in ipairs(image.cdefBlocks or {}) do
+            require("nupp.compiler.cinterop.cheader").declare(block as string)
+        end
         local semantics, decodeProblem = interfaceimage.decode(image, {
             nominals = context.nominals,
             arenas = context.interfaceArenas,
@@ -232,6 +238,9 @@ local function checkBatch(request: any): any
 
     local interfaces: {[string]: any} = {}
     local interfaceNames: {string} = {}
+    -- A literal `ffi.cdef` block declares to the process that checks it, not through
+    -- the module's interface, so the bundle carries the blocks for its readers.
+    local cdefBlocks: {string} = {}
     for _, source in ipairs(request.sources or {}) do
         local path = normalize(source.path)
         local name = source.name as string?
@@ -242,6 +251,9 @@ local function checkBatch(request: any): any
             semantic.path = path
             interfaces[name] = semantic
             interfaceNames[#interfaceNames + 1] = name
+            for _, block in ipairs(semantic.exports and semantic.exports.cdefBlocks or {}) do
+                cdefBlocks[#cdefBlocks + 1] = block
+            end
         end
     end
     table.sort(interfaceNames)
@@ -257,6 +269,7 @@ local function checkBatch(request: any): any
         if bundle == nil then
             return {ok = false, problem = "interface bundle: " .. tostring(imageProblem)}
         end
+        bundle.cdefBlocks = cdefBlocks
         local prerequisites: {string} = {}
         local seenPrerequisite: {[string]: boolean} = {}
         for _, node in ipairs(bundle.descriptor and bundle.descriptor.types or {}) do
