@@ -19,8 +19,8 @@
 # memory it holds. The output directory is fresh, so nothing is reused.
 #
 # The build is the one a checkout without the pinned LLVM does. With LLVM, the
-# test runner's host links it in, and that link runs in this process through
-# lld: about 450 MB more, every time. CI's shared toolchain cache sometimes
+# test runner's host links it in, and the build peaked about 450 MB higher,
+# every time. CI's shared toolchain cache sometimes
 # carried an LLVM tree another job had put there, so one commit measured 716 MB
 # in one run and 1145 MB in the next (#303). The two are different builds, not
 # noise, so each has its own budget, and `--llvm` measures the second.
@@ -28,7 +28,10 @@
 # Most of that 450 MB was never the link. The link runs in a child, which the
 # peak does not count; what the build did was read the 140 MB host into a string
 # and copy it into the stamped binary, holding both. The stamp now copies the
-# host a block at a time (#310), and the two budgets differ by what is left.
+# host a block at a time (#310). Three runs a platform, before and after: Linux
+# 882-895 MB to 718-725, macOS 1537-1557 to 699-735, Windows 1146-1155 to
+# 795-817. The default budget is Windows's; CI holds Linux and macOS to 850, so
+# a return of the old copy fails there as well.
 #
 # Usage: scripts/build-memory-budget [--llvm] [BUDGET_MB]
 set -eu
@@ -39,7 +42,7 @@ if [ "${1:-}" = --llvm ]; then
     shift
 fi
 if [ "$llvm" = true ]; then
-    budget_mb=${1:-${NUPP_BUILD_MEMORY_LLVM_BUDGET_MB:-LLVM_BUDGET}}
+    budget_mb=${1:-${NUPP_BUILD_MEMORY_LLVM_BUDGET_MB:-950}}
 else
     budget_mb=${1:-${NUPP_BUILD_MEMORY_BUDGET_MB:-900}}
 fi

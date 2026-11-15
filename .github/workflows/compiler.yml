@@ -1230,8 +1230,9 @@ jobs:
   # The same build where the pinned LLVM is in place, as it is in every checkout
   # that provisions it and in every job that uses pinned-llvm: the test runner's
   # host then links LLVM in and is about 140 MB, and nothing else held that
-  # build to a budget (#303, #310). Its own number, because the two builds
-  # differ by more than either one's run-to-run noise.
+  # build to a budget (#303, #310). Stamping that host used to read it whole
+  # and copy it, which put 170-830 MB on the peak depending on the platform,
+  # so it has budgets of its own that a return of anything like that fails.
   build-memory-llvm:
     name: Full build memory with LLVM / ${{ matrix.name }}
     needs: classify
@@ -1244,9 +1245,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {name: Linux x64, os: ubuntu-24.04}
-          - {name: macOS arm64, os: macos-15}
-          - {name: Windows x64, os: windows-2022}
+          # Set from three runs each: Linux 718-725 MB, macOS 699-735, Windows
+          # 795-817 (#310).
+          - {name: Linux x64, os: ubuntu-24.04, budget: 850}
+          - {name: macOS arm64, os: macos-15, budget: 850}
+          - {name: Windows x64, os: windows-2022, budget: 950}
     defaults:
       run:
         shell: bash
@@ -1279,7 +1282,7 @@ jobs:
         run: ./bin/nupp --version
 
       - name: Hold the LLVM-linked full build to its memory budget
-        run: ./scripts/build-memory-budget --llvm
+        run: ./scripts/build-memory-budget --llvm ${{ matrix.budget }}
 
   # The one status a ruleset should require. Its meaning does not change when
   # the jobs above are reorganized, renamed, or split, and it cannot pass by a
