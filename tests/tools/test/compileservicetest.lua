@@ -3,9 +3,10 @@
 -- command run by the shell.
 local test = require("assert")
 local compileservice = require("nupp.tools.compileservice")
--- The runner puts its route in front of the runtime's `popen` before each case,
--- and only once that is loaded.
+-- The runner puts its route in front of the runtime's `popen` and the compiler's
+-- process module before each case, and only once they are loaded.
 require("nupp.runtime.standardio")
+local process = require("nupp.compiler.process")
 local M = {}
 
 local ROOT = debug.getinfo(1, "S").source:match("^@(.+)/tests/")
@@ -70,6 +71,7 @@ function M.aTrailingReportOfTheStatusIsKept()
         {"/repo/bin/nupp check 2>&1; printf ' __status__:%s' $?", " __status__:" .. S, "pipe"},
         {[[/repo/bin/nupp check > out 2>&1; printf '%s\n' "$?" > status]], S .. "\n", "file:status"},
         {"/repo/bin/nupp check; echo $? >/dev/null", S .. "\n", "null"},
+        {"/repo/bin/nupp check 2>&1; printf '\n__status__:%s' $?", "\n__status__:" .. S, "pipe"},
     }
     for _, form in ipairs(forms) do
         local command = parse(form[1])
@@ -137,12 +139,12 @@ function M.onlyThisCheckoutsCompilerCommandsAreAnswered()
     test.eq(answered.cwd, "/work/p")
     test.eq(answered.argv[1], "build")
     test.eq(request("/other/bin/nupp check"), nil)
+    -- A relative program is found from where the command's `cd` went: another
+    -- tree's launcher is not this checkout's compiler.
+    test.eq(request("cd /tmp/planted && ./bin/nupp check", "/repo"), nil)
+    test.ne(request("cd /repo && ./bin/nupp check", "/work"), nil)
     test.eq(request("nupp check"), nil)
-    -- A relative launcher is the one beside the command's own `cd`, so a copied
-    -- tree's `./bin/nupp` stays that tree's even from inside this checkout.
-    test.eq(request("cd /tree && ./bin/nupp --help", "/repo"), nil)
-    test.ne(request("cd /repo/src && ../bin/nupp check", "/work"), nil)
-    for _, name in ipairs({"run", "test", "lsp", "watch", "bench", "task", "fixpoint", "rock", "__comptime-worker"}) do
+    for _, name in ipairs({"test", "lsp", "watch", "bench", "task", "fixpoint", "rock", "__comptime-worker"}) do
         test.eq(request("/repo/bin/nupp " .. name), nil, name)
     end
     -- Builds of the checkout itself keep the launcher's build lock.
@@ -158,11 +160,71 @@ function M.onlyThisCheckoutsCompilerCommandsAreAnswered()
     test.ne(request("/repo/bin/nupp lsp inspect --json main.nupp 1 1"), nil)
     test.ne(request("/repo/bin/nupp task --list --json"), nil)
     test.ne(request("/repo/bin/nupp __complete bash 2 check --js"), nil)
+    -- A project of its own beneath the checkout is not the checkout.
+    local windows = package.config:sub(1, 1) == "\\"
+    local checkout = compileservice.normalize(os.tmpname(), windows)
+    os.remove(checkout)
+    assert(os.execute("mkdir -p '" .. checkout .. "/fixture/src' '" .. checkout .. "/tests'") == 0)
+    local manifest = assert(io.open(checkout .. "/fixture/nupp.lua", "wb"))
+    manifest:write("return {}\n")
+    manifest:close()
+    local function build(cwd)
+        return compileservice.request(parse(checkout .. "/bin/nupp build"), checkout, cwd, windows)
+    end
+    test.ne(build(checkout .. "/fixture/src"), nil)
+    test.ne(build(checkout .. "/fixture"), nil)
+    test.eq(build(checkout .. "/tests"), nil)
+    test.eq(build(checkout), nil)
+    os.execute("rm -rf '" .. checkout .. "'")
+    -- So does asking for a report's schema.
+    test.ne(request("/repo/bin/nupp build --schema", "/repo"), nil)
+    test.ne(request("/repo/bin/nupp bench --list --file x.bench.nupp --schema"), nil)
+    test.eq(request("/repo/bin/nupp bench --list --json"), nil)
+    test.eq(request("/repo/bin/nupp run main.nupp --schema").spawn, true)
     test.eq(request("/repo/bin/nupp lsp serve"), nil)
     test.eq(request("/repo/bin/nupp lsp --stdio"), nil)
     test.eq(request("/repo/bin/nupp task build"), nil)
-    -- The words after `run`'s file are the program's.
-    test.eq(request("/repo/bin/nupp run main.nupp --help"), nil)
+    -- `run`'s program keeps a process of its own, which the service starts; the
+    -- words after its file are the program's, and `--watch` stays up.
+    test.eq(request("/repo/bin/nupp run main.nupp").spawn, true)
+    test.eq(request("/repo/bin/nupp run -O2 main.nupp --help").spawn, true)
+    test.eq(request("/repo/bin/nupp run main.nupp --watch").spawn, true)
+    test.eq(request("/repo/bin/nupp run --watch main.nupp"), nil)
+    test.eq(request("/repo/bin/nupp run --help").spawn, false)
+    test.eq(request("/repo/bin/nupp check").spawn, false)
+end
+
+-- `PATH='dir':"$PATH"` in front of the compiler, or of a bare `nupp` that
+-- search path finds in this checkout.
+function M.aSearchPathAssignmentKeepsTheCallersOwn()
+    local P = compileservice.PATH
+    local command = parse([[cd /p && PATH='/repo/bin':"$PATH" NO_COLOR= nupp check 2>&1]])
+    test.eq(command.env[1][1], "PATH")
+    test.eq(command.env[1][2], "/repo/bin:" .. P)
+    test.eq(command.env[2][1], "NO_COLOR")
+    test.eq(command.executable, "nupp")
+    test.eq(parse("PATH=/x:${PATH} /repo/bin/nupp check").env[1][2], "/x:" .. P)
+    test.eq(parse("PATH=$PATH:/x /repo/bin/nupp check").env[1][2], P .. ":/x")
+    for _, refused in ipairs({
+        [[X="$PATH" /repo/bin/nupp check]],
+        "/repo/bin/nupp check $PATH",
+        "/repo/bin/nupp check; echo $PATH",
+        "PATH=$PATHS /repo/bin/nupp check",
+    }) do
+        test.eq(parse(refused), nil, refused)
+    end
+
+    local function request(text)
+        return compileservice.request(parse(text), "/repo", "/work", false)
+    end
+
+    local own = os.getenv("PATH") or ""
+    test.eq(request([[PATH='/repo/bin':"$PATH" nupp check]]).env[1][2], "/repo/bin:" .. own)
+    test.ne(request("PATH=../repo/bin:$PATH nupp check"), nil)
+    test.ne(request("PATH=/work/x/../../repo/bin /repo/bin/nupp check"), nil)
+    -- A `nupp` the caller's own search path finds first is not one this can see.
+    test.eq(request("PATH=$PATH:/repo/bin nupp check"), nil)
+    test.eq(request("PATH=/other/bin:$PATH nupp check"), nil)
 end
 
 function M.windowsGetsTheWordsANativeProgramWouldHave()
@@ -179,6 +241,26 @@ function M.windowsGetsTheWordsANativeProgramWouldHave()
     -- Git Bash translates other POSIX paths in ways only it knows.
     test.eq(request("C:/repo/bin/nupp check /tmp/main.nupp"), nil)
     test.eq(request("X=/dev/null C:/repo/bin/nupp check"), nil)
+    -- A native program gets a search path separated by semicolons.
+    local own = os.getenv("PATH") or ""
+    test.eq(request([[PATH='/c/repo/bin':"$PATH" nupp check]]).env[1][2], "C:/repo/bin;" .. own)
+    test.eq(request([[PATH='C:/repo/bin':/d/x:"$PATH" nupp check]]).env[1][2], "C:/repo/bin;D:/x;" .. own)
+    -- An argv a caller passed is already what the compiler receives.
+    local native = compileservice.request(
+        {
+            env = {{"PATH", [[C:\repo\bin;D:\x]]}},
+            executable = "nupp",
+            argv = {"check", "/tmp/x"},
+            stdout = "pipe",
+            stderr = "pipe",
+            native = true,
+        },
+        "C:/repo",
+        "C:/work",
+        true
+    )
+    test.eq(native.argv[2], "/tmp/x")
+    test.eq(native.env[1][2], [[C:\repo\bin;D:\x]])
 end
 
 function M.framesCarryAnyBytes()
@@ -202,6 +284,9 @@ local function tempProject()
     local source = assert(io.open(dir .. "/main.nupp", "wb"))
     source:write("local value: integer = \"text\"\nprint(value)\n")
     source:close()
+    local program = assert(io.open(dir .. "/hello.nupp", "wb"))
+    program:write('print("hello", ...)\nio.stderr:write("to stderr\\n")\nos.exit(3)\n')
+    program:close()
 
     return dir
 end
@@ -231,6 +316,9 @@ function M.anAnsweredCommandReadsAsTheShellsOwn()
         ("cd '%s' && NO_COLOR= '%s' check 2>&1; echo \"__exit__:$?\""):format(dir, NUPP),
         ("cd '%s' && '%s' check > out.txt 2>&1; printf '%%s\\n' \"$?\" > status.txt"):format(dir, NUPP),
         ("cd '%s' && '%s' check main.nupp 2> out.txt; printf ' __status__:%%s' $?"):format(dir, NUPP),
+        ("cd '%s' && PATH='%s':\"$PATH\" nupp check main.nupp 2>&1"):format(dir, ROOT .. "/bin"),
+        ("cd '%s' && '%s' run hello.nupp a 'b c' 2>&1; echo \"__exit__:$?\""):format(dir, NUPP),
+        ("cd '%s' && '%s' run hello.nupp > out.txt 2>/dev/null; echo \"__exit__:$?\""):format(dir, NUPP),
     }
     -- What a command left in the files it was told to write, taken away again.
     local function written()
@@ -264,6 +352,44 @@ function M.anAnsweredCommandReadsAsTheShellsOwn()
         test.eq(ok, shellOk, command)
         test.eq(how, shellHow, command)
         test.eq(code, shellCode, command)
+    end
+    -- An argv handed to the compiler's process module takes the same route.
+    local before = counts()
+    local code, output = process.capture({NUPP, "check", "main.nupp"}, {cwd = dir, env = {NO_COLOR = "1"}})
+    test.eq(counts(), before + 1, "an argv reaches the service")
+    local shell = capture(("true && cd '%s' && NO_COLOR=1 '%s' check main.nupp 2>&1"):format(dir, NUPP))
+    test.eq(output, shell)
+    test.eq(code, 1)
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
+-- The file a redirect names is created with the permissions the shell would give
+-- it, so whoever ran the command can read it back. On arm64 macOS the service
+-- once created it with a mode read off the stack (#298).
+function M.aRedirectedFileReadsBackWithTheShellsPermissions()
+    local counts = rawget(_G, "__NUPP_TEST_COMPILE_SERVICE_COUNTS")
+    if os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil or os.getenv("NUPP_TEST_COMPILE_SERVICE") == "0" or counts == nil then
+        return
+    end
+    local dir = tempProject()
+    local function permissions(name)
+        local listing = capture(("cd '%s' && ls -l %s"):format(dir, name))
+
+        return listing:match("^(%S+)")
+    end
+
+    local before = counts()
+    capture(("cd '%s' && '%s' check > routed.txt 2> routed.err"):format(dir, NUPP))
+    test.eq(counts(), before + 1, "answered by the service")
+    capture(("true && cd '%s' && '%s' check > shell.txt 2> shell.err"):format(dir, NUPP))
+    test.eq(counts(), before + 1, "answered by the shell")
+    for _, pair in ipairs({{"routed.txt", "shell.txt"}, {"routed.err", "shell.err"}}) do
+        local file = io.open(dir .. "/" .. pair[1], "rb")
+        test.truthy(file, pair[1] .. " can be read back")
+        if file then
+            file:close()
+        end
+        test.eq(permissions(pair[1]), permissions(pair[2]), pair[1])
     end
     os.execute("rm -rf '" .. dir .. "'")
 end

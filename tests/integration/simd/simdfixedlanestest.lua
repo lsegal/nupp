@@ -597,9 +597,11 @@ local function buildAndRun(dir, entries, policy)
         ):format(entries, policy)
     )
     local logPath = dir .. "/build.log"
+    -- Removed apart from the build, which the test run's compile service then answers.
+    os.execute(("rm -rf %q"):format(dir .. "/build"))
     local status = os.execute(
         (
-            "cd %q && rm -rf build && %q build --target native > %q 2>&1"
+            "cd %q && %q build --target native > %q 2>&1"
         ):format(dir, os.getenv("NUPP_TEST_BIN") or HERE .. "/../bin/nupp", logPath)
     )
     testAssert.eq(status, 0, policy .. " build at " .. dir .. ": " .. read(logPath))

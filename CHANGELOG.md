@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Outside macOS, `nupp`, the native host and the embedding SDK give LuaJIT
+  machine-code areas of 512 KB, chained up to the same 16 MB, instead of one
+  16 MB area. LuaJIT reprotects a whole area around every trace it compiles,
+  and with several busy states in one process those calls queued on the
+  kernel's address-space lock. On the 4-core Linux CI runner the shared test
+  lane's kernel time fell from 23-41% of its CPU to about 7%, and it finished
+  in 563-611 s where it had taken 580-1,002 s. macOS keeps its one area, which
+  works around the system ignoring LuaJIT's placement hint.
+- `nupp bc`, `nupp run` and `nupp lsp artifact` of a file in a project nested
+  inside the current one, with its own `nupp.lua`, compile it through that
+  project, as the language server does. They named it by the outer project's
+  roots, so a `module` declaration in the file was refused with NUPP1002.
+- `nupp fmt --check` over many files keeps only the interfaces of the modules
+  they require, not every module's checked tree, and collects garbage the way
+  `nupp build` does. A cold check of a quarter of this repository's tree went
+  from about 2 GB to about 500 MB on Windows, in the same time. `nupp check`
+  of files outside a project and `nupp migrate` get the same treatment.
 - `nupp test` runs the shared lane's eight workers at once, each in a Lua state
   of its own that is replaced once its heap passes 256 MB
   (`NUPP_TEST_WORKER_HEAP_MB`). The workers used to share a pool as wide as

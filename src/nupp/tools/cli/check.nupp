@@ -263,7 +263,9 @@ local function run(options: any): integer
         return failed and 1 or 0
     end
 
-    local env = require("nupp.compiler.project.env").new(".", {compat = values.compat})
+    -- Each file is checked against the interfaces of what it requires, never their
+    -- trees, so those are not kept for the rest of the run.
+    local env = require("nupp.compiler.project.env").new(".", {compat = values.compat, releaseModuleTrees = true})
     effectiveCompat = env.compat or effectiveCompat
     for _, path in ipairs(remaining) do
         timing.compiledModules = timing.compiledModules + 1
