@@ -20,7 +20,7 @@ local generics = require("nupp.compiler.types.generics")
 local reflection = require("nupp.compiler.reflection")
 local T = require("nupp.compiler.types")
 
-export const SCHEMA = 6
+export const SCHEMA = 7
 
 --- What `interfaceimage.encode` is told about the run it encodes for.
 export type EncodeOptions = {
@@ -433,6 +433,7 @@ export function encode(semantics: {[string]: any}, options: EncodeOptions?): (an
                 member = entry.member,
                 parameterKey = entry.parameterKey,
                 definition = copyDefinition(entry.definition),
+                declared = entry.declaration ~= nil,
             }
         end
 
@@ -1314,7 +1315,9 @@ export function decode(image: any, options: DecodeOptions?): (any?, string?)
         local function decodeMethodEntry(entry: any): any
             return {
                 signature = edge(entry.signature),
-                declaration = nil,
+                -- The body stays with its own module's tree, but whether there is one is
+                -- what says an implementer may inherit it rather than write its own.
+                declaration = entry.declared == true and {} or nil,
                 member = entry.member,
                 parameterKey = entry.parameterKey,
                 definition = entry.definition,
