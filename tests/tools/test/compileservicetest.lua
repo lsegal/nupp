@@ -139,6 +139,10 @@ function M.onlyThisCheckoutsCompilerCommandsAreAnswered()
     test.eq(answered.cwd, "/work/p")
     test.eq(answered.argv[1], "build")
     test.eq(request("/other/bin/nupp check"), nil)
+    -- A relative program is found from where the command's `cd` went: another
+    -- tree's launcher is not this checkout's compiler.
+    test.eq(request("cd /tmp/planted && ./bin/nupp check", "/repo"), nil)
+    test.ne(request("cd /repo && ./bin/nupp check", "/work"), nil)
     test.eq(request("nupp check"), nil)
     for _, name in ipairs({"test", "lsp", "watch", "bench", "task", "fixpoint", "rock", "__comptime-worker"}) do
         test.eq(request("/repo/bin/nupp " .. name), nil, name)

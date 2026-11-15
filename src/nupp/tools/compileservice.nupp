@@ -693,11 +693,19 @@ end
 function compileservice.request(command: compileservice.Command, root: string, cwd: string, forWindows: boolean?): any?
     local translate = forWindows and not command.native
     local expected = root .. "/bin/nupp"
+    local directory = cwd
+    if command.cwd ~= nil then
+        local target = command.cwd as string
+        directory = absolute(target, forWindows) and compileservice.normalize(target, forWindows)
+            or compileservice.normalize(cwd .. "/" .. target, forWindows)
+    end
 
+    -- A relative program, or search-path entry, is found from the directory the
+    -- command's own `cd` went to, as the shell would find it.
     local function isCompiler(path: string): boolean
         local executable = compileservice.normalize(path, forWindows)
         if not absolute(executable, forWindows) then
-            executable = compileservice.normalize(cwd .. "/" .. executable, forWindows)
+            executable = compileservice.normalize(directory .. "/" .. executable, forWindows)
         end
 
         return forWindows and executable:lower() == expected:lower() or executable == expected
@@ -733,12 +741,6 @@ function compileservice.request(command: compileservice.Command, root: string, c
     local taken, help, spawn = answered(command.argv)
     if not taken then
         return nil
-    end
-    local directory = cwd
-    if command.cwd ~= nil then
-        local target = command.cwd as string
-        directory = absolute(target, forWindows) and compileservice.normalize(target, forWindows)
-            or compileservice.normalize(cwd .. "/" .. target, forWindows)
     end
     if WRITERS[name] and not help and buildsCheckout(directory, root, forWindows) then
         return nil
