@@ -662,13 +662,16 @@ end
 --- Updates the file-backed size of Mach-O's __LINKEDIT segment. Code signing
 --- requires every byte before its signature to belong to a segment; the payload is
 --- deliberately part of __LINKEDIT even though the loader itself reads the trailer.
-local function sizeMachOLinkedit(text: string): string?, string?
+---
+--- `text` is the file's head -- its header and load commands, all this rewrites --
+--- and `length` the whole file's size.
+local function sizeMachOLinkedit(text: string, length: number): string?, string?
     if text:sub(1, 4) ~= "\207\250\237\254" then
         return text
     end
     local commands = integerAt(text, 16, 4)
     local commandBytes = integerAt(text, 20, 4)
-    if not commands or not commandBytes or 32 + commandBytes > #text then
+    if not commands or not commandBytes or 32 + commandBytes > length then
         return nil, "cannot stamp malformed arm64 Mach-O load commands"
     end
     local cursor: number = 32
@@ -681,12 +684,12 @@ local function sizeMachOLinkedit(text: string): string?, string?
         if kind == 0x19 and text:sub(cursor + 9, cursor + 24):match("^__LINKEDIT") then
             local fileOffset = integerAt(text, cursor + 40, 8)
             local vmSize = integerAt(text, cursor + 32, 8)
-            if not fileOffset or not vmSize or fileOffset > #text then
+            if not fileOffset or not vmSize or fileOffset > length then
                 return nil, "cannot stamp malformed arm64 Mach-O __LINKEDIT segment"
             end
             -- The segment must map at least what the file holds. A linker that
             -- sized it tightly (lld does) leaves no room for the payload.
-            local fileSize = #text - fileOffset
+            local fileSize = length - fileOffset
             const PAGE = 16384
             local mapped = math.max(vmSize, math.ceil(fileSize / PAGE) * PAGE)
             text = replaceAt(text, cursor + 32, littleEndian(mapped, 8))
@@ -702,13 +705,17 @@ end
 --- Removes an existing Mach-O signature before stamping. Leaving it in place creates
 --- trailing bytes which Apple's signer refuses; removing its load command and blob
 --- lets a native release signer cover the complete payload afterwards.
-local function unsignedMachOStub(text: string): string?, string?
+---
+--- `text` is the stub's head and `length` the whole stub's size. Returns the
+--- rewritten head and how many of the stub's bytes the stamped file keeps: the
+--- signature is the stub's final blob, so dropping it is keeping fewer.
+local function unsignedMachOStub(text: string, length: number): (string?, string | number)
     if text:sub(1, 4) ~= "\207\250\237\254" then
-        return text
+        return text, length
     end
     local commands = integerAt(text, 16, 4)
     local commandBytes = integerAt(text, 20, 4)
-    if not commands or not commandBytes or 32 + commandBytes > #text then
+    if not commands or not commandBytes or 32 + commandBytes > length then
         return nil, "cannot stamp malformed arm64 Mach-O load commands"
     end
     local cursor: number = 32
@@ -718,22 +725,22 @@ local function unsignedMachOStub(text: string): string?, string?
     local signatureCommandSize: number?
     for _ = 1, commands do
         local kind = integerAt(text, cursor, 4)
-        local length = integerAt(text, cursor + 4, 4)
-        if not kind or not length or length < 8 or cursor + length > 32 + commandBytes then
+        local size = integerAt(text, cursor + 4, 4)
+        if not kind or not size or size < 8 or cursor + size > 32 + commandBytes then
             return nil, "cannot stamp malformed arm64 Mach-O load command"
         end
         if kind == 0x1d then
             signatureAt = integerAt(text, cursor + 8, 4)
             signatureSize = integerAt(text, cursor + 12, 4)
-            signatureCommand, signatureCommandSize = cursor, length
+            signatureCommand, signatureCommandSize = cursor, size
             break
         end
-        cursor = cursor + length
+        cursor = cursor + size
     end
     if not signatureCommand then
-        return text
+        return text, length
     end
-    if not signatureAt or not signatureSize or signatureAt + signatureSize ~= #text then
+    if not signatureAt or not signatureSize or signatureAt + signatureSize ~= length or signatureAt < #text then
         return nil, "cannot stamp a Mach-O whose code signature is not its final blob"
     end
     local foundCommand = assert(signatureCommand)
@@ -747,25 +754,51 @@ local function unsignedMachOStub(text: string): string?, string?
     text = replaceAt(text, 16, littleEndian(commands - 1, 4))
     text = replaceAt(text, 20, littleEndian(commandBytes - foundCommandSize, 4))
     text = replaceAt(text, 32, loadCommands)
-    text = text:sub(1, signatureAt)
+    local kept = assert(signatureAt)
+    local sized, sizeErr = sizeMachOLinkedit(text, kept)
+    if not sized then
+        return nil, tostring(sizeErr)
+    end
 
-    return sizeMachOLinkedit(text)
+    return sized, kept
 end
 
---- A stub with `payload` appended and a trailer saying where it starts. A signed
---- Mach-O is first made unsigned and its __LINKEDIT segment grows over the appended
---- bytes, so Apple's native signer can put a new signature after the trailer.
-local function stampBinary(stubText, payload, selectedPlatform, flags)
-    local macTarget = selectedPlatform == "aarch64-apple-darwin"
-        or (selectedPlatform == nil and jit.os == "OSX" and stubText:sub(1, 4) == "\207\250\237\254")
-    if macTarget then
-        local unsigned, unsignedErr = unsignedMachOStub(stubText)
-        if not unsigned then
-            return nil, unsignedErr
-        end
-        stubText = unsigned
+--- How many of a stub's leading bytes stamping may rewrite: a Mach-O's header and
+--- load commands, and none of any other stub. `text` holds at least the stub's
+--- first 32 bytes, and `length` is the whole stub's size.
+local function stubHeadLength(text: string, length: number): number
+    if text:sub(1, 4) ~= "\207\250\237\254" then
+        return 0
     end
-    local offset = #stubText
+
+    return math.min(length, 32 + (integerAt(text, 20, 4) or 0))
+end
+
+--- What stamping a stub writes, worked out from its head alone: the head
+--- rewritten, how many of the stub's bytes follow it, and the trailer after the
+--- payload. A stub is written as head, the rest of its kept bytes, the payload
+--- and the trailer, so the stub itself never has to be held.
+---
+--- A signed Mach-O is first made unsigned and its __LINKEDIT segment grows over the
+--- appended bytes, so Apple's native signer can put a new signature after the
+--- trailer.
+local function stampParts(
+    head: string,
+    length: number,
+    payload: string,
+    selectedPlatform: string?,
+    flags: integer?
+): (string?, string | number, string?)
+    local macTarget = selectedPlatform == "aarch64-apple-darwin"
+        or (selectedPlatform == nil and jit.os == "OSX" and head:sub(1, 4) == "\207\250\237\254")
+    local kept: number = length
+    if macTarget then
+        local unsigned, unsignedKept = unsignedMachOStub(head, length)
+        if not unsigned then
+            return nil, unsignedKept
+        end
+        head, kept = unsigned as string, unsignedKept as number
+    end
     local trailer = PAYLOAD_MAGIC .. littleEndian(
         PAYLOAD_VERSION,
         4
@@ -773,18 +806,36 @@ local function stampBinary(stubText, payload, selectedPlatform, flags)
         flags or 0,
         4
     ) .. littleEndian(
-        offset,
+        kept,
         8
     ) .. littleEndian(#payload, 8) .. hash.trailerDigest(payload) .. littleEndian(TRAILER_LENGTH, 8)
     assert(#trailer == TRAILER_LENGTH, "the trailer is a fixed size")
-
-    local stamped = stubText .. payload .. trailer
     if macTarget then
-        return sizeMachOLinkedit(stamped)
+        local sized, sizeErr = sizeMachOLinkedit(head, kept + #payload + #trailer)
+        if not sized then
+            return nil, tostring(sizeErr)
+        end
+        head = sized as string
     end
 
-    return stamped
+    return head, kept, trailer
 end
+
+--- A stub with `payload` appended and a trailer saying where it starts.
+local function stampBinary(stubText: string, payload: string, selectedPlatform: string?, flags: integer?): string?, string?
+    local head = stubText:sub(1, stubHeadLength(stubText, #stubText))
+    local stampedHead, kept, trailer = stampParts(head, #stubText, payload, selectedPlatform, flags)
+    if not stampedHead then
+        return nil, tostring(kept)
+    end
+
+    return (stampedHead as string) .. stubText:sub(#(stampedHead as string) + 1, kept as number) .. payload .. (
+        trailer as string
+    )
+end
+
+-- How much of a binary a copy holds at once.
+const COPY_BLOCK = 1048576
 
 local function tarField(value: string, width: integer): string
     assert(#value < width, "tar field fits its fixed width")
@@ -793,7 +844,7 @@ end
 
 --- A deterministic single-file POSIX tar. It is emitted on every compiler host so a
 --- Windows filesystem never gets to erase the executable mode in transit.
-local function posixArchive(output: string, text: string): string?, string?
+local function posixArchive(output: string, size: integer): string?, string?
     local name = fs.basename(output)
     if #name >= 100 then
         return nil, "cannot archive " .. output .. ": executable name exceeds the tar header limit"
@@ -803,7 +854,7 @@ local function posixArchive(output: string, text: string): string?, string?
         "0000755\0",
         "0000000\0",
         "0000000\0",
-        ("%011o\0"):format(#text),
+        ("%011o\0"):format(size),
         "00000000000\0",
         "        ",
         "0",
@@ -825,11 +876,34 @@ local function posixArchive(output: string, text: string): string?, string?
     end
     local checksumField = ("%06o\0 "):format(checksum)
     header = header:sub(1, 148) .. checksumField .. header:sub(157)
-    local padding = (512 - (#text % 512)) % 512
+    local padding = (512 - (size % 512)) % 512
     local archive = output .. ".tar"
-    local written, writeErr = writeFile(archive, header .. text .. ("\0"):rep(padding) .. ("\0"):rep(1024))
-    if not written then
-        return nil, tostring(writeErr)
+    local into, intoErr = io.open(archive, "wb")
+    if into == nil then
+        return nil, tostring(intoErr)
+    end
+    local from, fromErr = io.open(output, "rb")
+    if from == nil then
+        into:close()
+
+        return nil, tostring(fromErr)
+    end
+    -- A block at a time: the executable can be well over a hundred megabytes
+    -- when its host links LLVM in, and holding it whole cost the build that
+    -- much again (#310).
+    local wrote = into:write(header) ~= nil
+    while wrote do
+        local block = from:read(COPY_BLOCK)
+        if block == nil then
+            break
+        end
+        wrote = into:write(block) ~= nil
+    end
+    from:close()
+    wrote = wrote and into:write(("\0"):rep(padding) .. ("\0"):rep(1024)) ~= nil
+    into:close()
+    if not wrote then
+        return nil, "cannot write " .. archive
     end
 
     return archive
@@ -881,27 +955,15 @@ local function payloadBytes(text: string, selectedPlatform: string?): string?, i
     return dumped as string, PAYLOAD_FLAG_BYTECODE
 end
 
---- Writes `payload` into a copy of the stub at `output`.
----
---- A selected macOS result is deliberately unsigned. On a Mac, `codesign --sign -`
---- makes a development artifact runnable; release automation uses a Developer ID and
---- notarizes the archive. See
---- [distribution.md](docs/reference/distribution.md).
-local function stampFile(
+--- Makes a freshly stamped `output` usable: executable, signed for the Mac it was
+--- built on, and archived for a POSIX target. `magic` is the stub's first four
+--- bytes and `size` the stamped file's.
+local function finishStamp(
     output: string,
-    stubText: string,
-    payload: string,
-    selectedPlatform: string?,
-    flags: integer?
+    magic: string,
+    size: integer,
+    selectedPlatform: string?
 ): boolean?, string?, string?
-    local stampedText, stampErr = stampBinary(stubText, payload, selectedPlatform, flags)
-    if not stampedText then
-        return nil, stampErr
-    end
-    local written, writeErr = writeFile(output, stampedText)
-    if not written then
-        return nil, tostring(writeErr)
-    end
     local posixTarget = selectedPlatform == nil or require("nupp.tools.build.platform").isPosix(selectedPlatform)
     if posixTarget and jit.os ~= "Windows" then
         local code, chmodErr = process.capture({"chmod", "+x", output})
@@ -914,7 +976,7 @@ local function stampFile(
     -- has no timestamp and a fixed identifier, so it preserves the packaging
     -- fixpoint. Explicit cross-target output remains unsigned and byte-identical on
     -- every compiler host; release automation signs it on macOS.
-    if selectedPlatform == nil and jit.os == "OSX" and stubText:sub(1, 4) == "\207\250\237\254" then
+    if selectedPlatform == nil and jit.os == "OSX" and magic == "\207\250\237\254" then
         local code, signErr = process.capture({
             "codesign",
             "--force",
@@ -932,7 +994,7 @@ local function stampFile(
     local archive
     if selectedPlatform and posixTarget then
         local archiveErr
-        archive, archiveErr = posixArchive(output, stampedText)
+        archive, archiveErr = posixArchive(output, size)
         if not archive then
             return nil, archiveErr
         end
@@ -941,11 +1003,95 @@ local function stampFile(
     return true, nil, archive
 end
 
+--- Writes `payload` into a copy of the stub at `output`.
+---
+--- A selected macOS result is deliberately unsigned. On a Mac, `codesign --sign -`
+--- makes a development artifact runnable; release automation uses a Developer ID and
+--- notarizes the archive. See
+--- [distribution.md](docs/reference/distribution.md).
+local function stampFile(
+    output: string,
+    stubText: string,
+    payload: string,
+    selectedPlatform: string?,
+    flags: integer?
+): boolean?, string?, string?
+    local stampedText, stampErr = stampBinary(stubText, payload, selectedPlatform, flags)
+    if not stampedText then
+        return nil, stampErr
+    end
+    local written, writeErr = writeFile(output, stampedText as string)
+    if not written then
+        return nil, tostring(writeErr)
+    end
+
+    return finishStamp(output, stubText:sub(1, 4), #(stampedText as string), selectedPlatform)
+end
+
+--- `stampFile` for the stub at the path `stubPath`, which it copies a block at a
+--- time rather than reading whole.
+---
+--- A host that links LLVM in is about 140 MB. Read into a string and then copied
+--- into the stamped one, it put about 450 MB on the build's peak, more than the
+--- rest of the build's growth since the budget was set (#310).
+local function stampStub(
+    output: string,
+    stubPath: string,
+    payload: string,
+    selectedPlatform: string?,
+    flags: integer?
+): boolean?, string?, string?
+    local stub, stubErr = io.open(stubPath, "rb")
+    if stub == nil then
+        return nil, "cannot read the stub " .. stubPath .. ": " .. tostring(stubErr)
+    end
+    local length = stub:seek("end") as integer
+    stub:seek("set", 0)
+    local first = stub:read(32) or ""
+    stub:seek("set", 0)
+    local headLength = stubHeadLength(first, length)
+    local head = headLength > 0 and (stub:read(headLength) or "") or ""
+    local stampedHead, kept, trailer = stampParts(head, length, payload, selectedPlatform, flags)
+    if stampedHead == nil then
+        stub:close()
+
+        return nil, tostring(kept)
+    end
+    local into, intoErr = io.open(output, "wb")
+    if into == nil then
+        stub:close()
+
+        return nil, tostring(intoErr)
+    end
+    local wrote = into:write(stampedHead as string) ~= nil
+    local remaining = (kept as integer) - #(stampedHead as string)
+    stub:seek("set", #(stampedHead as string))
+    while wrote and remaining > 0 do
+        local block = stub:read(math.min(remaining, COPY_BLOCK))
+        if block == nil then
+            break
+        end
+        wrote = into:write(block) ~= nil
+        remaining = remaining - #block
+    end
+    stub:close()
+    wrote = wrote and remaining == 0 and into:write(payload, trailer as string) ~= nil
+    into:close()
+    if not wrote then
+        os.remove(output)
+
+        return nil, "cannot write " .. output .. " from the stub " .. stubPath
+    end
+
+    return finishStamp(output, first:sub(1, 4), (kept as integer) + #payload + TRAILER_LENGTH, selectedPlatform)
+end
+
 package_.bundleText = bundleText
 package_.bundleOutput = bundleOutput
 package_.componentOutput = componentOutput
 package_.binaryOutput = binaryOutput
 package_.stampFile = stampFile
+package_.stampStub = stampStub
 package_.payloadBytes = payloadBytes
 package_.payloadFlagBytecode = PAYLOAD_FLAG_BYTECODE
 package_.hostAbiVersion = hostAbiVersion
