@@ -193,7 +193,8 @@ local function run(options: any): integer
     -- The program's dependencies are read back from what the last compile in this
     -- project checked, rather than checked again: see
     -- `nupp.compiler.project.projectimage`.
-    local projectEnv = envMod.new(".", {projectInterfaces = true})
+    -- A file in a project nested inside this one is named by that project.
+    local projectEnv = envMod.new(envMod.projectRootFor(".", path), {projectInterfaces = true})
     local chunk, err
     local watch: Session? = nil
     if watching then
