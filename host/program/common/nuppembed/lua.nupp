@@ -282,8 +282,9 @@ end
 
 --- LuaJIT's capacity limits, raised before the state traces anything, because
 --- the size of the machine-code area is fixed when the first trace allocates
---- it. This is nupp.tools.jitlimits.FLAGS, which says why each is raised;
---- clitest holds the lists to one account. NUPP_JIT_DEFAULT keeps LuaJIT's own.
+--- it. This is nupp.tools.jitlimits.flagsOn(jit.os), which says why each is
+--- raised; clitest holds the lists to one account. NUPP_JIT_DEFAULT keeps
+--- LuaJIT's own.
 local function raiseJitLimits(borrows L: voidptr)
     if getenv("NUPP_JIT_DEFAULT") ~= nil then
         return
@@ -296,7 +297,11 @@ local function raiseJitLimits(borrows L: voidptr)
             lua_getfield(L, -1, "start")
             lua_pushstring(L, "maxtrace=20000")
             lua_pushstring(L, "maxside=1000")
-            lua_pushstring(L, "sizemcode=16384")
+            if jit.os == "OSX" then
+                lua_pushstring(L, "sizemcode=16384")
+            else
+                lua_pushstring(L, "sizemcode=512")
+            end
             lua_pushstring(L, "maxmcode=16384")
             -- A LuaJIT built without the JIT refuses the flags; that is not a
             -- reason to refuse to run.
