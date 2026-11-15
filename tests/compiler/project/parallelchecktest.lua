@@ -439,6 +439,51 @@ return {value = value, described = described}
     assert(os.remove(directory, true))
 end
 
+-- An overload's hidden slot is named from the types it takes. In a module the project
+-- does not index ahead of checking it, a method declared above a type it names saw
+-- that type before its declaration gave it a module. A worker that had imported the
+-- module already knew the name, so it called and defined the slot under a different
+-- member than a serial build: `Reader:readinto` in `nupp/io/internal/bytes.lua`.
+function M.overloadSlotsDoNotDependOnDeclarationOrder()
+    local sink = [[
+export interface Sink
+    function put(self, box: Box): integer
+        return 1
+    end
+
+    function put(self, text: string): integer
+        return #text
+    end
+end
+]]
+    local box = "export interface Box\n    value: integer\nend\n"
+    local function slots(first, second)
+        local directory = os.tmpname()
+        os.remove(directory)
+        write(directory .. "/nupp.lua", 'return {include = {"src"}}\n')
+        write(directory .. "/src/sample.nupp", "@!internal\n\nmodule sample\n\n" .. first .. "\n" .. second)
+        local code, output = process.capture({NUPP, "lsp", "artifact", "--kind", "lua", "src/sample.nupp"}, {
+            cwd = directory,
+        })
+        testAssert.eq(code, 0, output)
+        assert(os.remove(directory, true))
+        local found, names = {}, {}
+        for slot in output:gmatch("__nupp_m_%x+") do
+            if not found[slot] then
+                found[slot] = true
+                names[#names + 1] = slot
+            end
+        end
+        table.sort(names)
+
+        return table.concat(names, ",")
+    end
+
+    local forward = slots(sink, box)
+    assert(forward ~= "", "the overloads use hidden slots")
+    testAssert.eq(forward, slots(box, sink), "slots in either order")
+end
+
 -- Staging a runtime's carried source checks the modules that name it again, from
 -- the same parse. A call's destination stored on the tree by the first check named
 -- that check's copy of a standard type, and the second check's copy of the callee

@@ -177,46 +177,6 @@ return decoder:decode("hello") .. "," .. decoder:decode(7)
     assert(code:find(":__nupp_m_", 1, true), "calls and bodies use hidden overload slots")
 end
 
--- An overload's hidden slot is named from the types it takes. A method declared
--- above the record it names saw that record before its declaration gave it a module,
--- so its slot depended on the order of the two declarations, and a worker that had
--- already imported the module named it differently from a serial build.
-function M.overloadSlotsDoNotDependOnDeclarationOrder()
-    local sink = [[
-export record Sink
-    function put(self, box: Box): integer return box.value end
-    function put(self, text: string): integer return #text end
-end
-]]
-    local box = [[
-export record Box
-    value: integer
-end
-]]
-    local function slots(src)
-        local result = parser.parse(src, "sample.nupp")
-        testAssert.eq(#result.errors, 0, "syntax errors in test source")
-        for _, diag in ipairs(check.check(result, "sample.nupp", env, {moduleName = "sample"}) or {}) do
-            testAssert.ne(diag.severity, "error", diag.code .. ": " .. diag.msg)
-        end
-        local code = gen.generate(result, "sample")
-        local found = {}
-        for slot in code:gmatch("Sink[.:](__nupp_m_%x+)") do
-            found[slot] = true
-        end
-        local names = {}
-        for slot in pairs(found) do
-            names[#names + 1] = slot
-        end
-        table.sort(names)
-
-        return table.concat(names, ",")
-    end
-    local forward = slots("module sample\n\n" .. sink .. "\n" .. box)
-    assert(forward ~= "", "the overloads use hidden slots")
-    testAssert.eq(forward, slots("module sample\n\n" .. box .. "\n" .. sink), "slots in either order")
-end
-
 function M.repeatedStaticNamesSelectDistinctBodies()
     local value, code = runs(
         [[
