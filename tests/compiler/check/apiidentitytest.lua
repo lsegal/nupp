@@ -1166,4 +1166,46 @@ return ordinary
     )
 end
 
+-- #302: the routed member follows the winning overload's signature, not its
+-- position among the candidates, which sit in canonical order.
+function M.spawnRoutesOnlyTheNamedOverloadToSpawnNamed()
+    local cases = {
+        {argument = "index", body = "function(value: integer): integer return value end", member = "spawn"},
+        {argument = "\"named\"", body = "function(): integer return 1 end", member = "_spawnNamed"},
+        {argument = "\"text\"", body = "function(value: string): integer return #value end", member = "spawn"},
+    }
+    for _, case in ipairs(cases) do
+        local source = (
+            [[
+module routedspawn
+export function start(borrows scope: coroutine.Scope, index: integer): integer
+    local task = scope:spawn(%s, %s)
+    return task:await()
+end
+]]
+        ):format(case.argument, case.body)
+        local code, errors, parsed = compile(source, nil, "routedspawn.nupp")
+        test.eq(errors, "", errors)
+        local found = {}
+
+        local function visit(node)
+            if type(node) ~= "table" or not node.kind then
+                return
+            end
+            if node.trailingCallableCall then
+                found[#found + 1] = node
+            end
+            for _, child in ipairs(node) do
+                visit(child)
+            end
+        end
+
+        visit(parsed.root)
+        test.eq(#found, 1)
+        test.eq(found[1].trailingCallableMember, case.member, case.argument)
+        assert(code:find(":" .. case.member .. "(", 1, true), code)
+        test.eq(code:find(":_spawnNamed(", 1, true) ~= nil, case.member == "_spawnNamed", code)
+    end
+end
+
 return M
