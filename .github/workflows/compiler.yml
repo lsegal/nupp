@@ -1113,6 +1113,12 @@ jobs:
           restore-keys: |
             nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
 
+      # The toolchain key is shared, and a job that provisions the pinned LLVM
+      # can be the one that saves it. With LLVM the host links it in, a build
+      # about 450 MB larger than the one the budget holds (#303).
+      - name: Drop any LLVM tree the cache carried
+        run: rm -rf .nupp-cache/toolchain/llvm
+
       - name: Provision the pinned toolchain
         run: ./scripts/toolchain --all
 
