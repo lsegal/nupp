@@ -13,10 +13,6 @@
   module reads a builtin a project implements, such as `io`, `os` or
   `assert`, names a type of a module it does not require, or reaches a
   project module through one the target does not check as its own.
-- `scope:spawn(arguments..., f)` built by a parallel check worker no longer
-  calls the named form and drops the arguments. Which form a call chose was
-  read off its position in the overload set, whose order a worker could see
-  reversed.
 - Sending a large string to a child process, as `stdin:send` does, no longer
   copies the unsent rest on every write. A few megabytes sent through a pipe
   made gigabytes of short-lived garbage.

@@ -2323,12 +2323,22 @@ function callexpr.install(c: state.Checker): state.ExprHandlers
             if rotated and originalExprs then
                 (callArgs as cst.Args).exprs = originalExprs
             end
-            if rotated and surface and surface.fixedArityMember then
+            if rotated and surface and surface.overloadMembers then
                 -- Which candidate survived is the checker's answer, so the emitted
                 -- member follows it rather than a second reading of the arguments.
+                -- The candidates are in canonical order, so the winner is matched to
+                -- the member declared with its signature rather than by position.
                 local chosen: any = (node as any).overloadWinner
-                if chosen ~= nil and chosen.tag == "func" and not chosen.vararg and chosen.varargType == nil then
-                    (node as any).trailingCallableMember = surface.fixedArityMember
+                local spelling = chosen and T.tostring(chosen) or nil
+                for _, routed in ipairs(surface.overloadMembers) do
+                    local routedType = c.fieldType(ot, routed)
+                    if spelling
+                        and routedType
+                        and routedType.tag == "func"
+                        and T.tostring(dropSelf(specializeReceiver(routedType, ot))) == spelling
+                    then
+                        (node as any).trailingCallableMember = routed
+                    end
                 end
             end
             if nominal ~= nil
