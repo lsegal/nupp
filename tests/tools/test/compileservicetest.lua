@@ -156,6 +156,22 @@ function M.onlyThisCheckoutsCompilerCommandsAreAnswered()
     test.ne(request("/repo/bin/nupp lsp inspect --json main.nupp 1 1"), nil)
     test.ne(request("/repo/bin/nupp task --list --json"), nil)
     test.ne(request("/repo/bin/nupp __complete bash 2 check --js"), nil)
+    -- A project of its own beneath the checkout is not the checkout.
+    local windows = package.config:sub(1, 1) == "\\"
+    local checkout = compileservice.normalize(os.tmpname(), windows)
+    os.remove(checkout)
+    assert(os.execute("mkdir -p '" .. checkout .. "/fixture/src' '" .. checkout .. "/tests'") == 0)
+    local manifest = assert(io.open(checkout .. "/fixture/nupp.lua", "wb"))
+    manifest:write("return {}\n")
+    manifest:close()
+    local function build(cwd)
+        return compileservice.request(parse(checkout .. "/bin/nupp build"), checkout, cwd, windows)
+    end
+    test.ne(build(checkout .. "/fixture/src"), nil)
+    test.ne(build(checkout .. "/fixture"), nil)
+    test.eq(build(checkout .. "/tests"), nil)
+    test.eq(build(checkout), nil)
+    os.execute("rm -rf '" .. checkout .. "'")
     -- So does asking for a report's schema.
     test.ne(request("/repo/bin/nupp build --schema", "/repo"), nil)
     test.ne(request("/repo/bin/nupp bench --list --file x.bench.nupp --schema"), nil)

@@ -602,6 +602,27 @@ local function within(path: string, root: string, forWindows: boolean?): boolean
     return left == right or left:sub(1, #right + 1) == right .. "/"
 end
 
+--- Whether a command run in `directory` builds the checkout itself: it is the
+--- checkout, or lies beneath it with no project of its own (`nupp.lua`) nearer.
+--- A fixture or benchmark project under the checkout is a project of its own,
+--- and the launcher takes no lock for it either.
+local function buildsCheckout(directory: string, root: string, forWindows: boolean?): boolean
+    if not within(directory, root, forWindows) then
+        return false
+    end
+    local current = directory
+    while #current > #root do
+        local manifest = io.open(current .. "/nupp.lua", "rb")
+        if manifest ~= nil then
+            manifest:close()
+            return false
+        end
+        current = current:match("^(.*)/[^/]*$") or root
+    end
+
+    return true
+end
+
 -- What a native program started from Git Bash receives for a word written in
 -- POSIX spelling. Only the drive-letter form converts predictably; any other
 -- absolute POSIX path is the shell's to translate.
@@ -719,7 +740,7 @@ function compileservice.request(command: compileservice.Command, root: string, c
         directory = absolute(target, forWindows) and compileservice.normalize(target, forWindows)
             or compileservice.normalize(cwd .. "/" .. target, forWindows)
     end
-    if WRITERS[name] and not help and within(directory, root, forWindows) then
+    if WRITERS[name] and not help and buildsCheckout(directory, root, forWindows) then
         return nil
     end
     local argv: {string} = {}

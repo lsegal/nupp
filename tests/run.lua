@@ -386,6 +386,12 @@ end
 local declinedLog = os.getenv("NUPP_TEST_COMPILE_SERVICE_LOG")
 local function declined(command)
     if declinedLog and declinedLog ~= "" and command:find("bin/nupp", 1, true) then
+        -- A command that only names the compiler -- copies it, marks it
+        -- executable, looks it up -- starts no compiler.
+        local parsed = compileServiceModule and compileServiceModule.parse(command, "out")
+        if parsed and not parsed.executable:find("nupp$") then
+            return
+        end
         local file = io.open(declinedLog, "ab")
         if file then
             file:write((command:gsub("[\r\n]", " ")), "\n")
