@@ -1610,4 +1610,38 @@ function M.importedConstantFoldingRefreshesAfterPrivateBodyChanges()
     end
 end
 
+-- A query read from inside a cycle sees nil for the edge that closes it. Which edge
+-- that is depends on where the cycle was entered, so a provisional query does not
+-- keep that answer: the next read, after the cycle closed, computes it again.
+function M.aProvisionalQueryAsksAgainOnceItsCycleCloses()
+    local function graph(provisional)
+        local q = query.new()
+        local seen = {}
+        q:define("check", function(self, key)
+            if key == "a" then
+                self:get("check", "b")
+                return {value = 1}
+            end
+            seen[#seen + 1] = self:get("fact", "a")
+            return {value = 2}
+        end)
+        q:define("fact", function(self, key)
+            local checked = self:get("check", key)
+            return checked and checked.value or nil
+        end, nil, provisional)
+        q:get("check", "a")
+
+        return q, seen
+    end
+
+    local q, seen = graph(true)
+    testAssert.eq(seen[1], nil, "inside the cycle the fact is not there yet")
+    testAssert.eq(q:get("fact", "a"), 1, "once the cycle closed it is")
+    testAssert.eq(q:get("fact", "a"), 1, "and kept from then on")
+    testAssert.eq(q.stats.fact, 2, "computed once more, not on every read")
+
+    local kept = graph(false)
+    testAssert.eq(kept:get("fact", "a"), nil, "an ordinary query keeps the answer the cycle gave it")
+end
+
 return M

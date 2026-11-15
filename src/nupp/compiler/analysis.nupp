@@ -520,9 +520,19 @@ local function inferFunction(info, byDefinition)
     end
 
     collectBindings(bodyContents(info.body))
-    local rooted = {}
+    -- Assigning one parameter to another joins them, and the joined binding answers
+    -- to the first of them: walking the definitions in table order would name
+    -- whichever one hashed last.
+    local byIndex = {}
     for definition, index in pairs(info.params) do
-        rooted[find(definition)] = info.paramNames[index]
+        byIndex[index] = definition
+    end
+    local rooted = {}
+    for index = #info.paramNames, 1, -1 do
+        local definition = byIndex[index]
+        if definition then
+            rooted[find(definition)] = info.paramNames[index]
+        end
     end
 
     local function rootOf(expr)

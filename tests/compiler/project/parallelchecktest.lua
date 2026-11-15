@@ -989,4 +989,94 @@ function M.anInterruptedCheckLeavesNoWorkers()
     assert(os.remove(directory, true))
 end
 
+-- The state file itself, not a decoding of it, is what has to match. Its keys are
+-- written sorted, a nominal another module re-exports or aliases is described by
+-- the module declaring it, and a fact read inside an import cycle is read again
+-- once the cycle closes, so no field depends on which module the schedule reached
+-- first. Only how long a derive took is left out.
+function M.serialAndParallelBuildsWriteTheSameStateFile()
+    local directory = tempProject(false)
+    write(
+        directory .. "/src/contracts.nupp",
+        [[
+module contracts
+
+export record Waiting
+    ready: function(self: Waiting): boolean
+    operation: string
+end
+]]
+    )
+    write(
+        directory .. "/src/hostalias.nupp",
+        [[
+module hostalias
+
+local contract = require("contracts")
+local hostalias = {}
+
+type hostalias.Waiting = contract.Waiting
+
+hostalias.Waiting = contract.Waiting
+
+export = hostalias
+]]
+    )
+    write(
+        directory .. "/src/joined.nupp",
+        [[
+local function pick(text: string?, first: string?, second: string?): string?
+    if first == nil then
+        first, second = second, nil
+    end
+    return first or text
+end
+
+return {pick = pick}
+]]
+    )
+    write(
+        directory .. "/src/zuser.nupp",
+        [[
+module zuser
+
+local contracts = require("contracts")
+local joined = require("joined")
+
+export record Parker
+    park: function(self: Parker, waiting: contracts.Waiting): nil
+end
+
+export function name(): string?
+    return joined.pick("", nil, "b")
+end
+]]
+    )
+
+    local function stateText()
+        local file = assert(io.open(directory .. "/build/.nupp-state.json", "rb"))
+        local text = file:read("*a")
+        file:close()
+
+        return (text:gsub('"durationMs":[^,}]+', '"durationMs":0'):gsub('"cached":[^,}]+', '"cached":false'))
+    end
+
+    local serialCode, serialReport = coldBuild(directory, {NUPP_CHECK_JOBS = "1"}, {"-O2"})
+    testAssert.eq(serialCode, 0, "serial build: " .. json.encode(serialReport.diagnostics))
+    local serial = stateText()
+    coldBuild(directory, {NUPP_CHECK_JOBS = "1"}, {"-O2"})
+    testAssert.eq(stateText(), serial, "two serial builds")
+    for _, run in ipairs({{jobs = "2", seed = "17"}, {jobs = "3", seed = "83"}}) do
+        local code, report = coldBuild(directory, {
+            NUPP_CHECK_JOBS = run.jobs,
+            NUPP_TEST_PARALLEL_CHECK_RANDOM_SEED = run.seed,
+        }, {"-O2"})
+        testAssert.eq(code, 0, "parallel build: " .. json.encode(report.diagnostics))
+        testAssert.eq(report.timing.parallel.mode, "parallel", "parallel timing mode")
+        testAssert.eq(stateText(), serial, "a parallel build with seed " .. run.seed)
+    end
+
+    assert(os.remove(directory, true))
+end
+
 return M
