@@ -12,7 +12,10 @@ Because Nupp types are content-address interned, plain equality on a module
 interface is the interface-hash comparison, for free.
 
 A cycle resolves to nil for the re-entrant edge, which is how a `require` cycle
-between modules terminates.
+between modules terminates. Which module of a cycle is entered first, and so which
+edge reads the nil, depends on the order the queries were asked in. A query defined
+with `provisional` set does not keep an answer that read such an edge: it is asked
+again later, once the cycle has closed, and answers the same whichever order that was.
 ]]
 module nupp.compiler.project.query
 
@@ -48,7 +51,17 @@ export type Memo = {
 }
 
 --- A running computation, collecting what it reads.
-export type Frame = {deps: {Dep}}
+export type Frame = {
+    deps: {Dep},
+
+    --- Which query the frame computes, so a cycle edge can find where it began.
+    name: string?,
+    key: any,
+
+    --- Whether the computation read the re-entrant edge of a cycle, directly or
+    --- through a query it computed.
+    cyclic: boolean?
+}
 
 --- How to compute one query.
 ---
@@ -60,7 +73,11 @@ export type Def = {
 
     --- Decides whether a recomputed value counts as unchanged. Optional: plain equality
     --- is right for interned types and scalars.
-    eq: (function(a: any, b: any): boolean)?
+    eq: (function(a: any, b: any): boolean)?,
+
+    --- Whether an answer that read through a cycle is left unverified, so the next
+    --- read computes it again rather than keeping a value the cycle cut short.
+    provisional: boolean?
 }
 
 --- A query database: definitions, inputs, and everything memoized so far.
@@ -114,8 +131,14 @@ end
 --- @param name what to call it
 --- @param fn computes the value for a key
 --- @param eq decides "did the value really change", for the early cutoff
-function Q:define(name: string, fn: function(q: any, key: any): any, eq: (function(a: any, b: any): boolean)?)
-    self.defs[name] = {fn = fn, eq = eq}
+--- @param provisional whether an answer that read through a cycle is asked again
+function Q:define(
+    name: string,
+    fn: function(q: any, key: any): any,
+    eq: (function(a: any, b: any): boolean)?,
+    provisional: boolean?
+)
+    self.defs[name] = {fn = fn, eq = eq, provisional = provisional}
 end
 
 --- Sets an input, which bumps the revision and so invalidates whatever depended on it.
@@ -184,7 +207,15 @@ function Q:get(name: string, key: any): any
 
     local active = self.active[name]
     if active and active[key] then
-        -- cycle: the re-entrant edge observes the previous value (or nil)
+        -- cycle: the re-entrant edge observes the previous value (or nil). Every
+        -- computation between here and where the cycle began read that edge.
+        for index = #self.stack, 1, -1 do
+            local frame = self.stack[index]
+            if frame.name == name and frame.key == key then
+                break
+            end
+            frame.cyclic = true
+        end
         record(self, name, key)
         return entry and entry.value or nil
     end
@@ -201,7 +232,7 @@ function Q:get(name: string, key: any): any
         -- entry again, and again, until the stack runs out. With it, the re-entrant
         -- edge reports what this entry last changed at, which is the same rule the
         -- computation path resolves a cycle by.
-        self.stack[#self.stack + 1] = {deps = {}}
+        self.stack[#self.stack + 1] = {deps = {}, name = name, key = key}
         active = active or {}
         self.active[name] = active
         active[key] = true
@@ -231,7 +262,7 @@ function Q:get(name: string, key: any): any
     active = active or {}
     self.active[name] = active
     active[key] = true
-    self.stack[#self.stack + 1] = {deps = {}}
+    self.stack[#self.stack + 1] = {deps = {}, name = name, key = key}
     local ok, value = pcall(def.fn, self, key)
     local frame = self.stack[#self.stack]
     self.stack[#self.stack] = nil
@@ -254,7 +285,11 @@ function Q:get(name: string, key: any): any
             value = entry.value
         end
     end
-    m[key] = {value = value, changedAt = changedAt, verifiedAt = self.revision, deps = frame.deps}
+    -- An answer the cycle cut short is stamped one revision back, so the next read
+    -- revalidates it against the module it reads -- which recomputes it once that
+    -- module's own computation has finished.
+    local verifiedAt = def.provisional and frame.cyclic and self.revision - 1 or self.revision
+    m[key] = {value = value, changedAt = changedAt, verifiedAt = verifiedAt, deps = frame.deps}
     record(self, name, key)
 
     return value
