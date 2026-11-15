@@ -96,6 +96,55 @@ function M.hiddenConstructionRequiresAnExplicitFactory()
     assert(not description.fields[2], "private fields must stay hidden")
 end
 
+-- An instantiation copies its declaration's members when it is made. Effect
+-- finalization replaces a method with one that cannot suspend once its module is
+-- checked, so an instantiation made while the module was checked still held the
+-- earlier copy: a serial build, which reached it that way, described `noYield` as
+-- false where a worker that imported the finished declaration said true, and
+-- reflected the private fields of a record its own methods named.
+function M.describesAnInstantiationWithItsDeclarationsCurrentMembers()
+    local element = T.typevar("T", "reflection:stale-instantiation")
+    local pool = T.nominal("Pool", "record")
+    pool.typeParams, pool.paramKinds = {element}, {"type"}
+    pool.fieldOrder = {}
+    local self = generics.instantiate(pool, {[element] = element})
+    local early = T.func({self}, {T.integer})
+    pool.staticByname, pool.staticWriteByname = {free = early}, {free = early}
+    local instance = generics.instantiate(pool, {[element] = T.string})
+    local quiet = T.withYields(early, false)
+    assert(quiet ~= early and quiet.noYield, "finalization makes a quiet copy")
+    pool.staticByname.free, pool.staticWriteByname.free = quiet, quiet
+    -- Checking the declaration also replaces the tables an instantiation shares.
+    pool.fieldOrder = {"secret"}
+    pool.byname, pool.writeByname = {secret = T.string}, {secret = T.string}
+    pool.privateFields = {secret = true}
+    local descriptor = reflection.describe(instance)
+    local root = descriptor.types[descriptor.root]
+    testAssert.eq(root.staticFields[1].name, "free")
+    testAssert.eq(descriptor.types[root.staticFields[1].read].noYield, true, "the finalized member")
+    testAssert.eq(#root.fields, 0, "a private field declared afterwards stays hidden")
+    testAssert.eq(root.construction.requiresFactory, true, "and still needs a factory")
+end
+
+-- What an instantiation derives besides its members -- constructors among them --
+-- was also made only once. One its declaration's own methods named, while the
+-- declaration was hoisted, described a record with no constructor.
+function M.describesAnInstantiationWithItsDeclarationsCurrentConstructor()
+    local element = T.typevar("T", "reflection:stale-constructor")
+    local pool = T.nominal("Pool", "record")
+    pool.typeParams, pool.paramKinds = {element}, {"type"}
+    pool.fieldOrder = {}
+    local instance = generics.instantiate(pool, {[element] = T.string})
+    local self = generics.instantiate(pool, {[element] = element})
+    local constructor = T.func({element}, {self})
+    pool.constructors = {constructor}
+    pool.constructorEntries = {{signature = constructor, result = self, index = 1}}
+    local descriptor = reflection.describe(instance)
+    local construction = descriptor.types[descriptor.root].construction
+    testAssert.eq(construction.declared, true, "the declared constructor")
+    testAssert.eq(descriptor.types[construction.params[1].type].kind, "string", "with this instance's argument")
+end
+
 function M.storageFactsComeFromDeclarationsRatherThanFunctionTypes()
     local node = recursiveNode(T.string)
     local callback = T.func({}, {T.string}, false)

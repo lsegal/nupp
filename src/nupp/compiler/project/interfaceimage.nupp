@@ -543,6 +543,19 @@ export function encode(semantics: {[string]: any}, options: EncodeOptions?): (an
                     movesOwner = entry.movesOwner == true,
                 }
             end
+            -- The reflected fields leave the private ones out, but a checker reading
+            -- this declaration has to see them: what a construction may name, and what
+            -- reflection says about it, depend on them.
+            out.privateFieldTypes = {}
+            for _, name in ipairs(sortedNames(t.privateFields)) do
+                out.privateFieldTypes[
+                    #out.privateFieldTypes + 1
+                ] = {
+                    name = name,
+                    read = intern(t.byname and t.byname[name]),
+                    write = intern(t.writeByname and t.writeByname[name]),
+                }
+            end
             out.fieldDefinitions = copyDefinitions(t.fieldDefs)
             out.writeFieldDefinitions = copyDefinitions(t.writeFieldDefs)
             out.staticFieldDefinitions = copyDefinitions(t.staticFieldDefs)
@@ -1205,6 +1218,14 @@ export function decode(image: any, options: DecodeOptions?): (any?, string?)
             local definition = nominal.fieldDefs[field.name]
             if definition ~= nil then
                 definition.annotations = decodeAnnotations(field.annotations)
+            end
+        end
+        for _, field in ipairs(node.privateFieldTypes or {}) do
+            if field.read then
+                nominal.byname[field.name] = edge(field.read)
+            end
+            if field.write then
+                nominal.writeByname[field.name] = edge(field.write)
             end
         end
         nominal.staticByname, nominal.staticWriteByname = {}, {}

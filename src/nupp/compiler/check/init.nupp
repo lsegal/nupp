@@ -3103,6 +3103,11 @@ function checkMod.check(
                 local n, entry = c.declaredNominal(decl, decl.declKind)
                 decl.hoistedType, decl.hoistedEntry = n, entry
                 n.deriveDeclaration = decl
+                -- Named now rather than when the declaration is checked. A method
+                -- declared above this one mangles its overloads from the types it
+                -- names, and a worker that imported this module first already has
+                -- the name, so the two would mangle a different member.
+                n.moduleName = c.result.moduleName
                 n.deriveClaimsComplete = nil
                 n.deriveClaimedContracts = nil
                 c.beginNominal(n)

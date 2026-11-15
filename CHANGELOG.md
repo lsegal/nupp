@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A parallel cold `nupp build` writes the same Lua as a serial one. A worker
+  that imported a record with a `@private` field said it needed no factory; a
+  serial build described a generic record's instances as they were before
+  their module finished checking; and in an `@!internal` module, a method
+  declared above a type it takes got a different overload member name
+  depending on whether that module had been imported first.
 - `nupp build` of a binary target copies the host into the stamped binary a
   block at a time instead of reading it into memory and copying it there. A
   host that links LLVM in is about 140 MB, and holding it twice put
