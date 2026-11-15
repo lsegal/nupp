@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-- A parallel cold `nupp build` writes the same reflection descriptors as a
-  serial one. A worker that imported a record with a `@private` field said it
-  needed no factory, and a serial build described a generic record's methods
-  as they were before their module finished checking, so the two disagreed on
-  `requiresFactory`, `noYield` and the descriptor fingerprint.
+- A parallel cold `nupp build` writes the same Lua as a serial one. A worker
+  that imported a record with a `@private` field said it needed no factory; a
+  serial build described a generic record's instances as they were before
+  their module finished checking; and in an `@!internal` module, a method
+  declared above a type it takes got a different overload member name
+  depending on whether that module had been imported first.
 - A cold `nupp build` of a project that declares a const-generic function
   runs on the parallel checker. The build plans its const specializations
   first and hands the plan to the workers, so what it writes matches the
