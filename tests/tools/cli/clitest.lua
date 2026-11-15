@@ -1628,20 +1628,58 @@ local function readText(path)
     return text
 end
 
+-- The host decides `jit.os` when it is compiled for its target, so each operating
+-- system's list is the one its `if jit.os == "OSX"` clause leaves.
+local function hostLimits(raised, os)
+    local chosen = raised:gsub(
+        'if jit%.os == "OSX" then%s*(lua_pushstring%(L, "[^"]+"%))%s*else%s*(lua_pushstring%(L, "[^"]+"%))%s*end',
+        function(mac, other)
+            return os == "OSX" and mac or other
+        end
+    )
+    local flags = {}
+    for flag in chosen:gmatch('lua_pushstring%(L, "([^"]+)"%)') do
+        flags[#flags + 1] = flag
+    end
+
+    return table.concat(flags, ",")
+end
+
 function M.theNativeHostRaisesTheSameLimits()
-    local want = table.concat(jitlimits.FLAGS, ",")
     -- The host executable's state and the embedding SDK's each raise them.
     for _, source in ipairs({
         "host/program/common/nupphost/state.nupp",
         "host/program/common/nuppembed/lua.nupp"
     }) do
         local raised = assert(readText(source):match("local function raiseJitLimits%b()(.-)\nend"), source)
-        local flags = {}
-        for flag in raised:gmatch('lua_pushstring%(L, "([^"]+)"%)') do
-            flags[#flags + 1] = flag
+        for _, os in ipairs({"OSX", "Linux", "Windows"}) do
+            local want = table.concat(jitlimits.flagsOn(os), ",")
+            local got = hostLimits(raised, os)
+            assert(
+                got == want,
+                ("%s and the entry raise the same limits on %s\n  want: %q\n  got:  %q"):format(source, os, want, got)
+            )
         end
-        local got = table.concat(flags, ",")
-        assert(got == want, ("%s and the entry raise the same limits\n  want: %q\n  got:  %q"):format(source, want, got))
+    end
+    local here = table.concat(jitlimits.flagsOn(jit.os), ",")
+    assert(table.concat(jitlimits.FLAGS, ",") == here, "FLAGS is this machine's")
+end
+
+-- One 16 MB machine-code area works around macOS ignoring LuaJIT's placement hint.
+-- Where the hint is honoured, a large area only makes every reprotect dearer: eight
+-- workers in one Linux process spent most of their time in the kernel (#293).
+function M.onlyMacOSReservesOneLargeMachineCodeArea()
+    local function area(os)
+        for _, flag in ipairs(jitlimits.flagsOn(os)) do
+            local size = flag:match("^sizemcode=(%d+)$")
+            if size then
+                return tonumber(size)
+            end
+        end
+    end
+    assert(area("OSX") == 16384, "macOS keeps its one 16 MB area: " .. tostring(area("OSX")))
+    for _, os in ipairs({"Linux", "Windows", "BSD"}) do
+        assert(area(os) == 512, ("%s chains 512 KB areas: %s"):format(os, tostring(area(os))))
     end
 end
 

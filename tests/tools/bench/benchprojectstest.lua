@@ -15,8 +15,8 @@
 --
 -- Each check starts cold in CI and reads the standard library it reaches.
 -- Even two checks ran for over thirty minutes together on a three-core macOS
--- runner, so keep a benchmark project's check from competing with another.
-local CONCURRENT_CHECKS = 1
+-- runner, so the checks run one at a time, each a plain command the test run's
+-- compile service can answer.
 
 local HERE = require("helpers.paths").absoluteTests
 if HERE:sub(1, 1) ~= "/" and not HERE:match("^%a:[/\\]") then
@@ -95,18 +95,12 @@ function M.everyBenchmarkProjectChecks()
     local scratch = os.tmpname()
     os.remove(scratch)
     assert(os.execute("mkdir -p '" .. scratch .. "'") == 0)
-    for first = 1, #names, CONCURRENT_CHECKS do
-        local commands = {}
-        for index = first, math.min(#names, first + CONCURRENT_CHECKS - 1) do
-            local name = names[index]
-            commands[
-                #commands + 1
-            ] = (
-                "(cd '%s/bench/%s' && NO_COLOR=1 '%s' check >'%s/%s.log' 2>&1; echo $? >'%s/%s.status') &"
+    for _, name in ipairs(names) do
+        os.execute(
+            (
+                "cd '%s/bench/%s' && NO_COLOR=1 '%s' check >'%s/%s.log' 2>&1; echo $? >'%s/%s.status'"
             ):format(ROOT, name, NUPP, scratch, name, scratch, name)
-        end
-        commands[#commands + 1] = "wait"
-        os.execute(table.concat(commands, "\n"))
+        )
     end
     local problems = {}
     for _, name in ipairs(names) do

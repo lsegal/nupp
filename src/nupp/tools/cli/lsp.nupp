@@ -1191,13 +1191,16 @@ local function runArtifact(client, opts)
     -- checks a document it opens, and the whole graph under it, to publish diagnostics
     -- nobody here reads, and only then lowers it in an environment of its own; in the
     -- compiler's checkout that was most of a gigabyte before the lowering started.
+    -- The file is lowered in the project that owns it, nested or not, as the server
+    -- narrows a folder to one.
     local uri = pathToUri(path)
+    local root = require("nupp.compiler.project.env").projectRootFor(opts.root, path)
     local result = require("nupp.tools.lsp.artifacts").install({
         documents = {[uri] = {text = text, version = 1}},
         useRoot = function(): string
-            return opts.root
+            return root
         end,
-        currentRoot = opts.root,
+        currentRoot = root,
     }).resolve({
         textDocument = {uri = uri},
         kind = opts.kind,
