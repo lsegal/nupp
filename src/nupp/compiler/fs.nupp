@@ -266,8 +266,29 @@ export function stagingSuffix(): string
     return stagingToken .. "-" .. tostring(staged)
 end
 
-export function writeFile(path: string, text: string): boolean?, string?
+--- How much of a file a copy holds at once.
+const COPY_CHUNK = 1048576
+
+--- Writes a staging file beside `path` and renames it onto `path`. The staging
+--- file holds `text`, or else the contents of the file `source`, read a chunk
+--- at a time.
+local function stageFile(path: string, text: string?, source: string?): boolean?, string?
+    local input: affine(io.File, __nuppCloseFile)? = nil
+    if source ~= nil then
+        local opened, openErr = io.open(source as string, "rb")
+        if not opened then
+            if files2.stat(source as string) == "directory" then
+                return nil, tostring(source) .. " is a directory"
+            end
+
+            return nil, openErr
+        end
+        input = opened
+    end
     if not mkdir(dirname(path)) then
+        if input then
+            input:close()
+        end
         return nil, "cannot create " .. dirname(path)
     end
     -- The counter as well as the process, so that one process staging the same
@@ -276,9 +297,24 @@ export function writeFile(path: string, text: string): boolean?, string?
     local tmp = ("%s.%s.tmp"):format(path, stagingSuffix())
     local f, err = io.open(tmp, "wb")
     if not f then
+        if input then
+            input:close()
+        end
         return nil, err
     end
-    local wrote, writeErr = f:write(text)
+    local wrote: any, writeErr: string? = true, nil
+    if input then
+        while wrote do
+            local chunk = input:read(COPY_CHUNK)
+            if chunk == nil then
+                break
+            end
+            wrote, writeErr = f:write(chunk)
+        end
+        input:close()
+    else
+        wrote, writeErr = f:write(text or "")
+    end
     if not wrote then
         f:close()
         os.remove(tmp)
@@ -318,13 +354,19 @@ export function writeFile(path: string, text: string): boolean?, string?
     return true
 end
 
-export function copyFile(source: string, destination: string): boolean?, string?
-    local text, err = readFile(source)
-    if not text then
-        return nil, err
-    end
+export function writeFile(path: string, text: string): boolean?, string?
+    return stageFile(path, text, nil)
+end
 
-    return writeFile(destination, text)
+--- Copies `source` to `destination` a chunk at a time.
+---
+--- Never the whole file as one string: the files a build copies include native
+--- libraries, and one that links LLVM in is over a hundred megabytes. Reading
+--- that whole grew LuaJIT's buffer to twice the file and then interned the
+--- string, so a single copy added about 250 MB to the process's peak, and the
+--- build's peak depended on whether the toolchain had the pinned LLVM (#303).
+export function copyFile(source: string, destination: string): boolean?, string?
+    return stageFile(destination, nil, source)
 end
 
 local function exhausted(): (string?, files2.FileKind)
@@ -398,19 +440,15 @@ export function listFiles(path: string, skipDirectory: (function(name: string, p
     return files
 end
 
---- Puts a staged artifact in place: reads what a tool wrote beside its output,
---- removes it, and writes the output. A tool writes beside its output so that a
+--- Puts a staged artifact in place: copies what a tool wrote beside its output
+--- onto the output and removes it. A tool writes beside its output so that a
 --- failure leaves the last good artifact untouched, and this is the one step that
 --- replaces it.
 export function installStaged(staged: string, output: string): boolean, string?
-    local bytes, readErr = readFile(staged)
+    local copied, copyErr = copyFile(staged, output)
     os.remove(staged)
-    if bytes == nil then
-        return false, readErr
-    end
-    local wrote, writeErr = writeFile(output, bytes as string)
-    if not wrote then
-        return false, writeErr
+    if not copied then
+        return false, copyErr
     end
 
     return true, nil
