@@ -93,10 +93,10 @@ export function install(c: state.Checker): Intrinsic
         return cHeader(c).declare(body)
     end
 
-
     --- The type an intrinsic call has, or nil when this call is not one and the
     --- ordinary call path should carry on with it. The call site is described by the
     --- source names and resolved identity.
+
     return function(
         node: Node,
         calleeName: string,

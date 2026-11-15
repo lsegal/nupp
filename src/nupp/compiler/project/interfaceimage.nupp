@@ -1315,8 +1315,8 @@ export function decode(image: any, options: DecodeOptions?): (any?, string?)
         local function decodeMethodEntry(entry: any): any
             return {
                 signature = edge(entry.signature),
-                -- The body stays with its own module's tree, but whether there is one is
-                -- what says an implementer may inherit it rather than write its own.
+                -- The body stays with its own module's tree, but whether there is one
+                -- is what says an implementer may inherit it rather than write its own.
                 declaration = entry.declared == true and {} or nil,
                 member = entry.member,
                 parameterKey = entry.parameterKey,

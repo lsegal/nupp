@@ -874,6 +874,91 @@ return {value = value, made = value(box.packed(%d))}
     assert(os.remove(directory, true))
 end
 
+-- What one module declares has to mean the same in a worker that only read its
+-- interface: a prelude record named in its API, a C struct its `ffi.cdef` block
+-- declared, and an interface overload whose default body an implementer inherits.
+function M.crossModuleDeclarationsReachEveryWorker()
+    local directory = os.tmpname()
+    os.remove(directory)
+    write(directory .. "/nupp.lua", 'return {include = {"src"}}\n')
+    write(
+        directory .. "/src/lib/shared.nupp",
+        [=[
+module lib.shared
+
+local ffi = require("ffi")
+
+ffi.cdef[[typedef struct { int32_t x; } SharedPoint;]]
+
+export interface Source
+    next: function(self: Source): string
+
+    function take(self, count: integer): string
+        return self:next()
+    end
+
+    function take(self, text: string): string
+        return text
+    end
+end
+
+export function describe(info: types.reflect.Info): string
+    return info.name
+end
+]=]
+    )
+    for index = 1, 4 do
+        write(
+            directory .. ("/src/user%d.nupp"):format(index),
+            (
+                [[
+local ffi = require("ffi")
+local shared = require("lib.shared")
+
+local record Counted%d is shared.Source
+    function next(self): string
+        return "next"
+    end
+
+    function take(self, count: integer): string
+        return "counted"
+    end
+end
+
+local function name(info: types.reflect.Info): string
+    return shared.describe(info)
+end
+
+local function x(): number
+    local point: any = ffi.new("SharedPoint")
+    return point.x + %d
+end
+
+return {name = name, x = x, made = Counted%d()}
+]]
+            ):format(index, index, index)
+        )
+    end
+
+    local serialCode, serialReport, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
+    testAssert.eq(serialCode, 0, "serial fixture: " .. json.encode(serialReport.diagnostics))
+    -- Twice: the first run may be the one that stores the prelude, and a worker that
+    -- restores a stored prelude rather than checking its own is the case at stake.
+    for run = 1, 2 do
+        local code, report, state = coldCheck(directory, {NUPP_CHECK_JOBS = "4"})
+        testAssert.eq(report.timing.parallel.mode, "parallel", "parallel timing mode, run " .. run)
+        testAssert.eq(
+            stable(report.diagnostics),
+            stable(serialReport.diagnostics),
+            "parallel diagnostics, run " .. run
+        )
+        testAssert.eq(code, 0, "parallel exit status, run " .. run)
+        testAssert.eq(state, serialState, "parallel check records, run " .. run)
+    end
+
+    assert(os.remove(directory, true))
+end
+
 function M.workerAndInterfaceFailuresFallBackWithoutPublishingPartialState()
     local directory = tempProject(false)
     local serialCode, _, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
