@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- When a record's method is defined in a module other than the one that
+  declares it, other modules now always see the declared signature. Before,
+  modules checked after the defining module saw the definition's signature
+  instead. That dropped what only the declaration said, such as `borrows
+  self`, and gave a false `NUPP2619` that depended on check order. A parallel
+  check of `bench/native-runtime` reported it now and then in
+  `bytes.nupp`.
+
 - A parallel `nupp check` or `nupp build` no longer reports errors a serial
   one does not where one module uses what another declared: a prelude record
   such as `types.reflect.Info` in its API (`Info is not a Info`), a C type
