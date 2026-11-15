@@ -18,6 +18,13 @@
 # operating system), so children it starts are neither counted nor able to hide
 # memory it holds. The output directory is fresh, so nothing is reused.
 #
+# The build is the one a checkout without the pinned LLVM does. With LLVM, the
+# test runner's host links it in, and that link runs in this process through
+# lld: about 450 MB more, every time. CI's shared toolchain cache sometimes
+# carried an LLVM tree another job had put there, so one commit measured 716 MB
+# in one run and 1145 MB in the next (#303). The two are different builds, not
+# noise, and this holds only the first, so it refuses to measure the second.
+#
 # Usage: scripts/build-memory-budget [BUDGET_MB]
 set -eu
 
@@ -27,6 +34,12 @@ out="build/memory-budget"
 report="$root/$out.json"
 rm -rf "${root:?}/$out" "$report"
 trap 'rm -rf "${root:?}/$out" "$report"' EXIT
+
+if [ -n "${NUPP_LLVM_PREFIX:-}" ] || "$root/scripts/toolchain" llvm --available >/dev/null 2>&1; then
+    echo "build-memory-budget: the pinned LLVM is available, so the host would link it in and the" >&2
+    echo "build-memory-budget: peak would not be the one this budget holds; measure without it (#303)" >&2
+    exit 1
+fi
 
 (cd "$root" && ./bin/nupp build --json --target testRunner --output "$out") > "$report" || {
     echo "build-memory-budget: the test runner did not build" >&2
