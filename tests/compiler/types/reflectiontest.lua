@@ -126,6 +126,25 @@ function M.describesAnInstantiationWithItsDeclarationsCurrentMembers()
     testAssert.eq(root.construction.requiresFactory, true, "and still needs a factory")
 end
 
+-- What an instantiation derives besides its members -- constructors among them --
+-- was also made only once. One its declaration's own methods named, while the
+-- declaration was hoisted, described a record with no constructor.
+function M.describesAnInstantiationWithItsDeclarationsCurrentConstructor()
+    local element = T.typevar("T", "reflection:stale-constructor")
+    local pool = T.nominal("Pool", "record")
+    pool.typeParams, pool.paramKinds = {element}, {"type"}
+    pool.fieldOrder = {}
+    local instance = generics.instantiate(pool, {[element] = T.string})
+    local self = generics.instantiate(pool, {[element] = element})
+    local constructor = T.func({element}, {self})
+    pool.constructors = {constructor}
+    pool.constructorEntries = {{signature = constructor, result = self, index = 1}}
+    local descriptor = reflection.describe(instance)
+    local construction = descriptor.types[descriptor.root].construction
+    testAssert.eq(construction.declared, true, "the declared constructor")
+    testAssert.eq(descriptor.types[construction.params[1].type].kind, "string", "with this instance's argument")
+end
+
 function M.storageFactsComeFromDeclarationsRatherThanFunctionTypes()
     local node = recursiveNode(T.string)
     local callback = T.func({}, {T.string}, false)

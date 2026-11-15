@@ -1830,6 +1830,9 @@ local record InstantiationFill
     supertypes: {T.Type}
     supertypeValues: {T.Type}
     dependencies: {FillDependency}
+
+    --- `surfaceStamp` of the declaration when the surface was last derived.
+    surface: {any}?
 end
 
 --- A fill reaches its own instantiation through the members it wrote, so the weak
@@ -1837,6 +1840,66 @@ end
 local fills: {[T.Nominal]: InstantiationFill} = T.forgettable(setmetatable({}, {
     __mode = "k"
 }) as {[T.Nominal]: InstantiationFill})
+
+--- How many entries a table of named entry lists holds, so an entry appended to a
+--- list the declaration already had still reads as a change.
+local function entryCount(groups: {[string]: {any}}?): integer
+    local count: integer = 0
+    for _, entries in pairs(groups or {}) do
+        count = count + 1 + #entries
+    end
+
+    return count
+end
+
+local function keyCount(values: {[string]: any}?): integer
+    local count: integer = 0
+    for _ in pairs(values or {}) do
+        count = count + 1
+    end
+
+    return count
+end
+
+--- What `fillInstantiationSurface` read from a declaration, compared slot by slot.
+local SURFACE_SLOTS: integer = 22
+
+local function surfaceStamp(n: T.Nominal): {any}
+    return {
+        n.constructors,
+        #(n.constructors or {}),
+        n.constructorEntries,
+        #(n.constructorEntries or {}),
+        n.methodEntries,
+        entryCount(n.methodEntries),
+        n.methodDispatchEntries,
+        entryCount(n.methodDispatchEntries),
+        n.staticEntries,
+        entryCount(n.staticEntries),
+        n.overloadedMethods,
+        keyCount(n.overloadedMethods),
+        n.overloadedStatics,
+        keyCount(n.overloadedStatics),
+        n.associatedRequirements,
+        #(n.associatedRequirements or {}),
+        n.associatedAnswers,
+        keyCount(n.associatedAnswers),
+        n.indexReadKey,
+        n.indexReadValue,
+        n.indexWriteKey,
+        n.indexWriteValue,
+    }
+end
+
+local function sameSurface(left: {any}, right: {any}): boolean
+    for slot = 1, SURFACE_SLOTS do
+        if left[slot] ~= right[slot] then
+            return false
+        end
+    end
+
+    return true
+end
 
 local function copyBindings(map: Bindings): (Bindings, integer)
     local copy: Bindings = {}
@@ -2017,6 +2080,9 @@ local function fillCurrent(
     then
         return false
     end
+    if fill.surface == nil or not sameSurface(fill.surface as {any}, surfaceStamp(declaration)) then
+        return false
+    end
     local supertypeSource = declaration.supertypes
     if supertypeSource ~= fill.supertypeSource
         or not sameList(supertypeSource or {}, fill.supertypeRead)
@@ -2159,93 +2225,11 @@ function generics.instantiate(n: T.Nominal, map: Bindings): T.Nominal
     return inst
 end
 
---- Brings an instantiation's members up to date with its declaration.
----
---- An instantiation copies the declaration's members when it is made and again only
---- when it is instantiated anew. A declaration still gains facts after that -- effect
---- finalization marks a method that cannot suspend once its module is checked -- so
---- an instantiation a reader reaches without instantiating again can still hold the
---- earlier copy. Which ones do depends on what else the session checked afterwards.
-function generics.refreshInstantiation(inst: T.Nominal): nil
-    local fill = fills[inst]
-    if fill ~= nil and not pendingInstantiations[inst] then
-        generics.instantiate(fill.declaration, fill.map)
-    end
-end
-
-instantiateNominal = function(n: T.Nominal, map: Bindings): T.Nominal
-    local key = instantiationKey(n, map)
-    local outermost = refreshingInstantiations == nil
-    if outermost then
-        substitutionMemo = {}
-        concreteTypes = {}
-    end
-    local refreshed = refreshingInstantiations or {}
-    refreshingInstantiations = refreshed
-    local cached = instantiations[key]
-    if cached then
-        defaultMetadata(cached, n)
-    end
-    if cached and pendingInstantiations[cached] then
-        pendingInstantiations[cached] = nil
-    elseif cached then
-        if not refreshed[key] then
-            refreshed[key] = true
-            if not fillCurrent(cached, n, map, nil) then
-                fillInstantiationMembers(cached, n, map)
-            end
-        end
-        if outermost then
-            refreshingInstantiations = nil
-            substitutionMemo = nil
-            concreteTypes = nil
-        end
-        return cached
-    end
-    local inst = cached or allocateInstantiation(n, map)
-    inst.lpegPattern = n.lpegPattern
-    inst.lpegLibrary = n.lpegLibrary
-    inst.lpegPatternOrigin = n.lpegPatternOrigin
-    inst.paramKinds = n.paramKinds
-    inst.fieldOrder = n.fieldOrder
-    inst.fieldDefaults = n.fieldDefaults
-    inst.privateFields = n.privateFields
-    inst.moduleName = n.moduleName
-    inst.sealedModule = n.sealedModule
-    inst.affineFields = n.affineFields
-    inst.fieldBorrowSources = n.fieldBorrowSources
-    inst.borrowedRootFields = n.borrowedRootFields
-    inst.intrinsicAffine = n.intrinsicAffine
-    inst.intrinsicCopyable = n.intrinsicCopyable
-    inst.intrinsicAffineClaim = n.intrinsicAffineClaim
-    inst.terminalMethod = n.terminalMethod
-    inst.inherentCleanup = n.inherentCleanup and substCleanup(n.inherentCleanup, map, PRESERVE) or nil
-    local constArgs: {any} = inst.constArgs or {}
-    if inst.intrinsicAffine and constArgs[1] then
-        local term = constArgs[1]
-        local named = term.tag == "constLiteral" and term.value or nil
-        local method = type(named) == "string" and named:match("^self%.([%a_][%w_]*)$") or nil
-        inst.inherentCleanup = method and T.methodCleanup(method) or T.constFunctionCleanup(term)
-    end
-    inst.managedCell = n.managedCell
-    inst.managedAlias = n.managedAlias
-    inst.arrayOf = n.arrayOf and substWith(n.arrayOf, map, PRESERVE) or nil
-    inst.fieldDefs = n.fieldDefs
-    inst.writeFieldDefs = n.writeFieldDefs
-    inst.staticFieldDefs = n.staticFieldDefs
-    inst.staticWriteFieldDefs = n.staticWriteFieldDefs
-    inst.deriveKey = n.deriveKey
-    inst.deriveRecipe = n.deriveRecipe
-    inst.derivedDefinitions = n.derivedDefinitions
-    inst.derivedStaticDefinitions = n.derivedStaticDefinitions
-    inst.derivedContracts = n.derivedContracts
-    inst.selfType = n.selfType
-    inst.supertypes = {}
-    -- cached before the members are filled in, so a declaration that names itself finds
-    -- the instantiation under way rather than recurring
-    instantiations[key] = inst
-    refreshed[key] = true
-    fillInstantiationMembers(inst, n, map)
+--- What an instantiation derives from its declaration besides its members: method
+--- and static entries, indexers, constructors and associated metadata. Rebuilt with
+--- the members, because an instantiation made while its declaration was only hoisted
+--- would otherwise keep a declaration with no constructor and no methods.
+local function fillInstantiationSurface(inst: T.Nominal, n: T.Nominal, map: Bindings): nil
     -- Associated metadata travels with the declaration. The map names this nominal's
     -- own parameters; one it leaves out is genuinely unknown, so the map is completed
     -- with `any` before anything is rebuilt. Rebinding rather than materializing is
@@ -2373,6 +2357,101 @@ instantiateNominal = function(n: T.Nominal, map: Bindings): T.Nominal
         }
     end
 
+    local fill = fills[inst]
+    if fill ~= nil then
+        fill.surface = surfaceStamp(n)
+    end
+end
+
+--- Brings an instantiation's members up to date with its declaration.
+---
+--- An instantiation copies the declaration's members when it is made and again only
+--- when it is instantiated anew. A declaration still gains facts after that -- effect
+--- finalization marks a method that cannot suspend once its module is checked -- so
+--- an instantiation a reader reaches without instantiating again can still hold the
+--- earlier copy. Which ones do depends on what else the session checked afterwards.
+function generics.refreshInstantiation(inst: T.Nominal): nil
+    local fill = fills[inst]
+    if fill ~= nil and not pendingInstantiations[inst] then
+        generics.instantiate(fill.declaration, fill.map)
+    end
+end
+
+instantiateNominal = function(n: T.Nominal, map: Bindings): T.Nominal
+    local key = instantiationKey(n, map)
+    local outermost = refreshingInstantiations == nil
+    if outermost then
+        substitutionMemo = {}
+        concreteTypes = {}
+    end
+    local refreshed = refreshingInstantiations or {}
+    refreshingInstantiations = refreshed
+    local cached = instantiations[key]
+    if cached then
+        defaultMetadata(cached, n)
+    end
+    if cached and pendingInstantiations[cached] then
+        pendingInstantiations[cached] = nil
+    elseif cached then
+        if not refreshed[key] then
+            refreshed[key] = true
+            if not fillCurrent(cached, n, map, nil) then
+                fillInstantiationMembers(cached, n, map)
+                fillInstantiationSurface(cached, n, map)
+            end
+        end
+        if outermost then
+            refreshingInstantiations = nil
+            substitutionMemo = nil
+            concreteTypes = nil
+        end
+        return cached
+    end
+    local inst = cached or allocateInstantiation(n, map)
+    inst.lpegPattern = n.lpegPattern
+    inst.lpegLibrary = n.lpegLibrary
+    inst.lpegPatternOrigin = n.lpegPatternOrigin
+    inst.paramKinds = n.paramKinds
+    inst.fieldOrder = n.fieldOrder
+    inst.fieldDefaults = n.fieldDefaults
+    inst.privateFields = n.privateFields
+    inst.moduleName = n.moduleName
+    inst.sealedModule = n.sealedModule
+    inst.affineFields = n.affineFields
+    inst.fieldBorrowSources = n.fieldBorrowSources
+    inst.borrowedRootFields = n.borrowedRootFields
+    inst.intrinsicAffine = n.intrinsicAffine
+    inst.intrinsicCopyable = n.intrinsicCopyable
+    inst.intrinsicAffineClaim = n.intrinsicAffineClaim
+    inst.terminalMethod = n.terminalMethod
+    inst.inherentCleanup = n.inherentCleanup and substCleanup(n.inherentCleanup, map, PRESERVE) or nil
+    local constArgs: {any} = inst.constArgs or {}
+    if inst.intrinsicAffine and constArgs[1] then
+        local term = constArgs[1]
+        local named = term.tag == "constLiteral" and term.value or nil
+        local method = type(named) == "string" and named:match("^self%.([%a_][%w_]*)$") or nil
+        inst.inherentCleanup = method and T.methodCleanup(method) or T.constFunctionCleanup(term)
+    end
+    inst.managedCell = n.managedCell
+    inst.managedAlias = n.managedAlias
+    inst.arrayOf = n.arrayOf and substWith(n.arrayOf, map, PRESERVE) or nil
+    inst.fieldDefs = n.fieldDefs
+    inst.writeFieldDefs = n.writeFieldDefs
+    inst.staticFieldDefs = n.staticFieldDefs
+    inst.staticWriteFieldDefs = n.staticWriteFieldDefs
+    inst.deriveKey = n.deriveKey
+    inst.deriveRecipe = n.deriveRecipe
+    inst.derivedDefinitions = n.derivedDefinitions
+    inst.derivedStaticDefinitions = n.derivedStaticDefinitions
+    inst.derivedContracts = n.derivedContracts
+    inst.selfType = n.selfType
+    inst.supertypes = {}
+    -- cached before the members are filled in, so a declaration that names itself finds
+    -- the instantiation under way rather than recurring
+    instantiations[key] = inst
+    refreshed[key] = true
+    fillInstantiationMembers(inst, n, map)
+    fillInstantiationSurface(inst, n, map)
     if outermost then
         refreshingInstantiations = nil
         substitutionMemo = nil
