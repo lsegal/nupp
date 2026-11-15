@@ -20,7 +20,7 @@ local generics = require("nupp.compiler.types.generics")
 local reflection = require("nupp.compiler.reflection")
 local T = require("nupp.compiler.types")
 
-export const SCHEMA = 6
+export const SCHEMA = 7
 
 --- What `interfaceimage.encode` is told about the run it encodes for.
 export type EncodeOptions = {
@@ -433,6 +433,7 @@ export function encode(semantics: {[string]: any}, options: EncodeOptions?): (an
                 member = entry.member,
                 parameterKey = entry.parameterKey,
                 definition = copyDefinition(entry.definition),
+                declared = entry.declaration ~= nil,
             }
         end
 
@@ -785,19 +786,27 @@ export function decode(image: any, options: DecodeOptions?): (any?, string?)
         elseif node.nominal then
             local key = type(node.declarationKey) == "string" and node.declarationKey
                 or namespace .. "nominal\0" .. tostring(index)
-            local nominal = nominalMap[key]
-            if node.external and (nominal == nil or nominal.selfType == nil) then
-                return nil, "the module interface references unavailable declaration " .. tostring(
-                    node.name
-                ) .. " (" .. tostring(key) .. ")"
-            end
-            if nominal == nil then
-                nominal = T.nominal(node.name or "?", node.kind, node.declarationKey)
-                nominalMap[key] = nominal
-            end
-            built[index] = nominal
-            if not node.external then
-                declarations[#declarations + 1] = index
+            -- A declaration the compiler made before this process became a worker
+            -- is already whole here: the image's copy names it, and filling it in
+            -- again would only replace its members with copies of themselves.
+            local owned = type(node.declarationKey) == "string" and T.compilerNominal(node.declarationKey) or nil
+            if owned ~= nil then
+                built[index] = owned
+            else
+                local nominal = nominalMap[key]
+                if node.external and (nominal == nil or nominal.selfType == nil) then
+                    return nil, "the module interface references unavailable declaration " .. tostring(
+                        node.name
+                    ) .. " (" .. tostring(key) .. ")"
+                end
+                if nominal == nil then
+                    nominal = T.nominal(node.name or "?", node.kind, node.declarationKey)
+                    nominalMap[key] = nominal
+                end
+                built[index] = nominal
+                if not node.external then
+                    declarations[#declarations + 1] = index
+                end
             end
         elseif node.kind == "typevar" then
             built[index] = T.typevar(node.name or "T", node.identity or namespace .. "type\0" .. tostring(index))
@@ -1306,7 +1315,9 @@ export function decode(image: any, options: DecodeOptions?): (any?, string?)
         local function decodeMethodEntry(entry: any): any
             return {
                 signature = edge(entry.signature),
-                declaration = nil,
+                -- The body stays with its own module's tree, but whether there is one
+                -- is what says an implementer may inherit it rather than write its own.
+                declaration = entry.declared == true and {} or nil,
                 member = entry.member,
                 parameterKey = entry.parameterKey,
                 definition = entry.definition,

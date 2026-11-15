@@ -859,6 +859,14 @@ function preludecache.decode(image: any, origin: preludecache.Origin?): any?
         local where = image.internedAs[id]
         types.adopt(where[1] as string, where[2] as string, built[id])
     end
+    -- A declaration of the image's own is this process's declaration of its key,
+    -- the one a worker reading another worker's interface has to find.
+    for id, owned in pairs(mine) do
+        local t: any = built[id]
+        if owned and t.tag == "nominal" and type(t.declarationKey) == "string" then
+            types.adoptNominal(t)
+        end
+    end
     -- And the counters with them, or the next declaration this process allocates is
     -- numbered the way one of these already is.
     types.resumeIdentity(image.identity)

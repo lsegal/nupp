@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- A parallel `nupp check` or `nupp build` no longer reports errors a serial
+  one does not where one module uses what another declared: a prelude record
+  such as `types.reflect.Info` in its API (`Info is not a Info`), a C type
+  its literal `ffi.cdef` block declared (`not a C type`), or an interface
+  overload whose default body an implementing record inherits (`does not
+  implement overload`). A cold parallel check of `bench/native-runtime`
+  reported 13 to 51 such errors.
+
 - `build/.nupp-state.json` is the same, byte for byte apart from derive
   timings, whether a cold `nupp build` checked serially or on the parallel
   checker, and from one build to the next. The file is written with sorted

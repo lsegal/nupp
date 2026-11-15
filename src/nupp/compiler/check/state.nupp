@@ -54,7 +54,11 @@ export type ModuleExports = {
     deriveInterfaceFingerprint: string?,
     comptimeFunctions: {[string]: any},
     comptimeFunctionFingerprint: string?,
-    callGuarantees: {[string]: any}?
+    callGuarantees: {[string]: any}?,
+    -- The literal `ffi.cdef` blocks checking the file declared, in order. They
+    -- declare to the process rather than export, so a session that imports the
+    -- module instead of checking it declares them from here.
+    cdefBlocks: {string}?
 }
 
 --- A thing to report about a file.
