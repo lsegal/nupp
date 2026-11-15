@@ -269,61 +269,12 @@ end
 --- How much of a file a copy holds at once.
 const COPY_CHUNK = 1048576
 
---- Writes a staging file beside `path` and renames it onto `path`. The staging
---- file holds `text`, or else the contents of the file `source`, read a chunk
---- at a time.
-local function stageFile(path: string, text: string?, source: string?): boolean?, string?
-    local input: affine(io.File, __nuppCloseFile)? = nil
-    if source ~= nil then
-        local opened, openErr = io.open(source as string, "rb")
-        if not opened then
-            if files2.stat(source as string) == "directory" then
-                return nil, tostring(source) .. " is a directory"
-            end
-
-            return nil, openErr
-        end
-        input = opened
-    end
-    if not mkdir(dirname(path)) then
-        if input then
-            input:close()
-        end
-        return nil, "cannot create " .. dirname(path)
-    end
-    -- The counter as well as the process, so that one process staging the same
-    -- path twice at once -- a retry, a caller that writes then rewrites -- does
-    -- not collide with itself either.
-    local tmp = ("%s.%s.tmp"):format(path, stagingSuffix())
-    local f, err = io.open(tmp, "wb")
-    if not f then
-        if input then
-            input:close()
-        end
-        return nil, err
-    end
-    local wrote: any, writeErr: string? = true, nil
-    if input then
-        while wrote do
-            local chunk = input:read(COPY_CHUNK)
-            if chunk == nil then
-                break
-            end
-            wrote, writeErr = f:write(chunk)
-        end
-        input:close()
-    else
-        wrote, writeErr = f:write(text or "")
-    end
-    if not wrote then
-        f:close()
+--- Puts the staging file `tmp` in place at `path` once it was written and closed
+--- (`written`), and removes it otherwise, reporting `problem`.
+local function publish(tmp: string, path: string, written: any, problem: string?): boolean?, string?
+    if not written then
         os.remove(tmp)
-        return nil, writeErr
-    end
-    local closed, closeErr = f:close()
-    if not closed then
-        os.remove(tmp)
-        return nil, closeErr
+        return nil, problem
     end
     local ok, renameErr = os.rename(tmp, path)
     -- The Windows fallback, where a rename cannot replace an existing file. The
@@ -354,8 +305,31 @@ local function stageFile(path: string, text: string?, source: string?): boolean?
     return true
 end
 
+--- A fresh staging file name beside `path`, once its directory exists.
+local function stagingPath(path: string): string?, string?
+    if not mkdir(dirname(path)) then
+        return nil, "cannot create " .. dirname(path)
+    end
+    -- The counter as well as the process, so that one process staging the same
+    -- path twice at once -- a retry, a caller that writes then rewrites -- does
+    -- not collide with itself either.
+
+    return ("%s.%s.tmp"):format(path, stagingSuffix()), nil
+end
+
 export function writeFile(path: string, text: string): boolean?, string?
-    return stageFile(path, text, nil)
+    local tmp, stagingErr = stagingPath(path)
+    if tmp == nil then
+        return nil, stagingErr
+    end
+    local f, err = io.open(tmp as string, "wb")
+    if not f then
+        return nil, err
+    end
+    local wrote, writeErr = f:write(text)
+    local closed, closeErr = f:close()
+
+    return publish(tmp as string, path, wrote and closed, writeErr or closeErr)
 end
 
 --- Copies `source` to `destination` a chunk at a time.
@@ -366,7 +340,36 @@ end
 --- string, so a single copy added about 250 MB to the process's peak, and the
 --- build's peak depended on whether the toolchain had the pinned LLVM (#303).
 export function copyFile(source: string, destination: string): boolean?, string?
-    return stageFile(destination, nil, source)
+    local input, openErr = io.open(source, "rb")
+    if not input then
+        if files2.stat(source) == "directory" then
+            return nil, source .. " is a directory"
+        end
+
+        return nil, openErr
+    end
+    local tmp, stagingErr = stagingPath(destination)
+    if tmp == nil then
+        input:close()
+        return nil, stagingErr
+    end
+    local f, err = io.open(tmp as string, "wb")
+    if not f then
+        input:close()
+        return nil, err
+    end
+    local wrote: any, writeErr: string? = true, nil
+    while wrote do
+        local chunk = input:read(COPY_CHUNK)
+        if chunk == nil then
+            break
+        end
+        wrote, writeErr = f:write(chunk)
+    end
+    input:close()
+    local closed, closeErr = f:close()
+
+    return publish(tmp as string, destination, wrote and closed, writeErr or closeErr)
 end
 
 local function exhausted(): (string?, files2.FileKind)
