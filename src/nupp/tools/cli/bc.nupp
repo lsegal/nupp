@@ -175,7 +175,8 @@ local function run(options: any): integer
     local envMod = require("nupp.compiler.project.env")
     -- The file's dependencies are read back from what the last compile in this project
     -- checked, rather than checked again: see `nupp.compiler.project.projectimage`.
-    local env = envMod.new(".", {projectInterfaces = true})
+    -- A file in a project nested inside this one is named by that project.
+    local env = envMod.new(envMod.projectRootFor(".", path), {projectInterfaces = true})
     local settings = compile.settings(options)
     settings.diagnostics = collected
     local folding = (options.format or "text") == "text" and not options.prologue

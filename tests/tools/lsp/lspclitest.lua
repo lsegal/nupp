@@ -575,6 +575,38 @@ function M.artifactSaysWhyItCouldNotResolveOne()
     assert(decoded.unavailable.reason == "not-lowered", "with the reason it refused")
 end
 
+-- A project inside the one the command runs in -- a fixture component, a template --
+-- names its files by its own roots, so a single-file compile of one goes through
+-- that project's manifest rather than the outer one, whose name for the file its
+-- `module` declaration would not match (#299).
+function M.singleFileCompilesNameAFileByItsNestedProject()
+    local dir = tempProject({["nupp.lua"] = 'return {include = {"."}}\n'})
+    assert(os.execute("mkdir -p '" .. dir .. "/component/src'") == 0)
+    local files = {
+        ["component/nupp.lua"] = 'return {include = {"src"}}\n',
+        [
+            "component/src/helper.nupp"
+        ] = "local helper = {}\n\nfunction helper.answer(): number\n    return 42\nend\n\nreturn helper\n",
+        ["component/src/events.nupp"] = 'module events\n\nlocal helper = require("helper")\n\nprint(helper.answer())\n',
+    }
+    for name, source in pairs(files) do
+        local file = assert(io.open(dir .. "/" .. name, "wb"))
+        file:write(source)
+        file:close()
+    end
+    local path = "component/src/events.nupp"
+    local lua = capture(dir, "lsp artifact --kind lua " .. path .. "; echo \"__exit__:$?\"")
+    local bc = capture(dir, "bc " .. path .. "; echo \"__exit__:$?\"")
+    local ran = capture(dir, "run " .. path .. "; echo \"__exit__:$?\"")
+    os.execute("rm -rf '" .. dir .. "'")
+    assert(not lua:find("NUPP1002", 1, true), "lsp artifact names the module by its own project:\n" .. lua)
+    contains(lua, 'package.loaded["events"]', "the artifact is the nested project's module")
+    contains(lua, "__exit__:0", "and is printed")
+    assert(not bc:find("NUPP1002", 1, true), "bc names the module by its own project:\n" .. bc)
+    contains(bc, "__exit__:0", "and lists it")
+    contains(ran, "42\n__exit__:0", "run resolves the nested project's own modules")
+end
+
 -- Lua the generator wrote but a VM will not load is the one place the reason can
 -- be read, so it is printed rather than withheld, with the problem beside it.
 function M.artifactPrintsGeneratedLuaThatDoesNotLoad()

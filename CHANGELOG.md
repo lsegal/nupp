@@ -10,6 +10,10 @@
   lane's kernel time fell from 23-41% of its CPU to about 7%, and it finished
   in 563-611 s where it had taken 580-1,002 s. macOS keeps its one area, which
   works around the system ignoring LuaJIT's placement hint.
+- `nupp bc`, `nupp run` and `nupp lsp artifact` of a file in a project nested
+  inside the current one, with its own `nupp.lua`, compile it through that
+  project, as the language server does. They named it by the outer project's
+  roots, so a `module` declaration in the file was refused with NUPP1002.
 - `nupp fmt --check` over many files keeps only the interfaces of the modules
   they require, not every module's checked tree, and collects garbage the way
   `nupp build` does. A cold check of a quarter of this repository's tree went
