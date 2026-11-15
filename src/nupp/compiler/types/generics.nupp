@@ -1875,10 +1875,26 @@ local function fillInstantiationMap(into: {[string]: T.Type}, source: {[string]:
     return fill
 end
 
+--- The declaration's tables an instantiation shares rather than substitutes. Checking
+--- the declaration replaces them, so an instantiation made while it was only hoisted
+--- -- one its own methods name -- would otherwise keep the empty ones: no private
+--- fields, no stored field order, and no module.
 local function defaultMetadata(inst: T.Nominal, declaration: T.Nominal): nil
     inst.defaults = declaration.defaults
     inst.defaultEntries = declaration.defaultEntries
     inst.inheritedDefaults = declaration.inheritedDefaults
+    inst.fieldOrder = declaration.fieldOrder
+    inst.fieldDefaults = declaration.fieldDefaults
+    inst.privateFields = declaration.privateFields
+    inst.moduleName = declaration.moduleName
+    inst.sealedModule = declaration.sealedModule
+    inst.affineFields = declaration.affineFields
+    inst.fieldBorrowSources = declaration.fieldBorrowSources
+    inst.borrowedRootFields = declaration.borrowedRootFields
+    inst.fieldDefs = declaration.fieldDefs
+    inst.writeFieldDefs = declaration.writeFieldDefs
+    inst.staticFieldDefs = declaration.staticFieldDefs
+    inst.staticWriteFieldDefs = declaration.staticWriteFieldDefs
 end
 
 --- Copies the declaration's current member surface onto an instantiation. A generic

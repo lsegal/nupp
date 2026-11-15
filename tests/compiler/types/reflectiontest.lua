@@ -100,7 +100,8 @@ end
 -- finalization replaces a method with one that cannot suspend once its module is
 -- checked, so an instantiation made while the module was checked still held the
 -- earlier copy: a serial build, which reached it that way, described `noYield` as
--- false where a worker that imported the finished declaration said true.
+-- false where a worker that imported the finished declaration said true, and
+-- reflected the private fields of a record its own methods named.
 function M.describesAnInstantiationWithItsDeclarationsCurrentMembers()
     local element = T.typevar("T", "reflection:stale-instantiation")
     local pool = T.nominal("Pool", "record")
@@ -113,10 +114,16 @@ function M.describesAnInstantiationWithItsDeclarationsCurrentMembers()
     local quiet = T.withYields(early, false)
     assert(quiet ~= early and quiet.noYield, "finalization makes a quiet copy")
     pool.staticByname.free, pool.staticWriteByname.free = quiet, quiet
+    -- Checking the declaration also replaces the tables an instantiation shares.
+    pool.fieldOrder = {"secret"}
+    pool.byname, pool.writeByname = {secret = T.string}, {secret = T.string}
+    pool.privateFields = {secret = true}
     local descriptor = reflection.describe(instance)
     local root = descriptor.types[descriptor.root]
     testAssert.eq(root.staticFields[1].name, "free")
     testAssert.eq(descriptor.types[root.staticFields[1].read].noYield, true, "the finalized member")
+    testAssert.eq(#root.fields, 0, "a private field declared afterwards stays hidden")
+    testAssert.eq(root.construction.requiresFactory, true, "and still needs a factory")
 end
 
 function M.storageFactsComeFromDeclarationsRatherThanFunctionTypes()
