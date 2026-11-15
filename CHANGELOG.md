@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `nupp build` of a binary target copies the host into the stamped binary a
+  block at a time instead of reading it into memory and copying it there. A
+  host that links LLVM in is about 140 MB, and holding it twice put
+  170-830 MB on the build's peak. A cold build of this repository's test
+  runner with the pinned LLVM went from 1.15 GB to about 800 MB on Windows,
+  from 1.55 GB to about 720 MB on macOS, and from 890 MB to about 720 MB on
+  Linux.
 - A cold `nupp build` of a project that declares a const-generic function
   runs on the parallel checker. The build plans its const specializations
   first and hands the plan to the workers, so what it writes matches the

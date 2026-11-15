@@ -19,16 +19,33 @@
 # memory it holds. The output directory is fresh, so nothing is reused.
 #
 # The build is the one a checkout without the pinned LLVM does. With LLVM, the
-# test runner's host links it in, and that link runs in this process through
-# lld: about 450 MB more, every time. CI's shared toolchain cache sometimes
+# test runner's host links it in, and the build peaked about 450 MB higher,
+# every time. CI's shared toolchain cache sometimes
 # carried an LLVM tree another job had put there, so one commit measured 716 MB
 # in one run and 1145 MB in the next (#303). The two are different builds, not
-# noise, and this holds only the first, so it refuses to measure the second.
+# noise, so each has its own budget, and `--llvm` measures the second.
 #
-# Usage: scripts/build-memory-budget [BUDGET_MB]
+# Most of that 450 MB was never the link. The link runs in a child, which the
+# peak does not count; what the build did was read the 140 MB host into a string
+# and copy it into the stamped binary, holding both. The stamp now copies the
+# host a block at a time (#310). Three runs a platform, before and after: Linux
+# 882-895 MB to 718-725, macOS 1537-1557 to 699-735, Windows 1146-1155 to
+# 795-817. The default budget is Windows's; CI holds Linux and macOS to 850, so
+# a return of the old copy fails there as well.
+#
+# Usage: scripts/build-memory-budget [--llvm] [BUDGET_MB]
 set -eu
 
-budget_mb=${1:-${NUPP_BUILD_MEMORY_BUDGET_MB:-900}}
+llvm=false
+if [ "${1:-}" = --llvm ]; then
+    llvm=true
+    shift
+fi
+if [ "$llvm" = true ]; then
+    budget_mb=${1:-${NUPP_BUILD_MEMORY_LLVM_BUDGET_MB:-950}}
+else
+    budget_mb=${1:-${NUPP_BUILD_MEMORY_BUDGET_MB:-900}}
+fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="build/memory-budget"
 report="$root/$out.json"
@@ -36,9 +53,25 @@ rm -rf "${root:?}/$out" "$report"
 trap 'rm -rf "${root:?}/$out" "$report"' EXIT
 
 if [ -n "${NUPP_LLVM_PREFIX:-}" ] || "$root/scripts/toolchain" llvm --available >/dev/null 2>&1; then
-    echo "build-memory-budget: the pinned LLVM is available, so the host would link it in and the" >&2
-    echo "build-memory-budget: peak would not be the one this budget holds; measure without it (#303)" >&2
+    available=true
+else
+    available=false
+fi
+if [ "$llvm" = true ] && [ "$available" = false ]; then
+    echo "build-memory-budget: --llvm measures the build that links the pinned LLVM in, and it is" >&2
+    echo "build-memory-budget: not available; provision it with scripts/toolchain llvm (#310)" >&2
     exit 1
+fi
+if [ "$llvm" = false ] && [ "$available" = true ]; then
+    echo "build-memory-budget: the pinned LLVM is available, so the host would link it in and the" >&2
+    echo "build-memory-budget: peak would not be the one this budget holds; measure without it, or" >&2
+    echo "build-memory-budget: pass --llvm to hold the LLVM-linked build to its own budget (#303)" >&2
+    exit 1
+fi
+if [ "$llvm" = true ]; then
+    label="full build with LLVM"
+else
+    label="full build"
 fi
 
 (cd "$root" && ./bin/nupp build --json --target testRunner --output "$out") > "$report" || {
@@ -55,8 +88,8 @@ if [ -z "$peak" ]; then
     exit 1
 fi
 peak_mb=$((peak / 1048576))
-echo "full build: peak ${peak_mb} MB (budget ${budget_mb} MB), ${total} ms"
+echo "$label: peak ${peak_mb} MB (budget ${budget_mb} MB), ${total} ms"
 if [ "$peak_mb" -gt "$budget_mb" ]; then
-    echo "build-memory-budget: the full build peaked at ${peak_mb} MB, over its budget of ${budget_mb} MB" >&2
+    echo "build-memory-budget: the $label peaked at ${peak_mb} MB, over its budget of ${budget_mb} MB" >&2
     exit 1
 fi
