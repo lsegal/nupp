@@ -884,13 +884,15 @@ local function posixArchive(output: string, size: integer): string?, string?
     header = header:sub(1, 148) .. checksumField .. header:sub(157)
     local padding = (512 - (size % 512)) % 512
     local archive = output .. ".tar"
-    local into, intoErr = io.open(archive, "wb")
+    local staging = ("%s.%s.tmp"):format(archive, fs.stagingSuffix())
+    local into, intoErr = io.open(staging, "wb")
     if into == nil then
         return nil, tostring(intoErr)
     end
     local from, fromErr = io.open(output, "rb")
     if from == nil then
         into:close()
+        os.remove(staging)
 
         return nil, tostring(fromErr)
     end
@@ -907,9 +909,15 @@ local function posixArchive(output: string, size: integer): string?, string?
     end
     from:close()
     wrote = wrote and into:write(("\0"):rep(padding) .. ("\0"):rep(1024)) ~= nil
-    into:close()
+    wrote = into:close() ~= nil and wrote
     if not wrote then
+        os.remove(staging)
+
         return nil, "cannot write " .. archive
+    end
+    local committed, commitErr = fs.commitStaged(staging, archive)
+    if not committed then
+        return nil, tostring(commitErr)
     end
 
     return archive
@@ -1063,7 +1071,15 @@ local function stampStub(
 
         return nil, tostring(kept)
     end
-    local into, intoErr = io.open(output, "wb")
+    if not fs.mkdir(dirname(output)) then
+        stub:close()
+
+        return nil, "cannot create " .. dirname(output)
+    end
+    -- Staged and moved into place, as `writeFile` does, so a failed stamp never
+    -- leaves half a binary where the last good one was.
+    local staging = ("%s.%s.tmp"):format(output, fs.stagingSuffix())
+    local into, intoErr = io.open(staging, "wb")
     if into == nil then
         stub:close()
 
@@ -1082,11 +1098,15 @@ local function stampStub(
     end
     stub:close()
     wrote = wrote and remaining == 0 and into:write(payload, trailer as string) ~= nil
-    into:close()
+    wrote = into:close() ~= nil and wrote
     if not wrote then
-        os.remove(output)
+        os.remove(staging)
 
         return nil, "cannot write " .. output .. " from the stub " .. stubPath
+    end
+    local committed, commitErr = fs.commitStaged(staging, output)
+    if not committed then
+        return nil, tostring(commitErr)
     end
 
     return finishStamp(output, first:sub(1, 4), (kept as integer) + #payload + #(trailer as string), selectedPlatform)
