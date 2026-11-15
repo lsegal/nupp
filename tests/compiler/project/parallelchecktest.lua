@@ -583,11 +583,11 @@ function M.parallelBuildsWriteWhatSerialBuildsWrite()
     assert(os.remove(directory, true))
 end
 
--- Const specialization is planned across every module of a build at once. A
--- project declaring a const-generic function is built in one process, and says so,
--- without starting a worker to find that out; its check, which plans nothing, still
--- uses workers.
-function M.constGenericProjectsBuildSerially()
+-- Const specialization is planned across every module of a build at once, before
+-- any worker starts, and each worker generates against that plan. A const-generic
+-- function called locally and from other modules, with more tuples than its
+-- module keeps bodies for, builds what the serial build writes, byte for byte.
+function M.constGenericProjectsBuildInParallel()
     local directory = tempProject(false)
     write(
         directory .. "/src/scaled.nupp",
@@ -601,32 +601,230 @@ local function doubled<const N: integer>(value: number, count: N): number
 end
 
 local function four(): number
-    return doubled(1, 2)
+    return doubled(1, 2) + doubled(1, 2)
 end
 
-return {four = four}
+return {doubled = doubled, four = four}
 ]]
     )
-    local buildPids = directory .. "/build-workers.pid"
-    local code, report = coldBuild(directory, {
-        NUPP_CHECK_JOBS = "2",
-        NUPP_TEST_PARALLEL_CHECK_PID_FILE = buildPids,
-    }, {"-O2"})
-    testAssert.eq(code, 0, "const-generic build: " .. json.encode(report.diagnostics))
-    testAssert.eq(report.timing.parallel.mode, "serial", "the build stays in one process")
-    assert(
-        tostring(report.timing.parallel.reason):find("const-generic", 1, true),
-        "the build says why: " .. tostring(report.timing.parallel.reason)
+    for index = 1, 5 do
+        write(
+            directory .. ("/src/scaled_user%d.nupp"):format(index),
+            (
+                [[
+local scaled = require("scaled")
+
+local function value(): number
+    return scaled.doubled(1, %d) + scaled.doubled(2, %d) + scaled.four()
+end
+
+return {value = value}
+]]
+            ):format(index, index + 5)
+        )
+    end
+    for _, level in ipairs({"-O0", "-O2"}) do
+        local serialCode, serialReport, serialOutputs, serialState = coldBuild(directory, {NUPP_CHECK_JOBS = "1"}, {
+            level
+        })
+        testAssert.eq(serialCode, 0, level .. " serial build: " .. json.encode(serialReport.diagnostics))
+        local buildPids = directory .. "/build-workers" .. level .. ".pid"
+        local code, report, outputs, state = coldBuild(directory, {
+            NUPP_CHECK_JOBS = "2",
+            NUPP_TEST_PARALLEL_CHECK_PID_FILE = buildPids,
+        }, {level})
+        testAssert.eq(code, 0, level .. " parallel build: " .. json.encode(report.diagnostics))
+        testAssert.eq(
+            report.timing.parallel.mode,
+            "parallel",
+            level .. " parallel timing mode: " .. tostring(report.timing.parallel.reason)
+        )
+        testAssert.eq(countKeys(workerPids(buildPids)), 2, level .. " the build started its workers")
+        testAssert.eq(report.timing.parallel.rechecked, 0, level .. " worker records survive validation")
+        testAssert.eq(outputs, serialOutputs, level .. " build outputs")
+        testAssert.eq(state, serialState, level .. " build state")
+        if level == "-O2" then
+            local built = buildOutputs(directory)
+            assert(
+                built["./scaled.lua"]:find("local function __nuppConst_doubled_", 1, true),
+                "the declaration owns its bodies"
+            )
+            assert(
+                built["./scaled_user1.lua"]:find("__nuppConstSpecializations[", 1, true),
+                "a caller reaches a body in another module"
+            )
+            local declined = false
+            for _, record in pairs(json.decode(built["./.nupp-state.json"]).modules) do
+                for _, remark in ipairs(record.optimizationRemarks or {}) do
+                    declined = declined or remark.status == "declined"
+                end
+            end
+            assert(declined, "the module's body budget declines some tuples")
+        end
+    end
+
+    assert(os.remove(directory, true))
+end
+
+-- The checker reads some modules no require names: the project's own
+-- implementation of a builtin root such as `io` or `assert`, and the module a
+-- qualified type names, in code or in an `@raises` line. A worker checking a
+-- module before those would check them itself, which a worker refuses, so the
+-- graph scan orders them first. A module the project does not check as its own is
+-- followed by the coordinator to what it requires, so the scan keeps those too.
+function M.theGraphScanOrdersModulesTheCheckerReadsUnasked()
+    local parser = require("nupp.compiler.syntax.parser")
+    local header = require("nupp.compiler.project.header")
+    local moduleobject = require("nupp.tools.build.moduleobject")
+    local path = "/project/app/reader.nupp"
+    local text = [[
+--- Reads a number.
+--- @raises codec.Error when the file is malformed
+local function read(path: io.Path): number
+    assert(path)
+    return math.floor(1.5)
+end
+
+return {read = read}
+]]
+    local parsed = parser.parse(text, path)
+    local declared = {
+        ["app.codec"] = true,
+        ["app.reader"] = true,
+        assert = true,
+        ["nupp.runtime.standardio"] = true,
+        ["nupp.runtime.standardmath"] = true,
+        ["nupp.runtime.standardos"] = true,
+    }
+    local object = moduleobject.emit(
+        path,
+        parsed,
+        header.of(path, "app.reader", parsed),
+        {declaredModules = declared},
+        text
     )
-    testAssert.eq(countKeys(workerPids(buildPids)), 0, "the declined build started no worker")
-    local checkPids = directory .. "/check-workers.pid"
-    local checkCode, checkReport = coldCheck(directory, {
-        NUPP_CHECK_JOBS = "2",
-        NUPP_TEST_PARALLEL_CHECK_PID_FILE = checkPids,
-    })
-    testAssert.eq(checkCode, 0, "const-generic check")
-    testAssert.eq(checkReport.timing.parallel.mode, "parallel", "a check plans no specialization")
-    testAssert.eq(countKeys(workerPids(checkPids)), 2, "the check started its workers")
+    local found = {}
+    for _, name in ipairs(object.dependencies) do
+        found[name] = true
+    end
+    for _, name in ipairs({"app.codec", "assert", "nupp.runtime.standardio", "nupp.runtime.standardmath"}) do
+        assert(found[name], name .. " is a dependency: " .. table.concat(object.dependencies, ", "))
+    end
+    testAssert.eq(found["nupp.runtime.standardos"], nil, "a root the module never reads is not")
+end
+
+-- A target's sources need not be everything they require. A module outside them is
+-- checked by whichever worker reaches it, and a source it requires in turn has to
+-- be checked before that worker gets there.
+function M.sourcesReachedThroughAnUncheckedModuleAreCheckedFirst()
+    local directory = os.tmpname()
+    os.remove(directory)
+    write(
+        directory .. "/nupp.lua",
+        'return {include = {"src"}, build = {targets = {app = {kind = "modules", entries = {"app.main"}, '
+        .. 'sources = {"src/app/**.nupp"}}}, default = "app"}}\n'
+    )
+    write(
+        directory .. "/src/app/core.nupp",
+        [[
+module app.core
+
+export function base(): number
+    return 40
+end
+]]
+    )
+    write(
+        directory .. "/src/lib/mid.nupp",
+        [[
+module lib.mid
+
+local core = require("app.core")
+
+export function value(): number
+    return core.base() + 1
+end
+]]
+    )
+    for index = 1, 4 do
+        write(
+            directory .. ("/src/app/user%d.nupp"):format(index),
+            (
+                [[
+module app.user%d
+
+local mid = require("lib.mid")
+
+export function value(): number
+    return mid.value() + %d
+end
+]]
+            ):format(index, index)
+        )
+    end
+    write(directory .. "/src/app/main.nupp", 'local user1 = require("app.user1")\nreturn user1.value()\n')
+
+    local serialCode, serialReport, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
+    testAssert.eq(serialCode, 0, "serial fixture: " .. json.encode(serialReport.diagnostics))
+    local code, report, state = coldCheck(directory, {NUPP_CHECK_JOBS = "3"})
+    testAssert.eq(
+        report.timing.parallel.mode,
+        "parallel",
+        "parallel timing mode: " .. tostring(report.timing.parallel.reason)
+    )
+    testAssert.eq(code, 0, "parallel exit status")
+    testAssert.eq(state, serialState, "parallel check records")
+
+    assert(os.remove(directory, true))
+end
+
+-- An alias keeps its defaults as the syntax they were written in, and the module
+-- applying it resolves them. An interface image that dropped them left a worker
+-- reading `box.Packed<number>` with its const parameter unbound.
+function M.aliasDefaultsReachEveryWorker()
+    local directory = os.tmpname()
+    os.remove(directory)
+    write(directory .. "/nupp.lua", 'return {include = {"src"}}\n')
+    write(
+        directory .. "/src/lib/box.nupp",
+        [[
+module lib.box
+
+export interface Box<T, const Kind: string = "packed">
+    value: T
+end
+
+export type Packed<T, const Kind: string = "packed"> = Box<T, Kind>
+
+export function packed(value: number): Packed<number>
+    return {value = value}
+end
+]]
+    )
+    for index = 1, 4 do
+        write(
+            directory .. ("/src/user%d.nupp"):format(index),
+            (
+                [[
+local box = require("lib.box")
+
+local function value(item: box.Packed<number>): number
+    return item.value + %d
+end
+
+return {value = value, made = value(box.packed(%d))}
+]]
+            ):format(index, index)
+        )
+    end
+
+    local serialCode, serialReport, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
+    testAssert.eq(serialCode, 0, "serial fixture: " .. json.encode(serialReport.diagnostics))
+    local code, report, state = coldCheck(directory, {NUPP_CHECK_JOBS = "2"})
+    testAssert.eq(report.timing.parallel.mode, "parallel", "parallel timing mode")
+    testAssert.eq(stable(report.diagnostics), stable(serialReport.diagnostics), "parallel diagnostics")
+    testAssert.eq(code, 0, "parallel exit status")
+    testAssert.eq(state, serialState, "parallel check records")
 
     assert(os.remove(directory, true))
 end
