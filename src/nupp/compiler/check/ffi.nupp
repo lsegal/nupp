@@ -78,10 +78,25 @@ end
 --- @param c the run's state
 --- @return the intrinsic dispatch the call path asks first
 export function install(c: state.Checker): Intrinsic
+    --- Declares a literal block to the checker's C header, and keeps it with the
+    --- module's exports: a session that imports the module rather than checking it
+    --- has to declare it too before a type string naming what it declares means
+    --- anything there.
+    local function declareBlock(body: string): (boolean, string?, {[string]: boolean}?)
+        local exports = c.moduleExports
+        if exports ~= nil then
+            local blocks = exports.cdefBlocks or {}
+            blocks[#blocks + 1] = body
+            exports.cdefBlocks = blocks
+        end
+
+        return cHeader(c).declare(body)
+    end
 
     --- The type an intrinsic call has, or nil when this call is not one and the
     --- ordinary call path should carry on with it. The call site is described by the
     --- source names and resolved identity.
+
     return function(
         node: Node,
         calleeName: string,
@@ -531,7 +546,7 @@ export function install(c: state.Checker): Intrinsic
             then
                 local body = cdefBody(subject.token.text)
                 if body then
-                    local ok, _, names = cHeader(c).declare(body)
+                    local ok, _, names = declareBlock(body)
                     if ok then
                         c.recordCDeclarations(names)
                         node.cdefDeclarationBlock = true
@@ -552,7 +567,7 @@ export function install(c: state.Checker): Intrinsic
             if strTok then
                 local body = cdefBody(strTok.text)
                 if body then
-                    local ok, err, names = cHeader(c).declare(body)
+                    local ok, err, names = declareBlock(body)
                     c.recordCDeclarations(names)
                     node.cdefDeclarationBlock = true
                     if not ok then

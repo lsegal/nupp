@@ -189,6 +189,14 @@ function image.new(): any
         local where = assert(internedAs[index])
         T.adopt(where[1], where[2], tables[index])
     end
+    -- A declaration of the image's own is this process's declaration of its key,
+    -- the one a worker reading another worker's interface has to find.
+    for index, owned in pairs(mine) do
+        local t: any = tables[index]
+        if owned and t.tag == "nominal" and type(t.declarationKey) == "string" then
+            T.adoptNominal(t)
+        end
+    end
     T.resumeIdentity(identity)
 
     return roots

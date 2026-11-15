@@ -874,6 +874,91 @@ return {value = value, made = value(box.packed(%d))}
     assert(os.remove(directory, true))
 end
 
+-- What one module declares has to mean the same in a worker that only read its
+-- interface: a prelude record named in its API, a C struct its `ffi.cdef` block
+-- declared, and an interface overload whose default body an implementer inherits.
+function M.crossModuleDeclarationsReachEveryWorker()
+    local directory = os.tmpname()
+    os.remove(directory)
+    write(directory .. "/nupp.lua", 'return {include = {"src"}}\n')
+    write(
+        directory .. "/src/lib/shared.nupp",
+        [=[
+module lib.shared
+
+local ffi = require("ffi")
+
+ffi.cdef[[typedef struct { int32_t x; } SharedPoint;]]
+
+export interface Source
+    next: function(self: Source): string
+
+    function take(self, count: integer): string
+        return self:next()
+    end
+
+    function take(self, text: string): string
+        return text
+    end
+end
+
+export function describe(info: types.reflect.Info): string
+    return info.name
+end
+]=]
+    )
+    for index = 1, 4 do
+        write(
+            directory .. ("/src/user%d.nupp"):format(index),
+            (
+                [[
+local ffi = require("ffi")
+local shared = require("lib.shared")
+
+local record Counted%d is shared.Source
+    function next(self): string
+        return "next"
+    end
+
+    function take(self, count: integer): string
+        return "counted"
+    end
+end
+
+local function name(info: types.reflect.Info): string
+    return shared.describe(info)
+end
+
+local function x(): number
+    local point: any = ffi.new("SharedPoint")
+    return point.x + %d
+end
+
+return {name = name, x = x, made = Counted%d()}
+]]
+            ):format(index, index, index)
+        )
+    end
+
+    local serialCode, serialReport, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
+    testAssert.eq(serialCode, 0, "serial fixture: " .. json.encode(serialReport.diagnostics))
+    -- Twice: the first run may be the one that stores the prelude, and a worker that
+    -- restores a stored prelude rather than checking its own is the case at stake.
+    for run = 1, 2 do
+        local code, report, state = coldCheck(directory, {NUPP_CHECK_JOBS = "4"})
+        testAssert.eq(report.timing.parallel.mode, "parallel", "parallel timing mode, run " .. run)
+        testAssert.eq(
+            stable(report.diagnostics),
+            stable(serialReport.diagnostics),
+            "parallel diagnostics, run " .. run
+        )
+        testAssert.eq(code, 0, "parallel exit status, run " .. run)
+        testAssert.eq(state, serialState, "parallel check records, run " .. run)
+    end
+
+    assert(os.remove(directory, true))
+end
+
 function M.workerAndInterfaceFailuresFallBackWithoutPublishingPartialState()
     local directory = tempProject(false)
     local serialCode, _, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
@@ -984,6 +1069,96 @@ function M.anInterruptedCheckLeavesNoWorkers()
             time.sleep(10)
         end
         assert(ffi.C.kill(pid, 0) ~= 0, "parallel worker survived its interrupted parent: " .. tostring(pid))
+    end
+
+    assert(os.remove(directory, true))
+end
+
+-- The state file itself, not a decoding of it, is what has to match. Its keys are
+-- written sorted, a nominal another module re-exports or aliases is described by
+-- the module declaring it, and a fact read inside an import cycle is read again
+-- once the cycle closes, so no field depends on which module the schedule reached
+-- first. Only how long a derive took is left out.
+function M.serialAndParallelBuildsWriteTheSameStateFile()
+    local directory = tempProject(false)
+    write(
+        directory .. "/src/contracts.nupp",
+        [[
+module contracts
+
+export record Waiting
+    ready: function(self: Waiting): boolean
+    operation: string
+end
+]]
+    )
+    write(
+        directory .. "/src/hostalias.nupp",
+        [[
+module hostalias
+
+local contract = require("contracts")
+local hostalias = {}
+
+type hostalias.Waiting = contract.Waiting
+
+hostalias.Waiting = contract.Waiting
+
+export = hostalias
+]]
+    )
+    write(
+        directory .. "/src/joined.nupp",
+        [[
+local function pick(text: string?, first: string?, second: string?): string?
+    if first == nil then
+        first, second = second, nil
+    end
+    return first or text
+end
+
+return {pick = pick}
+]]
+    )
+    write(
+        directory .. "/src/zuser.nupp",
+        [[
+module zuser
+
+local contracts = require("contracts")
+local joined = require("joined")
+
+export record Parker
+    park: function(self: Parker, waiting: contracts.Waiting): nil
+end
+
+export function name(): string?
+    return joined.pick("", nil, "b")
+end
+]]
+    )
+
+    local function stateText()
+        local file = assert(io.open(directory .. "/build/.nupp-state.json", "rb"))
+        local text = file:read("*a")
+        file:close()
+
+        return (text:gsub('"durationMs":[^,}]+', '"durationMs":0'):gsub('"cached":[^,}]+', '"cached":false'))
+    end
+
+    local serialCode, serialReport = coldBuild(directory, {NUPP_CHECK_JOBS = "1"}, {"-O2"})
+    testAssert.eq(serialCode, 0, "serial build: " .. json.encode(serialReport.diagnostics))
+    local serial = stateText()
+    coldBuild(directory, {NUPP_CHECK_JOBS = "1"}, {"-O2"})
+    testAssert.eq(stateText(), serial, "two serial builds")
+    for _, run in ipairs({{jobs = "2", seed = "17"}, {jobs = "3", seed = "83"}}) do
+        local code, report = coldBuild(directory, {
+            NUPP_CHECK_JOBS = run.jobs,
+            NUPP_TEST_PARALLEL_CHECK_RANDOM_SEED = run.seed,
+        }, {"-O2"})
+        testAssert.eq(code, 0, "parallel build: " .. json.encode(report.diagnostics))
+        testAssert.eq(report.timing.parallel.mode, "parallel", "parallel timing mode")
+        testAssert.eq(stateText(), serial, "a parallel build with seed " .. run.seed)
     end
 
     assert(os.remove(directory, true))
