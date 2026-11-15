@@ -13,9 +13,18 @@
   module reads a builtin a project implements, such as `io`, `os` or
   `assert`, names a type of a module it does not require, or reaches a
   project module through one the target does not check as its own.
+- `scope:spawn(arguments..., f)` built by a parallel check worker no longer
+  calls the named form and drops the arguments. Which form a call chose was
+  read off its position in the overload set, whose order a worker could see
+  reversed.
 - Sending a large string to a child process, as `stdin:send` does, no longer
   copies the unsent rest on every write. A few megabytes sent through a pipe
   made gigabytes of short-lived garbage.
+- `nupp fmt --check` over many files keeps only the interfaces of the modules
+  they require, not every module's checked tree, and collects garbage the way
+  `nupp build` does. A cold check of a quarter of this repository's tree went
+  from about 2 GB to about 500 MB on Windows, in the same time. `nupp check`
+  of files outside a project and `nupp migrate` get the same treatment.
 - `nupp test` runs the shared lane's eight workers at once, each in a Lua state
   of its own that is replaced once its heap passes 256 MB
   (`NUPP_TEST_WORKER_HEAP_MB`). The workers used to share a pool as wide as

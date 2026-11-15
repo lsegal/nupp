@@ -1166,4 +1166,44 @@ return ordinary
     )
 end
 
+-- The named form of `spawn` lands on its own runtime member and the argument form
+-- does not. Routing went by the winner's position in the overload set, which is
+-- canonical rather than declared order: a worker that imported `coroutine.Scope`
+-- could see the two the other way round, and route every argument spawn to the
+-- named member, which drops the arguments.
+function M.spawnRoutesTheNamedFormByItsShape()
+    local source = [[
+module spawning
+export function start(borrows scope: coroutine.Scope): nil
+    scope:spawn(7, function(value: integer): integer
+        return value + 1
+    end)
+    scope:spawn("named", function(): integer
+        return 1
+    end)
+    scope:spawn(function(): integer
+        return 2
+    end)
+end
+]]
+    local _, errors, parsed = compile(source, nil, "spawning.nupp")
+    test.eq(errors, "", errors)
+    local members = {}
+
+    local function visit(node)
+        if type(node) ~= "table" or not node.kind then
+            return
+        end
+        if node.trailingCallableCall then
+            members[#members + 1] = node.trailingCallableMember
+        end
+        for _, child in ipairs(node) do
+            visit(child)
+        end
+    end
+
+    visit(parsed.root)
+    test.deepeq(members, {"spawn", "_spawnNamed", "spawn"})
+end
+
 return M
