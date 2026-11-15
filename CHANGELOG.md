@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- When a record's method is defined in a module other than the one that
+  declares it, other modules now always see the declared signature. Before,
+  modules checked after the defining module saw the definition's signature
+  instead. That dropped what only the declaration said, such as `borrows
+  self`, and gave a false `NUPP2619` that depended on check order. A parallel
+  check of `bench/native-runtime` reported it now and then in
+  `bytes.nupp`.
+
 - On Windows, a child process dropped while still running, such as the
   comptime worker a compiler command starts in the project, is waited for
   after it is terminated. Removing the project directory right after the
