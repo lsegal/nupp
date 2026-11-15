@@ -19,7 +19,6 @@ local classifier = {}
 local rules = {
     {"^docs/", {"docs"}},
     {"%.md$", {"docs"}},
-    {"^about%.toml$", {"docs", "packaging"}},
     {"^scripts/build%-pages%.mjs$", {"docs"}},
     {"^scripts/pages%-cache%.mjs$", {"docs", "browser"}},
     {"^scripts/docs%-serve%.mjs$", {"docs"}},
@@ -157,10 +156,6 @@ local rules = {
     {"^scripts/toolchain", {"everything"}},
     {"^scripts/", {"everything"}},
     {"^nupp%.lua$", {"everything"}},
-    {"^Cargo%.toml$", {"everything"}},
-    {"^Cargo%.lock$", {"everything"}},
-    {"^rust%-toolchain%.toml$", {"everything"}},
-    {"^%.cargo/", {"everything"}},
 }
 
 -- Every job `required-ci` can wait on. Adding one here without adding it to the

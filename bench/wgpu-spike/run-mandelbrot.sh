@@ -30,7 +30,7 @@ export LUA_PATH LUA_CPATH
 # needs the broad development provider that bin/nupp otherwise exports only to
 # its own process. Keep it feature-complete through the CPU comparison, then
 # restore the typed GPU provider for the generated binding below.
-NUPP_NATIVE_LIBRARY=$("$ROOT/scripts/toolchain" native-rust base)
+NUPP_NATIVE_LIBRARY=$("$ROOT/scripts/toolchain" native-provider base)
 export NUPP_NATIVE_LIBRARY
 NUPP_MANDELBROT_PRECHECKED=1 \
     MANDELBROT_RESULTS="$ROOT/$BUILD/expected.bin" bench/simd-mandelbrot/run.sh

@@ -55,8 +55,6 @@ jobs:
 
   execute:
     name: ${{ matrix.target.name }} / ${{ matrix.target.tier }} / ${{ matrix.shard.name }}
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     needs: platforms
     runs-on: ${{ matrix.target.os }}
     timeout-minutes: 150
@@ -91,13 +89,6 @@ jobs:
             hashFiles('src/**', 'nupp.lua', 'scripts/toolchain.pins') }}
           restore-keys: |
             nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Install the ABI-compatible Windows Rust toolchain
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal
 
       # Every AOT unit is compiled by the LLVM linked into nupp. After the
       # toolchain, so this LLVM wins over whatever a toolchain entry carried.
@@ -172,8 +163,6 @@ jobs:
 
   wasm:
     name: Wasm / ${{ matrix.shard.element }} / ${{ matrix.shard.batch }}
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     needs: [platforms, guest]
     runs-on: ubuntu-24.04
     timeout-minutes: 150
@@ -245,8 +234,6 @@ jobs:
 
   wasm-algorithms:
     name: Wasm / Owned algorithms
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     needs: guest
     runs-on: ubuntu-24.04
     timeout-minutes: 150

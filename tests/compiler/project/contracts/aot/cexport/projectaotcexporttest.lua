@@ -181,10 +181,14 @@ local function exported(shared)
     pipe:close()
     local names = {}
     if jit.os == "Windows" then
-        local listing = text:match("%[Ordinal/Name Pointer%] Table\r?\n(.-)\r?\n\r?\n")
+        -- Older binutils list `[   0] name`; newer ones put the ordinal base in
+        -- the heading and list `[   0] +base[   1]  0000 name`, with a hint.
+        local listing = text:match("%[Ordinal/Name Pointer%] Table[^\r\n]*\r?\n(.-)\r?\n\r?\n")
         assert(listing ~= nil, command .. " lists no export table:\n" .. text)
-        for name in listing:gmatch("%]%s+([%w_%.%$@]+)") do
-            names[name] = true
+        for line in listing:gmatch("[^\r\n]+") do
+            if line:find("^%s*%[") then
+                names[line:match("([%w_%.%$@]+)%s*$")] = true
+            end
         end
     else
         for line in text:gmatch("[^\r\n]+") do

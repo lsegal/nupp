@@ -2,19 +2,19 @@ name: Publish the prebuilt code generator with stage zero
 
 # A clean checkout links native programs (`nupp aot --emit executable`,
 # `kind = "program"`) with the previous release's code generator and link kit
-# rather than building LLVM and Cargo first. This adds them, per platform, to a
+# rather than building LLVM first. This adds them, per platform, to a
 # stage-zero release the owner has already published, next to its
 # `nupp-stage0-TAG.lua.gz`, and appends their digests to its notes. The
 # `PREBUILT_*` pins in scripts/toolchain.pins then move to that release.
 #
 # The code generator archive holds the code generator library (LLVM and lld,
 # which the compiler drives through LuaJIT's FFI) and the release's native
-# provider (`base`), so a checkout without Cargo bootstraps the compiler on it
-# too.
+# provider (`base`), so a checkout with no compiler yet bootstraps the compiler
+# on it too.
 #
-# Run by hand only. It builds the provider with Cargo and LLVM, which is why it
-# never runs on a pull request or on main (#139): nothing a checkout or CI does
-# afterwards builds them again.
+# Run by hand only. It builds LLVM and the provider, which is why it never runs
+# on a pull request or on main: nothing a checkout or CI does afterwards builds
+# them again.
 on:
   workflow_dispatch:
     inputs:
@@ -65,8 +65,6 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           set -euo pipefail
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal
           echo "NUPP_CC=gcc" >> "$GITHUB_ENV"
           echo "NUPP_CXX=g++" >> "$GITHUB_ENV"
 

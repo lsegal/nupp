@@ -14,8 +14,6 @@ permissions:
 jobs:
   build:
     name: Build website
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     runs-on: ubuntu-24.04
     outputs:
       pages: ${{ steps.pages.outputs.enabled }}
@@ -57,17 +55,6 @@ jobs:
           restore-keys: |
             pages-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Restore the Rust build outputs
-        uses: actions/cache@v4
-        with:
-          path: build/rust
-          key: >-
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml',
-            'native/**/Cargo.toml', 'scripts/toolchain', 'scripts/toolchain.pins') }}
-          restore-keys: |
-            nupp-rust-${{ runner.os }}-${{ runner.arch }}-
-
       - name: Restore the documentation rocks
         uses: actions/cache@v4
         with:
@@ -106,14 +93,6 @@ jobs:
       - name: Verify the completed playground
         id: playground
         run: node scripts/pages-cache.mjs restore playground
-
-      # Install before scripts/toolchain captures cargo --version. The guest
-      # target and multilib packages are needed only on a playground cache miss.
-      - name: Install the pinned Rust toolchain
-        shell: bash
-        run: |
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$channel" --profile minimal
 
       - name: Build pinned host dependencies
         run: ./scripts/toolchain --all
@@ -155,8 +134,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-multilib g++-multilib flex bison libelf-dev libssl-dev
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup target add --toolchain "$channel" i686-unknown-linux-musl
 
       - name: Build the playground
         if: steps.playground.outputs.reused != 'true'

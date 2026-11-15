@@ -1,6 +1,6 @@
--- The Cargo facade is testable without installing Rust: these fake pinned tools
--- record how the driver selected and ran them. `rust-vendor` is what asks for
--- them here, since the embedding SDK is the only Rust left to build.
+-- The delivery workflows and the toolchain driver's boundaries: what CI runs,
+-- what a release publishes, and what the driver refuses. Nothing here builds a
+-- native artifact; the driver runs against fake compilers.
 
 local HERE = require("helpers.paths").absoluteTests
 local ROOT = HERE .. "/.."
@@ -17,10 +17,6 @@ local function read(path)
     local text = file:read("*a")
     file:close()
     return text
-end
-
-local function readLines(path)
-    return (read(path):gsub("\r\n", "\n"))
 end
 
 local function countOccurrences(text, needle)
@@ -85,183 +81,16 @@ local function fakeCompiler(directory, name, version)
     )
 end
 
-local function fakeRustTools(directory, version, identity, identityMarker)
-    local rustc = executable(
-        directory,
-        "rustc",
-        (
-            [[#!/bin/sh
-case "${1:-}" in
-   --version) printf '%%s\n' 'rustc %s (fake)' ;;
-   -vV) printf '%%s\n' 'rustc %s (fake)' 'commit-hash: 0123abcd' 'host: %s' 'LLVM version: %s' ;;
-   --print)
-      [ "${2:-}" = sysroot ] || exit 2
-      printf '%%s\n' "$NUPP_TEST_RUST_SYSROOT"
-      ;;
-   *) exit 2 ;;
-esac
-]]
-        ):format(version, version, identity, identityMarker)
-    )
-    local cargo = executable(
-        directory,
-        "cargo",
-        (
-            [[#!/bin/sh
-if [ "${1:-}" = --version ]; then
-   if [ -n "${NUPP_TEST_RUST_TOOL_CHATTER:-}" ]; then
-      printf '%%s\n' 'info: syncing pinned Cargo proxy' >&2
-   fi
-   printf '%%s\n' 'cargo %s (fake)'
-   exit 0
-fi
-[ "${1:-}" = vendor ] || exit 5
-mkdir -p "${3:?}"
-printf '%%s\n' "$*" > "$NUPP_TEST_CARGO_RECORD"
-printf '%%s\n' "${NUPP_CC:-${CC:-}}" > "$NUPP_TEST_CARGO_CC_RECORD"
-printf '%%s\n' "${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER:-}" > "$NUPP_TEST_CARGO_LINKER_RECORD"
-printf '%%s\n' "${CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER:-}" > "$NUPP_TEST_CARGO_GNULLVM_LINKER_RECORD"
-]]
-        ):format(version)
-    )
-
-    return cargo, rustc
-end
-
-local function environment(directory, version, identity, identityMarker)
-    local compiler = fakeCompiler(directory)
-    local defaultIdentity = package.config:sub(1, 1) == "\\" and "x86_64-pc-windows-gnu" or "fake-unknown-nupp"
-    local cargo, rustc = fakeRustTools(
-        directory,
-        version or "1.98.0",
-        identity or defaultIdentity,
-        identityMarker or "fake-llvm-1"
-    )
-    assert(os.execute("mkdir -p " .. quote(directory .. "/vendor")) == 0)
-    assert(os.execute("mkdir -p " .. quote(directory .. "/rust-sysroot/lib")) == 0)
-
-    return {
-        NUPP_TOOLCHAIN_DIR = directory .. "/toolchain",
-        NUPP_RUST_BUILD_DIR = directory .. "/build/rust",
-        NUPP_CC = compiler,
-        NUPP_CXX = compiler,
-        NUPP_CARGO = cargo,
-        NUPP_RUSTC = rustc,
-        NUPP_RUST_VENDOR_DIR = directory .. "/vendor",
-        NUPP_TEST_CARGO_RECORD = directory .. "/cargo-arguments",
-        NUPP_TEST_CARGO_CC_RECORD = directory .. "/cargo-cc",
-        NUPP_TEST_CARGO_LINKER_RECORD = directory .. "/cargo-linker",
-        NUPP_TEST_CARGO_GNULLVM_LINKER_RECORD = directory .. "/cargo-gnullvm-linker",
-        NUPP_TEST_RUST_SYSROOT = directory .. "/rust-sysroot",
-        PATH = "$PATH",
-    }
-end
-
--- The `rust-vendor` command for a fresh output directory under `directory`.
-local function vendor(directory)
-    return "rust-vendor " .. quote(directory .. "/vendored")
-end
-
 -- The GPU provider is Nupp over wgpu-native, which no host links, so a host
 -- that asks for it is asking for something that does not exist.
 function M.gpuIsNotAHostFeature()
     local directory = temporary()
-    local env = environment(directory)
+    local env = {NUPP_TOOLCHAIN_DIR = directory .. "/toolchain", NUPP_CC = fakeCompiler(directory), PATH = "$PATH"}
     for _, name in ipairs({"native-gpu", "gpu"}) do
         local status, output = run(env, "host " .. name)
         assert(status ~= 0, output)
         assert(output:find("unknown host feature " .. name, 1, true), output)
     end
-end
-
-function M.anUnpinnedToolchainIsRejected()
-    local directory = temporary()
-    local env = environment(directory, "1.97.0")
-    local status, output = run(env, vendor(directory))
-
-    assert(status ~= 0, output)
-    assert(output:find("requires cargo 1.98.0", 1, true), output)
-    assert(io.open(env.NUPP_TEST_CARGO_RECORD, "rb") == nil, "the unpinned Cargo was allowed to build")
-end
-
--- A fresh rustup proxy reports installation and synchronization progress on
--- stderr before printing the requested version on stdout. That progress is a
--- useful build diagnostic, but it is not part of Cargo's tool identity.
-function M.rustupProxyProgressDoesNotChangeThePinnedVersion()
-    local directory = temporary()
-    local env = environment(directory)
-    env.NUPP_TEST_RUST_TOOL_CHATTER = "1"
-    local status, output = run(env, vendor(directory))
-
-    assert(status == 0, output)
-    assert(output:find("info: syncing pinned Cargo proxy", 1, true), output)
-    assert(not output:find("Cargo is info:", 1, true), output)
-end
-
--- Even on Unix, an ambient cargo/rustc can be rustup proxies rather than the
--- pinned binaries themselves. Resolve both through the exact channel once and
--- never execute those ambient proxies while inspecting or building.
-function M.unixSelectsPinnedRustupToolsBeforeAmbientProxies()
-    local directory = temporary()
-    local env = environment(directory)
-    local exactCargo = env.NUPP_CARGO
-    local exactRustc = env.NUPP_RUSTC
-    local proxy = directory .. "/proxy"
-    local proxyRecord = directory .. "/ambient-proxy"
-    local rustupRecord = directory .. "/rustup-toolchains"
-    assert(os.execute("mkdir -p " .. quote(proxy)) == 0)
-    executable(proxy, "uname", [[#!/bin/sh
-printf '%s\n' Linux
-]])
-    executable(
-        proxy,
-        "cargo",
-        (
-            "#!/bin/sh\nprintf 'cargo\\n' >> %s\nprintf 'info: syncing ambient Cargo proxy\\n'\nexit 91\n"
-        ):format(quote(proxyRecord))
-    )
-    executable(
-        proxy,
-        "rustc",
-        (
-            "#!/bin/sh\nprintf 'rustc\\n' >> %s\nprintf 'info: syncing ambient rustc proxy\\n'\nexit 92\n"
-        ):format(quote(proxyRecord))
-    )
-    executable(
-        proxy,
-        "rustup",
-        (
-            [[#!/bin/sh
-printf '%%s\n' "${RUSTUP_TOOLCHAIN:-}" >> %s
-[ "${1:-}" = which ] || exit 3
-case "${2:-}" in
-   cargo) printf '%%s\n' %s ;;
-   rustc) printf '%%s\n' %s ;;
-   *) exit 4 ;;
-esac
-]]
-        ):format(quote(rustupRecord), quote(exactCargo), quote(exactRustc))
-    )
-    env.NUPP_CARGO = nil
-    env.NUPP_RUSTC = nil
-    env.PATH = proxy .. ":$PATH"
-
-    local status, output = run(env, vendor(directory))
-
-    assert(status == 0, output)
-    assert(io.open(proxyRecord, "rb") == nil, "an ambient Rust proxy was executed")
-    local selected = readLines(rustupRecord)
-    local _, count = selected:gsub("1%.98%.0\n", "")
-    assert(count == 2, "Cargo and rustc did not both select the pinned Unix toolchain:\n" .. selected)
-end
-
--- Resolving rustup's exact binaries bypasses the proxy that normally adds this
--- path. Without it, rustc's bundled rust-objcopy cannot load libLLVM on macOS.
-function M.darwinExactRustToolsCarryTheirSysrootRuntime()
-    local driver = read(DRIVER)
-    assert(driver:find('rust_sysroot=$("$RUSTC" --print sysroot)', 1, true))
-    assert(driver:find('rust_runtime="$rust_sysroot/lib"', 1, true))
-    assert(driver:find('export DYLD_FALLBACK_LIBRARY_PATH', 1, true))
 end
 
 function M.gpuConformanceIsValidPosixShell()
@@ -444,138 +273,11 @@ function M.legacyProviderUpgradeBridgeIsGone()
     assert(not driver:match("\n    native%)"), "the ABI-v1 provider command remains in the toolchain")
 end
 
--- The hosted Windows default is the MSVC Rust toolchain, while LuaJIT and the
--- public static link are MinGW. Resolve the exact GNU-hosted toolchain through
--- rustup even when its ordinary Cargo proxy is already on PATH.
-function M.windowsSelectsThePinnedGnuRustToolchain()
-    local directory = temporary()
-    local env = environment(directory, "1.98.0", "x86_64-pc-windows-gnu")
-    local rustupRecord = directory .. "/rustup-toolchains"
-    executable(directory, "uname", [[#!/bin/sh
-printf '%s\n' MINGW64_NT
-]])
-    executable(
-        directory,
-        "rustup",
-        (
-            [[#!/bin/sh
-printf '%%s\n' "${RUSTUP_TOOLCHAIN:-}" >> %s
-[ "${1:-}" = which ] || exit 3
-case "${2:-}" in
-   cargo|rustc) printf '%%s/%%s\n' %s "$2" ;;
-   *) exit 4 ;;
-esac
-]]
-        ):format(quote(rustupRecord), quote(directory))
-    )
-    env.NUPP_CARGO = nil
-    env.NUPP_RUSTC = nil
-    env.CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER = "poison-gnullvm-linker"
-    env.PATH = directory .. ":$PATH"
-
-    local status, output = run(env, vendor(directory))
-
-    assert(status == 0, output)
-    local selected = readLines(rustupRecord)
-    local _, count = selected:gsub("1%.98%.0%-x86_64%-pc%-windows%-gnu\n", "")
-    assert(count == 2, "Cargo and rustc did not both select the pinned Windows GNU toolchain:\n" .. selected)
-    assert(
-        readLines(env.NUPP_TEST_CARGO_LINKER_RECORD) == readLines(env.NUPP_TEST_CARGO_CC_RECORD),
-        "Cargo did not link the Windows GNU artifact with Nupp's selected compiler"
-    )
-    assert(
-        readLines(env.NUPP_TEST_CARGO_GNULLVM_LINKER_RECORD) == "\n",
-        "the GNU build also configured the gnullvm linker"
-    )
-end
-
--- LLVM-MinGW carries UCRT and compiler-rt rather than GCC's runtime archives.
--- Its Rust host must therefore use Rust's matching gnullvm target instead of
--- asking the LLVM linker for libgcc while compiling Cargo build scripts.
-function M.windowsCompilerPackSelectsThePinnedGnullvmRustToolchain()
-    local directory = temporary()
-    local env = environment(directory, "1.98.0", "x86_64-pc-windows-gnullvm")
-    local rustupRecord = directory .. "/rustup-toolchains"
-    executable(directory, "uname", [[#!/bin/sh
-printf '%s\n' MINGW64_NT
-]])
-    executable(
-        directory,
-        "rustup",
-        (
-            [[#!/bin/sh
-printf '%%s\n' "${RUSTUP_TOOLCHAIN:-}" >> %s
-[ "${1:-}" = which ] || exit 3
-case "${2:-}" in
-   cargo|rustc) printf '%%s/%%s\n' %s "$2" ;;
-   *) exit 4 ;;
-esac
-]]
-        ):format(quote(rustupRecord), quote(directory))
-    )
-    env.NUPP_CARGO = nil
-    env.NUPP_RUSTC = nil
-    env.NUPP_RUST_WINDOWS_ABI = "gnullvm"
-    env.CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "poison-gnu-linker"
-    env.PATH = directory .. ":$PATH"
-
-    local status, output = run(env, vendor(directory))
-
-    assert(status == 0, output)
-    local selected = readLines(rustupRecord)
-    local _, count = selected:gsub("1%.98%.0%-x86_64%-pc%-windows%-gnullvm\n", "")
-    assert(count == 2, "Cargo and rustc did not both select the pinned Windows gnullvm toolchain:\n" .. selected)
-    assert(readLines(env.NUPP_TEST_CARGO_LINKER_RECORD) == "\n", "the gnullvm build also configured the GNU linker")
-    assert(
-        readLines(env.NUPP_TEST_CARGO_GNULLVM_LINKER_RECORD) == readLines(env.NUPP_TEST_CARGO_CC_RECORD),
-        "Cargo did not link the Windows gnullvm artifact with Nupp's selected compiler"
-    )
-end
-
-function M.gnullvmRustAbiIsRejectedOffWindows()
-    local directory = temporary()
-    local env = environment(directory)
-    executable(directory, "uname", [[#!/bin/sh
-printf '%s\n' Linux
-]])
-    env.NUPP_RUST_WINDOWS_ABI = "gnullvm"
-    env.PATH = directory .. ":$PATH"
-    local status, output = run(env, vendor(directory))
-    assert(status ~= 0, output)
-    assert(output:find("NUPP_RUST_WINDOWS_ABI=gnullvm is only supported on Windows", 1, true), output)
-end
-
-function M.windowsCiInstallsMatchingRustToolchains()
-    local compiler = read(ROOT .. "/.github/workflows/compiler.yml")
-    local release = read(ROOT .. "/.github/workflows/release.yml")
-    local gnu = 'rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal'
-    local gnullvm = 'rustup toolchain install "${channel}-x86_64-pc-windows-gnullvm" --profile minimal'
-    local measurements = read(ROOT .. "/.github/workflows/measurements.yml")
-    local compilerInstalls = countOccurrences(compiler, gnu)
-    local releaseInstalls = countOccurrences(release, gnu)
-    assert(compilerInstalls == 2, "the Windows integration and DX12 conformance jobs do not provision GNU Rust")
-    assert(
-        countOccurrences(measurements, gnu) == 2,
-        "the Windows native runtime and reification measurements do not provision GNU Rust"
-    )
-    assert(releaseInstalls == 1, "the ordinary Windows release host does not provision GNU Rust")
-    assert(not release:find(gnullvm, 1, true), "a release job still provisions gnullvm Rust")
-end
-
-function M.pagesCiInstallsThePinnedRustToolchain()
-    local pages = read(ROOT .. "/.github/workflows/pages.yml")
-    local marker = 'rustup toolchain install "$channel" --profile minimal'
-    assert(
-        countOccurrences(pages, marker) == 1,
-        "the Pages build does not provision the exact Rust toolchain before building docs"
-    )
-end
-
--- The Rust code is being deleted (#1, #8), so CI no longer tests it: no workflow
--- runs a crate's own tests or the Rust-native artifact gate, and the sanitizer
--- workflow over the crates is gone. The Nupp suites, the fixpoint and the
--- release packaging checks stay; hostembeddingtest runs in the broad suite.
-function M.ciRunsNoRustTestSuites()
+-- The product builds without Rust (#1, #8), so CI provisions none: no workflow,
+-- action or CI script installs a Rust toolchain, runs Cargo, or restores a Rust
+-- cache, and the jobs #139 turned off for building Rust run again. The
+-- sanitizer workflow and the Rust-native gate over the deleted crates stay gone.
+function M.ciProvisionsNoRust()
     local compiler = read(ROOT .. "/.github/workflows/compiler.yml")
     local release = read(ROOT .. "/.github/workflows/release.yml")
     local groups = read(ROOT .. "/tests/groups.lua")
@@ -587,11 +289,27 @@ function M.ciRunsNoRustTestSuites()
     }) do
         assert(not io.open(ROOT .. path, "rb"), path .. " still exists")
     end
-    for name, workflow in pairs({compiler = compiler, release = release}) do
-        assert(not workflow:find("test-rust-native-platform", 1, true), name .. " still runs the Rust-native gate")
-        assert(not workflow:find("cargo test", 1, true), name .. " still runs a Rust test suite")
-        assert(not workflow:find("rust-native-gate", 1, true), name .. " still names the Rust-native gate group")
+    local listing = assert(io.popen("git -C " .. quote(ROOT) .. " ls-files .github"))
+    for path in listing:lines() do
+        if path ~= ".github/scripts/check-no-rust-or-cpp.sh" then
+            local text = read(ROOT .. "/" .. path)
+            for _, needle in ipairs({
+                "rustup toolchain",
+                "rustup target",
+                "rustup which",
+                "cargo build",
+                "cargo test",
+                "cargo vendor",
+                "rust-toolchain",
+                "build/rust",
+                "native-rust",
+            }) do
+                assert(not text:find(needle, 1, true), path .. " still names " .. needle)
+            end
+            assert(not text:find("Turned off: builds Rust", 1, true), path .. " still turns a job off for building Rust")
+        end
     end
+    listing:close()
     assert(not groups:find("rust-native-gate", 1, true), "tests/groups.lua still defines the Rust-native gate")
     assert(compiler:find("./bin/nupp fixpoint", 1, true), "the retained compiler matrix has no fixpoint gate")
     assert(
@@ -608,6 +326,95 @@ function M.ciRunsNoRustTestSuites()
     )
     assert(release:find("shasum -a 256 -c SHA256SUMS", 1, true), "Unix packaging has no archive fixpoint")
     assert(release:find("release archive checksum mismatch", 1, true), "Windows packaging has no archive fixpoint")
+end
+
+-- What `check-no-rust-or-cpp.sh` answers for a list of paths, or for the files
+-- git tracks when there is no list.
+local function gate(paths)
+    local input = paths and os.tmpname()
+    local redirect = ""
+    if input then
+        write(input, table.concat(paths, "\n") .. "\n")
+        redirect = " --stdin < " .. quote(input)
+    end
+    local pipe = assert(io.popen(
+        ("sh %s%s 2>&1; echo \"__exit__:$?\""):format(quote(ROOT .. "/.github/scripts/check-no-rust-or-cpp.sh"), redirect)
+    ))
+    local output = pipe:read("*a")
+    pipe:close()
+    if input then
+        os.remove(input)
+    end
+    return tonumber(output:match("__exit__:(%d+)%s*$")), output
+end
+
+-- The tree holds no Rust and no C++ of its own, and CI keeps it that way.
+function M.theTreeHasNoRustOrCxx()
+    local status, output = gate()
+    assert(status == 0, output)
+    local compiler = read(ROOT .. "/.github/workflows/compiler.yml")
+    assert(
+        compiler:find(".github/scripts/check-no-rust-or-cpp.sh", 1, true),
+        "the compiler workflow does not run the Rust and C++ gate"
+    )
+end
+
+-- Every way Rust or C++ comes back is refused, wherever in the tree it lands,
+-- and the C fixtures and benchmark controls #1 keeps are not.
+function M.theRustAndCxxGateRefusesWhatItShould()
+    for _, path in ipairs({
+        "src/nupp/lib.rs",
+        "native/provider/build.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        "native/provider/Cargo.toml",
+        "rust-toolchain.toml",
+        "rust-toolchain",
+        ".cargo/config.toml",
+        "native/codegen/glue.cpp",
+        "host/stub.cxx",
+        "runtime/shim.cc",
+        "bench/other/control.cpp",
+        "tests/integration/simd/wasmtime-host/src/lib.rs",
+    }) do
+        local status, output = gate({"README.md", path})
+        assert(status == 1, path .. " passed the gate:\n" .. output)
+        assert(output:find(path, 1, true), "the gate did not name " .. path .. ":\n" .. output)
+    end
+    local status, output = gate({
+        "tests/fixtures/point.h",
+        "tests/fixtures/point.c",
+        "bench/simd11/handwritten/base64.c",
+        "bench/strings/scan_control.c",
+        "bench/serde-spike/serde_spike.cpp",
+        "bench/simd-json/native/simdjson_control.cpp",
+        "bench/simd-json/native/simdjson_control.h",
+        "src/nupp/tools/build/cargo.nupp",
+    })
+    assert(status == 0, "the gate refused an exempt path:\n" .. output)
+end
+
+-- A C++ compiler builds nothing of Nupp's own, so which one a machine has, or
+-- whether it has one at all, never moves where the native artifacts live.
+function M.thePrefixIgnoresTheCxxCompiler()
+    local directory = temporary()
+    local compiler = fakeCompiler(directory, "fake-cc", "fake")
+    local first = fakeCompiler(directory, "first-cxx", "one")
+    local second = fakeCompiler(directory, "second-cxx", "two")
+    local env = {NUPP_TOOLCHAIN_DIR = directory .. "/cache", NUPP_CC = compiler, PATH = "$PATH"}
+    env.NUPP_CXX = first
+    local status, one = run(env, "--prefix")
+    assert(status == 0, one)
+    env.NUPP_CXX = second
+    local againStatus, two = run(env, "--prefix")
+    assert(againStatus == 0, two)
+    assert(one == two, "two C++ compilers answered two prefixes: " .. one .. " and " .. two)
+    local driver = read(DRIVER)
+    assert(driver:find('require_cxx "building LLVM"', 1, true), "building LLVM does not ask for a C++ compiler")
+    assert(
+        driver:find('require_cxx "linking the code generator library"', 1, true),
+        "linking the code generator library does not ask for a C++ compiler"
+    )
 end
 
 function M.macosReleaseSigningIsOptionalButAtomic()
@@ -669,60 +476,6 @@ function M.taggedReleaseChecksOutBeforePublishing()
         "the publishing job does not create the tagged release"
     )
     assert(checkout < publish, "the publishing job verifies the tag before checking it out")
-end
-
--- Every Cargo package can end up in a provider for some feature, platform or
--- build mode. Releases copy host/notices without running Cargo, so the committed
--- aggregate must cover the whole lock file rather than only this machine's
--- resolved graph.
-function M.everyLockedRustDependencyHasACommittedNotice()
-    local lock = read(ROOT .. "/Cargo.lock")
-    local notice = read(ROOT .. "/host/notices/Rust-dependencies.html")
-    local expected = {}
-    local expectedCount = 0
-    local name, version, thirdParty
-
-    local function finishPackage()
-        if thirdParty then
-            assert(name and version, "a locked Cargo package has no name or version")
-            local marker = name .. "@" .. version
-            assert(not expected[marker], "duplicate locked Cargo package " .. marker)
-            expected[marker] = true
-            expectedCount = expectedCount + 1
-        end
-        name, version, thirdParty = nil, nil, false
-    end
-
-    for line in (lock .. "\n[[package]]\n"):gmatch("[^\r\n]+") do
-        if line == "[[package]]" then
-            finishPackage()
-        elseif name == nil then
-            name = line:match('^name = "([^"]+)"$')
-        elseif version == nil then
-            version = line:match('^version = "([^"]+)"$')
-        end
-        if line:match("^source = ") then
-            thirdParty = true
-        end
-    end
-
-    local seen = {}
-    local seenCount = 0
-    for marker in notice:gmatch('data%-crate="([^"]+)"') do
-        assert(expected[marker], "Rust notice names an unlocked package " .. marker)
-        assert(not seen[marker], "Rust notice repeats package " .. marker)
-        seen[marker] = true
-        seenCount = seenCount + 1
-    end
-
-    assert(seenCount == expectedCount, ("Rust notice covers %d of %d locked packages"):format(seenCount, expectedCount))
-    for marker in pairs(expected) do
-        assert(seen[marker], "Rust notice omits locked package " .. marker)
-    end
-    assert(
-        read(ROOT .. "/host/NOTICE.md"):find("notices/Rust-dependencies.html", 1, true),
-        "the release notice does not point readers to the Rust aggregate"
-    )
 end
 
 -- wgpu-native's prebuilt library statically carries wgpu's own Cargo graph to

@@ -613,11 +613,21 @@ for _, resource in ipairs({
 end
 
 -- What only the CLI reads: its test harness, the LLVM IR an AOT link pulls in,
--- and the documentation theme. The browser bundles carry neither the linker nor
--- `nupp doc`, and the compiler has to fit the guest's 7 MiB startup mailbox.
+-- the documentation theme, and the native GPU provider over wgpu-native. The
+-- browser bundles carry neither the linker nor `nupp doc`, and bind the GPU to
+-- WebGPU instead (targetbindings), and the compiler has to fit the guest's 7 MiB
+-- startup mailbox.
+local NATIVE_GPU_RESOURCES = {
+    ["src/nupp/runtime/provider/nativegpu.nupp"] = true,
+    ["src/nupp/runtime/provider/nativegpurelease.nupp"] = true,
+    ["src/nupp/runtime/provider/gpudevice.nupp"] = true,
+    ["src/nupp/runtime/provider/gpucosts.nupp"] = true,
+    ["src/nupp/runtime/provider/wgpu.nupp"] = true,
+}
 local function cliOnlyResource(resource)
     local path = type(resource) == "table" and resource.source or resource
     return path:match("^tests/") or path:match("%.ll$") or path == "src/nupp/tools/doc/theme.css"
+        or NATIVE_GPU_RESOURCES[path]
 end
 
 local BROWSER_RESOURCES = {}

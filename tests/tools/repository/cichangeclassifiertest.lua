@@ -263,9 +263,7 @@ function M.toolchainAndWorkflowChangesSelectEverything()
         "scripts/toolchain",
         "scripts/toolchain.pins",
         ".github/workflows/compiler.yml",
-        "nupp.lua",
-        "Cargo.lock",
-        "rust-toolchain.toml"
+        "nupp.lua"
     }) do
         selects(path, everyJob())
     end

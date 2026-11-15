@@ -17,8 +17,6 @@ on:
 jobs:
   gate:
     name: x86-64 ${{ matrix.tiers }}
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:

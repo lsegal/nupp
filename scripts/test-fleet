@@ -436,7 +436,6 @@ def worker(request_path, cache_path):
     environment.update(job.get("env") or {})
     toolchain = Path(request.get("workerToolchain") or cache / "toolchain").expanduser().resolve()
     environment["NUPP_TOOLCHAIN_DIR"] = str(toolchain)
-    environment["NUPP_RUST_BUILD_DIR"] = str(cache / "rust")
     environment["NUPP_CACHE_DIR"] = str(cache / "compiler")
     command = list(job["argv"])
     rerun = request.get("rerunReport")

@@ -21,7 +21,7 @@ function relevant(kind, name) {
     name === 'scripts/pages-cache.mjs';
   if (kind === 'guest') {
     return /^(native\/|runtime\/luajit\/|host\/notices\/|src\/nupp\/runtime\/vendor\/lunajson\/)/.test(name) ||
-      /^(Cargo\.(toml|lock)|rust-toolchain\.toml|\.cargo\/config\.toml|scripts\/toolchain(\.pins)?|scripts\/browser-[^/]+|tests\/integration\/browser\/luajit\/snapshot\.(html|mjs))$/.test(name);
+      /^(scripts\/toolchain(\.pins)?|scripts\/browser-[^/]+|tests\/integration\/browser\/luajit\/snapshot\.(html|mjs))$/.test(name);
   }
   if (/^(src\/|native\/|runtime\/|host\/|scripts\/|templates\/|rocks\/|tests\/|bench\/|evals\/)/.test(name)) return true;
   if (name.startsWith('editors/')) return kind === 'playground' && name.startsWith('editors/playground/');
@@ -37,7 +37,7 @@ export function inputKey(kind, repo = root) {
   const digest = createHash('sha256');
   digest.update(JSON.stringify([1, kind, process.platform, process.arch, process.version,
     process.env.ImageOS, process.env.ImageVersion,
-    process.env.NUPP_CC, process.env.NUPP_CXX, process.env.NUPP_CARGO, process.env.NUPP_RUSTC,
+    process.env.NUPP_CC, process.env.NUPP_CXX,
     kind === 'compiler' ? path.resolve(repo) : null]));
   for (const name of names) {
     digest.update(name + '\0');

@@ -42,7 +42,6 @@ Components: luajit luarocks lpeg lpeg-source stage0 llvm wgpu
             wgpu-static [PLATFORM]
             browser-sources browser-emulator browser-guest
             native-provider FEATURES
-            rust-vendor OUTPUT
             host FEATURES, host-library FEATURES
             kit FEATURES, kit-archive FEATURES OUTPUT
             codegen-library
@@ -55,15 +54,13 @@ not already cached. --all builds every component and prints nothing. --prefix
 prints the root the components are installed under without building anything.
 
 Environment:
-  NUPP_CC, NUPP_CXX          the compiler pair. Probed when unset.
-  NUPP_CARGO, NUPP_RUSTC     the pinned Rust toolchain. Probed when unset.
+  NUPP_CC                    the C compiler. Probed when unset.
+  NUPP_CXX                   the C++ compiler, only for building LLVM from source.
+                             Probed when unset.
   NUPP_PREBUILT_PROVIDER     1 to take native-provider from the pinned prebuilt
                              code generator archive, 0 never to. Without a
                              built compiler it is taken whenever one is pinned.
-  NUPP_RUST_WINDOWS_ABI      GNU (default) or gnullvm for LLVM-MinGW.
   NUPP_TOOLCHAIN_DIR         where to install. Defaults to the repository cache.
-  NUPP_RUST_BUILD_DIR        Rust outputs. Defaults to build/rust.
-  NUPP_RUST_VENDOR_DIR       cargo-vendor directory required by offline Rust builds.
   NUPP_HOST_SOURCE_DIR       a directory of already-downloaded pinned archives.
   NUPP_HOST_SOURCE_BASE_URL  a flat mirror to fetch archives from.
   NUPP_HOST_OFFLINE          refuse to reach the network.
@@ -108,29 +105,26 @@ case "$PLATFORM" in
     windows)
         [ -n "$CC" ] || CC=$(probe gcc cc clang) \
             || die "no C compiler found. Name one with NUPP_CC"
-        [ -n "$CXX" ] || CXX=$(probe g++ c++ clang++) \
-            || die "no C++ compiler found. Name one with NUPP_CXX"
+        [ -n "$CXX" ] || CXX=$(probe g++ c++ clang++) || CXX=""
         ;;
     *)
         [ -n "$CC" ] || CC=$(probe clang cc gcc) \
             || die "no C compiler found. Name one with NUPP_CC"
-        [ -n "$CXX" ] || CXX=$(probe clang++ c++ g++) \
-            || die "no C++ compiler found. Name one with NUPP_CXX"
+        [ -n "$CXX" ] || CXX=$(probe clang++ c++ g++) || CXX=""
         ;;
-esac
-
-RUST_WINDOWS_ABI=${NUPP_RUST_WINDOWS_ABI:-gnu}
-case "$RUST_WINDOWS_ABI" in
-    gnu) ;;
-    gnullvm)
-        [ "$PLATFORM" = windows ] \
-            || die "NUPP_RUST_WINDOWS_ABI=gnullvm is only supported on Windows"
-        ;;
-    *) die "NUPP_RUST_WINDOWS_ABI must be gnu or gnullvm" ;;
 esac
 
 command -v "$CC" >/dev/null 2>&1 || die "NUPP_CC names $CC, which is not on PATH"
-command -v "$CXX" >/dev/null 2>&1 || die "NUPP_CXX names $CXX, which is not on PATH"
+[ -z "${NUPP_CXX:-}" ] || command -v "$CXX" >/dev/null 2>&1 \
+    || die "NUPP_CXX names $CXX, which is not on PATH"
+
+# Nothing of Nupp's own is C++. The pinned LLVM is, so building it here, and
+# linking the code generator library from it, are the two things that need a
+# C++ compiler; a checkout that takes the prebuilt code generator never asks.
+require_cxx() {
+    [ -n "$CXX" ] \
+        || die "$1 needs a C++ compiler. Name one with NUPP_CXX, or use the prebuilt code generator (scripts/toolchain prebuilt-codegen)"
+}
 
 case "$PLATFORM" in
     bsd) MAKE=${MAKE:-gmake} ;;
@@ -166,7 +160,7 @@ sha256() { sha256_stdin < "$1"; }
 
 # The pins that decide a native artifact, which is every pin but the stage-zero
 # one. That one names a Nupp release and a bundle of Lua; no C compiler ever
-# sees it, and keying LuaJIT, LPeg and every Rust crate on it would make the
+# sees it, and keying LuaJIT, LPeg and every host on it would make the
 # one-line pin bump a stage-zero move asks for a from-scratch native rebuild on
 # machine that pulls it. The prebuilt code generator and kit published beside
 # it are left out for the same reason: they are fetched, never compiled against.
@@ -179,9 +173,9 @@ pins_digest() {
         | sha256_stdin
 }
 
-# Public embedding headers are staged beside the Rust libraries rather than
-# compiled into them. Give those staged SDKs their own content key so changing
-# the public ABI refreshes the SDK without needlessly rebuilding a Rust crate.
+# Public embedding headers are staged beside the libraries rather than compiled
+# into them. Give those staged SDKs their own content key so changing the public
+# ABI refreshes the SDK without needlessly relinking a host.
 embedding_headers_digest() {
     (cd "$ROOT" && find host/include -type f -name '*.h' 2>/dev/null) \
         | LC_ALL=C sort | while IFS= read -r file; do
@@ -190,22 +184,16 @@ embedding_headers_digest() {
         done | sha256_stdin | cut -c1-16
 }
 
-# Rust inputs have their own content key. Keeping this separate from the public
-# headers means editing a header only restages the SDK, while every workspace or
-# lock-file change rebuilds the Rust artifact.
-rust_sources_digest() {
+# What a host is linked from beyond the native sources' own pins: this driver,
+# the LuaJIT patch and the list of public exports. Kept apart from the public
+# headers, so editing a header only restages the SDK.
+host_sources_digest() {
     {
         # `scripts/toolchain.pins` is not in this list because it is folded in
         # below through `pins_digest`, which leaves out the stage-zero pin.
-        for file in Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml \
-            scripts/toolchain scripts/patches/luajit.patch \
-            host/include/nupp.exports; do
+        for file in scripts/toolchain scripts/patches/luajit.patch host/include/nupp.exports; do
             [ -f "$ROOT/$file" ] && printf '%s\n' "$file"
         done
-        (cd "$ROOT" && find native/crates -type f \
-            \( -name '*.rs' -o -name '*.c' -o -name '*.cpp' -o -name '*.h' \
-                -o -name 'Cargo.toml' -o -name 'build.rs' \) \
-            2>/dev/null) || true
     } | LC_ALL=C sort | {
         while IFS= read -r file; do
             printf '%s ' "$file"
@@ -237,13 +225,12 @@ fi
 ARCHIVES="$CACHE/archives"
 SOURCES="$CACHE/sources"
 
-# What the answer depends on: the compilers, their versions, the machine, and
+# What the answer depends on: the C compiler, its version, the machine, and
 # these provisioning rules. Several change without a native source changing;
 # ignoring one can return an artifact built with another compiler or link line.
 key_material() {
-    printf '%s\n%s\n' "$CC" "$CXX"
+    printf '%s\n' "$CC"
     "$CC" --version 2>&1 | head -n 2 || true
-    "$CXX" --version 2>&1 | head -n 2 || true
     printf '%s %s\n' "$UNAME" "$(uname -m 2>/dev/null || echo unknown)"
     sha256 "$ROOT/scripts/toolchain"
     sha256 "$ROOT/scripts/patches/luajit.patch"
@@ -251,7 +238,6 @@ key_material() {
 }
 KEY=$(key_material | sha256_stdin | cut -c1-16)
 PREFIX="$CACHE/$KEY"
-RUST_BUILD_ROOT=${NUPP_RUST_BUILD_DIR:-"$ROOT/build/rust"}
 
 # --- fetching ---------------------------------------------------------------
 
@@ -628,6 +614,7 @@ build_codegen_library() {
     CODEGEN_LIBRARY_OUT="$cg_out/$cg_filename"
     take_lock "codegen-$cg_digest" "$cg_out/.complete" || return 0
     [ -f "$cg_out/.complete" ] && [ -f "$CODEGEN_LIBRARY_OUT" ] && { release_lock; return 0; }
+    require_cxx "linking the code generator library"
     note "linking the code generator library"
     rm -rf "$cg_out"
     mkdir -p "$cg_out"
@@ -677,8 +664,8 @@ EOF
 #
 # The code generator archive carries two shared libraries: the code generator
 # library (`codegen-library`), which the compiler loads for LLVM and lld, and
-# the release's native provider, which a checkout without Cargo starts the
-# compiler on (the prebuilt native provider, below). The kit is the same
+# the release's native provider, which a checkout with no compiler yet starts
+# the compiler on (the prebuilt native provider, below). The kit is the same
 # archive `kit-archive` writes, so a release publishes one file for both a
 # catalog and a checkout.
 
@@ -811,7 +798,7 @@ codegen_archive() {
 # the list; `codegen` selects nothing and is accepted for the stage-zero
 # compiler that still asks for it.
 prebuilt_provider() {
-    requested=$(normalize_rust_features "${1:-}")
+    requested=$(normalize_features "${1:-}")
     build_prebuilt codegen
     provider_dir=$(dirname "$PREBUILT_OUT")
     [ -f "$provider_dir/features" ] \
@@ -911,97 +898,15 @@ take_lock() {
 
 # --- components -------------------------------------------------------------
 
-# Rust is a deliberate native prerequisite, not another ambient implementation
-# detail. The exact release in rust-toolchain.toml is accepted; a newer stable
-# is not silently substituted, because compiler and Cargo versions participate
-# in the artifact identity and can change code generation or feature solving.
-select_rust_tools() {
-    CARGO=${NUPP_CARGO:-cargo}
-    RUSTC=${NUPP_RUSTC:-rustc}
-    # Asked for before reading it, so a tree without one is reported by the line
-    # below rather than by `sed` naming a path on standard error. Every caller
-    # here captures only standard output, so that stray line arrives wherever
-    # the caller's own output was going.
-    [ -f "$ROOT/rust-toolchain.toml" ] || die "rust-toolchain.toml is missing; nothing pins the Rust toolchain"
-    expected=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' "$ROOT/rust-toolchain.toml")
-    [ -n "$expected" ] || die "rust-toolchain.toml names no exact channel"
-    rustup_toolchain=$expected
-    [ "$PLATFORM" != windows ] \
-        || rustup_toolchain="$expected-x86_64-pc-windows-$RUST_WINDOWS_ABI"
-    rustup_which() {
-        RUSTUP_TOOLCHAIN="$rustup_toolchain" RUSTUP_SKIP_UPDATE_CHECK=1 \
-            rustup which "$1" 2>/dev/null
-    }
-    if [ -z "${NUPP_CARGO:-}" ] && command -v rustup >/dev/null 2>&1; then
-        CARGO=$(rustup_which cargo || printf cargo)
-    fi
-    if [ -z "${NUPP_RUSTC:-}" ] && command -v rustup >/dev/null 2>&1; then
-        RUSTC=$(rustup_which rustc || printf rustc)
-    fi
-    command -v "$CARGO" >/dev/null 2>&1 \
-        || die "no Cargo found. Install the toolchain pinned by rust-toolchain.toml or name it with NUPP_CARGO"
-    command -v "$RUSTC" >/dev/null 2>&1 \
-        || die "no rustc found. Install the toolchain pinned by rust-toolchain.toml or name it with NUPP_RUSTC"
-
-    # Resolve rustup's proxy once above, then execute the exact tool binary.
-    # Running an ambient proxy here can synchronize a channel and mix its
-    # progress into the version identity or select a different host ABI.
-    cargo_version=$("$CARGO" --version) \
-        || die "cannot run Cargo named by NUPP_CARGO"
-    rustc_version=$("$RUSTC" --version) \
-        || die "cannot run rustc named by NUPP_RUSTC"
-    case "$cargo_version" in
-        "cargo $expected "*) ;;
-        *) die "Cargo is $cargo_version; rust-toolchain.toml requires cargo $expected" ;;
-    esac
-    case "$rustc_version" in
-        "rustc $expected "*) ;;
-        *) die "rustc is $rustc_version; rust-toolchain.toml requires rustc $expected" ;;
-    esac
-    rustc_verbose=$("$RUSTC" -vV) \
-        || die "cannot inspect rustc named by NUPP_RUSTC"
-    rust_host=$(printf '%s\n' "$rustc_verbose" | sed -n 's/^host: //p')
-    rust_commit=$(printf '%s\n' "$rustc_verbose" | sed -n 's/^commit-hash: //p')
-    rust_sysroot=$("$RUSTC" --print sysroot) \
-        || die "cannot locate the sysroot for rustc named by NUPP_RUSTC"
-    if [ "$PLATFORM" = darwin ]; then
-        rust_runtime="$rust_sysroot/lib"
-        case ":${DYLD_FALLBACK_LIBRARY_PATH:-}:" in
-            *":$rust_runtime:"*) ;;
-            *)
-                DYLD_FALLBACK_LIBRARY_PATH="$rust_runtime${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
-                export DYLD_FALLBACK_LIBRARY_PATH
-                ;;
-        esac
-    fi
-    if [ "$PLATFORM" = windows ]; then
-        case "$RUST_WINDOWS_ABI:$rust_host" in
-            gnu:x86_64-pc-windows-gnu|gnullvm:x86_64-pc-windows-gnullvm) ;;
-            *) die "Rust host $rust_host does not match NUPP_RUST_WINDOWS_ABI=$RUST_WINDOWS_ABI; install rustup toolchain $rustup_toolchain or name an equivalent toolchain" ;;
-        esac
-        case "$RUST_WINDOWS_ABI" in
-            gnu)
-                unset CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER
-                export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$CC"
-                ;;
-            gnullvm)
-                unset CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER
-                export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER="$CC"
-                ;;
-        esac
-    fi
-    RUST_TOOL_MATERIAL=$(printf '%s\n%s\n' "$cargo_version" "$rustc_verbose")
-}
-
-normalize_rust_features() {
+normalize_features() {
     raw=${1:-}
     case "$raw" in
-        *[!A-Za-z0-9_,-]*) die "invalid Rust feature list $raw" ;;
+        *[!A-Za-z0-9_,-]*) die "invalid feature list $raw" ;;
     esac
     features=$(printf '%s' "$raw" | tr ',' ' ')
     for feature in $features; do
         case "$feature" in
-            *[!A-Za-z0-9_-]*) die "invalid Rust feature $feature" ;;
+            *[!A-Za-z0-9_-]*) die "invalid feature $feature" ;;
         esac
     done
     printf '%s\n' $features | sed '/^$/d' | LC_ALL=C sort -u \
@@ -1016,88 +921,6 @@ native_provider_filename() {
     esac
 }
 
-# Cargo accepts ambient knobs that materially alter a binary without changing
-# its source or lock file. Keep supported codegen/profile overrides, and the
-# C flags build scripts compile with, in the content key, and reject the
-# implicit target override because the artifact path and platform filename
-# below deliberately describe the host target.
-rust_environment_material() {
-    [ -z "${CARGO_BUILD_TARGET:-}" ] \
-        || die "CARGO_BUILD_TARGET is unsupported; Rust host builds require an explicit toolchain target design"
-    env | LC_ALL=C sort | sed -n \
-        -e '/^RUSTFLAGS=/p' \
-        -e '/^CARGO_ENCODED_RUSTFLAGS=/p' \
-        -e '/^CARGO_PROFILE_/p' \
-        -e '/^CARGO_TARGET_.*_RUSTFLAGS=/p' \
-        -e '/^MACOSX_DEPLOYMENT_TARGET=/p' \
-        -e '/^IPHONEOS_DEPLOYMENT_TARGET=/p' \
-        -e '/^CFLAGS=/p' \
-        -e '/^CFLAGS_/p' \
-        -e '/^HOST_CFLAGS=/p' \
-        -e '/^TARGET_CFLAGS=/p'
-}
-
-# Rust writes the path of every source a panic can be reported from into the
-# binary: about 675 under the building user's CARGO_HOME, and about 122 under
-# rustup's copy of the standard library, which rustc substitutes for the
-# `/rustc/<commit>` path the release was built with whenever rust-src is
-# installed. Both name a home directory, so two users' builds of one tree
-# differed. The registry goes to `/cargo`, a vendor directory to `/vendor`, and
-# the standard library back to the path the release itself records, so a build
-# on a machine without rust-src is the same build.
-#
-# Through build.rustflags, so every crate in the graph is remapped rather than
-# only the final one `cargo rustc --` reaches. What it maps from is left out of
-# the artifact key on purpose: the point is that the answer does not depend on
-# it. An ambient RUSTFLAGS replaces build.rustflags in Cargo, and is already
-# part of the key.
-rust_remap_arguments() {
-    cargo_home=${CARGO_HOME:-$HOME/.cargo}
-    vendor=${NUPP_RUST_VENDOR_DIR:-}
-    if [ "$PLATFORM" = windows ] && command -v cygpath >/dev/null 2>&1; then
-        cargo_home=$(cygpath -w "$cargo_home")
-        [ -z "$vendor" ] || vendor=$(cygpath -w "$vendor")
-    fi
-    # Later mappings win in rustc, so the more specific ones go last.
-    flags="$(toml_string "--remap-path-prefix=$cargo_home=/cargo")"
-    [ -z "$vendor" ] || flags="$flags, $(toml_string "--remap-path-prefix=$vendor=/vendor")"
-    [ -z "$rust_commit" ] || flags="$flags, $(toml_string \
-        "--remap-path-prefix=$rust_sysroot/lib/rustlib/src/rust=/rustc/$rust_commit")"
-    printf 'build.rustflags=[%s]\n' "$flags"
-}
-
-# A TOML basic string, for a value handed to `cargo --config`. Windows paths are
-# full of backslashes, and a path may hold a quote.
-toml_string() {
-    printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
-}
-
-rust_vendor_arguments() {
-    vendor=${NUPP_RUST_VENDOR_DIR:-}
-    if [ -z "$vendor" ]; then
-        offline && die "offline Rust builds require NUPP_RUST_VENDOR_DIR; provision it with scripts/toolchain rust-vendor OUTPUT"
-        return 0
-    fi
-    [ -d "$vendor" ] || die "NUPP_RUST_VENDOR_DIR is not a directory: $vendor"
-    printf '%s\n' \
-        "source.crates-io.replace-with='nupp-vendored-sources'" \
-        "source.nupp-vendored-sources.directory='$vendor'"
-}
-
-provision_rust_vendor() {
-    destination=$1
-    [ -n "$destination" ] || die "rust-vendor needs an output directory"
-    [ ! -e "$destination" ] || die "rust-vendor refuses to replace $destination"
-    select_rust_tools
-    note "provisioning locked Rust sources in $destination"
-    set -- "$CARGO" vendor --locked "$destination"
-    offline && set -- "$@" --offline
-    RUSTC="$RUSTC" "$@" >&2
-}
-
-# Rust entry points are content-addressed under the checkout's build/rust tree.
-# They always build the locked workspace with default features disabled so the
-# compiler-selected feature union is the dependency union.
 # Whether a host's code generator is built in: when the pinned LLVM is already
 # built, or when NUPP_REQUIRE_CODEGEN=1 asks for it (a release, which builds
 # LLVM if it must). Otherwise the build goes ahead without it, the way
@@ -1131,7 +954,7 @@ without_codegen() {
 # else is left to select; `codegen` is dropped, because the code generator is
 # a library of its own now but the pinned stage-zero compiler still asks for it.
 provider_features() {
-    for pf_feature in $(without_codegen "$(normalize_rust_features "${1:-}")" | tr ',' ' '); do
+    for pf_feature in $(without_codegen "$(normalize_features "${1:-}")" | tr ',' ' '); do
         [ "$pf_feature" = base ] || die "the native provider has no $pf_feature feature"
     done
 }
@@ -1244,36 +1067,36 @@ build_native_provider() {
 select_host_features() {
     host_feature_words=$(printf '%s' "${1:-}" | tr ',' ' ')
     host_feature_words=$(printf '%s\n' $host_feature_words | LC_ALL=C sort -u | tr '\n' ' ')
-    host_cargo_features=""
+    host_features=""
     host_lpeg_prefix=""
     for feature in $host_feature_words; do
         case "$feature" in
             lpeg)
                 host_lpeg_prefix=$(build_lpeg; printf '%s' "$PREFIX/lpeg")
-                host_cargo_features="$host_cargo_features,lpeg"
+                host_features="$host_features,lpeg"
                 ;;
-            workers) host_cargo_features="$host_cargo_features,workers" ;;
+            workers) host_features="$host_features,workers" ;;
             native-files|files|filesystem)
-                host_cargo_features="$host_cargo_features,native-files"
+                host_features="$host_features,native-files"
                 ;;
-            native-net|net) host_cargo_features="$host_cargo_features,native-net" ;;
-            native-tls|tls) host_cargo_features="$host_cargo_features,native-tls" ;;
+            native-net|net) host_features="$host_features,native-net" ;;
+            native-tls|tls) host_features="$host_features,native-tls" ;;
             native-process|process)
-                host_cargo_features="$host_cargo_features,native-process"
+                host_features="$host_features,native-process"
                 ;;
             native-compression|compression)
-                host_cargo_features="$host_cargo_features,native-compression"
+                host_features="$host_features,native-compression"
                 ;;
             native-codegen|codegen)
                 if codegen_wanted; then
-                    host_cargo_features="$host_cargo_features,native-codegen"
+                    host_features="$host_features,native-codegen"
                 fi
                 ;;
             base|native-checksum|native-time) ;;
             *) die "unknown host feature $feature" ;;
         esac
     done
-    host_cargo_features=$(normalize_rust_features "${host_cargo_features#,}")
+    host_features=$(normalize_features "${host_features#,}")
 }
 
 # A host that links libnupp.a is an executable, and LuaJIT's ffi.C finds the
@@ -2006,19 +1829,19 @@ build_host() {
     kind=$1
     features=${2:-}
     select_host_features "$features"
-    selected_cargo_features=$host_cargo_features
+    selected_features=$host_features
     selected_lpeg_prefix=$host_lpeg_prefix
     # The embedding SDK carries no code generator: a program embedding the
     # compiler finds the code generator library the way a checkout does.
-    case "$kind:,$selected_cargo_features," in
+    case "$kind:,$selected_features," in
         library:*,native-codegen,*)
             note "the embedding library is built without the code generator"
-            selected_cargo_features=$(printf '%s\n' "$selected_cargo_features" | tr ',' '\n' \
+            selected_features=$(printf '%s\n' "$selected_features" | tr ',' '\n' \
                 | grep -v '^native-codegen$' | tr '\n' ',' | sed 's/,$//')
             ;;
     esac
     digest=$(printf '%s|%s|%s|%s' \
-        "$kind" "$selected_cargo_features" "$(embedding_headers_digest)" "$(rust_sources_digest)" \
+        "$kind" "$selected_features" "$(embedding_headers_digest)" "$(host_sources_digest)" \
         | sha256_stdin | cut -c1-16)
     out="$PREFIX/host/$digest"
     HOST_OUT="$out"
@@ -2027,7 +1850,7 @@ build_host() {
     luajit_prefix=$(build_luajit; printf '%s' "$PREFIX/luajit")
 
     if [ "$kind" = library ]; then
-        build_nupp_embedding "$luajit_prefix" "$selected_cargo_features" "$selected_lpeg_prefix"
+        build_nupp_embedding "$luajit_prefix" "$selected_features" "$selected_lpeg_prefix"
         embedding=$NUPP_EMBED_OUT
         dynamic_name=$(embedding_library_filename)
         digest=$(printf '%s|%s' "$stage_digest" "$(basename "$embedding")" | sha256_stdin | cut -c1-16)
@@ -2048,7 +1871,7 @@ build_host() {
         cp "$ROOT/host/include/nupp.h" "$out/nupp.h"
         {
             printf '{\n  "schemaVersion": 1,\n'
-            printf '  "features": "%s",\n' "$selected_cargo_features"
+            printf '  "features": "%s",\n' "$selected_features"
             printf '  "header": "nupp.h",\n'
             printf '  "static": "libnupp.a",\n'
             printf '  "staticLinkFlags": ['
@@ -2058,7 +1881,7 @@ build_host() {
                 printf '%s"%s"' "$separator" "$flag"
                 separator=', '
             done <<EOF
-$(host_system_flags "$selected_cargo_features")
+$(host_system_flags "$selected_features")
 $(static_host_export_flags)
 EOF
             printf '],\n'
@@ -2075,7 +1898,7 @@ EOF
         return 0
     fi
 
-    build_nupp_host "$selected_cargo_features" "$selected_lpeg_prefix" "$luajit_prefix"
+    build_nupp_host "$selected_features" "$selected_lpeg_prefix" "$luajit_prefix"
     nupp_host=$NUPP_HOST_OUT
     digest=$(printf '%s|%s' "$stage_digest" "$(basename "$nupp_host")" | sha256_stdin | cut -c1-16)
     out="$PREFIX/host/$digest"
@@ -2182,7 +2005,7 @@ build_kit() {
         # Before the kit's lock: a run holds one lock at a time.
         darwin) build_wgpu_static; kit_wgpu=$WGPU_STATIC ;;
     esac
-    # Public feature sets can share a Rust host but advertise different kit metadata.
+    # Public feature sets can share a host but advertise different kit metadata.
     digest=$(printf 'kit-7|%s|%s|%s' "$(basename "$host_out")" "$features" "${kit_wgpu:+$WGPU_VERSION}" \
         | sha256_stdin | cut -c1-16)
     out="$PREFIX/kits/$digest"
@@ -2193,7 +2016,7 @@ build_kit() {
         darwin-*) ;;
         posix-Linux) build_kit_linux "$features" "$host_out" "$out"; release_lock; return 0 ;;
         windows-*)
-            build_kit_windows "$features" "$host_out" "$out" "$selected_cargo_features"
+            build_kit_windows "$features" "$host_out" "$out" "$selected_features"
             release_lock
             return 0
             ;;
@@ -2645,6 +2468,7 @@ build_llvm() {
     verify_notice "$source/llvm/LICENSE.TXT" LLVM-LICENSE.txt
     verify_notice "$source/lld/LICENSE.TXT" LLD-LICENSE.txt
     jobs=${NUPP_LLVM_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)}
+    require_cxx "building LLVM"
     note "building LLVM $LLVM_VERSION with $CC/$CXX, $jobs jobs (this takes a while)"
     rm -rf "$out"
     mkdir -p "$out"
@@ -2827,11 +2651,6 @@ case "$1" in
             || die "no prebuilt native provider is pinned for $PREBUILT_TARGET, and there is no compiler yet to build one with"
         prebuilt_provider "${2:-}"
         native_path "$PREBUILT_OUT"
-        exit 0
-        ;;
-    rust-vendor)
-        provision_rust_vendor "${2:-}"
-        native_path "${2:-}"
         exit 0
         ;;
     host)

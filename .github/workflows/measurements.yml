@@ -43,8 +43,6 @@ concurrency:
 jobs:
   native-runtime:
     name: Native runtime / ${{ matrix.name }}
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -64,7 +62,7 @@ jobs:
         uses: actions/checkout@v5
 
       # Cache pinned source archives and host tools, but not the task-local
-      # Cargo target whose empty first build is one of the measurements. A
+      # build whose empty first run is one of the measurements. A
       # deliberate cold build belongs in an empty task-local cache and must
       # never be served from the caches ordinary correctness runs fill.
       - name: Restore the provisioned toolchain
@@ -76,13 +74,6 @@ jobs:
             hashFiles('scripts/toolchain.pins', 'scripts/toolchain') }}
           restore-keys: |
             nupp-native-measure-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Install the ABI-compatible Windows Rust toolchain
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal
 
       - name: Provision the pinned toolchain
         shell: bash
@@ -103,8 +94,6 @@ jobs:
 
   reification:
     name: Reification and array-of-structs / ${{ matrix.name }}
-    # Turned off: builds Rust, directly or by bootstrapping the compiler (#139).
-    if: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -146,13 +135,6 @@ jobs:
             hashFiles('scripts/toolchain.pins', 'scripts/toolchain') }}
           restore-keys: |
             nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Install the ABI-compatible Windows Rust toolchain
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
-          rustup toolchain install "${channel}-x86_64-pc-windows-gnu" --profile minimal
 
       - name: Provision the pinned toolchain
         shell: bash
