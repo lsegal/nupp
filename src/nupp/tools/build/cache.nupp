@@ -18,6 +18,7 @@ local hash = require("nupp.compiler.hash")
 local json = require("serde.json")
 local fs = require("nupp.compiler.fs")
 local fingerprint = require("nupp.compiler.project.fingerprint")
+local sortedJson = require("nupp.tools.internal.sortedjson").encode
 
 local readFile, writeFile = fs.readFile, fs.writeFile
 
@@ -386,6 +387,9 @@ export function loadState(path: string): State
     return adoptState(state)
 end
 
+--- Writes object keys sorted: a table iterates in an order that depends on its
+--- history, so two builds recording the same state would otherwise write
+--- different bytes.
 export function saveState(path: string, state: State): boolean?, string?
-    return writeFile(path, json.encodevalue(state) .. "\n")
+    return writeFile(path, sortedJson(state) .. "\n")
 end
