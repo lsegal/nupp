@@ -4538,13 +4538,17 @@ function types.releaseUnreferenced(): nil
             cache[key] = nil
         end
     end
+    -- Each table goes back to the metatable it had. The five arenas here are weak
+    -- for good, and leaving them none made them strong for the rest of the process.
     local weak = {__mode = "v"}
-    for _, into in ipairs(releasable) do
+    local had: {any} = {}
+    for index, into in ipairs(releasable) do
+        had[index] = getmetatable(into) or false
         setmetatable(into, weak)
     end
     collectgarbage("collect")
-    for _, into in ipairs(releasable) do
-        setmetatable(into, nil)
+    for index, into in ipairs(releasable) do
+        setmetatable(into, had[index] or nil)
     end
 end
 
