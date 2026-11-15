@@ -96,6 +96,29 @@ function M.hiddenConstructionRequiresAnExplicitFactory()
     assert(not description.fields[2], "private fields must stay hidden")
 end
 
+-- An instantiation copies its declaration's members when it is made. Effect
+-- finalization replaces a method with one that cannot suspend once its module is
+-- checked, so an instantiation made while the module was checked still held the
+-- earlier copy: a serial build, which reached it that way, described `noYield` as
+-- false where a worker that imported the finished declaration said true.
+function M.describesAnInstantiationWithItsDeclarationsCurrentMembers()
+    local element = T.typevar("T", "reflection:stale-instantiation")
+    local pool = T.nominal("Pool", "record")
+    pool.typeParams, pool.paramKinds = {element}, {"type"}
+    pool.fieldOrder = {}
+    local self = generics.instantiate(pool, {[element] = element})
+    local early = T.func({self}, {T.integer})
+    pool.staticByname, pool.staticWriteByname = {free = early}, {free = early}
+    local instance = generics.instantiate(pool, {[element] = T.string})
+    local quiet = T.withYields(early, false)
+    assert(quiet ~= early and quiet.noYield, "finalization makes a quiet copy")
+    pool.staticByname.free, pool.staticWriteByname.free = quiet, quiet
+    local descriptor = reflection.describe(instance)
+    local root = descriptor.types[descriptor.root]
+    testAssert.eq(root.staticFields[1].name, "free")
+    testAssert.eq(descriptor.types[root.staticFields[1].read].noYield, true, "the finalized member")
+end
+
 function M.storageFactsComeFromDeclarationsRatherThanFunctionTypes()
     local node = recursiveNode(T.string)
     local callback = T.func({}, {T.string}, false)

@@ -526,6 +526,24 @@ function M.keepsTheStoredFieldOrder()
     testAssert.deepeq(got.fieldOrder, {"second", "first"}, "stored fields in declaration order")
 end
 
+-- The reflected fields leave the private ones out. A worker that imported a record
+-- with a private field, and described it, said it needed no factory where the
+-- process that checked the record said it did.
+function M.keepsPrivateFieldTypes()
+    local sender = indexed("Sender", "/project/sample.nupp")
+    sender.fieldOrder = {"state", "send"}
+    sender.byname = {state = T.any, send = T.func({}, {})}
+    sender.writeByname = {state = T.any, send = sender.byname.send}
+    sender.privateFields = {state = true}
+    local got = roundTrip(sender)
+    testAssert.eq(got.byname.state, T.any, "the private field's type")
+    testAssert.eq(got.writeByname.state, T.any, "the private field's write type")
+    testAssert.eq(got.privateFields.state, true, "still private")
+    testAssert.eq(reflection.describe(got).fingerprint, reflection.describe(sender).fingerprint, "same descriptor")
+    local construction = reflection.describe(got).types[1].construction
+    testAssert.eq(construction.requiresFactory, true, "a hidden field still needs a factory")
+end
+
 function M.keepsTransportStateOutOfThePublicDescriptor()
     local parser = require("nupp.compiler.syntax.parser")
     local gen = require("nupp.compiler.lua.gen")

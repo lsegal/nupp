@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A parallel cold `nupp build` writes the same reflection descriptors as a
+  serial one. A worker that imported a record with a `@private` field said it
+  needed no factory, and a serial build described a generic record's methods
+  as they were before their module finished checking, so the two disagreed on
+  `requiresFactory`, `noYield` and the descriptor fingerprint.
 - `nupp test` runs the shared lane's eight workers at once, each in a Lua state
   of its own that is replaced once its heap passes 256 MB
   (`NUPP_TEST_WORKER_HEAP_MB`). The workers used to share a pool as wide as
