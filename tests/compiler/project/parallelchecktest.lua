@@ -212,19 +212,19 @@ local function checkState(directory)
     return stable(saved)
 end
 
+-- Each worker writes its own `<path>.<pid>` record, so concurrent writers never share
+-- a file.
 local function workerPids(path)
-    local file = io.open(path, "rb")
-    if not file then
-        return {}
-    end
+    local directory, prefix = fs.dirname(path), fs.basename(path) .. "."
     local pids = {}
-    for line in file:lines() do
-        local pid = tonumber(line)
-        if pid and pid > 1 then
-            pids[pid] = true
+    for name in fs.children(directory) do
+        if name:sub(1, #prefix) == prefix then
+            local pid = tonumber(name:sub(#prefix + 1))
+            if pid and pid > 1 then
+                pids[pid] = true
+            end
         end
     end
-    file:close()
 
     return pids
 end
