@@ -677,8 +677,8 @@ local function sizeMachOLinkedit(text: string, length: number): string?, string?
     local cursor: number = 32
     for _ = 1, commands do
         local kind = integerAt(text, cursor, 4)
-        local length = integerAt(text, cursor + 4, 4)
-        if not kind or not length or length < 8 or cursor + length > 32 + commandBytes then
+        local size = integerAt(text, cursor + 4, 4)
+        if not kind or not size or size < 8 or cursor + size > 32 + commandBytes then
             return nil, "cannot stamp malformed arm64 Mach-O load command"
         end
         if kind == 0x19 and text:sub(cursor + 9, cursor + 24):match("^__LINKEDIT") then
@@ -696,7 +696,7 @@ local function sizeMachOLinkedit(text: string, length: number): string?, string?
 
             return replaceAt(text, cursor + 48, littleEndian(fileSize, 8))
         end
-        cursor = cursor + length
+        cursor = cursor + size
     end
 
     return text
@@ -788,7 +788,8 @@ local function stampParts(
     payload: string,
     selectedPlatform: string?,
     flags: integer?
-): (string?, string | number, string?)
+): (string?, string
+    | number, string?)
     local macTarget = selectedPlatform == "aarch64-apple-darwin"
         or (selectedPlatform == nil and jit.os == "OSX" and head:sub(1, 4) == "\207\250\237\254")
     local kept: number = length
@@ -822,16 +823,21 @@ local function stampParts(
 end
 
 --- A stub with `payload` appended and a trailer saying where it starts.
-local function stampBinary(stubText: string, payload: string, selectedPlatform: string?, flags: integer?): string?, string?
+local function stampBinary(
+    stubText: string,
+    payload: string,
+    selectedPlatform: string?,
+    flags: integer?
+): string?, string?
     local head = stubText:sub(1, stubHeadLength(stubText, #stubText))
     local stampedHead, kept, trailer = stampParts(head, #stubText, payload, selectedPlatform, flags)
     if not stampedHead then
         return nil, tostring(kept)
     end
 
-    return (stampedHead as string) .. stubText:sub(#(stampedHead as string) + 1, kept as number) .. payload .. (
-        trailer as string
-    )
+    return (
+        stampedHead as string
+    ) .. stubText:sub(#(stampedHead as string) + 1, kept as number) .. payload .. (trailer as string)
 end
 
 -- How much of a binary a copy holds at once.
@@ -1083,7 +1089,7 @@ local function stampStub(
         return nil, "cannot write " .. output .. " from the stub " .. stubPath
     end
 
-    return finishStamp(output, first:sub(1, 4), (kept as integer) + #payload + TRAILER_LENGTH, selectedPlatform)
+    return finishStamp(output, first:sub(1, 4), (kept as integer) + #payload + #(trailer as string), selectedPlatform)
 end
 
 package_.bundleText = bundleText
