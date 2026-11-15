@@ -109,6 +109,12 @@ function extensions.member(root: string, name: string): boolean
     return specification ~= nil and (specification.direct == true or specification.members[name] == true)
 end
 
+--- The module that implements a root's extension, whether or not it is declared.
+function extensions.module(root: string): string?
+    local specification = ROOTS[root]
+    return specification and specification.module or nil
+end
+
 local function firstUse(c: any, root: string): boolean
     local observed = c.builtinExtensionUses
     if not observed then
