@@ -311,6 +311,8 @@ if windows then
     local ERROR_IO_PENDING: integer = 997
     local WAIT_OBJECT_0: integer = 0
     local WAIT_TIMEOUT: integer = 0x102
+    -- How long closing a child waits for a termination to finish.
+    local TERMINATE_WAIT_MS: integer = 5000
     local STARTF_USESTDHANDLES: integer = 0x100
     local CREATE_UNICODE_ENVIRONMENT: integer = 0x400
     local EXTENDED_STARTUPINFO_PRESENT: integer = 0x80000
@@ -638,10 +640,15 @@ if windows then
         return out[0], nil
     end
 
+    -- A child dropped while running is terminated, and waited for: termination
+    -- only begins when `TerminateProcess` returns, and until the child has gone it
+    -- still holds its files and its working directory open, so a caller removing
+    -- that directory next is refused with a sharing violation.
     local function closeChild(child: any): nil
         if child.process ~= nil then
             if C.WaitForSingleObject(child.process, 0) ~= WAIT_OBJECT_0 then
                 C.TerminateProcess(child.process, 1)
+                C.WaitForSingleObject(child.process, TERMINATE_WAIT_MS)
             end
             C.CloseHandle(child.process)
             child.process = nil
