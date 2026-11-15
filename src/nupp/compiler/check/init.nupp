@@ -1000,11 +1000,38 @@ local function finalizeNominalEffects(c: state.Checker)
         return nil
     end
 
+    -- A nominal this module re-exports is described by the module declaring it, as
+    -- that module's own snapshot. Its live tables are shared with whatever else this
+    -- process checked -- an implementation module rewrites a declared record's
+    -- methods, an alias renames it -- so reading them here would make this module's
+    -- interface depend on which modules happened to be checked before it.
+    local foreign: {[string]: string} = {}
+
+    local function declaredElsewhere(nominal: T.Nominal, path: string): boolean
+        local origin = (nominal.origin or nominal) as T.Nominal
+        local declaredBy = origin.moduleName
+        if not declaredBy or declaredBy == c.result.moduleName or not (c.env and c.env.resolveModuleExports) then
+            return false
+        end
+        local exports = c.env.resolveModuleExports(c.env, declaredBy)
+        local snapshot = exports and exports.nominalEffectFingerprint
+        if type(snapshot) ~= "string" then
+            return false
+        end
+        foreign[declaredBy] = snapshot
+        parts[#parts + 1] = path .. ":from:" .. declaredBy .. "." .. tostring(origin.name)
+
+        return true
+    end
+
     local function visit(nominal: T.Nominal, path: string)
         if seen[nominal] then
             return
         end
         seen[nominal] = true
+        if declaredElsewhere(nominal, path) then
+            return
+        end
 
         local function record(which: string, members: {[string]: Type}, method: boolean)
             local names: {string} = {}
@@ -1053,6 +1080,14 @@ local function finalizeNominalEffects(c: state.Checker)
         if exported.tag == "nominal" then
             visit(exported as T.Nominal, name)
         end
+    end
+    local declaring: {string} = {}
+    for declaredBy in pairs(foreign) do
+        declaring[#declaring + 1] = declaredBy
+    end
+    table.sort(declaring)
+    for _, declaredBy in ipairs(declaring) do
+        parts[#parts + 1] = "module:" .. declaredBy .. "=" .. (foreign[declaredBy] as string)
     end
     c.moduleExports.nominalEffectFingerprint = table.concat(parts, "\0")
 end
@@ -1897,7 +1932,13 @@ function checkMod.check(
         local key = c.declKey(stat)
         -- The runtime table lives at M.Point, which is what `is` compares and
         -- construction stamps for references from inside this file.
-        if t and t.tag == "nominal" and c.qualifierOf(stat) then
+        -- An alias of a nominal another module declares names it here without moving
+        -- it: that nominal is shared with every module this process checks, so
+        -- stamping it would rename it for whichever of them came after this one.
+        local nominal = t and t.tag == "nominal" and ((t as T.Nominal).origin or t) as T.Nominal or nil
+        local declaredBy = nominal and nominal.moduleName
+        local foreignAlias = stat.kind == "typeAlias" and declaredBy ~= nil and declaredBy ~= c.result.moduleName
+        if t and t.tag == "nominal" and c.qualifierOf(stat) and not foreignAlias then
             t.runtimePath = key
         end
         -- The table a declaration attaches to reads as a namespace, the same as any

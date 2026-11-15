@@ -454,4 +454,27 @@ function test.calledOnlyIgnoresTheDeclaringName()
     testAssert.eq(calledOnly("pick(x) return x end", "return t"), false, "never called")
 end
 
+-- Assigning one parameter to another joins the two bindings. The joined binding
+-- used to be named for whichever parameter's definition the parameter table
+-- yielded last, which varied from one process to the next.
+function test.aJoinedParameterIsNamedForTheFirstOfThem()
+    local src = [[
+local function pick(text: string?, first: string?, second: string?): string?
+    if first == nil then
+        first, second = second, nil
+    end
+    return first
+end
+return pick("", nil, "b")
+]]
+    for _ = 1, 16 do
+        local queries, result = analysed(src)
+        local call = findKind(result.root, "call")
+        local known = queries.known(call and call.obj and call.obj.token)
+        assert(known, "the callee resolved")
+        testAssert.eq(known.summary.reads.first, true, "the joined binding reads as the first parameter")
+        testAssert.eq(known.summary.reads.second, nil, "and never as the second")
+    end
+end
+
 return test

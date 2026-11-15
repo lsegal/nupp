@@ -272,8 +272,13 @@ local function knownCall(call, byDefinition)
     end
     local selected = call and (call.constructorEntry or call.methodEntry) or nil
     local declaration = selected and selected.declaration or nil
-    if declaration and declaration.effectInfo then
-        return declaration.effectInfo
+    -- Only a declaration this run analysed. One from another module carries the
+    -- record its own module's run left on it only when that module was checked in
+    -- this process; imported from an interface, it has none, and the call has to
+    -- answer the same either way.
+    local info = declaration and declaration.effectInfo or nil
+    if info and info.facts == byDefinition then
+        return info
     end
     local callee = call and call.obj
     local token = callee and (callee.token or callee.name)
@@ -336,6 +341,7 @@ local function collectFunctions(root)
                     paramNames = {},
                     contract = body.effectContract,
                     summary = unknownSummary(),
+                    facts = byDefinition,
                 }
                 for _, param in ipairs(body.params or {}) do
                     if param.name and not param.namedVararg then
@@ -368,6 +374,7 @@ local function collectFunctions(root)
                 paramNames = {},
                 contract = target.effectContract or body and body.effectContract,
                 summary = unknownSummary(),
+                facts = byDefinition,
             }
             if target.name and target.name.method then
                 info.paramNames[1] = "self"
@@ -513,9 +520,19 @@ local function inferFunction(info, byDefinition)
     end
 
     collectBindings(bodyContents(info.body))
-    local rooted = {}
+    -- Assigning one parameter to another joins them, and the joined binding answers
+    -- to the first of them: walking the definitions in table order would name
+    -- whichever one hashed last.
+    local byIndex = {}
     for definition, index in pairs(info.params) do
-        rooted[find(definition)] = info.paramNames[index]
+        byIndex[index] = definition
+    end
+    local rooted = {}
+    for index = #info.paramNames, 1, -1 do
+        local definition = byIndex[index]
+        if definition then
+            rooted[find(definition)] = info.paramNames[index]
+        end
     end
 
     local function rootOf(expr)

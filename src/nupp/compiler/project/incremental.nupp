@@ -1048,7 +1048,11 @@ export function new(rootDir: string, opts: table?): Inc
 
             return exports and exports.callGuarantees and exports.callGuarantees[member] or nil
         end,
-        sameStable
+        sameStable,
+        -- Asked from inside a `require` cycle, the module may still be checking.
+        -- That answer is kept only until the module finishes, so what a build
+        -- records does not depend on which module of the cycle it entered first.
+        true
     )
 
     q:define(
@@ -1058,17 +1062,23 @@ export function new(rootDir: string, opts: table?): Inc
             local entry = module and self:get("moduleCallGuarantees", module .. "\0" .. member) or nil
             return entry and entry[fact] or nil
         end,
-        sameStable
+        sameStable,
+        true
     )
 
-    q:define("moduleCallGuarantee", function(self, key)
-        local module, member, identity, guarantee = key:match("^([^%z]+)%z([^%z]+)%z([^%z]+)%z([^%z]+)$")
-        local entry = module and self:get("moduleCallGuarantees", module .. "\0" .. member) or nil
-        local actualIdentity = entry and entry.identity or identity or ((module or "?") .. "." .. (member or "?"))
-        local present = entry and entry[guarantee] == true
+    q:define(
+        "moduleCallGuarantee",
+        function(self, key)
+            local module, member, identity, guarantee = key:match("^([^%z]+)%z([^%z]+)%z([^%z]+)%z([^%z]+)$")
+            local entry = module and self:get("moduleCallGuarantees", module .. "\0" .. member) or nil
+            local actualIdentity = entry and entry.identity or identity or ((module or "?") .. "." .. (member or "?"))
+            local present = entry and entry[guarantee] == true
 
-        return actualIdentity .. (present and "\0present" or "\0absent")
-    end)
+            return actualIdentity .. (present and "\0present" or "\0absent")
+        end,
+        nil,
+        true
+    )
 
     -- Bundled declarations share the query graph with project declarations. Their
     -- imports observe overlays and retain the canonical types returned by it.
