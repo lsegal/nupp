@@ -229,6 +229,20 @@ function M.sizesOneLaneWithoutAnotherRun()
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- LuaJIT refuses a chunk with more than 200 locals in scope at once, and the
+-- runner's main chunk is the one that grows: past the limit `loadfile` fails
+-- and no suite runs at all, this one included. So hold a margin, to fail here
+-- while the runner still loads. Fold helpers into a `do` block to make room.
+function M.runnerChunksStayUnderTheLocalLimit()
+    local margin = 10
+    for _, name in ipairs({"run.lua", "cache.lua"}) do
+        local source = read(ROOT .. "/tests/" .. name)
+        local padded = ("local _ "):rep(margin) .. source
+        local _, err = loadstring(padded, "@tests/" .. name)
+        test.eq(err, nil, ("tests/%s has fewer than %d locals to spare"):format(name, margin))
+    end
+end
+
 function M.bundledRunnerWorksOutsideTheCompilerCheckout()
     local dir = os.tmpname()
     os.remove(dir)

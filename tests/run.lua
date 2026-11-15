@@ -386,6 +386,12 @@ end
 local declinedLog = os.getenv("NUPP_TEST_COMPILE_SERVICE_LOG")
 local function declined(command)
     if declinedLog and declinedLog ~= "" and command:find("bin/nupp", 1, true) then
+        -- A command that only names the compiler -- copies it, marks it
+        -- executable, looks it up -- starts no compiler.
+        local parsed = compileServiceModule and compileServiceModule.parse(command, "out")
+        if parsed and not parsed.executable:find("nupp$") then
+            return
+        end
         local file = io.open(declinedLog, "ab")
         if file then
             file:write((command:gsub("[\r\n]", " ")), "\n")
@@ -451,6 +457,100 @@ local function routedPopen(command, mode)
     end
 
     return proxy
+end
+
+local routeProcessCommands
+do
+    -- Suites start the compiler by argv too, through `nupp.compiler.process`:
+    -- `process.capture({NUPP, "check", path}, {cwd = dir})`. The call is already the
+    -- command the service would have read off a command line, so it goes through the
+    -- same route as it is. A bounded or serviced child stays the caller's.
+    local function routedArgv(argv, opts, mode)
+        if type(argv) ~= "table" or type(argv[1]) ~= "string" or not argv[1]:find("nupp", 1, true) then
+            return nil
+        end
+        opts = opts or {}
+        if opts.timeoutMs or opts.memoryMb or opts.pump or opts.cancelled or opts.replaceShell then
+            return nil
+        end
+        local client = compileServiceClient()
+        if not client then
+            return nil
+        end
+        local env, names = {}, {}
+        for name in pairs(opts.env or {}) do
+            names[#names + 1] = name
+        end
+        table.sort(names)
+        for _, name in ipairs(names) do
+            env[#env + 1] = {name, tostring(opts.env[name])}
+        end
+        local words = {}
+        for index = 2, #argv do
+            words[#words + 1] = tostring(argv[index])
+        end
+        local status, pipe, out, err = client:run({
+            cwd = opts.cwd,
+            env = env,
+            executable = argv[1],
+            argv = words,
+            stdout = mode,
+            stderr = mode == "pipe" and "pipe" or "err",
+            native = true,
+        })
+        if status == nil then
+            declined(table.concat(argv, " "))
+            return nil
+        end
+        client:forward(out, err)
+        local output = ""
+        if pipe then
+            local file = io.open(pipe, "rb")
+            if file then
+                output = file:read("*a") or ""
+                file:close()
+            end
+            os.remove(pipe)
+        end
+
+        return status, output
+    end
+
+    -- Put in front of the module's entry points before every case, as the suites may
+    -- have loaded it, or put back an entry point of their own, since the last.
+    local processRoutes = {}
+    local isProcessRoute = setmetatable({}, {__mode = "k"})
+    routeProcessCommands = function()
+        local process = package.loaded["nupp.compiler.process"]
+        if type(process) ~= "table" or rawget(_G, "__NUPP_TEST_EMBEDDED") or os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil then
+            return
+        end
+        local modes = {capture = "pipe", captureIsolated = "pipe", run = "out"}
+        for name, mode in pairs(modes) do
+            local underlying = process[name]
+            if isProcessRoute[underlying] then
+                processRoutes[name] = underlying
+            elseif type(underlying) == "function" then
+                processRoutes[name] = function(argv, opts)
+                    local caller = debug.getinfo(2, "S")
+                    if caller and startedByTests((caller.source:gsub("\\", "/"))) then
+                        local status, output = routedArgv(argv, opts, mode)
+                        if status ~= nil then
+                            if mode == "out" then
+                                return status
+                            end
+
+                            return status, output
+                        end
+                    end
+
+                    return underlying(argv, opts)
+                end
+                isProcessRoute[processRoutes[name]] = true
+                process[name] = processRoutes[name]
+            end
+        end
+    end
 end
 
 -- POSIX suites reach the shell through the interpreter's own functions, which the
@@ -1876,354 +1976,357 @@ local function workerErrors(command, errors)
     return ("{ %s; } 2>%s"):format(command, shellQuote(errors))
 end
 
-local fixtureRoot = buildRoot .. "/test-fixtures"
-local fixtureSerial = 0
-local FIXTURE_LEASE_SECONDS = 15 * 60
--- How long a consumer waits on a producer that is still running. Not a budget
--- for the producer, which is as slow as its work is: only a bound on trusting a
--- process id that may since have been handed to something else.
-local FIXTURE_LIVE_PRODUCER_SECONDS = 3 * 60 * 60
-local fixtureDigest = require("nupp.compiler.project.fingerprint").contentDigest(true)
+local resolveFixture
+do
+    local fixtureRoot = buildRoot .. "/test-fixtures"
+    local fixtureSerial = 0
+    local FIXTURE_LEASE_SECONDS = 15 * 60
+    -- How long a consumer waits on a producer that is still running. Not a budget
+    -- for the producer, which is as slow as its work is: only a bound on trusting a
+    -- process id that may since have been handed to something else.
+    local FIXTURE_LIVE_PRODUCER_SECONDS = 3 * 60 * 60
+    local fixtureDigest = require("nupp.compiler.project.fingerprint").contentDigest(true)
 
-local function readJson(path)
-    local file = io.open(path, "rb")
-    if not file then
-        return nil, "missing"
+    local function readJson(path)
+        local file = io.open(path, "rb")
+        if not file then
+            return nil, "missing"
+        end
+        local text = file:read("*a") or ""
+        file:close()
+        local ok, value = pcall(testJson.decode, text)
+
+        return ok and value or nil, ok and "valid" or "invalid"
     end
-    local text = file:read("*a") or ""
-    file:close()
-    local ok, value = pcall(testJson.decode, text)
 
-    return ok and value or nil, ok and "valid" or "invalid"
-end
+    local function fixtureManifest(root)
+        local files = require("io.internal.files")
+        local manifest = {}
 
-local function fixtureManifest(root)
-    local files = require("io.internal.files")
-    local manifest = {}
-
-    local function walk(directory, prefix)
-        for name, kind in files.list(directory) or function()
-        end do
-            local relative = prefix == "" and name or prefix .. "/" .. name
-            local path = directory .. "/" .. name
-            if relative ~= ".nupp-fixture.json" then
-                if kind == "directory" then
-                    manifest[#manifest + 1] = {path = relative, kind = "directory"}
-                    local ok, problem = walk(path, relative)
-                    if not ok then
-                        return nil, problem
+        local function walk(directory, prefix)
+            for name, kind in files.list(directory) or function()
+            end do
+                local relative = prefix == "" and name or prefix .. "/" .. name
+                local path = directory .. "/" .. name
+                if relative ~= ".nupp-fixture.json" then
+                    if kind == "directory" then
+                        manifest[#manifest + 1] = {path = relative, kind = "directory"}
+                        local ok, problem = walk(path, relative)
+                        if not ok then
+                            return nil, problem
+                        end
+                    elseif kind == "file" then
+                        local file, problem = io.open(path, "rb")
+                        if not file then
+                            return nil, tostring(problem)
+                        end
+                        local content = file:read("*a")
+                        file:close()
+                        if content == nil then
+                            return nil, "cannot read fixture artifact " .. path
+                        end
+                        manifest[#manifest + 1] = {path = relative, kind = "file", digest = fixtureDigest(content)}
+                    else
+                        return nil, "fixture artifacts must be regular files or directories: " .. path
                     end
-                elseif kind == "file" then
-                    local file, problem = io.open(path, "rb")
-                    if not file then
-                        return nil, tostring(problem)
-                    end
-                    local content = file:read("*a")
-                    file:close()
-                    if content == nil then
-                        return nil, "cannot read fixture artifact " .. path
-                    end
-                    manifest[#manifest + 1] = {path = relative, kind = "file", digest = fixtureDigest(content)}
-                else
-                    return nil, "fixture artifacts must be regular files or directories: " .. path
                 end
             end
+
+            return true
         end
 
-        return true
-    end
-
-    local ok, problem = walk(root, "")
-    if not ok then
-        return nil, problem
-    end
-    table.sort(manifest, function(a, b)
-        return a.path < b.path
-    end)
-
-    return manifest
-end
-
-local function fixtureMetadata(path, published, key)
-    local value, state = readJson(path)
-    if state == "missing" then
-        return nil, "missing"
-    elseif state ~= "valid"
-        or type(value) ~= "table"
-        or value.version ~= 1
-        or value.key ~= key
-        or type(value.files) ~= "table"
-    then
-        return nil, "invalid"
-    end
-    local storedCount = 0
-    for index in pairs(value.files) do
-        if type(index) ~= "number" or index < 1 or index ~= math.floor(index) then
-            return nil, "invalid"
+        local ok, problem = walk(root, "")
+        if not ok then
+            return nil, problem
         end
-        storedCount = storedCount + 1
+        table.sort(manifest, function(a, b)
+            return a.path < b.path
+        end)
+
+        return manifest
     end
-    local actual = fixtureManifest(published)
-    if actual == nil or #actual ~= storedCount then
-        return nil, "invalid"
-    end
-    for index = 1, storedCount do
-        local expected = value.files[index]
-        local found = actual[index]
-        if type(expected) ~= "table"
-            or type(expected.path) ~= "string"
-            or (expected.kind ~= "file" and expected.kind ~= "directory")
-            or expected.path ~= found.path
-            or expected.kind ~= found.kind
-            or expected.digest ~= found.digest
+
+    local function fixtureMetadata(path, published, key)
+        local value, state = readJson(path)
+        if state == "missing" then
+            return nil, "missing"
+        elseif state ~= "valid"
+            or type(value) ~= "table"
+            or value.version ~= 1
+            or value.key ~= key
+            or type(value.files) ~= "table"
         then
             return nil, "invalid"
         end
-    end
-
-    return value, "valid"
-end
-
---- When a lock was taken and by which process, as its holder stamped it.
----
---- A lock from before holders were named carries only the time, and one being
---- written may carry neither yet; both answer what they have.
-local function lockStamp(path)
-    local file = io.open(path, "rb")
-    if not file then
-        return nil
-    end
-    local line = file:read("*l") or ""
-    file:close()
-    local created, holder = line:match("^(%d+)%s*(%d*)")
-
-    return {created = tonumber(created), holder = tonumber(holder)}
-end
-
---- Whether a lock's holder is known to have exited. Unknown is not dead: a lock
---- with no holder, or a runtime that cannot ask, is judged by age instead.
-local function holderExited(stamp)
-    return stamp ~= nil and stamp.holder ~= nil and processAlive ~= nil and not processAlive(stamp.holder)
-end
-
-local function writeText(path, text)
-    local file, problem = io.open(path, "wb")
-    if not file then
-        error(("cannot write %s: %s"):format(path, tostring(problem)), 0)
-    end
-    file:write(text)
-    file:close()
-end
-
---- Finds or produces one immutable content-addressed fixture.
----
---- The lock is an exclusive-create file rather than a directory existence
---- check. Directory creation is intentionally idempotent on every supported
---- provider and therefore cannot say which worker won.
-local function resolveFixture(key, produce)
-    if type(key) ~= "string" or key == "" or not key:match("^[A-Za-z0-9._-]+$") then
-        error("fixture keys must contain only letters, digits, dot, underscore, and hyphen", 2)
-    elseif type(produce) ~= "function" then
-        error("fixture producer must be a function", 2)
-    elseif not exclusiveCreate then
-        error("content-addressed fixtures require exclusive file creation on this runtime", 2)
-    end
-
-    local files = require("io.internal.files")
-    local made, makeProblem = files.mkdir(fixtureRoot)
-    if not made then
-        error("cannot create fixture store: " .. tostring(makeProblem), 2)
-    end
-    local slot = "fixture-" .. fixtureDigest("nupp-test-fixture\0" .. key)
-    local published = fixtureRoot .. "/" .. slot
-    local metadata = published .. "/.nupp-fixture.json"
-    local failure = fixtureRoot .. "/" .. slot .. ".failed.json"
-    local lock = fixtureRoot .. "/" .. slot .. ".lock"
-
-    local cached = fixtureMetadata(metadata, published, key)
-    if cached ~= nil then
-        return published, cached.value, true
-    end
-    local failedFixture = readJson(failure)
-    if failedFixture ~= nil then
-        error("fixture " .. key .. " failed: " .. tostring(failedFixture.message), 2)
-    end
-
-    if exclusiveCreate(lock) then
-        fixtureSerial = fixtureSerial + 1
-        -- Recheck after taking the lock: another producer may have published
-        -- between the optimistic read and this exclusive create. If a published
-        -- directory has missing or corrupt metadata, quarantine it atomically
-        -- before rebuilding. Cache corruption costs one cold production and
-        -- never asks the caller to repair the store by hand.
-        cached = fixtureMetadata(metadata, published, key)
-        if cached ~= nil then
-            os.remove(lock)
-            return published, cached.value, true
-        elseif files.exists(published) then
-            local quarantine = fixtureRoot .. "/." .. slot .. ".corrupt-" .. shardSalt .. "-" .. fixtureSerial
-            os.remove(quarantine, true)
-            local quarantined, quarantineProblem = os.rename(published, quarantine)
-            if not quarantined then
-                os.remove(lock)
-                error("cannot quarantine corrupt fixture " .. key .. ": " .. tostring(quarantineProblem), 2)
+        local storedCount = 0
+        for index in pairs(value.files) do
+            if type(index) ~= "number" or index < 1 or index ~= math.floor(index) then
+                return nil, "invalid"
             end
-            local removed, removeProblem = os.remove(quarantine, true)
-            if not removed then
-                os.remove(lock)
-                error("cannot remove corrupt fixture " .. key .. ": " .. tostring(removeProblem), 2)
+            storedCount = storedCount + 1
+        end
+        local actual = fixtureManifest(published)
+        if actual == nil or #actual ~= storedCount then
+            return nil, "invalid"
+        end
+        for index = 1, storedCount do
+            local expected = value.files[index]
+            local found = actual[index]
+            if type(expected) ~= "table"
+                or type(expected.path) ~= "string"
+                or (expected.kind ~= "file" and expected.kind ~= "directory")
+                or expected.path ~= found.path
+                or expected.kind ~= found.kind
+                or expected.digest ~= found.digest
+            then
+                return nil, "invalid"
             end
         end
-        local temporary = fixtureRoot .. "/." .. slot .. ".tmp-" .. shardSalt .. "-" .. fixtureSerial
-        os.remove(temporary, true)
-        local prepared, prepareProblem = files.mkdir(temporary)
-        if not prepared then
-            os.remove(lock)
-            error("cannot prepare fixture " .. key .. ": " .. tostring(prepareProblem), 2)
-        end
-        local ok, value = pcall(produce, temporary)
-        if ok then
-            local files, manifestProblem = fixtureManifest(temporary)
-            local encoded, document = false, nil
-            if files == nil then
-                ok, value = false, "fixture artifacts cannot be recorded: " .. tostring(manifestProblem)
-            else
-                encoded, document = pcall(testJson.encode, {version = 1, key = key, value = value, files = files})
-                if not encoded then
-                    ok, value = false, "fixture value is not JSON-compatible: " .. tostring(document)
-                else
-                    local wrote, writeProblem = pcall(writeText, temporary .. "/.nupp-fixture.json", document .. "\n")
-                    if not wrote then
-                        ok, value = false, writeProblem
-                    end
-                end
-            end
-        end
-        if ok then
-            local moved, moveProblem = os.rename(temporary, published)
-            os.remove(lock)
-            if not moved then
-                os.remove(temporary, true)
-                error("cannot publish fixture " .. key .. ": " .. tostring(moveProblem), 2)
-            end
 
-            return published, value, false
-        end
-
-        os.remove(temporary, true)
-        local failureWritten, failureProblem = pcall(
-            writeText,
-            failure,
-            testJson.encode({
-                message = tostring(value)
-            }) .. "\n"
-        )
-        os.remove(lock)
-        if not failureWritten then
-            error("fixture " .. key .. " failed and its result could not be published: " .. tostring(failureProblem), 2)
-        end
-        error("fixture " .. key .. " failed: " .. tostring(value), 2)
+        return value, "valid"
     end
 
-    -- A producer can take far longer than the ten minutes a suite is budgeted:
-    -- one compiling wasmtime from source on a cold machine took more than
-    -- fifteen. So the wait follows the producer rather than the clock. While the
-    -- process the lock names is running this keeps waiting, up to a ceiling that
-    -- only guards against its id having been reused; once that process is gone
-    -- without publishing, it died holding the lock, and this reclaims it and
-    -- produces the fixture itself. The ten minutes remain for a lock whose
-    -- holder cannot be asked about.
-    local began = os.time()
-    local deadline = began + 10 * 60
-    local ceiling = began + FIXTURE_LIVE_PRODUCER_SECONDS
-    local stamp
-    while true do
-        cached = fixtureMetadata(metadata, published, key)
+    --- When a lock was taken and by which process, as its holder stamped it.
+    ---
+    --- A lock from before holders were named carries only the time, and one being
+    --- written may carry neither yet; both answer what they have.
+    local function lockStamp(path)
+        local file = io.open(path, "rb")
+        if not file then
+            return nil
+        end
+        local line = file:read("*l") or ""
+        file:close()
+        local created, holder = line:match("^(%d+)%s*(%d*)")
+
+        return {created = tonumber(created), holder = tonumber(holder)}
+    end
+
+    --- Whether a lock's holder is known to have exited. Unknown is not dead: a lock
+    --- with no holder, or a runtime that cannot ask, is judged by age instead.
+    local function holderExited(stamp)
+        return stamp ~= nil and stamp.holder ~= nil and processAlive ~= nil and not processAlive(stamp.holder)
+    end
+
+    local function writeText(path, text)
+        local file, problem = io.open(path, "wb")
+        if not file then
+            error(("cannot write %s: %s"):format(path, tostring(problem)), 0)
+        end
+        file:write(text)
+        file:close()
+    end
+
+    --- Finds or produces one immutable content-addressed fixture.
+    ---
+    --- The lock is an exclusive-create file rather than a directory existence
+    --- check. Directory creation is intentionally idempotent on every supported
+    --- provider and therefore cannot say which worker won.
+    resolveFixture = function(key, produce)
+        if type(key) ~= "string" or key == "" or not key:match("^[A-Za-z0-9._-]+$") then
+            error("fixture keys must contain only letters, digits, dot, underscore, and hyphen", 2)
+        elseif type(produce) ~= "function" then
+            error("fixture producer must be a function", 2)
+        elseif not exclusiveCreate then
+            error("content-addressed fixtures require exclusive file creation on this runtime", 2)
+        end
+
+        local files = require("io.internal.files")
+        local made, makeProblem = files.mkdir(fixtureRoot)
+        if not made then
+            error("cannot create fixture store: " .. tostring(makeProblem), 2)
+        end
+        local slot = "fixture-" .. fixtureDigest("nupp-test-fixture\0" .. key)
+        local published = fixtureRoot .. "/" .. slot
+        local metadata = published .. "/.nupp-fixture.json"
+        local failure = fixtureRoot .. "/" .. slot .. ".failed.json"
+        local lock = fixtureRoot .. "/" .. slot .. ".lock"
+
+        local cached = fixtureMetadata(metadata, published, key)
         if cached ~= nil then
             return published, cached.value, true
         end
-        failedFixture = readJson(failure)
+        local failedFixture = readJson(failure)
         if failedFixture ~= nil then
             error("fixture " .. key .. " failed: " .. tostring(failedFixture.message), 2)
         end
-        stamp = lockStamp(lock)
-        if stamp == nil then
-            -- Released between the reads above and this one: whatever the
-            -- producer left is there now, or it left nothing and the lock is free.
+
+        if exclusiveCreate(lock) then
+            fixtureSerial = fixtureSerial + 1
+            -- Recheck after taking the lock: another producer may have published
+            -- between the optimistic read and this exclusive create. If a published
+            -- directory has missing or corrupt metadata, quarantine it atomically
+            -- before rebuilding. Cache corruption costs one cold production and
+            -- never asks the caller to repair the store by hand.
             cached = fixtureMetadata(metadata, published, key)
             if cached ~= nil then
+                os.remove(lock)
                 return published, cached.value, true
-            elseif readJson(failure) == nil then
-                return resolveFixture(key, produce)
+            elseif files.exists(published) then
+                local quarantine = fixtureRoot .. "/." .. slot .. ".corrupt-" .. shardSalt .. "-" .. fixtureSerial
+                os.remove(quarantine, true)
+                local quarantined, quarantineProblem = os.rename(published, quarantine)
+                if not quarantined then
+                    os.remove(lock)
+                    error("cannot quarantine corrupt fixture " .. key .. ": " .. tostring(quarantineProblem), 2)
+                end
+                local removed, removeProblem = os.remove(quarantine, true)
+                if not removed then
+                    os.remove(lock)
+                    error("cannot remove corrupt fixture " .. key .. ": " .. tostring(removeProblem), 2)
+                end
             end
-        elseif holderExited(stamp) then
-            fixtureSerial = fixtureSerial + 1
-            local claimed = lock .. ".dead-" .. shardSalt .. "-" .. fixtureSerial
-            if os.rename(lock, claimed) then
-                os.remove(claimed)
+            local temporary = fixtureRoot .. "/." .. slot .. ".tmp-" .. shardSalt .. "-" .. fixtureSerial
+            os.remove(temporary, true)
+            local prepared, prepareProblem = files.mkdir(temporary)
+            if not prepared then
+                os.remove(lock)
+                error("cannot prepare fixture " .. key .. ": " .. tostring(prepareProblem), 2)
             end
-            return resolveFixture(key, produce)
-        end
-        local now = os.time()
-        local live = stamp ~= nil and stamp.holder ~= nil and processAlive ~= nil
-        if now >= ceiling or (now >= deadline and not live) then
-            break
-        end
-        if pauseBriefly then
-            pauseBriefly()
-        end
-    end
-    local holder = stamp and stamp.holder
-    local waited = os.time() - began
-    if holder ~= nil then
-        error(
-            (
-                "timed out after %ds waiting for fixture %s; pid %d still holds %s and is still running"
-            ):format(waited, key, holder, lock),
-            2
-        )
-    end
-    error(
-        (
-            "timed out after %ds waiting for fixture %s; %s does not name its producer, and a run started once it is %d minutes old reclaims it"
-        ):format(waited, key, lock, math.floor(FIXTURE_LEASE_SECONDS / 60)),
-        2
-    )
-end
-
--- A failed producer fans its result out to every consumer in one run. A new
--- top-level run gets one new attempt; immutable successful fixtures remain. A
--- killed producer can leave its exclusive-create lock behind. A new top-level
--- run atomically reaps a lock whose holder has exited, and one older than
--- fifteen minutes that names no holder it can ask about, while leaving a live
--- producer alone however long it has been working.
-if not queueDir and #shard == 0 then
-    pcall(function()
-        local files = require("io.internal.files")
-        for name in files.list(fixtureRoot) or function()
-        end do
-            if name:match("%.failed%.json$") then
-                os.remove(fixtureRoot .. "/" .. name)
-            elseif name:match("%.lock$") then
-                local path = fixtureRoot .. "/" .. name
-                local stamp = lockStamp(path)
-                local created = stamp and stamp.created
-                local cutoff = os.time() - FIXTURE_LEASE_SECONDS
-                local modified = not created and select(3, files.stat(path)) or nil
-                local known = stamp ~= nil and stamp.holder ~= nil and processAlive ~= nil
-                local stale = holderExited(stamp)
-                    or not known and created and created <= cutoff
-                    or not known and modified ~= nil and tonumber(modified) / 1000 <= cutoff
-                if stale then
-                    fixtureSerial = fixtureSerial + 1
-                    local claimed = path .. ".stale-" .. shardSalt .. "-" .. fixtureSerial
-                    if os.rename(path, claimed) then
-                        os.remove(claimed)
+            local ok, value = pcall(produce, temporary)
+            if ok then
+                local files, manifestProblem = fixtureManifest(temporary)
+                local encoded, document = false, nil
+                if files == nil then
+                    ok, value = false, "fixture artifacts cannot be recorded: " .. tostring(manifestProblem)
+                else
+                    encoded, document = pcall(testJson.encode, {version = 1, key = key, value = value, files = files})
+                    if not encoded then
+                        ok, value = false, "fixture value is not JSON-compatible: " .. tostring(document)
+                    else
+                        local wrote, writeProblem = pcall(writeText, temporary .. "/.nupp-fixture.json", document .. "\n")
+                        if not wrote then
+                            ok, value = false, writeProblem
+                        end
                     end
                 end
             end
+            if ok then
+                local moved, moveProblem = os.rename(temporary, published)
+                os.remove(lock)
+                if not moved then
+                    os.remove(temporary, true)
+                    error("cannot publish fixture " .. key .. ": " .. tostring(moveProblem), 2)
+                end
+
+                return published, value, false
+            end
+
+            os.remove(temporary, true)
+            local failureWritten, failureProblem = pcall(
+                writeText,
+                failure,
+                testJson.encode({
+                    message = tostring(value)
+                }) .. "\n"
+            )
+            os.remove(lock)
+            if not failureWritten then
+                error("fixture " .. key .. " failed and its result could not be published: " .. tostring(failureProblem), 2)
+            end
+            error("fixture " .. key .. " failed: " .. tostring(value), 2)
         end
-    end)
+
+        -- A producer can take far longer than the ten minutes a suite is budgeted:
+        -- one compiling wasmtime from source on a cold machine took more than
+        -- fifteen. So the wait follows the producer rather than the clock. While the
+        -- process the lock names is running this keeps waiting, up to a ceiling that
+        -- only guards against its id having been reused; once that process is gone
+        -- without publishing, it died holding the lock, and this reclaims it and
+        -- produces the fixture itself. The ten minutes remain for a lock whose
+        -- holder cannot be asked about.
+        local began = os.time()
+        local deadline = began + 10 * 60
+        local ceiling = began + FIXTURE_LIVE_PRODUCER_SECONDS
+        local stamp
+        while true do
+            cached = fixtureMetadata(metadata, published, key)
+            if cached ~= nil then
+                return published, cached.value, true
+            end
+            failedFixture = readJson(failure)
+            if failedFixture ~= nil then
+                error("fixture " .. key .. " failed: " .. tostring(failedFixture.message), 2)
+            end
+            stamp = lockStamp(lock)
+            if stamp == nil then
+                -- Released between the reads above and this one: whatever the
+                -- producer left is there now, or it left nothing and the lock is free.
+                cached = fixtureMetadata(metadata, published, key)
+                if cached ~= nil then
+                    return published, cached.value, true
+                elseif readJson(failure) == nil then
+                    return resolveFixture(key, produce)
+                end
+            elseif holderExited(stamp) then
+                fixtureSerial = fixtureSerial + 1
+                local claimed = lock .. ".dead-" .. shardSalt .. "-" .. fixtureSerial
+                if os.rename(lock, claimed) then
+                    os.remove(claimed)
+                end
+                return resolveFixture(key, produce)
+            end
+            local now = os.time()
+            local live = stamp ~= nil and stamp.holder ~= nil and processAlive ~= nil
+            if now >= ceiling or (now >= deadline and not live) then
+                break
+            end
+            if pauseBriefly then
+                pauseBriefly()
+            end
+        end
+        local holder = stamp and stamp.holder
+        local waited = os.time() - began
+        if holder ~= nil then
+            error(
+                (
+                    "timed out after %ds waiting for fixture %s; pid %d still holds %s and is still running"
+                ):format(waited, key, holder, lock),
+                2
+            )
+        end
+        error(
+            (
+                "timed out after %ds waiting for fixture %s; %s does not name its producer, and a run started once it is %d minutes old reclaims it"
+            ):format(waited, key, lock, math.floor(FIXTURE_LEASE_SECONDS / 60)),
+            2
+        )
+    end
+
+    -- A failed producer fans its result out to every consumer in one run. A new
+    -- top-level run gets one new attempt; immutable successful fixtures remain. A
+    -- killed producer can leave its exclusive-create lock behind. A new top-level
+    -- run atomically reaps a lock whose holder has exited, and one older than
+    -- fifteen minutes that names no holder it can ask about, while leaving a live
+    -- producer alone however long it has been working.
+    if not queueDir and #shard == 0 then
+        pcall(function()
+            local files = require("io.internal.files")
+            for name in files.list(fixtureRoot) or function()
+            end do
+                if name:match("%.failed%.json$") then
+                    os.remove(fixtureRoot .. "/" .. name)
+                elseif name:match("%.lock$") then
+                    local path = fixtureRoot .. "/" .. name
+                    local stamp = lockStamp(path)
+                    local created = stamp and stamp.created
+                    local cutoff = os.time() - FIXTURE_LEASE_SECONDS
+                    local modified = not created and select(3, files.stat(path)) or nil
+                    local known = stamp ~= nil and stamp.holder ~= nil and processAlive ~= nil
+                    local stale = holderExited(stamp)
+                        or not known and created and created <= cutoff
+                        or not known and modified ~= nil and tonumber(modified) / 1000 <= cutoff
+                    if stale then
+                        fixtureSerial = fixtureSerial + 1
+                        local claimed = path .. ".stale-" .. shardSalt .. "-" .. fixtureSerial
+                        if os.rename(path, claimed) then
+                            os.remove(claimed)
+                        end
+                    end
+                end
+            end
+        end)
+    end
 end
 
 --- How far this state's heap may grow past where the last release left it before
@@ -2258,6 +2361,7 @@ end
 -- cleanup failure as the useful second half of the report.
 local function runCase(hooks, fn)
     routeCompileCommands()
+    routeProcessCommands()
     local ok, problem = call(hooks.beforeEach)
     if ok then
         ok, problem = call(fn)
@@ -2763,229 +2867,232 @@ end
 -- source as well as a short hard list makes the safe choice the default when a
 -- new suite reaches one. Shell calls instead choose reusable process workers:
 -- several suites share each worker, and a failed case does not end its queue.
-local PROCESS_ISOLATED = {
-    -- Debug type witnesses and schema extensions need a fresh runtime context.
-    serdedebugcontracttest = true,
-    contractprojecttest = true,
-    evalfilesystemtest = true,
-    evalcatalogtest = true,
-    evalsemanticstest = true,
-    templateresolutiontest = true,
-    templatesubstitutiontest = true,
-    templatemanifesttest = true,
-    templatevariabletest = true,
-    templatetreetest = true,
-    templatesandboxtest = true,
-    templatepathtest = true,
-    templateresourcetest = true,
-    templateremotetest = true,
-    templatetest = true,
-    templatelibtest = true,
-    templatebrowsertest = true,
-    templatesimdtest = true,
-    templatelovetest = true,
-    templategametest = true,
+local processIsolated, usesShell
+do
+    local PROCESS_ISOLATED = {
+        -- Debug type witnesses and schema extensions need a fresh runtime context.
+        serdedebugcontracttest = true,
+        contractprojecttest = true,
+        evalfilesystemtest = true,
+        evalcatalogtest = true,
+        evalsemanticstest = true,
+        templateresolutiontest = true,
+        templatesubstitutiontest = true,
+        templatemanifesttest = true,
+        templatevariabletest = true,
+        templatetreetest = true,
+        templatesandboxtest = true,
+        templatepathtest = true,
+        templateresourcetest = true,
+        templateremotetest = true,
+        templatetest = true,
+        templatelibtest = true,
+        templatebrowsertest = true,
+        templatesimdtest = true,
+        templatelovetest = true,
+        templategametest = true,
 
-    bundlefactorytest = true,
-    bundlecomponenttest = true,
-    bundlebootstraptest = true,
-    bundleprovidertest = true,
-    bundlesignaturetest = true,
-    bundlepayloadtest = true,
-    bundleworkertest = true,
-    bundleschedulertest = true,
-    bundlefailuretest = true,
-    bundlescopetest = true,
-    bundleregiontest = true,
-    bundlebuffertest = true,
-    bundleforktest = true,
-    bundlelifetimetest = true,
-    bundlechanneltest = true,
-    bundlededicatedtest = true,
+        bundlefactorytest = true,
+        bundlecomponenttest = true,
+        bundlebootstraptest = true,
+        bundleprovidertest = true,
+        bundlesignaturetest = true,
+        bundlepayloadtest = true,
+        bundleworkertest = true,
+        bundleschedulertest = true,
+        bundlefailuretest = true,
+        bundlescopetest = true,
+        bundleregiontest = true,
+        bundlebuffertest = true,
+        bundleforktest = true,
+        bundlelifetimetest = true,
+        bundlechanneltest = true,
+        bundlededicatedtest = true,
 
-    deriveinternalprovidertest = true,
-    deriveexportprovidertest = true,
-    derivepublicprovidertest = true,
-    deriveexternalprovidertest = true,
+        deriveinternalprovidertest = true,
+        deriveexportprovidertest = true,
+        derivepublicprovidertest = true,
+        deriveexternalprovidertest = true,
 
-    derivediagnostictest = true,
-    deriveidentitytest = true,
-    derivelimittest = true,
-    deriveemissiontest = true,
+        derivediagnostictest = true,
+        deriveidentitytest = true,
+        derivelimittest = true,
+        deriveemissiontest = true,
 
-    derivemanifesttest = true,
-    derivetecstest = true,
+        derivemanifesttest = true,
+        derivetecstest = true,
 
-    -- These exercise worker hosting or runner descriptor behavior even when the
-    -- operation is built as a source fixture rather than called by the Lua test.
-    bundletest = true,
-    comptimetest = true,
-    publicclitest = true,
-    -- Their compiler fixtures reach build commands through shared helpers, so the
-    -- process call is not text in the suite for the source scan below to find.
-    deriveacceptancetest = true,
-    deriveprovidertest = true,
-    derivetest = true,
-    eventschecktest = true,
-    logtest = true,
-    runtimereflectiontest = true,
-    serdetest = true,
-    typeleveltest = true,
-    -- Imports cheadertest as a fixture; its top level asks the shell for an
-    -- absolute checkout path on hosts where debug information is relative.
-    hotreloadguaranteetest = true,
-    projectlinktest = true,
-    spipackagetest = true,
-    spitest = true,
-    profiletest = true,
-    runnertest = true,
-    -- These execute generated ownership cleanups. Their providers are registered
-    -- in process-global runtime tables, so a reused worker state is not their
-    -- isolation boundary even though the cases themselves do not shell out.
-    streamadapterstest = true,
-    nativefoundationstest = true,
-    soatest = true,
-    -- Rebuilds the math runtime through the process root and exercises LuaJIT's
-    -- wide FFI operations. A long-lived shell worker can retain JIT and FFI
-    -- state from unrelated suites even after its Lua globals are restored.
-    fixedwidthtest = true,
-    -- Builds and installs the URI provider by replacing the runtime root global.
-    uritest = true,
-}
+        -- These exercise worker hosting or runner descriptor behavior even when the
+        -- operation is built as a source fixture rather than called by the Lua test.
+        bundletest = true,
+        comptimetest = true,
+        publicclitest = true,
+        -- Their compiler fixtures reach build commands through shared helpers, so the
+        -- process call is not text in the suite for the source scan below to find.
+        deriveacceptancetest = true,
+        deriveprovidertest = true,
+        derivetest = true,
+        eventschecktest = true,
+        logtest = true,
+        runtimereflectiontest = true,
+        serdetest = true,
+        typeleveltest = true,
+        -- Imports cheadertest as a fixture; its top level asks the shell for an
+        -- absolute checkout path on hosts where debug information is relative.
+        hotreloadguaranteetest = true,
+        projectlinktest = true,
+        spipackagetest = true,
+        spitest = true,
+        profiletest = true,
+        runnertest = true,
+        -- These execute generated ownership cleanups. Their providers are registered
+        -- in process-global runtime tables, so a reused worker state is not their
+        -- isolation boundary even though the cases themselves do not shell out.
+        streamadapterstest = true,
+        nativefoundationstest = true,
+        soatest = true,
+        -- Rebuilds the math runtime through the process root and exercises LuaJIT's
+        -- wide FFI operations. A long-lived shell worker can retain JIT and FFI
+        -- state from unrelated suites even after its Lua globals are restored.
+        fixedwidthtest = true,
+        -- Builds and installs the URI provider by replacing the runtime root global.
+        uritest = true,
+    }
 
-local processCalls = {
-    'require("nupp.workers")',
-    "require('nupp.workers')",
-    'require("io.internal.process")',
-    "require('io.internal.process')",
-    'require("debug.profile")',
-    "require('debug.profile')",
-    -- Reaching into the loader is process-shaped whether or not a process is
-    -- started. A suite that clears a module to prove it loads lazily, injects a
-    -- loader, or writes a global through `rawset` is mutating what every other
-    -- suite in that state sees. None of these move a suite today -- every suite
-    -- that does one of them already shells out as well -- and that is exactly
-    -- why they belong here: the next one to be written might not.
-    "package.loaded",
-    "package.preload",
-    "package.loadlib",
-    "rawset(_G,",
-}
+    local processCalls = {
+        'require("nupp.workers")',
+        "require('nupp.workers')",
+        'require("io.internal.process")',
+        "require('io.internal.process')",
+        'require("debug.profile")',
+        "require('debug.profile')",
+        -- Reaching into the loader is process-shaped whether or not a process is
+        -- started. A suite that clears a module to prove it loads lazily, injects a
+        -- loader, or writes a global through `rawset` is mutating what every other
+        -- suite in that state sees. None of these move a suite today -- every suite
+        -- that does one of them already shells out as well -- and that is exactly
+        -- why they belong here: the next one to be written might not.
+        "package.loaded",
+        "package.preload",
+        "package.loadlib",
+        "rawset(_G,",
+    }
 
-local shellCalls = {"os.execute", "io.popen",}
-local SHELLING = {
-    projectcrossaggregatetest = true,
-    projectcrosscontracttest = true,
-    projectexportedlayouttest = true,
-    projectbinaryfilesystemtest = true,
-    projectbundlelayouttest = true,
-    projectcrossrefusaltest = true,
-    projectaotlinktest = true,
-    projectlayoutcachetest = true,
-    projectprocessbinarytest = true,
-    buildprogresstest = true,
-    buildprogressspecializationtest = true,
-    buildprogressclitest = true,
+    local shellCalls = {"os.execute", "io.popen",}
+    local SHELLING = {
+        projectcrossaggregatetest = true,
+        projectcrosscontracttest = true,
+        projectexportedlayouttest = true,
+        projectbinaryfilesystemtest = true,
+        projectbundlelayouttest = true,
+        projectcrossrefusaltest = true,
+        projectaotlinktest = true,
+        projectlayoutcachetest = true,
+        projectprocessbinarytest = true,
+        buildprogresstest = true,
+        buildprogressspecializationtest = true,
+        buildprogressclitest = true,
 
-    fmttreetest = true,
-    fmttree2test = true,
-    fmttree3test = true,
-    fmttree4test = true,
+        fmttreetest = true,
+        fmttree2test = true,
+        fmttree3test = true,
+        fmttree4test = true,
 
-    fmtclitest = true,
-    fmtoptionclitest = true,
-    fmtcacheclitest = true,
+        fmtclitest = true,
+        fmtoptionclitest = true,
+        fmtcacheclitest = true,
 
-    benchgpuprocesstest = true,
-    benchrecordsprocesstest = true,
-    benchschemaprocesstest = true,
-    benchprotocolprocesstest = true,
-    benchsuiteprocesstest = true,
-    benchhistoryprocesstest = true,
-    benchrunnertest = true,
-    benchpilotprocesstest = true,
-    benchselectionprocesstest = true,
+        benchgpuprocesstest = true,
+        benchrecordsprocesstest = true,
+        benchschemaprocesstest = true,
+        benchprotocolprocesstest = true,
+        benchsuiteprocesstest = true,
+        benchhistoryprocesstest = true,
+        benchrunnertest = true,
+        benchpilotprocesstest = true,
+        benchselectionprocesstest = true,
 
-    projecthashtest = true,
-    projectaotscopetest = true,
-    projectmoduletest = true,
-    projectpathtest = true,
-    projectprocesstest = true,
-    projectmaterializationtest = true,
-    projectmanifesttest = true,
-    projectcrosstest = true,
-    projectnativetest = true,
-    projecttest = true,
-    projectchecktest = true,
-    projectinvalidationtest = true,
-    projectctest = true,
-    projectbinarytest = true,
-    projectfixpointtest = true,
-    projectaottest = true,
-    projectclinktest = true,
-    projectcargotest = true,
-    projectgeneratortest = true,
-    projectfilesystemtest = true,
-    projectrocktest = true,
-    projecttestcommandtest = true,
-    projecttasktest = true,
-    projectsyntaxtest = true,
+        projecthashtest = true,
+        projectaotscopetest = true,
+        projectmoduletest = true,
+        projectpathtest = true,
+        projectprocesstest = true,
+        projectmaterializationtest = true,
+        projectmanifesttest = true,
+        projectcrosstest = true,
+        projectnativetest = true,
+        projecttest = true,
+        projectchecktest = true,
+        projectinvalidationtest = true,
+        projectctest = true,
+        projectbinarytest = true,
+        projectfixpointtest = true,
+        projectaottest = true,
+        projectclinktest = true,
+        projectcargotest = true,
+        projectgeneratortest = true,
+        projectfilesystemtest = true,
+        projectrocktest = true,
+        projecttestcommandtest = true,
+        projecttasktest = true,
+        projectsyntaxtest = true,
 
-    serdecontracttest = true,
-    serdecapabilitycontracttest = true,
-    -- Shelling happens in the helper so source inspection would otherwise rely
-    -- on an explanatory comment retaining the implementation's exact spelling.
-    simdfleetequivalencetest = true,
-    simdnativealgorithmdifferentialtest = true,
-    simdprimitivedifferentialtest = true,
-    simdwasmalgorithmdifferentialtest = true,
-    simdwasmtimeconformancetest = true,
-}
-local sourceBySuite = {}
+        serdecontracttest = true,
+        serdecapabilitycontracttest = true,
+        -- Shelling happens in the helper so source inspection would otherwise rely
+        -- on an explanatory comment retaining the implementation's exact spelling.
+        simdfleetequivalencetest = true,
+        simdnativealgorithmdifferentialtest = true,
+        simdprimitivedifferentialtest = true,
+        simdwasmalgorithmdifferentialtest = true,
+        simdwasmtimeconformancetest = true,
+    }
+    local sourceBySuite = {}
 
-local function suiteSource(suiteInfo)
-    if not suiteInfo then
-        return nil
+    local function suiteSource(suiteInfo)
+        if not suiteInfo then
+            return nil
+        end
+        local cached = sourceBySuite[suiteInfo.name]
+        if cached ~= nil then
+            return cached
+        end
+        local file = io.open(dir .. "/" .. suiteInfo.path, "rb")
+        if not file then
+            return nil
+        end
+        local source = file:read("*a") or ""
+        file:close()
+        sourceBySuite[suiteInfo.name] = source
+
+        return source
     end
-    local cached = sourceBySuite[suiteInfo.name]
-    if cached ~= nil then
-        return cached
-    end
-    local file = io.open(dir .. "/" .. suiteInfo.path, "rb")
-    if not file then
-        return nil
-    end
-    local source = file:read("*a") or ""
-    file:close()
-    sourceBySuite[suiteInfo.name] = source
 
-    return source
-end
+    local function sourceContains(suiteInfo, calls)
+        local source = suiteSource(suiteInfo)
+        if source == nil then
+            return false
+        end
+        for _, call in ipairs(calls) do
+            if source:find(call, 1, true) then
+                return true
+            end
+        end
 
-local function sourceContains(suiteInfo, calls)
-    local source = suiteSource(suiteInfo)
-    if source == nil then
         return false
     end
-    for _, call in ipairs(calls) do
-        if source:find(call, 1, true) then
-            return true
+
+    processIsolated = function(suiteInfo)
+        if not suiteInfo or PROCESS_ISOLATED[suiteInfo.name] then
+            return suiteInfo ~= nil
         end
+
+        return suiteSource(suiteInfo) == nil or sourceContains(suiteInfo, processCalls)
     end
 
-    return false
-end
-
-local function processIsolated(suiteInfo)
-    if not suiteInfo or PROCESS_ISOLATED[suiteInfo.name] then
-        return suiteInfo ~= nil
+    usesShell = function(suiteInfo)
+        return suiteInfo ~= nil and (SHELLING[suiteInfo.name] or sourceContains(suiteInfo, shellCalls))
     end
-
-    return suiteSource(suiteInfo) == nil or sourceContains(suiteInfo, processCalls)
-end
-
-local function usesShell(suiteInfo)
-    return suiteInfo ~= nil and (SHELLING[suiteInfo.name] or sourceContains(suiteInfo, shellCalls))
 end
 
 local function suiteLane(suiteInfo)

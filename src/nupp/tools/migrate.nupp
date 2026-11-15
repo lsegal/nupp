@@ -135,7 +135,8 @@ local function serdePlan(source: string, path: string): (Plan?, string?, any)
     if #parsed.errors > 0 then
         return nil, parsed.errors[1].msg, parsed.errors[1]
     end
-    local env = require("nupp.compiler.project.env").new(".", {cache = false})
+    -- Only this file's tree is read back; what it requires is read for its interface.
+    local env = require("nupp.compiler.project.env").new(".", {cache = false, releaseModuleTrees = true})
     require("nupp.compiler.check").check(parsed, path, env as {[string]: any}, {legacySerializationMigration = true})
     local lexer = require("nupp.compiler.syntax.lexer")
     local edits: {Edit} = {}
