@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `nupp bc`, `nupp run` and `nupp lsp artifact` of a file in a project nested
+  inside the current one, with its own `nupp.lua`, compile it through that
+  project, as the language server does. They named it by the outer project's
+  roots, so a `module` declaration in the file was refused with NUPP1002.
 - `nupp fmt --check` over many files keeps only the interfaces of the modules
   they require, not every module's checked tree, and collects garbage the way
   `nupp build` does. A cold check of a quarter of this repository's tree went
