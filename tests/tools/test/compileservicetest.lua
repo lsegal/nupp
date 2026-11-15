@@ -264,4 +264,35 @@ function M.anAnsweredCommandReadsAsTheShellsOwn()
     os.execute("rm -rf '" .. dir .. "'")
 end
 
+-- The file a redirect names is created with the permissions the shell would give
+-- it, so whoever ran the command can read it back. On arm64 macOS the service
+-- once created it with a mode read off the stack (#298).
+function M.aRedirectedFileReadsBackWithTheShellsPermissions()
+    local counts = rawget(_G, "__NUPP_TEST_COMPILE_SERVICE_COUNTS")
+    if os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil or os.getenv("NUPP_TEST_COMPILE_SERVICE") == "0" or counts == nil then
+        return
+    end
+    local dir = tempProject()
+    local function permissions(name)
+        local listing = capture(("cd '%s' && ls -l %s"):format(dir, name))
+
+        return listing:match("^(%S+)")
+    end
+
+    local before = counts()
+    capture(("cd '%s' && '%s' check > routed.txt 2> routed.err"):format(dir, NUPP))
+    test.eq(counts(), before + 1, "answered by the service")
+    capture(("true && cd '%s' && '%s' check > shell.txt 2> shell.err"):format(dir, NUPP))
+    test.eq(counts(), before + 1, "answered by the shell")
+    for _, pair in ipairs({{"routed.txt", "shell.txt"}, {"routed.err", "shell.err"}}) do
+        local file = io.open(dir .. "/" .. pair[1], "rb")
+        test.truthy(file, pair[1] .. " can be read back")
+        if file then
+            file:close()
+        end
+        test.eq(permissions(pair[1]), permissions(pair[2]), pair[1])
+    end
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
 return M

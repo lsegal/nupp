@@ -665,7 +665,7 @@ int nuppcs_TerminateProcess(void *, unsigned int) __asm__("TerminateProcess");
                 [[
 int nuppcs_dup(int) __asm__("dup");
 int nuppcs_dup2(int, int) __asm__("dup2");
-int nuppcs_open(const char *, int, int) __asm__("open");
+int nuppcs_open(const char *, int, ...) __asm__("open");
 int nuppcs_close(int) __asm__("close");
 long nuppcs_read(int, void *, unsigned long) __asm__("read");
 long nuppcs_write(int, const void *, unsigned long) __asm__("write");
@@ -918,10 +918,13 @@ local function redirect(out: string, err: string): function(): nil
     local function openFor(target: string): integer
         local path = target == "null" and nullDevice() or target
 
-        return c.nuppcs_open(path, writeFlags(), 438) as integer
+        -- `open` is variadic, and arm64 macOS passes variadic arguments on the
+        -- stack, so the mode has to go as a C `int` through `...` or the file is
+        -- created with whatever permissions were lying there.
+        return c.nuppcs_open(path, writeFlags(), library.new("int", 438)) as integer
     end
 
-    local input = c.nuppcs_open(nullDevice(), windows and 0x8000 or 0, 0) as integer
+    local input = c.nuppcs_open(nullDevice(), windows and 0x8000 or 0, library.new("int", 0)) as integer
     local output = openFor(out)
     local errors = err == "stdout" and output or openFor(err)
     c.nuppcs_dup2(input, 0)
