@@ -68,11 +68,13 @@ end
 --- `input` carries `queue` (the build's `{name, path}` work list), `inc` (the
 --- coordinator's session), `root`, `outDir`, `config`, `target`,
 --- `state` (the new build state) and `reporter`. A build also sets `build`, the
---- `constSelection` its modules generate against, and the `linked` dependency
---- modules it compiles from source. Returns `{records, codes}` -- the records
---- by module name and, for a build, the Lua each generated -- or nil and why
---- this process should do the work instead. Either way the reporter is told how
---- the run used its workers.
+--- `constSelection` its modules generate against (as `constspecialize.describe`
+--- carries it, or `constSelectionProblem` saying why it could not be), and the
+--- `linked` dependency modules it compiles from source, and may set `beforeWorkers`,
+--- called once the run is going to start them. Returns `{records, codes}`
+--- -- the records by module name and, for a build, the Lua each generated -- or
+--- nil and why this process should do the work instead. Either way the reporter
+--- is told how the run used its workers.
 function parallelcheck.run(input: any): (any?, string?)
     local report = input.reporter
     local inc = input.inc
@@ -131,22 +133,16 @@ function parallelcheck.run(input: any): (any?, string?)
     if jobCount == 1 then
         return declined(plan.reason)
     end
-    -- A build's const specialization is planned across every module at once, which
-    -- workers cannot do, so a build that has a candidate stays in this process. The
-    -- planner's own syntactic test decides it, before any worker is started: the
-    -- text filter leaves only the sources spelling a `const` parameter to parse.
-    if input.build and input.constSelection ~= nil then
-        local constspecialize = require("nupp.compiler.lua.constspecialize")
-        for _, source in ipairs(ordered) do
-            local text = inc.fileText(source.path) as string
-            if text:find("[<,]%s*const%s+[%a_]") ~= nil and constspecialize.declares(inc.parseFile(source.path)) then
-                return declined(
-                    source.path .. " declares a const-generic function, which a build specializes across modules"
-                )
-            end
-        end
+    -- A build's const selection reaches the workers as plain data naming nodes by
+    -- their place in the source. One that names a node without a place cannot be
+    -- carried, so that build stays in this process.
+    if input.build and input.constSelectionProblem ~= nil then
+        return declined(tostring(input.constSelectionProblem))
     end
 
+    if input.beforeWorkers ~= nil then
+        input.beforeWorkers()
+    end
     report:at(input.build and "parallel build" or "parallel check")
     local tasks = require("coroutine")
     local suspension = require("nupp.suspension")
@@ -276,48 +272,58 @@ function parallelcheck.run(input: any): (any?, string?)
 
         return left.path < right.path
     end)
-    local scanAssigned: {{any}} = {}
-    local scanWeights: {integer} = {}
-    for worker = 1, jobCount do
-        scanAssigned[worker], scanWeights[worker] = {}, 0
-    end
-    for _, source in ipairs(ordered) do
-        local selected: integer = 1
-        for worker = 2, jobCount do
-            if scanWeights[worker] < scanWeights[selected] then
-                selected = worker
+
+    -- Scans one list of `{path, name, bytes}` across the workers, each source to
+    -- the least loaded one, and returns the objects they emitted.
+    local function scanSources(list: {any}): {any}
+        local scanAssigned: {{any}} = {}
+        local scanWeights: {integer} = {}
+        for worker = 1, jobCount do
+            scanAssigned[worker], scanWeights[worker] = {}, 0
+        end
+        for _, source in ipairs(list) do
+            local selected: integer = 1
+            for worker = 2, jobCount do
+                if scanWeights[worker] < scanWeights[selected] then
+                    selected = worker
+                end
+            end
+            local assigned = scanAssigned[selected]
+            assigned[#assigned + 1] = {path = source.path, name = source.name}
+            scanWeights[selected] = scanWeights[selected] + math.max(1, (source.bytes or 1) as integer)
+        end
+        local emitted: {any} = {}
+
+        local function scanWorker(index: integer): nil
+            if #scanAssigned[index] == 0 then
+                return
+            end
+            local answer = requestWorker(index, {
+                kind = "scan",
+                sources = scanAssigned[index],
+                declaredModules = declaredModules,
+                supportedModules = supportedModules,
+            })
+            if not answer.ok then
+                error(answer.problem or "parallel graph scan failed", 0)
+            end
+            for _, object in ipairs(answer.objects or {}) do
+                emitted[#emitted + 1] = object
             end
         end
-        local list = scanAssigned[selected]
-        list[#list + 1] = {path = source.path, name = source.name}
-        scanWeights[selected] = scanWeights[selected] + math.max(1, source.bytes as integer)
-    end
 
-    local function scanWorker(index: integer): nil
-        if #scanAssigned[index] == 0 then
-            return
-        end
-        local answer = requestWorker(index, {
-            kind = "scan",
-            sources = scanAssigned[index],
-            declaredModules = declaredModules,
-            supportedModules = supportedModules,
-        })
-        if not answer.ok then
-            error(answer.problem or "parallel graph scan failed", 0)
-        end
-        for _, object in ipairs(answer.objects or {}) do
-            objects[#objects + 1] = object
-        end
-    end
-
-    local scanned, scanProblem = pcall(function(): nil
         do
             local scope = tasks.scope(jobCount)
             for worker = 1, jobCount do
                 scope:spawn(worker, scanWorker)
             end
         end
+
+        return emitted
+    end
+
+    local scanned, scanProblem = pcall(function(): nil
+        objects = scanSources(ordered)
     end)
     if not scanned then
         return abandon(scanProblem)
@@ -325,6 +331,64 @@ function parallelcheck.run(input: any): (any?, string?)
     local sourceCount = #ordered
     if #objects ~= sourceCount then
         return abandon("parallel graph scan did not return every module")
+    end
+
+    -- A module the project does not check as its own -- a standard module one of
+    -- its sources requires -- is checked by whichever worker reaches it. What that
+    -- module requires has to be ready there as well, so it is scanned too, and the
+    -- project modules it reaches become dependencies of every module reaching it.
+    local through: {[string]: {string}} = {}
+    local passed, passProblem = pcall(function(): nil
+        local fresh: {any} = objects
+        while #fresh > 0 do
+            local round: {any} = {}
+            local nameAt: {[string]: string} = {}
+            for _, object in ipairs(fresh) do
+                for _, name in ipairs(object.dependencies or {}) do
+                    if not declaredModules[name] and through[name] == nil then
+                        through[name] = {}
+                        local path = moduleTargets.supports(name, target.host) and inc.modulePath(name) or nil
+                        if path ~= nil then
+                            round[#round + 1] = {path = path, name = name}
+                            nameAt[fs.normalize(path as string)] = name
+                        end
+                    end
+                end
+            end
+            fresh = #round > 0 and scanSources(round) or {}
+            for _, object in ipairs(fresh) do
+                local name = nameAt[fs.normalize(object.path)]
+                if name ~= nil then
+                    through[name] = object.dependencies or {}
+                end
+            end
+        end
+    end)
+    if not passed then
+        return abandon(passProblem)
+    end
+    for _, object in ipairs(objects) do
+        local reached: {[string]: boolean} = {}
+        local pending: {string} = {}
+        local dependencies: {string} = {}
+        for _, name in ipairs(object.dependencies or {}) do
+            dependencies[#dependencies + 1] = name
+            if through[name] ~= nil and not reached[name] then
+                reached[name] = true
+                pending[#pending + 1] = name
+            end
+        end
+        while #pending > 0 do
+            for _, name in ipairs(through[table.remove(pending) as string] or {}) do
+                if declaredModules[name] then
+                    dependencies[#dependencies + 1] = name
+                elseif through[name] ~= nil and not reached[name] then
+                    reached[name] = true
+                    pending[#pending + 1] = name
+                end
+            end
+        end
+        object.dependencies = dependencies
     end
 
     -- Linking is plain data, but a malformed object must still end in the serial

@@ -6763,6 +6763,33 @@ function M.returningTaskSpawnsRefuseBorrowedAffineCaptures()
     )
 end
 
+-- An intersection orders its overloads canonically rather than as `spawn` declares
+-- them, so routing a call to the named member by position sent `spawn(worker, body)`
+-- there too: the body ran with no argument and the worker index arrived as a name.
+function M.spawnRoutesOnlyTheNamedOverloadToItsMember()
+    local source = table.concat(
+        {
+            "local function work(index: integer): nil print(index) end",
+            "local function pair(a: integer, b: integer): nil print(a + b) end",
+            "do local scope = coroutine.scope() ;",
+            "   local worker: integer = 3",
+            "   scope:spawn(worker, work)",
+            "   scope:spawn(1, 2, pair)",
+            "   scope:spawn(function(): nil end)",
+            "   scope:spawn('named', function(): nil end)",
+            "end",
+        },
+        "\n"
+    )
+    local result, diags = checked(source)
+    testAssert.eq(#diags, 0, diags[1] and diags[1].msg or "check")
+    local code = gen.generate(result, "spawn-routing")
+    local _, named = code:gsub("_spawnNamed%(", "")
+    local _, plain = code:gsub(":spawn%(", "")
+    testAssert.eq(named, 1, "only the named form lands on _spawnNamed:\n" .. code)
+    testAssert.eq(plain, 3, "the argument forms land on spawn:\n" .. code)
+end
+
 -- A scope joins every child before it settles, so a child body may borrow the scope it
 -- is started on: the borrow cannot outlive what it borrows (D-16). It may borrow
 -- nothing else, and a scope another scope settles first is something else.

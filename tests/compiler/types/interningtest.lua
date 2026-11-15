@@ -95,12 +95,74 @@ function M.unreferencedTypesAreReleasedAndRebuiltAlike()
     test.eq(build().id, id, "the same structure built again has the same id")
 end
 
+-- The test runner releases the arenas between cases, so every case but a worker's
+-- first runs after a release. Leaving them without a metatable afterwards made them
+-- strong for the rest of the process: every case after the first saw nothing let go
+-- of, and the case above kept all 101 types it built. Which case ran first in its
+-- process depended on how each platform's lanes sliced the suite, so it failed on
+-- Windows and macOS only (#316).
+function M.arenasStayWeakAfterARelease()
+    types.releaseUnreferenced()
+    types.settle()
+    local before = arenaSize()
+    local function build()
+        local members = {}
+        for index = 1, 50 do
+            members[index] = types.array(types.literal("issue-316-released-" .. index))
+        end
+
+        return types.union(members)
+    end
+    local id = build().id
+    test.truthy(arenaSize() > before, "building the union interned something")
+    types.settle()
+    test.eq(arenaSize(), before, "a release left the arenas holding what nothing references")
+    test.eq(build().id, id, "the same structure built again has the same id")
+end
+
 -- Something still holding a type keeps it interned: building the same structure
 -- again finds that object rather than making a second one.
 function M.referencedTypesStayInterned()
     local held = types.array(types.literal("issue-271-held"))
     types.settle()
     test.truthy(types.array(types.literal("issue-271-held")) == held, "a held type was interned twice")
+end
+
+-- A compiled trace keeps what it was recorded against alive where no collection
+-- can see it, so settling has to throw the traces away first. With the JIT off
+-- there is no trace and this passes either way.
+function M.settleLetsGoOfWhatATraceWasRecordedAgainst()
+    types.settle()
+    local before = arenaSize()
+    local function anchor()
+        local traced = types.array(types.literal("issue-312-traced"))
+        local function get()
+            return traced
+        end
+        local hits = 0
+        for _ = 1, 1000 do
+            if get() == traced then
+                hits = hits + 1
+            end
+        end
+
+        return hits
+    end
+    test.eq(anchor(), 1000)
+    types.settle()
+    test.eq(arenaSize(), before, "a type only a trace referenced stayed interned")
+end
+
+-- An interned function keeps lists of its own. Sharing the caller's made what it
+-- shared depend on which build of it survived, and so on when the collector ran.
+function M.functionTypesDoNotKeepTheCallersLists()
+    local params = {types.literal("issue-312-param")}
+    local rets = {types.literal("issue-312-ret")}
+    local fn = types.func(params, rets)
+    test.truthy(fn.params ~= params, "the function kept the caller's parameter list")
+    test.truthy(fn.rets ~= rets, "the function kept the caller's result list")
+    test.truthy(fn.params[1] == params[1] and #fn.params == 1, "the parameters were copied")
+    test.truthy(fn.rets[1] == rets[1] and #fn.rets == 1, "the results were copied")
 end
 
 return M

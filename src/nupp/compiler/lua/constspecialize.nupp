@@ -449,3 +449,213 @@ export function selectGraph(plans: {any}, maximum: integer?): ({any}, {any})
 
     return accepted, declined
 end
+
+-- Where a node sits in its module's source: the offsets of its first and last
+-- tokens, and its kind. Two checks of one source agree on it, so it can name a
+-- node to a process holding its own tree of the same file.
+local function placeOf(node: any): string?
+    local first, last = cst.firstToken(node), cst.lastToken(node)
+    if first == nil or last == nil or first.offset == nil or last.offset == nil then
+        return nil
+    end
+
+    return tostring(first.offset) .. ":" .. tostring(last.offset) .. ":" .. tostring(node.kind)
+end
+
+--- A selection as plain data another process can carry. A specialization refers
+--- to itself, to its owner and to checked nodes, so what is carried is what the
+--- generator reads off it -- keys, names, omitted positions, substituted literals --
+--- with each node named by its place in its source. `hashes` is the specialization
+--- hash of each declaring module. Returns nil, and why, when a node has no place.
+export function describe(accepted: {any}, declined: {any}, hashes: {[string]: string}): (any?, string?)
+    local owners: {any} = {}
+    local ownerAt: {[any]: integer} = {}
+    local carriersOf: {[any]: {any}} = {}
+    local files: {[string]: boolean} = {}
+
+    local function calls(specialization: any): {any}?
+        local described: {any} = {}
+        for _, call in ipairs(specialization.calls) do
+            local place = placeOf(call)
+            local filename = specialization.callFiles[call]
+            if place == nil or filename == nil then
+                return nil
+            end
+            files[filename] = true
+            described[#described + 1] = {filename = filename, place = place}
+        end
+
+        return described
+    end
+
+    local function ownerOf(owner: any): integer?
+        local index = ownerAt[owner]
+        if index == nil then
+            local place = placeOf(owner.declaration)
+            if place == nil then
+                return nil
+            end
+            local carriers: {any} = {}
+            for _, binder in ipairs(owner.binders) do
+                for _, carrier in ipairs(binder.carriers) do
+                    carriers[#carriers + 1] = {position = carrier.position, definition = carrier.definition}
+                end
+            end
+            files[owner.filename] = true
+            owners[#owners + 1] = {filename = owner.filename, place = place}
+            index = #owners
+            ownerAt[owner] = index
+            carriersOf[owner] = carriers
+        end
+
+        return index
+    end
+
+    local described = {accepted = {} as {any}, declined = {} as {any}, owners = owners, files = files, hashes = hashes}
+    for _, specialization in ipairs(accepted) do
+        local owner = ownerOf(specialization.owner)
+        local reached = calls(specialization)
+        if owner == nil or reached == nil then
+            return nil, "a const specialization of " .. tostring(specialization.owner.name) .. " has no source place"
+        end
+        local omitted: {integer} = {}
+        local substitutions: {any} = {}
+        for _, carrier in ipairs(carriersOf[specialization.owner] or {}) do
+            omitted[#omitted + 1] = carrier.position
+            substitutions[
+                #substitutions + 1
+            ] = {position = carrier.position, literal = specialization.substitutions[carrier.definition],}
+        end
+        described.accepted[
+            #described.accepted + 1
+        ] = {
+            key = specialization.key,
+            name = specialization.name,
+            physical = specialization.physical.key,
+            owner = owner,
+            omitted = omitted,
+            substitutions = substitutions,
+            calls = reached,
+        }
+    end
+    for _, specialization in ipairs(declined) do
+        local reached = calls(specialization)
+        if reached == nil then
+            return nil, "a const specialization of " .. tostring(specialization.owner.name) .. " has no source place"
+        end
+        described.declined[
+            #described.declined + 1
+        ] = {
+            key = specialization.key,
+            name = specialization.name,
+            owner = specialization.owner.filename,
+            calls = reached,
+        }
+    end
+
+    return described, nil
+end
+
+--- The selection one module generates against, rebuilt from `describe`'s plain
+--- data over this process's own checked tree of that module. Raises when a place
+--- names no node, or more than one: the tree is not the one that was planned.
+export function rebind(described: any, result: any, filename: string): any
+    if not described.files[filename] then
+        return {accepted = {}, declined = {}}
+    end
+    local nodes: {[string]: any} = {}
+    walk(result.root, function(node): nil
+        if node.kind == "call" or node.kind == "localFuncStmt" then
+            local place = placeOf(node)
+            if place ~= nil then
+                nodes[place] = nodes[place] == nil and node or false
+            end
+        end
+    end)
+
+    local function nodeAt(place: string): any
+        local node = nodes[place]
+        if not node then
+            error("const specialization place " .. place .. " in " .. filename .. " names no single node", 0)
+        end
+
+        return node
+    end
+
+    -- One object per owner, as the planner had: the generator groups bodies by it.
+    local owners: {[integer]: any} = {}
+
+    local function ownerOf(index: integer): any
+        local owner = owners[index]
+        if owner == nil then
+            local planned = described.owners[index]
+            local bound: any = {filename = planned.filename}
+            if planned.filename == filename then
+                bound.declaration = nodeAt(planned.place)
+            end
+            owner = bound
+            owners[index] = bound
+        end
+
+        return owner
+    end
+
+    local function bind(entry: any, specialization: any): any
+        specialization.calls = {}
+        specialization.callFiles = {}
+        for _, call in ipairs(entry.calls) do
+            if call.filename == filename then
+                local node = nodeAt(call.place)
+                specialization.calls[#specialization.calls + 1] = node
+                specialization.callFiles[node] = filename
+            end
+        end
+
+        return specialization
+    end
+
+    local accepted, declined = {}, {}
+    local byKey: {[string]: any} = {}
+    for _, entry in ipairs(described.accepted) do
+        local owner = ownerOf(entry.owner)
+        local omitted: {[integer]: boolean} = {}
+        for _, position in ipairs(entry.omitted) do
+            omitted[position] = true
+        end
+        local substitutions: {[any]: string} = {}
+        if owner.declaration ~= nil then
+            local params = owner.declaration.body.params or {}
+            for _, substitution in ipairs(entry.substitutions) do
+                local param = params[substitution.position]
+                local definition = param ~= nil and param.name ~= nil and param.name.definition or nil
+                if definition == nil then
+                    error("const specialization " .. entry.name .. " names no parameter in " .. filename, 0)
+                end
+                substitutions[definition] = substitution.literal
+            end
+        end
+        local specialization = bind(entry, {
+            key = entry.key,
+            name = entry.name,
+            owner = owner,
+            omitted = omitted,
+            substitutions = substitutions,
+            selected = true,
+        })
+        byKey[entry.key] = specialization
+        accepted[#accepted + 1] = specialization
+    end
+    for index, entry in ipairs(described.accepted) do
+        accepted[index].physical = byKey[entry.physical] or accepted[index]
+    end
+    for _, entry in ipairs(described.declined) do
+        declined[#declined + 1] = bind(entry, {
+            key = entry.key,
+            name = entry.name,
+            owner = {filename = entry.owner},
+            selected = false,
+        })
+    end
+
+    return {accepted = accepted, declined = declined}
+end

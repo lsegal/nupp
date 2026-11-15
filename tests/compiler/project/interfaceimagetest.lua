@@ -516,6 +516,34 @@ function M.keepsDefaultsAfterAHole()
     testAssert.eq(got.paramDefaults[2], T.string, "default after a hole")
 end
 
+-- The stored fields, in the order they were declared. Read back off the reflected
+-- members instead, a method declared in the record's body became a stored field
+-- in every worker that imported the record rather than checked it.
+function M.keepsTheStoredFieldOrder()
+    local pair = indexed("Ordered", "/project/sample.nupp")
+    pair.fieldOrder = {"second", "first"}
+    local got = roundTrip(pair)
+    testAssert.deepeq(got.fieldOrder, {"second", "first"}, "stored fields in declaration order")
+end
+
+-- The reflected fields leave the private ones out. A worker that imported a record
+-- with a private field, and described it, said it needed no factory where the
+-- process that checked the record said it did.
+function M.keepsPrivateFieldTypes()
+    local sender = indexed("Sender", "/project/sample.nupp")
+    sender.fieldOrder = {"state", "send"}
+    sender.byname = {state = T.any, send = T.func({}, {})}
+    sender.writeByname = {state = T.any, send = sender.byname.send}
+    sender.privateFields = {state = true}
+    local got = roundTrip(sender)
+    testAssert.eq(got.byname.state, T.any, "the private field's type")
+    testAssert.eq(got.writeByname.state, T.any, "the private field's write type")
+    testAssert.eq(got.privateFields.state, true, "still private")
+    testAssert.eq(reflection.describe(got).fingerprint, reflection.describe(sender).fingerprint, "same descriptor")
+    local construction = reflection.describe(got).types[1].construction
+    testAssert.eq(construction.requiresFactory, true, "a hidden field still needs a factory")
+end
+
 function M.keepsTransportStateOutOfThePublicDescriptor()
     local parser = require("nupp.compiler.syntax.parser")
     local gen = require("nupp.compiler.lua.gen")

@@ -222,6 +222,16 @@
         }
       ]
     },
+    "build-memory-llvm": {
+      "platforms": ["linux", "macos", "windows"],
+      "selectedBy": "fixpoint",
+      "steps": [
+        {
+          "name": "Hold the LLVM-linked full build to its memory budget",
+          "guarantees": ["a cold full build that links the pinned LLVM into its host stays under its own peak memory budget on every platform"]
+        }
+      ]
+    },
     "required-ci": {
       "platforms": ["linux"],
       "selectedBy": "always",

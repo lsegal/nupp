@@ -52,6 +52,22 @@ trap 'rm -f "$roundtrip"' EXIT
 cmp "$IMAGE" "$roundtrip" \
     || { echo "prelude-image: fresh generation is not byte-reproducible" >&2; exit 1; }
 
+# Nor may it depend on when the collector ran. The arenas are weak, so two runs
+# that collect at different moments keep different builds of a type alive, and a
+# compiled trace keeps whatever it was recorded against. Two runs that collect at
+# the same moments agree whatever they keep, so the comparison above cannot see
+# it: these run once collecting constantly with no traces, and once never
+# collecting at all (#312).
+for stress in \
+    'if jit then jit.off() end debug.sethook(function() collectgarbage("collect") end, "", 1000000)' \
+    'collectgarbage("stop")'
+do
+    "$LUA" -e "$stress" "$GENERATOR" \
+        "$ROOT/$bootstrap_dir/nupp-compiler.lua" "$roundtrip" source
+    cmp "$IMAGE" "$roundtrip" \
+        || { echo "prelude-image: generation depends on garbage-collector timing ($stress)" >&2; exit 1; }
+done
+
 # The standard-library interfaces are written against the prelude image's graph,
 # so they come from a bundle that already carries it. That bundle carries an empty
 # standard-library image, so every module in it is checked from source, which is

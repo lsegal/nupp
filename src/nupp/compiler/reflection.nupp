@@ -4,6 +4,7 @@ module nupp.compiler.reflection
 
 local hash = require("nupp.compiler.hash")
 local stable = require("nupp.compiler.stable")
+local generics = require("nupp.compiler.types.generics")
 local members = require("nupp.compiler.types.members")
 local T = require("nupp.compiler.types")
 local relations = require("nupp.compiler.types.relations")
@@ -153,6 +154,9 @@ function reflection.graph(root: any, hooks: any?): (integer?, {any}, {any})
         end
 
         if tag == "nominal" then
+            -- Read the members the declaration has now, not the ones the
+            -- instantiation copied when it was made.
+            generics.refreshInstantiation(t)
             out.kind = t.declKind
             out.name = t.name
             out.moduleName = ((t as any).origin or t as any).moduleName

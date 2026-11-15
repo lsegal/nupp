@@ -196,6 +196,7 @@ local function fakeBackend(script)
         if script.blockWritesWhileUnread and state.pendingOut > 0 then
             return 0, false
         end
+        state.largestOffer = math.max(state.largestOffer or 0, #data)
         local limit = script.inputChunk or #data
         local taken = data:sub(1, limit)
         state.written[#state.written + 1] = taken
@@ -434,6 +435,22 @@ function M.sendStopsAtAStallOrAtItsDeadline()
     testAssert.eq(second.stdin:send("abcdef", nil, 10), 6, "a pipe that keeps taking bytes outlasts a stall bound")
     testAssert.eq(second.stdin.setTimeout, nil, "the stream timeout setter is gone")
     second:_drop()
+end
+
+function M.aLongSendOffersEachWriteABoundedSlice()
+    -- A pipe takes a few kilobytes a write. Offering it the whole unwritten rest
+    -- copied that rest on every write, so a few megabytes on their way into a pipe
+    -- made gigabytes of garbage.
+    local backend = fakeBackend({out = {}, err = {}, inputChunk = 4096})
+    local child = spawnOn(backend, {args = {"cat"}})
+    local payload = string.rep("0123456789abcdef", 65536)
+    testAssert.eq(child.stdin:send(payload), #payload, "every byte went")
+    testAssert.eq(table.concat(backend.state.written), payload, "in order")
+    assert(
+        backend.state.largestOffer <= 65536,
+        "each write was offered a slice rather than the rest: " .. tostring(backend.state.largestOffer)
+    )
+    child:_drop()
 end
 
 function M.streamsReportEndedAndReleasedLikeEveryOtherStream()

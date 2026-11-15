@@ -266,29 +266,10 @@ export function stagingSuffix(): string
     return stagingToken .. "-" .. tostring(staged)
 end
 
-export function writeFile(path: string, text: string): boolean?, string?
-    if not mkdir(dirname(path)) then
-        return nil, "cannot create " .. dirname(path)
-    end
-    -- The counter as well as the process, so that one process staging the same
-    -- path twice at once -- a retry, a caller that writes then rewrites -- does
-    -- not collide with itself either.
-    local tmp = ("%s.%s.tmp"):format(path, stagingSuffix())
-    local f, err = io.open(tmp, "wb")
-    if not f then
-        return nil, err
-    end
-    local wrote, writeErr = f:write(text)
-    if not wrote then
-        f:close()
-        os.remove(tmp)
-        return nil, writeErr
-    end
-    local closed, closeErr = f:close()
-    if not closed then
-        os.remove(tmp)
-        return nil, closeErr
-    end
+--- Moves the finished staging file `tmp` onto `path`, replacing whatever is
+--- there, and removes `tmp` when that fails. For a writer that stages a file
+--- itself rather than handing `writeFile` the whole text.
+export function commitStaged(tmp: string, path: string): boolean?, string?
     local ok, renameErr = os.rename(tmp, path)
     -- The Windows fallback, where a rename cannot replace an existing file. The
     -- backup is named for this writer for the same reason the staging file is:
@@ -316,6 +297,33 @@ export function writeFile(path: string, text: string): boolean?, string?
     end
 
     return true
+end
+
+export function writeFile(path: string, text: string): boolean?, string?
+    if not mkdir(dirname(path)) then
+        return nil, "cannot create " .. dirname(path)
+    end
+    -- The counter as well as the process, so that one process staging the same
+    -- path twice at once -- a retry, a caller that writes then rewrites -- does
+    -- not collide with itself either.
+    local tmp = ("%s.%s.tmp"):format(path, stagingSuffix())
+    local f, err = io.open(tmp, "wb")
+    if not f then
+        return nil, err
+    end
+    local wrote, writeErr = f:write(text)
+    if not wrote then
+        f:close()
+        os.remove(tmp)
+        return nil, writeErr
+    end
+    local closed, closeErr = f:close()
+    if not closed then
+        os.remove(tmp)
+        return nil, closeErr
+    end
+
+    return commitStaged(tmp, path)
 end
 
 export function copyFile(source: string, destination: string): boolean?, string?
