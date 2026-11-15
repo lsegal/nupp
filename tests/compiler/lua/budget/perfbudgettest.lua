@@ -392,10 +392,41 @@ end
 -- runners when this was set; the bound is the requirement, not a snapshot.
 local SINGLE_COMPILE_PEAK_BYTES = 200 * 1024 * 1024
 
-function M.aSingleTestProgramCompileStaysUnderItsMemoryBudget()
+--- Runs `program` from a fresh directory once for every warm-up, then once more with
+--- `NUPP_PEAK_MEMORY_FILE` set, and answers what that last run printed and its peak.
+local function measuredRun(program, warmups)
     local dir = temporary()
-    writeFile(
-        dir .. "/main.nupp",
+    writeFile(dir .. "/main.nupp", program)
+    -- Named with backslashes on Windows: the harness rewrites a drive-letter path in a
+    -- command into the shell's spelling, and the compiler reading it is not the shell.
+    local peaks = dir .. "/peaks.tsv"
+    local named = package.config:sub(1, 1) == "\\" and peaks:gsub("/", "\\") or peaks
+    for _ = 1, warmups do
+        run(dir, "run main.nupp")
+    end
+    local env = ("NUPP_PEAK_MEMORY_FILE='%s' "):format(named)
+    local pipe = assert(io.popen(("cd '%s' && %s'%s' run main.nupp 2>&1"):format(dir, env, NUPP)))
+    local out = pipe:read("*a"):gsub("\r", "")
+    pipe:close()
+    local reported = readFile(peaks) or ""
+    os.execute("rm -rf '" .. dir .. "'")
+
+    local peak = nil
+    for line in reported:gmatch("[^\n]+") do
+        local bytes, arguments = line:match("^(%d+)\t(.*)$")
+        if arguments and arguments:match("^run ") then
+            peak = tonumber(bytes)
+        end
+    end
+    assert(peak, "the compiler reported no peak: " .. reported)
+
+    return out, peak
+end
+
+function M.aSingleTestProgramCompileStaysUnderItsMemoryBudget()
+    -- One warm-up, so the run measured reads the checked prelude back the way every
+    -- command in a lane after the first does, rather than checking it.
+    local out, peak = measuredRun(
         table.concat({
             "local type Point = {x: number, y: number}",
             "",
@@ -414,36 +445,143 @@ function M.aSingleTestProgramCompileStaysUnderItsMemoryBudget()
             "end",
             'print(string.format("%.3f", total))',
             "",
-        }, "\n")
+        }, "\n"),
+        1
     )
-    -- Named with backslashes on Windows: the harness rewrites a drive-letter path in a
-    -- command into the shell's spelling, and the compiler reading it is not the shell.
-    local peaks = dir .. "/peaks.tsv"
-    local named = package.config:sub(1, 1) == "\\" and peaks:gsub("/", "\\") or peaks
-    -- Once first, so the run measured reads the checked prelude back the way every
-    -- command in a lane after the first does, rather than checking it.
-    run(dir, "run main.nupp")
-    local env = ("NUPP_PEAK_MEMORY_FILE='%s' "):format(named)
-    local pipe = assert(io.popen(("cd '%s' && %s'%s' run main.nupp 2>&1"):format(dir, env, NUPP)))
-    local out = pipe:read("*a"):gsub("\r", "")
-    pipe:close()
-    local reported = readFile(peaks) or ""
-    os.execute("rm -rf '" .. dir .. "'")
-
     assert(out:find("221.371", 1, true), "the program did not run: " .. out)
-    local peak = nil
-    for line in reported:gmatch("[^\n]+") do
-        local bytes, arguments = line:match("^(%d+)\t(.*)$")
-        if arguments and arguments:match("^run ") then
-            peak = tonumber(bytes)
-        end
-    end
-    assert(peak, "the compiler reported no peak: " .. reported)
     assert(
         peak <= SINGLE_COMPILE_PEAK_BYTES,
         ("compiling and running one test program peaked at %.1f MB, over the budget of %.1f MB"):format(
             peak / 1048576,
             SINGLE_COMPILE_PEAK_BYTES / 1048576
+        )
+    )
+end
+
+-- The same bound for a program that requires a standard-library module (#265).
+-- Checking `serde.json`'s graph from source peaked at 274-320 MB; the checked
+-- interfaces are kept beside the prelude and hydrated instead. Two warm-ups: the
+-- first command keeps the prelude, the second the interfaces checked against it.
+function M.aCompileThatRequiresTheStandardLibraryStaysUnderItsMemoryBudget()
+    local out, peak = measuredRun(
+        table.concat({
+            'local json = require("serde.json")',
+            "local record User",
+            "    id: uint32",
+            "    name: string?",
+            "end",
+            "local users = serde.binding(User)",
+            'print(json.encode(users, User(id = 41, name = "Ada")))',
+            "",
+        }, "\n"),
+        2
+    )
+    assert(out:find('{"id":41,"name":"Ada"}', 1, true), "the program did not run: " .. out)
+    assert(
+        peak <= SINGLE_COMPILE_PEAK_BYTES,
+        ("compiling and running a serde.json program peaked at %.1f MB, over the budget of %.1f MB"):format(
+            peak / 1048576,
+            SINGLE_COMPILE_PEAK_BYTES / 1048576
+        )
+    )
+end
+
+--- The peak `nupp bc` reports compiling `file` in `dir`, with `prefix` before it.
+local function bytecodePeak(dir, file, prefix)
+    local peaks = dir .. "/peaks.tsv"
+    os.remove(peaks)
+    local named = package.config:sub(1, 1) == "\\" and peaks:gsub("/", "\\") or peaks
+    local env = ("%sNUPP_PEAK_MEMORY_FILE='%s' "):format(prefix, named)
+    -- Through a pipe, because the test runner's compile service answers a plain `bc`
+    -- inside its own long-lived process, whose peak is not this command's.
+    local pipe = assert(io.popen(("cd '%s' && %s'%s' bc --json -O1 %s 2>&1 | cat"):format(dir, env, NUPP, file)))
+    local out = pipe:read("*a")
+    pipe:close()
+    local peak = nil
+    for line in (readFile(peaks) or ""):gmatch("[^\n]+") do
+        local bytes, arguments = line:match("^(%d+)\t(.*)$")
+        if arguments and arguments:match("^bc ") then
+            peak = tonumber(bytes)
+        end
+    end
+    assert(peak, "the compiler reported no peak: " .. out)
+    local ok, report = pcall(json.decode, out)
+    assert(ok and type(report) == "table" and report.ok, "bc failed: " .. out)
+
+    return peak
+end
+
+-- A single-file compile inside a project holds its dependencies' checked interfaces
+-- rather than checking the whole import graph again (#277). `nupp bc` of one file in
+-- the compiler's own checkout checked a hundred and forty modules from source and
+-- peaked at about 530 MB; with the project's interfaces read back from the build
+-- directory, the same graph here costs what the one file does. Two warm-ups: the
+-- first command keeps the prelude, the second the interfaces checked against it.
+function M.aSingleFileCompileInAProjectReadsItsDependenciesBack()
+    local dir = temporary()
+    moduleGraph(dir, 120)
+    writeFile(dir .. "/src/main.nupp", 'local top = require("m119")\nprint(top.make(3).a)\n')
+    run(dir, "bc -O1 src/main.nupp")
+    run(dir, "bc -O1 src/main.nupp")
+    local warm = bytecodePeak(dir, "src/main.nupp", "")
+    local fromSource = bytecodePeak(dir, "src/main.nupp", "NUPP_NO_INTERFACE_CACHE=1 ")
+    os.execute("rm -rf '" .. dir .. "'")
+
+    assert(
+        warm <= SINGLE_COMPILE_PEAK_BYTES,
+        ("a single-file compile in a 120-module project peaked at %.1f MB, over the budget of %.1f MB"):format(
+            warm / 1048576,
+            SINGLE_COMPILE_PEAK_BYTES / 1048576
+        )
+    )
+    assert(
+        warm < fromSource,
+        ("reading the project's interfaces back peaked at %.1f MB, no less than checking them, %.1f MB"):format(
+            warm / 1048576,
+            fromSource / 1048576
+        )
+    )
+end
+
+-- What a build may leave behind in a process that builds again, once the types nothing
+-- holds have been released.
+local REBUILD_RETAINED_KB = 8 * 1024
+
+-- A test worker builds project after project in one process. Every type each build
+-- interned used to stay -- the arenas kept them, and weakly keyed caches whose answers
+-- reached their own keys kept them past the arenas -- so the heaviest suites grew by
+-- about 45 MB a build and peaked past 2 GB (#266). Released between builds, the heap
+-- after the last of several builds is where it was after the first.
+function M.repeatedBuildsInOneProcessKeepAFlatHeap()
+    local fs = require("nupp.compiler.fs")
+    local project = require("nupp.tools.build.project")
+    local types = require("nupp.compiler.types")
+    local function buildOnce(index)
+        local dir = temporary()
+        assert(fs.writeFile(dir .. "/nupp.lua", [[return {include = {"src"}, build = {
+            kind = "bundle", outDir = "out", output = "out/app.lua", entries = {"main"}
+        }}]]))
+        assert(fs.mkdir(dir .. "/src"))
+        assert(fs.writeFile(dir .. "/src/main.nupp", ("module main\nlocal x = %d\nprint(x)\n"):format(index)))
+        local status = project.build(dir)
+        os.execute("rm -rf '" .. dir .. "'")
+        assert(status == 0, "a fixture project did not build")
+        types.releaseUnreferenced()
+
+        return collectgarbage("count")
+    end
+    -- The first build loads and checks what every later one reuses.
+    buildOnce(1)
+    local settled = buildOnce(2)
+    local last = settled
+    for index = 3, 5 do
+        last = buildOnce(index)
+    end
+    assert(
+        last - settled <= REBUILD_RETAINED_KB,
+        ("three more builds left %.1f MB behind, over the budget of %.1f MB"):format(
+            (last - settled) / 1024,
+            REBUILD_RETAINED_KB / 1024
         )
     )
 end

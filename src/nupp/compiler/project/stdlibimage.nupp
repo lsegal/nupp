@@ -339,12 +339,11 @@ export function encode(env: any, names: {string}): (string?, string?)
     return data as string, nil
 end
 
---- Decodes the carried image into `env`'s checker identity.
+--- Decodes `data`, an image `encode` wrote, into `env`'s checker identity.
 ---
---- Nil when there is none, or when it was written for another prelude image or other
---- check settings; the caller then checks modules from source.
-export function hydrate(env: any): (Hydrated?, string?)
-    local data = bundled.source(RESOURCE)
+--- Nil when it was written for another prelude image or other check settings; the
+--- caller then checks modules from source.
+export function hydrateData(env: any, data: string?): (Hydrated?, string?)
     if data == nil or data == "" then
         return nil, "no standard-library image"
     end
@@ -370,4 +369,9 @@ export function hydrate(env: any): (Hydrated?, string?)
     end
 
     return {semantics = semantics, modules = payload.modules}, nil
+end
+
+--- Decodes the carried image into `env`'s checker identity, as `hydrateData` does.
+export function hydrate(env: any): (Hydrated?, string?)
+    return hydrateData(env, bundled.source(RESOURCE))
 end

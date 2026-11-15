@@ -49,19 +49,24 @@ that object is the one every other reference in it is already using -- and the
 image's members are written onto it, because checking the prelude is also what
 filled it in.
 
-The serials go with them. `intern` stamps each type with one, and the counter
-that issues them starts at zero in every process, so restoring types without
-restoring the counter would have this process hand out a serial some restored
-type already carries. `types.resumeIdentity` moves the counters forward to where
-the writing process left them, never back.
+An interned type's id is a digest of its key, so it needs no counter carried
+with it. A nominal's is not: `types.nominal` numbers declarations from a counter
+that starts at zero in every process, so restoring nominals without restoring the
+counter would have this process hand out a number some restored nominal already
+carries. `types.resumeIdentity` moves the counters forward to where the writing
+process left them, never back.
+
+The arenas are weak, so an interned type nothing references is let go of, and
+one the image carries is no exception. That is harmless: nothing is left to tell
+the copy apart from one built again under the same key, which gets the same id.
 
 ## Origin
 
 Moving the counters forward covers what this process issues next, not what it
-issued before. A key spells a type by its parts' serials and a nominal's id by
-its counter, so an image means what it says only in an arena that numbered
-everything before the prelude the way the writer's did. Read over any other, a
-restored type and a live one share an id, and a key built from that id finds
+issued before. A key spells a type by its parts' ids and a nominal's id by its
+counter, so an image means what it says only in an arena that numbered every
+declaration before the prelude the way the writer's did. Read over any other, a
+restored nominal and a live one share an id, and a key built from that id finds
 whichever the arena met first -- or the image's keys find the live types and the
 image's nominals are not the ones they point at, so a returned generic nominal
 is not the nominal it is annotated with.
@@ -69,9 +74,13 @@ is not the nominal it is annotated with.
 "The first environment in a process" was meant to be that condition, and is not
 one: a module reloaded over a live `nupp.compiler.types` is a first environment
 again with a checked prelude already in the arena, which is what the test
-runner's lanes do between suites. So the image records its origin -- the three
-counters and a digest of every interned key and id, taken before the prelude was
-checked -- and is read only into an arena whose own origin is the same. Every
+runner's lanes do between suites. So the image records its origin -- the two
+counters and a digest of every declaration they numbered, taken before the
+prelude was checked -- and is read only into an arena whose own origin is the
+same. Interned types need no listing of their own: their ids are spelled from
+structure and from those numbers, so arenas that agree on the numbers agree on
+every id. (They once had one, every interned key and id, which a weak arena
+would make depend on when the collector last ran.) Every
 command starts from the same one, which is the case the cache exists for; any
 other reader checks the prelude itself.
 
@@ -102,7 +111,6 @@ of them cover the whole prelude.
 ]]
 module nupp.compiler.project.preludecache
 
-local hash = require("nupp.compiler.hash")
 local triviaarena = require("nupp.compiler.syntax.triviaarena")
 local types = require("nupp.compiler.types")
 
@@ -124,19 +132,18 @@ local ROOT_NAMES = {
 
 --- Bumped when the shape below changes. An image that does not say this number is
 --- discarded, the same way a store entry stamped differently is.
-local FORMAT = 3
+local FORMAT = 4
 
 --- Where type identity stood when a prelude was about to be checked or read.
 ---
 --- The counters say how much had been issued, and `digest` says what: every
---- interned key with the id it was stamped with. See "Origin" above.
+--- declaration that was numbered, in order. See "Origin" above.
 export type preludecache.Origin = {
-    serial: integer,
     capability: integer,
     nominal: integer,
 
-    --- Filled in by `preludecache.seal`, and only when it is needed: the counters
-    --- tell most origins apart, and the listing is as long as the arena.
+    --- Filled in by `preludecache.seal`, once the counters say the arena is still
+    --- the one the origin was taken from.
     digest: string?
 }
 
@@ -144,7 +151,7 @@ export type preludecache.Origin = {
 function preludecache.origin(): preludecache.Origin
     local identity = types.identity()
 
-    return {serial = identity.serial, capability = identity.capability, nominal = identity.nominal}
+    return {capability = identity.capability, nominal = identity.nominal}
 end
 
 --- Fills in `origin.digest`, or nil when the arena is no longer the one `origin`
@@ -157,28 +164,16 @@ function preludecache.seal(origin: preludecache.Origin): string?
         return origin.digest
     end
     local identity = types.identity()
-    if identity.serial ~= origin.serial
-        or identity.capability ~= origin.capability
-        or identity.nominal ~= origin.nominal
-    then
+    if identity.capability ~= origin.capability or identity.nominal ~= origin.nominal then
         return nil
     end
-    local lines: {string} = {}
-    for bucket, entries in pairs(identity.arenas) do
-        for key, value in pairs(entries) do
-            local id = type(value) == "table" and (value as any).id or nil
-            lines[#lines + 1] = bucket .. "\0" .. key .. "\0" .. tostring(id)
-        end
-    end
-    table.sort(lines)
-    origin.digest = hash.digest(table.concat(lines, "\n"))
+    origin.digest = identity.declarations
 
     return origin.digest
 end
 
 local function isOrigin(value: any): boolean
     return type(value) == "table"
-        and type(value.serial) == "number"
         and type(value.capability) == "number"
         and type(value.nominal) == "number"
         and type(value.digest) == "string"
@@ -187,11 +182,7 @@ end
 --- Whether `recorded` is `origin`: the counters first, the listing only when they
 --- agree.
 local function sameOrigin(recorded: any, origin: preludecache.Origin): boolean
-    if not isOrigin(recorded)
-        or recorded.serial ~= origin.serial
-        or recorded.capability ~= origin.capability
-        or recorded.nominal ~= origin.nominal
-    then
+    if not isOrigin(recorded) or recorded.capability ~= origin.capability or recorded.nominal ~= origin.nominal then
         return false
     end
 
@@ -211,8 +202,8 @@ function preludecache.replaces(stored: any, origin: preludecache.Origin): boolea
     if not isOrigin(recorded) then
         return true
     end
-    if recorded.serial ~= origin.serial then
-        return recorded.serial > origin.serial
+    if recorded.nominal ~= origin.nominal then
+        return recorded.nominal > origin.nominal
     end
 
     return sameOrigin(recorded, origin)
@@ -559,13 +550,8 @@ function preludecache.encode(roots: any, origin: preludecache.Origin?): any?
         arenas = arenas,
         triviaOf = triviaOf,
         internedAs = internedAs,
-        identity = {serial = identity.serial, capability = identity.capability, nominal = identity.nominal,},
-        origin = {
-            serial = origin.serial,
-            capability = origin.capability,
-            nominal = origin.nominal,
-            digest = origin.digest,
-        },
+        identity = {capability = identity.capability, nominal = identity.nominal,},
+        origin = {capability = origin.capability, nominal = origin.nominal, digest = origin.digest,},
         roots = rootIds,
         runtime = roots.preludeRuntime,
     }
@@ -753,7 +739,7 @@ function preludecache.decode(image: any, origin: preludecache.Origin?): any?
             return nil
         end
     end
-    for _, name in ipairs({"serial", "capability", "nominal"}) do
+    for _, name in ipairs({"capability", "nominal"}) do
         local value = image.identity[name]
         if not isInteger(value) or value < 0 then
             return nil
@@ -873,8 +859,8 @@ function preludecache.decode(image: any, origin: preludecache.Origin?): any?
         local where = image.internedAs[id]
         types.adopt(where[1] as string, where[2] as string, built[id])
     end
-    -- And the counters with them, or the next type this process interns is stamped
-    -- with a serial one of these already carries.
+    -- And the counters with them, or the next declaration this process allocates is
+    -- numbered the way one of these already is.
     types.resumeIdentity(image.identity)
 
     local roots: any = {}
@@ -883,6 +869,10 @@ function preludecache.decode(image: any, origin: preludecache.Origin?): any?
         roots[name] = id ~= 0 and built[id as integer] or nil
     end
     roots.preludeRuntime = image.runtime
+    -- Every table by id, so an image written against this one can name what it
+    -- shares with it; see `nupp.compiler.project.stdlibimage`. The ids are this
+    -- image's, so such an image is true only beside the image it was written beside.
+    roots.arena = built
 
     return roots
 end

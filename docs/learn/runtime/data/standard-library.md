@@ -142,7 +142,7 @@ and lifetime requirements.
 
 ### Forcing a native feature
 
-[`nativeFeatures`](../../projects/build.md#compiler-native-features) turns a binary
+[`nativeFeatures`](../../projects/build.md#compiler-native-features) turns a native
 feature on or off for an unusual packaging arrangement. Leave it unset and use
 automatic detection unless the packaging requires otherwise.
 

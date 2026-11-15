@@ -411,12 +411,39 @@ end
 local function newClient(root)
     local emitted = {}
     local sources = {}
-    local session = require("nupp.tools.lsp").newSession(root, function(message)
-        emitted[#emitted + 1] = message
-    end)
+    -- Started on the first request rather than here. A session builds the project's
+    -- query graph as it starts, and an operation that only reads files -- `artifact`
+    -- lowers through a fresh environment of its own -- should not pay for one, nor
+    -- leave the stored prelude to it: a process hands that to its first environment.
+    local session: any = nil
+    local initErr: any = nil
     local nextId = 0
 
+    local function start(): any
+        if session == nil then
+            session = require("nupp.tools.lsp").newSession(root, function(message)
+                emitted[#emitted + 1] = message
+            end)
+            nextId = nextId + 1
+            local id = nextId
+            session.dispatch({jsonrpc = "2.0", id = id, method = "initialize", params = {}})
+            for index = #emitted, 1, -1 do
+                local message = emitted[index]
+                if message.id == id and message.error then
+                    initErr = message.error.message
+                end
+            end
+            session.dispatch({jsonrpc = "2.0", method = "initialized", params = {}})
+        end
+
+        return initErr
+    end
+
     local function request(method, params)
+        local startErr = start()
+        if startErr then
+            return nil, startErr
+        end
         nextId = nextId + 1
         local id = nextId
         session.dispatch({jsonrpc = "2.0", id = id, method = method, params = params})
@@ -434,14 +461,9 @@ local function newClient(root)
     end
 
     local function notify(method, params)
+        start()
         session.dispatch({jsonrpc = "2.0", method = method, params = params})
     end
-
-    local _, initErr = request("initialize", {})
-    if initErr then
-        return nil, initErr
-    end
-    notify("initialized", {})
 
     local function source(path)
         path = normalizePath(path)
@@ -1161,18 +1183,26 @@ local function runArtifact(client, opts)
         return nil, usage("--kind names the artifact to resolve: lua or bytecode")
     end
     local path = resolvePath(opts.root, opts.positional[1])
-    local _, readErr = client.open(path)
+    local text, readErr = client.source(path)
     if readErr then
         return nil, readErr
     end
-    local result, requestErr = client.request("nupp/artifact", {
-        textDocument = {uri = pathToUri(path)},
+    -- Resolved the way the server resolves `nupp/artifact`, but without one. A session
+    -- checks a document it opens, and the whole graph under it, to publish diagnostics
+    -- nobody here reads, and only then lowers it in an environment of its own; in the
+    -- compiler's checkout that was most of a gigabyte before the lowering started.
+    local uri = pathToUri(path)
+    local result = require("nupp.tools.lsp.artifacts").install({
+        documents = {[uri] = {text = text, version = 1}},
+        useRoot = function(): string
+            return opts.root
+        end,
+        currentRoot = opts.root,
+    }).resolve({
+        textDocument = {uri = uri},
         kind = opts.kind,
         optLevel = tonumber(opts.artifactOptLevel) or 0,
     })
-    if requestErr then
-        return nil, requestErr
-    end
     if opts.format == "json" then
         jsonOutput(result)
     elseif not result.available then

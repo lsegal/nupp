@@ -11,7 +11,7 @@ local WORK_CEILINGS = {
     utf8simd = {units = 1, cases = 199082, calls = 1, fingerprint = "park-miller:31:9704630:1254652296"},
     base64simd = {units = 1, cases = 80744, calls = 1, fingerprint = "park-miller:20260917:4493157:2096655930"},
     ["simd-json"] = {units = 2, cases = 223519, calls = 1, fingerprint = "park-miller:20260917:453616:447386101"},
-    ["fused-json"] = {units = 1, cases = 10, calls = 1},
+    ["fused-json"] = {units = 1, cases = 11, calls = 1},
 }
 
 local function projectFiles(name)
@@ -191,6 +191,18 @@ function M.fusedJsonKeyCoversTheNativeBuilder()
     end
     test(covered["native/aotruntime/common/ksrt/builder.nupp"], "the fused-json key omits the builder")
     test(covered["native/aotruntime/common/ksrt/values.nupp"], "the fused-json key omits the runtime's values")
+end
+
+-- The fused pass runs every case of the compiled-decoder differential, so its
+-- ceiling must follow that suite even on hosts that cannot run the pass.
+function M.fusedJsonCeilingCountsEveryDifferentialCase()
+    local source = runner.read(ROOT .. "/tests/stdlib/serde/json/jsonfuseddifferentialtest.lua")
+    local count = 0
+    for _ in source:gmatch("\nfunction M%.[%w_]+%(") do
+        count = count + 1
+    end
+    test(count > 0, "found no compiled-decoder differential cases")
+    test.eq(WORK_CEILINGS["fused-json"].cases, count)
 end
 
 return M

@@ -728,6 +728,22 @@ local queueDir = nil
 -- cross the suite boundary.
 local freshQueuePieces = os.getenv("NUPP_TEST_FRESH_QUEUE_PIECES") == "1"
 local supervisedPiece = os.getenv("NUPP_TEST_SUPERVISED_PIECE") == "1"
+-- The live Lua heap, in megabytes, past which a Nupp worker state stops taking
+-- work once its suite is done. The parent replaces it with a fresh state on the
+-- same queue. A state kept what every suite it ran left behind, so the shared
+-- lane's process outgrew a 7 GB macOS runner, and each suite after that ran
+-- slower than the last (#287). A state holds about 280 MB once the compiler is
+-- loaded and settled at 300-625 MB without a bound, so 256 retires it after a
+-- few suites. `NUPP_TEST_WORKER_HEAP_MB` overrides it; 0 retires a state after
+-- every suite.
+local workerHeapLimit = (tonumber(os.getenv("NUPP_TEST_WORKER_HEAP_MB") or "") or 256) * 1024
+-- The collector pause the parent chose for this worker state, from what memory
+-- each of its states has to itself. See `workerPause` below.
+if embedded and rawget(_G, "__NUPP_TEST_GC_PAUSE") then
+    collectgarbage("setpause", rawget(_G, "__NUPP_TEST_GC_PAUSE"))
+end
+-- Set when this state stopped taking work for that reason.
+local retired = false
 local jobs = nil
 -- Workers for one lane only, from `--jobs=shell:2`. A lane whose suites start
 -- children of their own -- the shell lane's cold native builds -- can want fewer
@@ -2210,6 +2226,33 @@ if not queueDir and #shard == 0 then
     end)
 end
 
+--- How far this state's heap may grow past where the last release left it before
+--- the next case pays for another, in kilobytes.
+local RELEASE_GROWTH_KB = 64 * 1024
+local releasedAtKb = nil
+
+--- Lets go of the types the compiles in finished cases interned.
+---
+--- The compiler's type arenas are kept for the life of the process, which suits one
+--- command and does not suit a worker that builds a project in case after case: every
+--- type of every one of them stayed, and the heaviest suites peaked past 2 GB in
+--- their own process while a shared lane of Nupp workers outgrew a 16 GB runner
+--- (#266). Releasing costs a full collection, so it waits until the heap has grown
+--- enough since the last one for the collection to be worth it; a case that compiles
+--- nothing never gets there. Between cases only, never inside one, because a type
+--- built again after its release is the same structure under a new id.
+local function releaseCompiledTypes()
+    local types = package.loaded["nupp.compiler.types"]
+    if type(types) ~= "table" or type(types.releaseUnreferenced) ~= "function" then
+        return
+    end
+    if releasedAtKb ~= nil and collectgarbage("count") < releasedAtKb + RELEASE_GROWTH_KB then
+        return
+    end
+    types.releaseUnreferenced()
+    releasedAtKb = collectgarbage("count")
+end
+
 -- afterEach gets a chance to clean up after a failed setup or test. If both
 -- phases fail, keep the original failure as the headline and retain the
 -- cleanup failure as the useful second half of the report.
@@ -2351,6 +2394,36 @@ local function defaultJobs()
     local found = tonumber(text or "")
 
     return math.max(minimumJobs, found and found >= 1 and math.floor(found) or 1)
+end
+
+--- The machine's physical memory in bytes, or nil when it cannot be read.
+local function physicalMemory()
+    local handle = io.popen("sysctl -n hw.memsize 2>/dev/null || echo $(( $(getconf _PHYS_PAGES) * $(getconf PAGESIZE) ))")
+    local text = handle and handle:read("*l") or nil
+    if handle then
+        handle:close()
+    end
+    local found = tonumber(text or "")
+
+    return found and found > 0 and found or nil
+end
+
+--- The collector pause for Nupp worker states, or nil for LuaJIT's default.
+---
+--- At the default a state collects once its heap is twice what was live, and
+--- eight states peaked at about 1.1 GB each. Where a state has less than 1.5 GB
+--- of the machine to itself, 120 holds it to 1.2 times its live heap instead:
+--- on the 7 GB macOS runner the shared lane went from 4437 s to 823 s (#287).
+--- Not everywhere, because collecting that often costs kernel time: on the
+--- 16 GB Linux runner the same lane went from 613 s to 1047 s, most of it system
+--- time, for memory it had to spare.
+local function workerPause(workers)
+    local memory = physicalMemory()
+    if memory and workers > 0 and memory / workers < 1.5 * 1024 * 1024 * 1024 then
+        return 120
+    end
+
+    return nil
 end
 
 --- What the last run measured, so this one can start the slow work first.
@@ -3139,21 +3212,40 @@ then
                 -- Keep inherited output quiet for the threaded phase; ordinary Lua
                 -- output is captured in its state, process-writing suites are in the
                 -- process-worker queues, and progress has its own saved descriptor.
+                local pause = workerPause(#lanes)
                 local restoreOutput = silenceProcessOutput()
+                -- Each lane gets a worker of its own rather than a share of the
+                -- pool. The pool is as wide as the machine has cores, so on a
+                -- 3-core runner five of eight lanes queued behind the first three
+                -- and found the queue empty when they started (#287). A worker of
+                -- its own is also a Lua state that ends with the task, which is
+                -- what lets a lane that has grown hand its queue to a fresh one.
+                local function launch(child)
+                    child.task = scope:worker(
+                        job.run,
+                        child.arg,
+                        child.cache,
+                        progressFd,
+                        verbose,
+                        colorMode,
+                        suiteCatalog,
+                        pause
+                    )
+                end
                 local launched, problem = pcall(function()
                     for _, lane in ipairs(lanes) do
                         local index = children + 1
                         children = index
                         madeShardRoot = madeShardRoot or os.execute("mkdir -p '" .. shardCacheRoot .. "'") ~= nil
-                        local cache = ("%s/shard-%d"):format(shardCacheRoot, index)
-                        running[
-                            #running + 1
-                        ] = {
+                        local child = {
                             label = lane.label,
+                            arg = lane.arg,
                             index = index,
+                            cache = ("%s/shard-%d"):format(shardCacheRoot, index),
                             startedAt = now() - started,
-                            task = scope:spawn(job.run, lane.arg, cache, progressFd, verbose, colorMode, suiteCatalog),
                         }
+                        launch(child)
+                        running[#running + 1] = child
                     end
                 end)
                 if not launched then
@@ -3162,25 +3254,84 @@ then
                     error(problem, 0)
                 end
 
-                return function()
+                -- One lane's successive states make one report: a lane is the unit
+                -- the timing summary and the queue accounting reason about.
+                local function merge(child, report)
+                    local into = child.report
+                    if not into then
+                        report.states = 1
+                        child.report = report
+                        return
+                    end
+                    for _, key in ipairs({"total", "passed", "skipped", "notExecuted", "failed", "durationMs"}) do
+                        into[key] = (tonumber(into[key]) or 0) + (tonumber(report[key]) or 0)
+                    end
+                    for _, key in ipairs({"tests", "suites", "claimed"}) do
+                        into[key] = into[key] or {}
+                        for _, item in ipairs(report[key] or {}) do
+                            into[key][#into[key] + 1] = item
+                        end
+                    end
+                    into.states = into.states + 1
+                end
+
+                -- Settles whichever lanes have finished without waiting on the
+                -- rest. A state that retired with work left is replaced on the
+                -- same queue and store; answers whether every lane is done.
+                local function tend()
+                    local done = true
+                    for _, child in ipairs(running) do
+                        if not child.finished then
+                            if child.task:isdone() then
+                                local ok, report = pcall(function()
+                                    return child.task:await()
+                                end)
+                                if ok and type(report) == "table" then
+                                    merge(child, report)
+                                    local relaunched, problem = true, nil
+                                    if report.retired then
+                                        relaunched, problem = pcall(launch, child)
+                                    end
+                                    if not relaunched then
+                                        child.failure = "a fresh worker state could not be started: " .. tostring(problem)
+                                    end
+                                    child.finished = not report.retired or not relaunched
+                                else
+                                    child.failure = tostring(report)
+                                    child.finished = true
+                                end
+                            end
+                            done = done and child.finished == true
+                        end
+                    end
+
+                    return done
+                end
+
+                local function collect()
                     local completed, reports = pcall(function()
+                        while not tend() do
+                            pauseBriefly()
+                        end
                         local reports = {}
                         for _, child in ipairs(running) do
-                            local ok, report = pcall(function()
-                                return child.task:await()
-                            end)
-                            if ok and type(report) == "table" then
+                            -- What a lane's earlier states finished still counts when
+                            -- a later one dies; the failure accounts for that state.
+                            local report = child.report
+                            if report then
                                 report.shard = {
                                     index = child.index,
                                     names = (report.claimed and #report.claimed > 0) and report.claimed
                                     or {child.label},
                                     executionLane = executionLane,
+                                    states = report.states,
                                     startedAt = child.startedAt,
                                     collectedAt = now() - started
                                 }
                                 reports[#reports + 1] = report
-                            else
-                                reports[#reports + 1] = {names = {child.label}, failure = tostring(report)}
+                            end
+                            if child.failure then
+                                reports[#reports + 1] = {names = {child.label}, failure = child.failure}
                             end
                         end
                         scope:close()
@@ -3195,6 +3346,8 @@ then
 
                     return reports
                 end
+
+                return collect, tend
             end
 
             local running = {}
@@ -3236,7 +3389,14 @@ then
                     local processProgressFd = progressFd and (package.config:sub(1, 1) == "\\" and 2 or progressFd)
                         or nil
                     local progress = processProgressFd and ("NUPP_TEST_PROGRESS_FD=%d "):format(processProgressFd) or ""
-                    local fresh = executionLane == "isolated" and "NUPP_TEST_FRESH_QUEUE_PIECES=1 " or ""
+                    -- Shell suites run each in a process of its own too (#261). One
+                    -- long-lived shell worker kept what every suite it claimed left
+                    -- behind, growing to 2-4 GB, and eight of them shut down a 16 GB
+                    -- Linux runner twelve minutes into the lane. A fresh process
+                    -- holds a worker to the suite it is running.
+                    local fresh = (executionLane == "isolated" or executionLane == "shell")
+                        and "NUPP_TEST_FRESH_QUEUE_PIECES=1 "
+                        or ""
                     local invocation = rawget(_G, "__NUPP_TEST_RUNNER_COMMAND") or ("luajit '%s'"):format(arg[0])
                     local worker = (
                         "%s%s%s%s --json %s --color=%s%s"
@@ -3408,6 +3568,7 @@ then
                             specs = report.shard.names,
                             alone = report.shard.alone,
                             executionLane = report.shard.executionLane,
+                            states = report.shard.states,
                             durationMs = tonumber(report.durationMs) or 0,
                             startedAt = report.shard.startedAt,
                             collectedAt = report.shard.collectedAt,
@@ -3553,7 +3714,10 @@ then
         if sharedQueue and isolatedQueue then
             beginPhase(("%d suites across %d Nupp workers"):format(sharedQueue.count, #sharedQueue.lanes))
         end
-        local collectShared = sharedQueue and startFanOut(sharedQueue.lanes, true, false, "shared") or nil
+        local collectShared, tendShared = nil, nil
+        if sharedQueue then
+            collectShared, tendShared = startFanOut(sharedQueue.lanes, true, false, "shared")
+        end
         local collectShell
         if shellQueue then
             if sharedQueue and pauseBriefly then
@@ -3568,7 +3732,9 @@ then
                             pieces = pieces + 1
                         end
                     end
-                    waiting = pieces > tail
+                    -- Retired Nupp worker states are replaced here as well, or the
+                    -- pieces they left would never be taken and this would not end.
+                    waiting = pieces > tail and not (tendShared and tendShared())
                     if waiting then
                         pauseBriefly()
                     end
@@ -3737,6 +3903,7 @@ local function runSuite(suiteInfo, slices)
                 slowestCase, slowestCaseMs = name, caseElapsed
             end
             recordResult(suiteInfo.name, name, case, ok, err, stdout, stderr, caseElapsed, caseContext)
+            releaseCompiledTypes()
         end
     end
     local after = now()
@@ -3885,7 +4052,7 @@ local function recordPieceFailure(spec, message)
     reportFailure(results[#results])
 end
 
---- Runs one claimed isolated piece in a new process.
+--- Runs one claimed isolated or shell piece in a new process.
 ---
 --- The long-lived process owns only queue claims and aggregation. The child is
 --- handed a shard rather than the queue, so it cannot claim a second piece and
@@ -3907,7 +4074,7 @@ local function runFreshPiece(spec)
     local pipe = io.popen(command, "r")
     if not pipe then
         os.remove(errors)
-        recordPieceFailure(spec, "the isolated piece could not be started")
+        recordPieceFailure(spec, "the piece could not be started")
         mark("E")
         return
     end
@@ -3924,7 +4091,7 @@ local function runFreshPiece(spec)
     local decoded, report = pcall(testJson.decode, text)
     if not decoded or type(report) ~= "table" then
         local detail = {
-            "the isolated piece wrote no report",
+            "the piece wrote no report",
             status and ("exit " .. status) or "unreported exit status",
             #text .. " bytes on stdout",
         }
@@ -4046,6 +4213,16 @@ local function takeWork()
                 end
             end
             restoreLane()
+            -- Only a Nupp worker state retires: the parent starts its successor.
+            -- Garbage is collected before deciding, so a state is replaced for
+            -- what it holds rather than for what it has not yet freed.
+            if embedded and collectgarbage("count") > workerHeapLimit then
+                collectgarbage()
+                if collectgarbage("count") > workerHeapLimit then
+                    retired = true
+                    return
+                end
+            end
         end
     end
 end
@@ -4371,7 +4548,8 @@ local report = {
     metrics = metricTotals,
     suites = suiteRecords,
     shards = sharded and sharded.shards or {},
-    claimed = #claimed > 0 and claimed or nil
+    claimed = #claimed > 0 and claimed or nil,
+    retired = retired or nil
 }
 
 if embedded then
