@@ -335,6 +335,15 @@ local function tokens(command: string): {any}?
                 elseif plain(char) then
                     text[#text + 1] = char
                     index = index + 1
+                elseif char == "~"
+                    and #text > 0
+                    and plain(command:sub(index - 1, index - 1))
+                    and not command:sub(index - 1, index - 1):match("[=:]") then
+                    -- Only a leading `~`, or one after `=` or `:`, names a home
+                    -- directory; inside a word, as in a short name like
+                    -- `C:/Users/RUNNER~1`, it is itself.
+                    text[#text + 1] = char
+                    index = index + 1
                 else
                     return nil
                 end
