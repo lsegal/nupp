@@ -19,20 +19,26 @@ case "${1:-}" in
     *) printf 'usage: %s [--stdin]\n' "$0" >&2; exit 2 ;;
 esac
 
-refused=$(list | while IFS= read -r path; do
-    case "$path" in
-        # Benchmark controls: what a Nupp benchmark is measured against.
-        bench/serde-spike/serde_spike.cpp) continue ;;
-        bench/simd-json/native/simdjson_control.*) continue ;;
-    esac
-    case "$path" in
-        *.rs|*.cpp|*.cxx|*.cc|*.c++) printf '%s\n' "$path" ;;
-        Cargo.toml|*/Cargo.toml|Cargo.lock|*/Cargo.lock) printf '%s\n' "$path" ;;
-        build.rs|*/build.rs) printf '%s\n' "$path" ;;
-        rust-toolchain|*/rust-toolchain|rust-toolchain.toml|*/rust-toolchain.toml) printf '%s\n' "$path" ;;
-        .cargo/*|*/.cargo/*) printf '%s\n' "$path" ;;
-    esac
-done)
+# A function rather than a loop inside `$(...)`: bash 3.2, macOS's /bin/sh,
+# reads a case pattern's `)` there as the end of the substitution.
+refuse() {
+    while IFS= read -r path; do
+        case "$path" in
+            # Benchmark controls: what a Nupp benchmark is measured against.
+            bench/serde-spike/serde_spike.cpp) continue ;;
+            bench/simd-json/native/simdjson_control.*) continue ;;
+        esac
+        case "$path" in
+            *.rs|*.cpp|*.cxx|*.cc|*.c++) printf '%s\n' "$path" ;;
+            Cargo.toml|*/Cargo.toml|Cargo.lock|*/Cargo.lock) printf '%s\n' "$path" ;;
+            build.rs|*/build.rs) printf '%s\n' "$path" ;;
+            rust-toolchain|*/rust-toolchain|rust-toolchain.toml|*/rust-toolchain.toml) printf '%s\n' "$path" ;;
+            .cargo/*|*/.cargo/*) printf '%s\n' "$path" ;;
+        esac
+    done
+}
+
+refused=$(list | refuse)
 
 if [ -n "$refused" ]; then
     printf '%s\n' "Rust or C++ is back in the tree. The compiler, runtime, host and providers are Nupp (#8):" >&2
