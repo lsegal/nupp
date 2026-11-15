@@ -3895,6 +3895,10 @@ local declarationTrail = ""
 -- process a worker.
 local declaredNominals: {[string]: types.Nominal} = {}
 
+-- Keyed declarations made before `setIdentityNamespace`: the compiler's own, such
+-- as the prelude's, which every worker made the same way before it was one.
+local compilerNominals: {[string]: types.Nominal} = setmetatable({}, {__mode = "v"})
+
 --- A nominal type: one identity per declaration, never shared with another declaration
 --- of the same shape. That is what makes it nominal.
 ---
@@ -3932,9 +3936,26 @@ function types.nominal(name: string, declKind: string, declarationKey: string?):
     declarationTrail = keyDigest(declarationTrail .. "\0" .. t.id .. "\0" .. (declarationKey or ""))
     if shared then
         declaredNominals[declarationKey as string] = t
+    elseif declarationKey ~= nil then
+        compilerNominals[declarationKey as string] = t
     end
 
     return t
+end
+
+--- The compiler-owned declaration under `declarationKey`, in a worker.
+---
+--- Such a declaration was made before the worker had a namespace, so another
+--- worker's interface spells it by key alone, and reading that interface has to
+--- give back this process's own nominal rather than a copy of it. Outside a worker
+--- a process may have built several environments, each with its own, so there is
+--- no one answer and this returns nil.
+function types.compilerNominal(declarationKey: string): types.Nominal?
+    if identityNamespace == "" then
+        return nil
+    end
+
+    return compilerNominals[declarationKey]
 end
 
 --- The declaration key of a record declared inside `owner`'s body, at `offset` in
