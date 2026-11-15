@@ -7,6 +7,20 @@
   needed no factory, and a serial build described a generic record's methods
   as they were before their module finished checking, so the two disagreed on
   `requiresFactory`, `noYield` and the descriptor fingerprint.
+- A cold `nupp build` of a project that declares a const-generic function
+  runs on the parallel checker. The build plans its const specializations
+  first and hands the plan to the workers, so what it writes matches the
+  serial build byte for byte. It used to build such a project in one process.
+- A parallel `nupp check` or `nupp build` no longer reports a const parameter
+  as unbound where a module leaves out an argument another module's alias
+  gives a default, such as `span.Span<uint8>`.
+- The parallel checker no longer falls back to checking serially when a
+  module reads a builtin a project implements, such as `io`, `os` or
+  `assert`, names a type of a module it does not require, or reaches a
+  project module through one the target does not check as its own.
+- Sending a large string to a child process, as `stdin:send` does, no longer
+  copies the unsent rest on every write. A few megabytes sent through a pipe
+  made gigabytes of short-lived garbage.
 - `nupp test` runs the shared lane's eight workers at once, each in a Lua state
   of its own that is replaced once its heap passes 256 MB
   (`NUPP_TEST_WORKER_HEAP_MB`). The workers used to share a pool as wide as
@@ -43,24 +57,6 @@
   program that requires `serde.json` went from about 300 MB and 24 s to about
   110 MB and 5 s on Windows once warm. `NUPP_NO_STDLIB_CACHE` turns the cache
   off.
-- A cold `nupp build` of a project that declares a const-generic function no
-  longer starts parallel check workers it then discards. The build used to
-  start up to six workers, have them parse every source, and only then decide
-  to build in one process; it now decides before starting any.
-- A cold `nupp build` of a project that declares a const-generic function
-  runs on the parallel checker. The build plans its const specializations
-  first and hands the plan to the workers, so what it writes matches the
-  serial build byte for byte. It used to build such a project in one process.
-- A parallel `nupp check` or `nupp build` no longer reports a const parameter
-  as unbound where a module leaves out an argument another module's alias
-  gives a default, such as `span.Span<uint8>`.
-- The parallel checker no longer falls back to checking serially when a
-  module reads a builtin a project implements, such as `io`, `os` or
-  `assert`, names a type of a module it does not require, or reaches a
-  project module through one the target does not check as its own.
-- Sending a large string to a child process, as `stdin:send` does, no longer
-  copies the unsent rest on every write. A few megabytes sent through a pipe
-  made gigabytes of short-lived garbage.
 - On ARM64, a 64-bit shift by a 64-bit constant count, such as
   `x ~ (x << 1ULL)`, keeps its count once LuaJIT traces it. The traced code
   shifted by zero instead, so `math.u64.prefixxor(1)` could answer `0ULL` on
