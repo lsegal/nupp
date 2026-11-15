@@ -343,13 +343,18 @@ local function encoded(value: any): string
     })
 end
 
+-- Each worker records itself in its own `<path>.<pid>` file. Workers start
+-- together, and Windows' append mode seeks to the end and then writes as two
+-- steps, so two appends to one shared file could land at the same offset and
+-- leave only one record.
 local function note(path: string?): nil
     if path == nil then
         return
     end
-    local file = io.open(path as string, "ab")
+    local pid = tostring(fs.processId() or 0)
+    local file = io.open(path as string .. "." .. pid, "wb")
     if file ~= nil then
-        file:write(tostring(require("nupp.compiler.fs").processId() or 0), "\n")
+        file:write(pid, "\n")
         file:close()
     end
 end
