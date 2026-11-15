@@ -95,6 +95,31 @@ function M.unreferencedTypesAreReleasedAndRebuiltAlike()
     test.eq(build().id, id, "the same structure built again has the same id")
 end
 
+-- The test runner releases the arenas between cases, so every case but a worker's
+-- first runs after a release. Leaving them without a metatable afterwards made them
+-- strong for the rest of the process: every case after the first saw nothing let go
+-- of, and the case above kept all 101 types it built. Which case ran first in its
+-- process depended on how each platform's lanes sliced the suite, so it failed on
+-- Windows and macOS only (#316).
+function M.arenasStayWeakAfterARelease()
+    types.releaseUnreferenced()
+    types.settle()
+    local before = arenaSize()
+    local function build()
+        local members = {}
+        for index = 1, 50 do
+            members[index] = types.array(types.literal("issue-316-released-" .. index))
+        end
+
+        return types.union(members)
+    end
+    local id = build().id
+    test.truthy(arenaSize() > before, "building the union interned something")
+    types.settle()
+    test.eq(arenaSize(), before, "a release left the arenas holding what nothing references")
+    test.eq(build().id, id, "the same structure built again has the same id")
+end
+
 -- Something still holding a type keeps it interned: building the same structure
 -- again finds that object rather than making a second one.
 function M.referencedTypesStayInterned()
