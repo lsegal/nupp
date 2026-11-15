@@ -30,15 +30,34 @@ to none and about 14,600, and from 21-25 s to 18.3-18.8 s. `bench/jit-limits.lua
 repeats the measurement. A larger area buys nothing more (32 MB measured the
 same), and LuaJIT reprotects the whole area around each trace, so a much larger
 one costs compile time.
+
+The one large area is only for macOS. Elsewhere the placement hint is honoured,
+so areas of LuaJIT's usual kind chain up to the same 16 MB without a flush, and
+a large area is a cost there: every reprotect rewrites and shoots down the
+mappings of every page written in it, under the lock the whole process shares
+for its address space. Eight test workers in one Linux process spent 38% of
+their CPU time in those `mprotect` calls with 16 MB areas and about 10% with
+512 KB ones (#293).
 ]]
 module nupp.tools.jitlimits
 
---- The limits, each as its own `jit.opt.start` argument.
+--- The machine-code area on an operating system, as `jit.os` spells it.
+local function area(system: string): string
+    return system == "OSX" and "sizemcode=16384" or "sizemcode=512"
+end
+
+--- The limits on an operating system, as `jit.os` spells it, each as its own
+--- `jit.opt.start` argument.
 ---
 --- The native host applies the same list to every state it creates, in
 --- `host/program/common/nupphost/state.nupp`, and so does the embedding SDK, in
 --- `host/program/common/nuppembed/lua.nupp`; `clitest` holds all three to one account.
-export const FLAGS = {"maxtrace=20000", "maxside=1000", "sizemcode=16384", "maxmcode=16384"}
+export function flags(system: string): {string}
+    return {"maxtrace=20000", "maxside=1000", area(system), "maxmcode=16384"}
+end
+
+--- The limits on this machine.
+export const FLAGS = flags(jit.os)
 
 --- Raises the limits, unless `NUPP_JIT_DEFAULT` asks for LuaJIT's own.
 ---
