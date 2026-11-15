@@ -123,7 +123,7 @@ end
 
 --- LuaJIT's capacity limits, raised before the state traces anything, because
 --- the size of the machine-code area is fixed when the first trace allocates
---- it. This is nupp.tools.jitlimits.flags(jit.os), which says why each is
+--- it. This is nupp.tools.jitlimits.flagsOn(jit.os), which says why each is
 --- raised; clitest holds the two lists to one account. NUPP_JIT_DEFAULT keeps
 --- LuaJIT's own.
 local function raiseJitLimits(borrows L: voidptr)

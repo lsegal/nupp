@@ -1653,7 +1653,7 @@ function M.theNativeHostRaisesTheSameLimits()
     }) do
         local raised = assert(readText(source):match("local function raiseJitLimits%b()(.-)\nend"), source)
         for _, os in ipairs({"OSX", "Linux", "Windows"}) do
-            local want = table.concat(jitlimits.flags(os), ",")
+            local want = table.concat(jitlimits.flagsOn(os), ",")
             local got = hostLimits(raised, os)
             assert(
                 got == want,
@@ -1661,7 +1661,8 @@ function M.theNativeHostRaisesTheSameLimits()
             )
         end
     end
-    assert(table.concat(jitlimits.FLAGS, ",") == table.concat(jitlimits.flags(jit.os), ","), "FLAGS is this machine's")
+    local here = table.concat(jitlimits.flagsOn(jit.os), ",")
+    assert(table.concat(jitlimits.FLAGS, ",") == here, "FLAGS is this machine's")
 end
 
 -- One 16 MB machine-code area works around macOS ignoring LuaJIT's placement hint.
@@ -1669,7 +1670,7 @@ end
 -- workers in one Linux process spent most of their time in the kernel (#293).
 function M.onlyMacOSReservesOneLargeMachineCodeArea()
     local function area(os)
-        for _, flag in ipairs(jitlimits.flags(os)) do
+        for _, flag in ipairs(jitlimits.flagsOn(os)) do
             local size = flag:match("^sizemcode=(%d+)$")
             if size then
                 return tonumber(size)

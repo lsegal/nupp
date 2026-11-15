@@ -52,12 +52,12 @@ end
 --- The native host applies the same list to every state it creates, in
 --- `host/program/common/nupphost/state.nupp`, and so does the embedding SDK, in
 --- `host/program/common/nuppembed/lua.nupp`; `clitest` holds all three to one account.
-export function flags(system: string): {string}
+export function flagsOn(system: string): {string}
     return {"maxtrace=20000", "maxside=1000", area(system), "maxmcode=16384"}
 end
 
 --- The limits on this machine.
-export const FLAGS = flags(jit.os)
+export const FLAGS = flagsOn(jit.os)
 
 --- Raises the limits, unless `NUPP_JIT_DEFAULT` asks for LuaJIT's own.
 ---
