@@ -20,11 +20,12 @@ local type CompilerSurface = {
     --- there is outlined for another Lua state without an annotation.
     sendableLast: boolean?,
 
-    --- The runtime member each overload after the first lands on, indexed the way the
-    --- declaration writes them. Two overloads of one name are the same shape at run
-    --- time here -- a callable and one more value -- so routing the selected one is
-    --- what keeps a type test out of the emitted call.
-    overloadMembers: {[integer]: string}?,
+    --- The runtime member an overload lands on, keyed by the name of its last declared
+    --- parameter. Two overloads of one name are the same shape at run time here -- a
+    --- callable and one more value -- so routing the selected one is what keeps a type
+    --- test out of the emitted call. Not keyed by position: an intersection orders its
+    --- members canonically, not the way the declaration writes them.
+    overloadMembers: {[string]: string}?,
 
     --- The child body may borrow the scope it is started on. A scope joins every
     --- child before it settles, so such a borrow cannot outlive what it borrows.
@@ -51,7 +52,7 @@ local COMPILER_SURFACES: {
         "nupp.tasks"
     ] = {
         Scope = {
-            spawn = {rotate = true, overloadMembers = {[2] = "_spawnNamed"}, bodyMayBorrowScope = true,},
+            spawn = {rotate = true, overloadMembers = {name = "_spawnNamed"}, bodyMayBorrowScope = true,},
             work = workerSurface,
             worker = workerSurface,
             channel = {effect = "runtime.workers"},

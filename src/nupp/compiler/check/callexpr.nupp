@@ -2327,13 +2327,11 @@ function callexpr.install(c: state.Checker): state.ExprHandlers
                 -- Which candidate survived is the checker's answer, so the emitted
                 -- member follows it rather than a second reading of the arguments.
                 local chosen: any = (node as any).overloadWinner
-                for index, candidate in ipairs((node as any).overloadCandidates or {}) do
-                    if candidate == chosen then
-                        local routed = surface.overloadMembers[index]
-                        if routed ~= nil then
-                            (node as any).trailingCallableMember = routed
-                        end
-                    end
+                local names: {string}? = chosen and chosen.paramNames or nil
+                local last = names and names[#names] or nil
+                local routed = last and surface.overloadMembers[last] or nil
+                if routed ~= nil then
+                    (node as any).trailingCallableMember = routed
                 end
             end
             if nominal ~= nil
