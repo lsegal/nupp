@@ -132,6 +132,9 @@ export function attach(env: any, envMod: any, helpers: {
     local checking: {any} = {}
 
     local function settingsKey(): string
+        -- The root is named by its filesystem identity, not its absolute spelling:
+        -- Windows reaches one directory by its 8.3 short name and its long name, and
+        -- a command started from each kept an image the other never found (#317).
         local parts = {
             "projectimage",
             tostring(SCHEMA),
@@ -139,7 +142,7 @@ export function attach(env: any, envMod: any, helpers: {
             tostring(env.layoutTarget or ""),
             tostring(env.compat or ""),
             require("nupp.compiler.compat").VERSION,
-            require("nupp.compiler.fs").absolute(env.rootDir or "."),
+            require("nupp.compiler.fs").canonical(env.rootDir or "."),
             tostring(env.rootDir or "."),
             readFile((env.rootDir or ".") .. "/nupp.lua") or "",
         }
