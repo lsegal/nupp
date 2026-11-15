@@ -208,6 +208,34 @@ io.stdout:flush()
     assert(not alive, "the child outlived the state that started it")
 end
 
+-- Windows terminates a child asynchronously, and until it has gone it keeps its
+-- working directory open, which refuses that directory's removal with a sharing
+-- violation. A child nothing closed -- the comptime worker a compiler run starts in
+-- the project, left to its finalizer when the run's state closes -- is killed by
+-- that finalizer, and a caller removing the project next must find it gone (#328).
+-- A native child, because a terminated MSYS shell leaves the program it ran alive.
+function M.aChildItsFinalizerKilledNoLongerHoldsItsWorkingDirectory()
+    ready()
+    local provider = require("nupp.runtime.provider.nativeprocess")
+    for attempt = 1, 20 do
+        local directory = root .. "/held-cwd-" .. attempt
+        os.execute("mkdir -p '" .. directory .. "'")
+        local owner = assert(provider:spawn({
+            args = {"luajit", "-e", "while true do end"},
+            cwd = directory,
+            stdin = "null",
+            stdout = "null",
+            stderr = "null",
+        }))
+        owner.child = nil
+        owner = nil
+        collectgarbage()
+        collectgarbage()
+        local removed, reason = os.remove(directory, true)
+        assert(removed, "the killed child still held its directory: " .. tostring(reason))
+    end
+end
+
 function M.sharedViewsUseTheRealStreamsAndDeliverEof()
     ready()
     local child = assert(startProcess({args = shell("cat"), stderr = "null"}))

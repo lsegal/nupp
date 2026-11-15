@@ -1987,8 +1987,24 @@ export function install(c: state.Checker): state.StatHandlers
                     )
                 end
             end
+            -- A definition filling a member another file declared is held to that
+            -- declaration above, and leaves it as it was. The nominal is shared with
+            -- every module this process checks, so restating the member here would
+            -- make what a later module reads depend on which modules were checked
+            -- before it: an implementation module's `function R:view()` would drop
+            -- the `borrows self` that `R.view` declares (#327).
+            local static = not fname.method and (owner.declKind == "record" or owner.declKind == "interface")
+            local slot = static and owner.staticByname[member] or owner.byname[member]
+            local slotDefinition = static and owner.staticFieldDefs[member] or owner.fieldDefs[member]
+            local declaredElsewhere = slot ~= nil
+                and (slot.tag == "func" or slot.tag == "intersection")
+                and slotDefinition ~= nil
+                and memberDefinition ~= nil
+                and slotDefinition.filename ~= memberDefinition.filename
             local stored
-            if fname.method then
+            if declaredElsewhere then
+                stored = nil
+            elseif fname.method then
                 -- stored with the receiver as the first parameter, the shape
                 -- declaration files use; call sites drop it again
                 local params = {selfType}
