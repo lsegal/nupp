@@ -962,4 +962,84 @@ function M.storedProjectInterfacesCompileTheSameAsTheirSource()
     assert(edited == editedFromSource, "an edited dependency compiled differently:\n" .. edited .. "\n" .. editedFromSource)
 end
 
+--- Another spelling of the existing directory `dir`, or nil where the platform has
+--- none to offer: its 8.3 short name on Windows, a symbolic link to it elsewhere.
+local function otherSpelling(dir)
+    if package.config:sub(1, 1) == "\\" then
+        local ffi = require("ffi")
+        pcall(ffi.cdef, "uint32_t GetShortPathNameA(const char *, char *, uint32_t);")
+        local long = dir:gsub("/", "\\")
+        local buffer = ffi.new("char[?]", 1024)
+        local length = ffi.C.GetShortPathNameA(long, buffer, 1024)
+        local short = length > 0 and length < 1024 and ffi.string(buffer, length) or nil
+
+        return short ~= long and short or nil
+    end
+    local link = dir .. "-link"
+    if os.execute(("ln -s '%s' '%s'"):format(dir, link)) ~= 0 then
+        return nil
+    end
+
+    return link
+end
+
+-- One project reached by two spellings of its root is one project (#317). Windows
+-- names a directory by its 8.3 short name as well as its long one -- the test
+-- runner's temporary directory is spelled short on a CI runner -- and the store of
+-- checked interfaces was keyed by the absolute spelling, so a command started from
+-- one never found what a command started from the other had kept. Each checked the
+-- graph from source and wrote it again, which cost more than either alone.
+function M.storedProjectInterfacesAreSharedByEverySpellingOfTheRoot()
+    local parent = tempProject({})
+    local dir = parent .. "/a project directory"
+    assert(os.execute("mkdir -p '" .. dir .. "/src'") == 0)
+    editFixture(dir, "nupp.lua", 'return {include = {"src"}}\n')
+    editFixture(dir, "src/shapes.nupp", "module shapes\n\nexport record Point\n    x: number\n    y: number\nend\n")
+    editFixture(
+        dir,
+        "src/main.nupp",
+        'local shapes = require("shapes")\n\nprint(shapes.Point(x = 3, y = 4).x)\n'
+    )
+    local other = otherSpelling(dir)
+    if other == nil then
+        os.execute("rm -rf '" .. parent .. "'")
+        return require("assert").suite.skip("this platform offers no second spelling of a directory")
+    end
+    local shared = parent .. "/cache"
+
+    local function compile(root)
+        local named = package.config:sub(1, 1) == "\\" and root:gsub("/", "\\") or root
+        local pipe = assert(
+            io.popen(("cd '%s' && NUPP_CACHE_DIR='%s' '%s' bc -O1 src/main.nupp 2>&1"):format(named, shared, NUPP))
+        )
+        local out = pipe:read("*a"):gsub("\r", "")
+        pipe:close()
+
+        return out
+    end
+
+    local function stored()
+        local file = io.open(dir .. "/build/cache/interfaces.buf", "rb")
+        local text = file and file:read("*a")
+        if file then
+            file:close()
+        end
+
+        return text
+    end
+
+    -- The first command keeps the prelude, the second the interfaces checked against it.
+    local first = compile(dir)
+    compile(dir)
+    local kept = stored()
+    local again = compile(other)
+    local after = stored()
+    os.execute("rm -rf '" .. parent .. "'")
+
+    assert(first:find('"shapes"', 1, true), "main did not compile: " .. first)
+    assert(kept, "the checked project interfaces were not stored")
+    assert(again == first, "the other spelling compiled differently:\n" .. again .. "\n" .. first)
+    assert(after == kept, "the other spelling of the root (" .. other .. ") kept its own interfaces again")
+end
+
 return M
