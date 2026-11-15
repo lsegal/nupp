@@ -55,7 +55,7 @@ local REPORT_SCHEMA = {
     required = {"ok", "diagnostics", "unformatted", "written", "failed"},
 }
 
-local function run(options: any): integer
+local function format(options: any): integer
     local positional: {string} = options.files
     local values = options
     local write, asking = values.write, values.check
@@ -78,7 +78,10 @@ local function run(options: any): integer
     local diagnosticMod = require("nupp.compiler.diagnostics")
     local reportMod = require("nupp.tools.cli.report")
     local asJson = values.format == "json"
-    local env = envMod.new(".")
+    -- Each file is checked for its imports against the modules it requires, and only
+    -- their interfaces are read back, so a run over the whole tree need not keep every
+    -- module's checked tree alive until it ends.
+    local env = envMod.new(".", {releaseModuleTrees = true})
     -- The manifest's default, unless --no-method-parens overrides it for this run;
     -- there is no flag to force it back on over a manifest that turned it off, the same
     -- one-way shape as --no-color over --color.
@@ -279,6 +282,20 @@ local function run(options: any): integer
     end
 
     return finish(failed and 1 or 0, unformatted)
+end
+
+--- How far the heap may grow past what the last collection kept before the next one
+--- starts, as a percentage, the way a build runs (#257). Checking a file's imports
+--- makes several times the file's size in garbage, and at LuaJIT's default of 200 a run
+--- over a quarter of this repository's tree peaked at about twice what it kept (#286).
+const FMT_GC_PAUSE = 100
+
+local function run(options: any): integer
+    local pause = collectgarbage("setpause", FMT_GC_PAUSE)
+    local code = format(options)
+    collectgarbage("setpause", pause)
+
+    return code
 end
 
 --- Format Nupp source.

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `nupp fmt --check` over many files keeps only the interfaces of the modules
+  they require, not every module's checked tree, and collects garbage the way
+  `nupp build` does. A cold check of a quarter of this repository's tree went
+  from about 2 GB to about 500 MB on Windows, in the same time. `nupp check`
+  of files outside a project and `nupp migrate` get the same treatment.
 - `nupp test` runs the shared lane's eight workers at once, each in a Lua state
   of its own that is replaced once its heap passes 256 MB
   (`NUPP_TEST_WORKER_HEAP_MB`). The workers used to share a pool as wide as
