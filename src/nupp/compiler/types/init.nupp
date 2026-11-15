@@ -1319,6 +1319,21 @@ end
 --- not the branch that builds the closure was taken. Type construction is on every hot
 --- path in the checker, so those aborts were 27% of the ones a cold self-build
 --- recorded. Keep this file's constructors closure-free.
+--- A list of its own for a type that keeps one, rather than the caller's.
+---
+--- Interning keeps whichever build of a type came first, and with weak arenas that
+--- is whichever one was still alive. Keeping the caller's list made the type share it
+--- with whatever else that caller handed it to, so what a type was shared with
+--- depended on when the collector ran (#312).
+local function copyTypes(list: {types.Type}): {types.Type}
+    local out: {types.Type} = {}
+    for j = 1, #list do
+        out[j] = list[j]
+    end
+
+    return out
+end
+
 local function interned(key: string): types.Type?
     return arena[key]
 end
@@ -3190,8 +3205,8 @@ function types.func(
         key,
         types.Func(
             tag = "func",
-            params = params,
-            rets = rets,
+            params = copyTypes(params),
+            rets = copyTypes(rets),
             vararg = vararg or false,
             varargType = vararg and varargType or nil,
             paramModes = modes,
@@ -4427,7 +4442,16 @@ end
 ---
 --- One full collection is not enough. A type held only as the value of a weak-keyed
 --- table is marked by the cycle that clears its key, and freed only by the next.
+---
+--- Nor is a collection alone. A compiled trace keeps the tables it was recorded
+--- against as constants, out of the collector's sight, so a type some hot loop
+--- happened to meet stays in its arena for as long as the trace does. Which loops got
+--- hot differs from run to run, so the traces go first (#312).
 function types.settle(): nil
+    local vm: any = rawget(_G, "jit")
+    if vm then
+        vm.flush()
+    end
     local before: integer = -1
     local after: integer = 0
     while after ~= before do
