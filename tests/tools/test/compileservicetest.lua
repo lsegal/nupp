@@ -138,6 +138,10 @@ function M.onlyThisCheckoutsCompilerCommandsAreAnswered()
     test.eq(answered.argv[1], "build")
     test.eq(request("/other/bin/nupp check"), nil)
     test.eq(request("nupp check"), nil)
+    -- A relative launcher is the one beside the command's own `cd`, so a copied
+    -- tree's `./bin/nupp` stays that tree's even from inside this checkout.
+    test.eq(request("cd /tree && ./bin/nupp --help", "/repo"), nil)
+    test.ne(request("cd /repo/src && ../bin/nupp check", "/work"), nil)
     for _, name in ipairs({"run", "test", "lsp", "watch", "bench", "task", "fixpoint", "rock", "__comptime-worker"}) do
         test.eq(request("/repo/bin/nupp " .. name), nil, name)
     end

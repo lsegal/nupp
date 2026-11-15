@@ -551,9 +551,17 @@ end
 --- `root` is the checkout whose `bin/nupp` the service runs, and `cwd` the
 --- caller's own working directory, both normalized.
 function compileservice.request(command: compileservice.Command, root: string, cwd: string, forWindows: boolean?): any?
+    local directory = cwd
+    if command.cwd ~= nil then
+        local target = command.cwd as string
+        directory = absolute(target, forWindows) and compileservice.normalize(target, forWindows)
+            or compileservice.normalize(cwd .. "/" .. target, forWindows)
+    end
+    -- A relative launcher is found from where the command runs, after its `cd`:
+    -- `cd tree && ./bin/nupp` is that tree's launcher, not this checkout's.
     local executable = compileservice.normalize(command.executable, forWindows)
     if not absolute(executable, forWindows) then
-        executable = compileservice.normalize(cwd .. "/" .. executable, forWindows)
+        executable = compileservice.normalize(directory .. "/" .. executable, forWindows)
     end
     local expected = root .. "/bin/nupp"
     if forWindows then
@@ -567,12 +575,6 @@ function compileservice.request(command: compileservice.Command, root: string, c
     local taken, help = answered(command.argv)
     if not taken then
         return nil
-    end
-    local directory = cwd
-    if command.cwd ~= nil then
-        local target = command.cwd as string
-        directory = absolute(target, forWindows) and compileservice.normalize(target, forWindows)
-            or compileservice.normalize(cwd .. "/" .. target, forWindows)
     end
     if WRITERS[name] and not help and within(directory, root, forWindows) then
         return nil
