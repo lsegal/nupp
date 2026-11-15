@@ -959,6 +959,83 @@ return {name = name, x = x, made = Counted%d()}
     assert(os.remove(directory, true))
 end
 
+-- A record's methods may be defined by another module than the one declaring them,
+-- as `bytes.internal.sharedbytes` defines `SharedBytes`'s. Whichever of the two a
+-- process checks first, a third module reads the member as declared: here the
+-- `borrows self` that the definition does not restate (#327).
+function M.aMemberDefinedElsewhereKeepsItsDeclaration()
+    local directory = os.tmpname()
+    os.remove(directory)
+    write(directory .. "/nupp.lua", 'return {include = {"src"}}\n')
+    write(
+        directory .. "/src/lib/types.nupp",
+        [[
+module lib.types
+
+local span = require("bytes.span")
+
+export record Region
+    data: any
+
+    view: function(borrows self: Region): span.Span<uint8> borrows (self)
+end
+]]
+    )
+    write(
+        directory .. "/src/lib/impl.nupp",
+        [[
+module lib.impl
+
+local span = require("bytes.span")
+local types = require("lib.types")
+
+export type Region = types.Region
+export const Region = types.Region
+
+function Region:view(): span.Span<uint8>
+    return self.data as span.Span<uint8>
+end
+]]
+    )
+    -- Requiring the implementation first is what puts it ahead of this module in
+    -- the serial order too.
+    write(
+        directory .. "/src/user.nupp",
+        [[
+module user
+
+local impl = require("lib.impl")
+local types = require("lib.types")
+local span = require("bytes.span")
+
+export const Region = impl.Region
+
+export function held(borrows source: any): span.Span<uint8> borrows (source)
+    return (source as types.Region):view()
+end
+]]
+    )
+
+    local serialCode, serialReport, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
+    testAssert.eq(serialCode, 0, "serial fixture: " .. json.encode(serialReport.diagnostics))
+    for _, run in ipairs({{jobs = "2", seed = "9"}, {jobs = "3", seed = "12"}}) do
+        local code, report, state = coldCheck(directory, {
+            NUPP_CHECK_JOBS = run.jobs,
+            NUPP_TEST_PARALLEL_CHECK_RANDOM_SEED = run.seed,
+        })
+        testAssert.eq(report.timing.parallel.mode, "parallel", "parallel timing mode, seed " .. run.seed)
+        testAssert.eq(
+            stable(report.diagnostics),
+            stable(serialReport.diagnostics),
+            "parallel diagnostics, seed " .. run.seed
+        )
+        testAssert.eq(code, 0, "parallel exit status, seed " .. run.seed)
+        testAssert.eq(state, serialState, "parallel check records, seed " .. run.seed)
+    end
+
+    assert(os.remove(directory, true))
+end
+
 function M.workerAndInterfaceFailuresFallBackWithoutPublishingPartialState()
     local directory = tempProject(false)
     local serialCode, _, serialState = coldCheck(directory, {NUPP_CHECK_JOBS = "1"})
