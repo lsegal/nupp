@@ -2143,6 +2143,20 @@ function generics.instantiate(n: T.Nominal, map: Bindings): T.Nominal
     return inst
 end
 
+--- Brings an instantiation's members up to date with its declaration.
+---
+--- An instantiation copies the declaration's members when it is made and again only
+--- when it is instantiated anew. A declaration still gains facts after that -- effect
+--- finalization marks a method that cannot suspend once its module is checked -- so
+--- an instantiation a reader reaches without instantiating again can still hold the
+--- earlier copy. Which ones do depends on what else the session checked afterwards.
+function generics.refreshInstantiation(inst: T.Nominal): nil
+    local fill = fills[inst]
+    if fill ~= nil and not pendingInstantiations[inst] then
+        generics.instantiate(fill.declaration, fill.map)
+    end
+end
+
 instantiateNominal = function(n: T.Nominal, map: Bindings): T.Nominal
     local key = instantiationKey(n, map)
     local outermost = refreshingInstantiations == nil
