@@ -34,8 +34,16 @@ local function readAll(path)
    return text
 end
 
--- The flags `nupp.tools.jitlimits` applies, read from its source so the two
--- cannot come apart, unless `LIMITS` names others.
+local function shellQuote(text)
+   return "'" .. text:gsub("'", "'\\''") .. "'"
+end
+
+-- The flags `nupp.tools.jitlimits` applies, unless `LIMITS` names others.
+--
+-- Asked of the built compiler rather than read from the source: they depend on the
+-- operating system (`flagsOn(jit.os)`), so there is no list there to read, and the
+-- module's own answer is the one the shipped row has to match. The CLI loads the
+-- module first thing and exits through `os.exit`, so wrapping that reads it.
 local function limitFlags()
    local override = os.getenv("LIMITS")
    local flags = {}
@@ -43,9 +51,22 @@ local function limitFlags()
       for flag in override:gmatch("[^,]+") do flags[#flags + 1] = flag end
       return flags
    end
-   local source = readAll(ROOT .. "/src/nupp/tools/jitlimits.nupp")
-   local list = assert(source:match("jitlimits%.FLAGS = {(.-)}"), "the limits are declared")
-   for flag in list:gmatch('"([^"]+)"') do flags[#flags + 1] = flag end
+   local answer = os.tmpname()
+   local init = ([[
+local exit = os.exit
+os.exit = function(...)
+   local module = package.loaded["nupp.tools.jitlimits"]
+   local file = module and io.open(%q, "w")
+   if file then file:write(table.concat(module.FLAGS, ",")) file:close() end
+   return exit(...)
+end
+]]):format(answer)
+   os.execute(("cd %s && LUA_INIT=%s ./bin/nupp --version >/dev/null 2>&1")
+      :format(ROOT, shellQuote(init)))
+   local list = readAll(answer)
+   os.remove(answer)
+   for flag in list:gmatch("[^,]+") do flags[#flags + 1] = flag end
+   assert(#flags > 0, "the built compiler names its limits")
    return flags
 end
 
@@ -79,10 +100,6 @@ local CONFIGURATIONS = {
 }
 
 local RUN = [[cd %s && rm -rf build/cache && %s LUA_INIT=%s ./bin/nupp check >/dev/null 2>&1]]
-
-local function shellQuote(text)
-   return "'" .. text:gsub("'", "'\\''") .. "'"
-end
 
 -- os.clock cannot see a child process, so shell the timing out to `time`.
 local function measure(configuration)
