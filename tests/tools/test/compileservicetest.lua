@@ -43,6 +43,25 @@ function M.quotingFollowsTheShell()
     test.eq(command.argv[5], "\\q")
 end
 
+-- A `~` inside a word is literal, as in the short names a Windows temp path
+-- carries; a leading one, or one after `=` or `:`, is the shell's to expand.
+function M.aTildeInsideAWordIsLiteral()
+    local command = parse("cd C:/Users/RUNNER~1/Temp/s1 && C:/Users/RUNNER~1/Temp/s1/bin/nupp build a~b")
+    test.ne(command, nil)
+    test.eq(command.cwd, "C:/Users/RUNNER~1/Temp/s1")
+    test.eq(command.executable, "C:/Users/RUNNER~1/Temp/s1/bin/nupp")
+    test.eq(command.argv[2], "a~b")
+    for _, refused in ipairs({
+        "/repo/bin/nupp check ~/x",
+        "/repo/bin/nupp check ~",
+        "X=~/x /repo/bin/nupp check",
+        "PATH=/bin:~/bin /repo/bin/nupp check",
+        "/repo/bin/nupp check --out=~/x",
+    }) do
+        test.eq(parse(refused), nil, refused)
+    end
+end
+
 function M.redirectionsApplyInOrder()
     local both = parse("/repo/bin/nupp check >/dev/null 2>&1")
     test.eq(both.stdout, "null")
