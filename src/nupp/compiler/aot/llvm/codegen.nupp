@@ -267,15 +267,162 @@ local function selected(): (codegen.Backend?, string?)
     return nil, UNAVAILABLE
 end
 
---- Initializes the three targets a build reaches, once per backend.
-local function initialized(backend: codegen.Backend): codegen.Backend
-    if not backend.initialized then
-        local C: any = backend.C
-        for _, target in ipairs({"AArch64", "X86", "WebAssembly"}) do
-            for _, part in ipairs({"TargetInfo", "Target", "TargetMC", "AsmPrinter", "AsmParser", "Disassembler"}) do
-                C["nuppcg_LLVMInitialize" .. target .. part]()
+--- How deep this Lua state is inside `exclusive`, so a nested call does not
+--- wait on the lock it already holds.
+local held = 0
+
+--- This state's handle on the process's named mutex (Windows).
+local mutex: any = nil
+
+local lockDeclared = false
+
+local function declareLock(): nil
+    if lockDeclared then
+        return
+    end
+    lockDeclared = true
+    if windows then
+        ffi.cdef[[
+unsigned long nuppcg_GetCurrentProcessId(void) __asm__("GetCurrentProcessId");
+void *nuppcg_CreateMutexA(void *attributes, int owned, const char *name) __asm__("CreateMutexA");
+unsigned long nuppcg_WaitForSingleObject(void *handle, unsigned long milliseconds) __asm__("WaitForSingleObject");
+int nuppcg_ReleaseMutex(void *handle) __asm__("ReleaseMutex");
+]]
+    else
+        ffi.cdef[[
+int nuppcg_getpid(void) __asm__("getpid");
+int nuppcg_lockcreat(const char *path, unsigned int mode) __asm__("creat");
+int nuppcg_open(const char *path, int flags) __asm__("open");
+int nuppcg_flock(int fd, int operation) __asm__("flock");
+int nuppcg_unlink(const char *path) __asm__("unlink");
+int nuppcg_lockclose(int fd) __asm__("close");
+]]
+    end
+end
+
+--- `flock`'s operations, the same on Linux and macOS.
+const LOCK_EX = 2
+
+const LOCK_NB = 4
+
+const LOCK_UN = 8
+
+--- The lock file a POSIX process's states share, named for the process.
+local function lockPath(): string
+    local C: any = ffi.C
+    local directory = os.getenv("TMPDIR")
+    if directory == nil or directory == "" then
+        directory = "/tmp"
+    end
+
+    return ("%s/nupp-codegen-%d.lock"):format(
+        ((directory as string):gsub("/+$", "")) as string,
+        tonumber(C.nuppcg_getpid()) as integer
+    )
+end
+
+--- Takes the POSIX lock: `flock` on the process's lock file, which conflicts
+--- between two descriptors of one process as it does between processes. The
+--- holder removes the file before letting go, so a waiter that wins a file no
+--- longer at the path (its own probe of the path is not refused) starts over.
+--- @return the locked descriptor
+local function lockFile(path: string): integer
+    local C: any = ffi.C
+    while true do
+        local fd = tonumber(C.nuppcg_lockcreat(path, tonumber("600", 8) as integer)) as integer
+        if fd < 0 then
+            error("cannot open the code generator's lock " .. path, 0)
+        end
+        if C.nuppcg_flock(fd, LOCK_EX) == 0 then
+            local probe = tonumber(C.nuppcg_open(path, 0)) as integer
+            local current = probe >= 0 and C.nuppcg_flock(probe, LOCK_EX | LOCK_NB) ~= 0
+            if probe >= 0 then
+                C.nuppcg_lockclose(probe)
+            end
+            if current then
+                return fd
+            end
+            C.nuppcg_flock(fd, LOCK_UN)
+        end
+        C.nuppcg_lockclose(fd)
+    end
+end
+
+--- A held lock: the descriptor and path a POSIX process locked, which
+--- Windows, holding its mutex, leaves empty.
+record Held
+    fd: integer
+    path: string
+end
+
+--- Takes the process-wide lock `exclusive` describes.
+local function acquire(): Held
+    declareLock()
+    local C: any = ffi.C
+    if windows then
+        if mutex == nil then
+            local name = ("Local\nupp-codegen-%d"):format(tonumber(C.nuppcg_GetCurrentProcessId()) as integer)
+            mutex = C.nuppcg_CreateMutexA(nil, 0, name)
+            if mutex == nil then
+                error("cannot create the code generator's lock " .. name, 0)
             end
         end
+        -- An abandoned mutex (0x80) is granted all the same.
+        C.nuppcg_WaitForSingleObject(mutex, 0xFFFFFFFF)
+
+        return Held(fd = -1, path = "")
+    end
+    local path = lockPath()
+
+    return Held(fd = lockFile(path), path = path)
+end
+
+local function release(lock: Held): nil
+    local C: any = ffi.C
+    if windows then
+        C.nuppcg_ReleaseMutex(mutex)
+        return
+    end
+    C.nuppcg_unlink(lock.path)
+    C.nuppcg_flock(lock.fd, LOCK_UN)
+    C.nuppcg_lockclose(lock.fd)
+end
+
+--- Runs `work` while no other Lua state of this process is inside the code
+--- generator's process-wide parts: target initialization, lld, and forking a
+--- compile. Those keep their state in process globals -- lld's context above
+--- all, which a second link replaces and then frees under the first (#357) --
+--- while module state such as `initialized` is this state's alone, so only a
+--- lock the operating system names for the process keeps two states apart.
+local function exclusive(work: function(): any): any
+    if held > 0 then
+        return work()
+    end
+    local lock = acquire()
+    held = held + 1
+    local ok, result = pcall(work)
+    held = held - 1
+    release(lock)
+    if not ok then
+        error(result, 0)
+    end
+
+    return result
+end
+
+--- Initializes the three targets a build reaches, once per backend. LLVM's
+--- target registry is a process global and registration is not atomic, so
+--- every state takes the lock the first time it reaches a backend.
+local function initialized(backend: codegen.Backend): codegen.Backend
+    if not backend.initialized then
+        exclusive(function(): nil
+            local C: any = backend.C
+            for _, target in ipairs({"AArch64", "X86", "WebAssembly"}) do
+                for _, part in ipairs({"TargetInfo", "Target", "TargetMC", "AsmPrinter", "AsmParser", "Disassembler"}) do
+                    C["nuppcg_LLVMInitialize" .. target .. part]()
+                end
+            end
+        end)
         backend.initialized = true
     end
 
@@ -956,8 +1103,8 @@ end
 --- compile in parallel.
 ---
 --- A child touches nothing but LLVM, the files it writes and the allocator,
---- and nothing else in `nupp` uses LLVM from another thread, so no lock LLVM
---- needs can be held by a thread the fork left behind.
+--- and the fork waits for any other Lua state of this process to leave lld, so
+--- no lock LLVM needs is held by a thread the fork left behind.
 local function forked(
     backend: codegen.Backend,
     jobs: {codegen.Job},
@@ -976,7 +1123,14 @@ local function forked(
             local job = jobs[nextJob]
             os.remove(job.object .. ".report")
             local errors = C.nuppcg_creat(job.object .. ".stderr", tonumber("644", 8) as integer)
-            local pid = C.nuppcg_fork()
+            -- Not while another state is inside lld: the child would inherit
+            -- whatever lock LLVM holds there, with no thread left to release it.
+            -- The child leaves the lock to the parent, which shares its file.
+            local lock = acquire()
+            local pid = tonumber(C.nuppcg_fork()) as integer
+            if pid ~= 0 then
+                release(lock)
+            end
             if pid == 0 then
                 -- The child: its diagnostics go to its own file, and it leaves
                 -- with `_exit`, running nothing the parent registered.
@@ -1189,14 +1343,20 @@ local function runLld(backend: codegen.Backend, argv: {string}): (integer, strin
         {FLAVOR_DARWIN, ffi.cast("void *", C.nuppcg_lldMachOLink)},
         {FLAVOR_WASM, ffi.cast("void *", C.nuppcg_lldWasmLink)},
     })
-    C.nuppcg_crashRecoveryEnable(false)
-    local result: any = C.nuppcg_lldMain(
-        ffi.new("nuppcg_Arguments", arguments, #argv),
-        stream,
-        stream,
-        ffi.new("nuppcg_Drivers", drivers, 5)
-    )
-    C.nuppcg_crashRecoveryDisable()
+    -- lld's context and crash recovery are both the process's, so one link
+    -- runs at a time whichever state asks.
+    local result: any = exclusive(function(): any
+        C.nuppcg_crashRecoveryEnable(false)
+        local answer: any = C.nuppcg_lldMain(
+            ffi.new("nuppcg_Arguments", arguments, #argv),
+            stream,
+            stream,
+            ffi.new("nuppcg_Drivers", drivers, 5)
+        )
+        C.nuppcg_crashRecoveryDisable()
+
+        return answer
+    end)
     -- Closing flushes the stream into the file.
     C.nuppcg_rawFdOstreamClose(stream)
     local text = readFile(path) or ""
