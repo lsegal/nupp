@@ -478,6 +478,49 @@ function M.taggedReleaseChecksOutBeforePublishing()
     assert(checkout < publish, "the publishing job verifies the tag before checking it out")
 end
 
+-- A kit carries the native provider, which this checkout's compiler builds
+-- (#209), so `kit-archive` refuses on a bare checkout (#332). Every job that
+-- archives a kit builds the compiler first, and a kit a release publishes
+-- carries the host features the release records for it.
+function M.kitArchiveFollowsTheCompiler()
+    local features = read(ROOT .. "/src/nupp/tools/build/release.nupp"):match("local HOST_FEATURES:.-= {(.-)}")
+    local expected = {}
+    for name in assert(features, "release.nupp has no HOST_FEATURES"):gmatch('"([^"]+)"') do
+        expected[#expected + 1] = name
+    end
+    expected = table.concat(expected, ",")
+
+    local archives = 0
+    local listing = assert(io.popen("git -C " .. quote(ROOT) .. " ls-files .github/workflows"))
+    for path in listing:lines() do
+        local text = read(ROOT .. "/" .. path)
+        local cursor = 1
+        while true do
+            local at, finish = text:find("./scripts/toolchain kit-archive", cursor, true)
+            if not at then
+                break
+            end
+            archives = archives + 1
+            local job = 1
+            for start in text:sub(1, at):gmatch("()\n  [%w_-]+:\r?\n") do
+                job = start
+            end
+            assert(
+                text:sub(job, at):find("./bin/nupp --version", 1, true),
+                path .. " archives a link kit before building the compiler"
+            )
+            local list = text:sub(finish + 1):match('^[%s\\]*([%w,_-]+)')
+            assert(
+                list == nil or list == expected,
+                path .. " archives a kit with features " .. tostring(list) .. ", not " .. expected
+            )
+            cursor = finish + 1
+        end
+    end
+    listing:close()
+    assert(archives >= 3, "the workflows no longer archive link kits where this test expects")
+end
+
 -- wgpu-native's prebuilt library statically carries wgpu's own Cargo graph to
 -- every GPU program it is staged beside. Its lock file is only in the source
 -- archive of the pinned tag, so the committed notice names that tag, and a
