@@ -892,4 +892,26 @@ never("Live network and socket conformance.", [[
 stdlibtest nettest netnativetest tlstest httpnativetest
 ]])
 
-return groups, {scopes = scopes, packages = packages, neverCache = neverCache}
+-- What the heaviest suites cost when a run has no timings file to plan from:
+-- seconds of suite work on a hosted macOS arm64 runner, the slowest host CI
+-- has, and how many slices the weight spreads over. One long case is one
+-- slice; many short cases spread. A run's own measurements always replace
+-- these, so they only have to put the long work first and cut up what can be
+-- cut. Taken from the green rolling legs of November 2026 (#355).
+local estimates = {
+    aotclitest = {seconds = 6000, slices = 6},
+    benchprojectstest = {seconds = 4800, slices = 1},
+    aotbuildtest = {seconds = 2500, slices = 4},
+    aotbudgettest = {seconds = 2000, slices = 1},
+    aotincrementaltest = {seconds = 1500, slices = 3},
+    simdprimitivedifferentialtest = {seconds = 1250, slices = 1},
+    fmttreetest = {seconds = 1100, slices = 1},
+    fmttree2test = {seconds = 1100, slices = 1},
+    fmttree3test = {seconds = 1100, slices = 1},
+    fmttree4test = {seconds = 1100, slices = 1},
+    parallelchecktest = {seconds = 1000, slices = 2},
+    serdecontracttest = {seconds = 1000, slices = 1},
+    projecttestcommandtest = {seconds = 850, slices = 2},
+}
+
+return groups, {scopes = scopes, packages = packages, neverCache = neverCache, estimates = estimates}
