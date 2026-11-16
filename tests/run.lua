@@ -252,6 +252,25 @@ do
         processSalt = stateSalt .. "-" .. tostring(os.time())
     end
 end
+-- Where `nupp test` looks once the process has exited. Every state running
+-- suites keeps one file there naming the suite it is executing, so a crash that
+-- takes the whole process down is still reported against that suite.
+local runningDir = rawget(_G, "__NUPP_TEST_RUNNING") or os.getenv("NUPP_TEST_RUNNING")
+local runningFile = runningDir and runningDir ~= "" and (runningDir .. "/" .. processSalt) or nil
+local function markRunning(name)
+    if not runningFile then
+        return
+    end
+    if name == nil then
+        os.remove(runningFile)
+        return
+    end
+    local file = io.open(runningFile, "wb")
+    if file then
+        file:write(name, "\n")
+        file:close()
+    end
+end
 local shardSalt = ((os.getenv("NUPP_CACHE_DIR") or ""):match("shard%-(%d+)") or "0") .. "-" .. processSalt
 local handedOut = 0
 local reservedTempNames = {}
@@ -1197,6 +1216,9 @@ do
         -- the outer run was invoked, which is what happened the first time CI
         -- ran this variable across a whole group rather than one suite.
         stopExporting("NUPP_TEST_TRACE_CASES")
+        -- The directory a run names its executing suites in belongs to that run.
+        -- A nested runner a case starts must not leave its own suites there.
+        stopExporting("NUPP_TEST_RUNNING")
         -- A worker leads a process group of its own, which everything its cases
         -- start joins, so the parent can end every one of them together: see
         -- `groupedWorker`. Read once and unexported for the same reason as the two
@@ -3339,7 +3361,8 @@ then
                         verbose,
                         colorMode,
                         suiteCatalog,
-                        pause
+                        pause,
+                        runningDir
                     )
                 end
                 local launched, problem = pcall(function()
@@ -3889,7 +3912,7 @@ end
 local restoreLane = function()
 end
 
-local function runSuite(suiteInfo, slices)
+local function executeSuite(suiteInfo, slices)
     local firstResult = #results + 1
     -- Loading is measured with the suite rather than left out of it. A Nupp suite
     -- is compiled here, and a Lua one runs its top level here, so a suite can cost
@@ -4048,6 +4071,15 @@ local function runSuite(suiteInfo, slices)
         if results[index].status == "failed" then
             reportFailure(results[index])
         end
+    end
+end
+
+local function runSuite(suiteInfo, slices)
+    markRunning(suiteInfo.name)
+    local ok, problem = pcall(executeSuite, suiteInfo, slices)
+    markRunning(nil)
+    if not ok then
+        error(problem, 0)
     end
 end
 
