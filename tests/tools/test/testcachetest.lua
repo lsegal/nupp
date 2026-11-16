@@ -1,6 +1,7 @@
 local test = require("assert")
 local json = require("testjson")
 local fs = require("nupp.compiler.fs")
+local files = require("io.internal.files")
 local cacheModule = dofile("tests/cache.lua")
 local M = {}
 
@@ -81,12 +82,14 @@ function M.partialFailedSkippedAndRecentRunsCannotPopulateTheStore()
         test.eq(next(assert(cacheModule.open(options)).packages), nil)
         options.selected = {{name = "alphatest"}}
         local clock = os.time
-        os.time = function()
-            return clock() - 10
-        end
-        -- Each open spawns shells, which is slow enough on Windows that the
-        -- fixture written at the start of the case is no longer recent here.
+        -- Each open spawns shells, which on a loaded Windows runner can take
+        -- longer than the recency window. Hold the clock at the fixture's own
+        -- modification time so the window is measured from the write alone.
         fs.writeFile(root .. "/tests/one/fixture", "first")
+        local _, _, modified = files.stat(root .. "/tests/one/fixture")
+        os.time = function()
+            return math.floor(tonumber(modified) / 1000)
+        end
         local recent, entry = opened(options)
         test.eq(entry.recent, true)
         recent.save(results, suites)
