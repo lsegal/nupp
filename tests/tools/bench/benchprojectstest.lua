@@ -13,10 +13,7 @@
 -- packages (`pkgConfig`) this machine's pkg-config cannot resolve: checking it reads
 -- their flags, and CI's runners carry neither simdjson nor a luajit.pc.
 --
--- Each check starts cold in CI and reads the standard library it reaches.
--- Even two checks ran for over thirty minutes together on a three-core macOS
--- runner, so the checks run one at a time, each a plain command the test run's
--- compile service can answer.
+-- Each check is a plain command the test run's compile service can answer.
 
 local HERE = require("helpers.paths").absoluteTests
 if HERE:sub(1, 1) ~= "/" and not HERE:match("^%a:[/\\]") then
@@ -89,30 +86,26 @@ local function projects()
     return names
 end
 
-function M.everyBenchmarkProjectChecks()
-    local names = projects()
+local names = projects()
+
+function M.theBenchmarkProjectsAreFound()
     assert(#names >= 8, "the benchmark projects were found: " .. #names)
-    local scratch = os.tmpname()
-    os.remove(scratch)
-    assert(os.execute("mkdir -p '" .. scratch .. "'") == 0)
-    for _, name in ipairs(names) do
-        os.execute(
-            (
-                "cd '%s/bench/%s' && NO_COLOR=1 '%s' check >'%s/%s.log' 2>&1; echo $? >'%s/%s.status'"
-            ):format(ROOT, name, NUPP, scratch, name, scratch, name)
+end
+
+-- One case per project rather than one case checking them all, so the runner can
+-- slice the suite and check several projects at once on separate workers. As one
+-- case it was a single piece no worker could share: 20 minutes on Windows and 66
+-- on macOS, longer than everything else on its worker put together (#349).
+for _, name in ipairs(names) do
+    M["checks_" .. (name:gsub("[^%w]", "_"))] = function()
+        local log = os.tmpname()
+        local status = os.execute(
+            ("cd '%s/bench/%s' && NO_COLOR=1 '%s' check >'%s' 2>&1"):format(ROOT, name, NUPP, log)
         )
+        local output = read(log)
+        os.remove(log)
+        assert(status == 0 or status == true, ("bench/%s does not check:\n%s"):format(name, output))
     end
-    local problems = {}
-    for _, name in ipairs(names) do
-        local status = read(scratch .. "/" .. name .. ".status"):match("%d+")
-        if status ~= "0" then
-            problems[
-                #problems + 1
-            ] = ("bench/%s (status %s):\n%s"):format(name, tostring(status), read(scratch .. "/" .. name .. ".log"))
-        end
-    end
-    os.execute("rm -rf '" .. scratch .. "'")
-    assert(#problems == 0, #problems .. " benchmark projects do not check:\n" .. table.concat(problems, "\n"))
 end
 
 return M

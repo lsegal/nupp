@@ -16,6 +16,10 @@
 -- spread a suite across shards case by case. One case asking about the whole tree was
 -- the floor of the whole test run whenever the formatter changed; four each ask about
 -- their quarter and can run at once. Every file is in exactly one part.
+--
+-- Sixteen parts, four cases in each of the four suites. A quarter of the tree was
+-- still one piece of 1100 s on a hosted macOS runner, each suite the floor of its
+-- worker; as cases they can be sliced across every core (#349).
 local envMod = require("nupp.compiler.project.env")
 
 local HERE = require("helpers.paths").absoluteTests
@@ -24,7 +28,7 @@ local HERE = require("helpers.paths").absoluteTests
 -- middle of it does not match what is under them.
 local ROOT = assert(HERE:match("^(.*)/[^/]+$"), "tests directory has no parent")
 local NUPP = ROOT .. "/bin/nupp"
-local PARTS = 4
+local PARTS = 16
 
 --- The project's sources, as `nupp fmt` with nothing named would find them.
 ---

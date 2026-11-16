@@ -43,8 +43,11 @@ function M.helperSeedsOnlyReusableWorktreeState()
     assert(
         os.execute(
             (
-                "mkdir -p %s/scripts %s/src %s/build/cache " .. "%s/build/nupp/tools %s/build/lib %s/.rocks"
-            ):format(quote(origin), quote(origin), quote(origin), quote(origin), quote(origin), quote(origin))
+                "mkdir -p %s/scripts %s/src %s/build/cache %s/build/test-runner "
+                .. "%s/build/nupp/tools %s/build/lib %s/.rocks"
+            ):format(
+                quote(origin), quote(origin), quote(origin), quote(origin), quote(origin), quote(origin), quote(origin)
+            )
         ) == 0
     )
     assert(os.execute(("cp %s/scripts/worktree %s/scripts/worktree"):format(quote(ROOT), quote(origin))) == 0)
