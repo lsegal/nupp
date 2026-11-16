@@ -493,10 +493,17 @@ local function bytecodePeak(dir, file, prefix)
     local named = package.config:sub(1, 1) == "\\" and peaks:gsub("/", "\\") or peaks
     local env = ("%sNUPP_PEAK_MEMORY_FILE='%s' "):format(prefix, named)
     -- Through a pipe, because the test runner's compile service answers a plain `bc`
-    -- inside its own long-lived process, whose peak is not this command's.
-    local pipe = assert(io.popen(("cd '%s' && %s'%s' bc --json -O1 %s 2>&1 | cat"):format(dir, env, NUPP, file)))
+    -- inside its own long-lived process, whose peak is not this command's. Its
+    -- standard error goes beside it rather than into the JSON: a notice the launcher
+    -- prints there is not part of the report, and decoding it with the report
+    -- failed a run whose compile was fine (#347).
+    local errors = dir .. "/bc-stderr.txt"
+    local pipe = assert(
+        io.popen(("cd '%s' && %s'%s' bc --json -O1 %s 2>'%s' | cat"):format(dir, env, NUPP, file, errors))
+    )
     local out = pipe:read("*a")
     pipe:close()
+    local said = out .. "\n" .. (readFile(errors) or "")
     local peak = nil
     for line in (readFile(peaks) or ""):gmatch("[^\n]+") do
         local bytes, arguments = line:match("^(%d+)\t(.*)$")
@@ -504,9 +511,9 @@ local function bytecodePeak(dir, file, prefix)
             peak = tonumber(bytes)
         end
     end
-    assert(peak, "the compiler reported no peak: " .. out)
+    assert(peak, "the compiler reported no peak: " .. said)
     local ok, report = pcall(json.decode, out)
-    assert(ok and type(report) == "table" and report.ok, "bc failed: " .. out)
+    assert(ok and type(report) == "table" and report.ok, "bc failed: " .. said)
 
     return peak
 end
