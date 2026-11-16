@@ -416,6 +416,70 @@ function M.aBuildWaitsForTheBuildAlreadyRunning()
     os.execute("rm -rf '" .. dir .. "'")
 end
 
+-- A command that found the tree behind and then got the lock asks again before
+-- building. Between the two, a build somebody else was running can finish: its
+-- stamp goes back and its lock comes off. `hostbinarytest`'s `nupp build --target
+-- dist` in the repository is that build, and a `bc` arriving as it finished built
+-- the compiler a second time and printed the notice into the JSON
+-- `perfbudgettest` decodes (#347). A `find` standing in for the launcher's holds
+-- the command at that moment while the other build finishes, so the window is
+-- the whole wait rather than a few microseconds.
+function M.aBuildThatFinishedWhileThisOneWaitedIsNotRepeated()
+    local dir, plant, env = plantedTree()
+    plant(
+        "build/nupp/tools/main.lua",
+        [[
+if arg[1] == "build" then
+    print("CURRENT_COMPILER")
+else
+    print("REQUESTED_CHECK")
+end
+]]
+    )
+    plant("build/.nupp-complete", "complete\n")
+    assert(os.execute("mkdir -p '" .. dir .. "/src' '" .. dir .. "/shim'") == 0)
+    plant("src/changed.nupp", "return true\n")
+    assert(os.execute("touch -t 200001010000 '" .. dir .. "/build/.nupp-complete'") == 0)
+    assert(os.execute("touch -t 200101010000 '" .. dir .. "/src/changed.nupp'") == 0)
+    local find = capture("command -v find"):match("([^\n]+)%s*$")
+    assert(find)
+    plant(
+        "shim/find",
+        ([[
+#!/bin/sh
+out=$('%s' "$@")
+if [ "${1%%/src}" != "$1" ] && [ ! -e '%s/seen' ]; then
+    : > '%s/seen'
+    i=0
+    while [ ! -e '%s/released' ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+fi
+[ -n "$out" ] && printf '%%s\n' "$out"
+exit 0
+]]):format(find, dir, dir, dir)
+    )
+    assert(os.execute("chmod +x '" .. dir .. "/shim/find'") == 0)
+
+    local script = (
+        [[
+      cd '%s'
+      PATH="%s/shim:$PATH" %s ./bin/nupp check example.nupp > ran.txt 2>&1 &
+      i=0
+      while [ ! -e seen ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+      touch build/.nupp-complete
+      : > released
+      wait
+      cat ran.txt
+   ]]
+    ):format(dir, dir, env)
+    local out = capture(script .. " 2>&1")
+
+    assert(out:find("REQUESTED_CHECK", 1, true), "the command did not run: " .. out)
+    assert(not out:find("CURRENT_COMPILER", 1, true), "the finished build was built again: " .. out)
+    assert(not out:find("sources changed", 1, true), "and was announced: " .. out)
+
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
 -- A built compiler that cannot build falls back to the stage zero, and the module
 -- bytecode cache goes with it. An entry that is damaged but still loads fails the
 -- built compiler the same way on every run, the self-hosted pass after the
