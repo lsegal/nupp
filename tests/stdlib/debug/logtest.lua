@@ -458,7 +458,10 @@ function M.writerSinksOwnTheirFormatterAndWriter()
 end
 
 function M.theDefaultSinkCanBeRestored()
+    -- Loading logging again publishes that copy's `warn`; restore the global with
+    -- the module so a later suite still sees one warning function.
     local previousLog, previousError = package.loaded["debug.log"], io.stderr
+    local previousWarn = rawget(_G, "warn")
     package.loaded["debug.log"] = nil
     local ok, problem = pcall(function()
         local log = runtime()
@@ -483,6 +486,7 @@ function M.theDefaultSinkCanBeRestored()
         testAssert.eq(written[2], "warn sample: restored\n")
     end)
     io.stderr, package.loaded["debug.log"] = previousError, previousLog
+    rawset(_G, "warn", previousWarn)
     assert(ok, problem)
 end
 
