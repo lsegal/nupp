@@ -14,6 +14,9 @@
 # worker that dies, which worker it was and the suite and case it last named.
 # A runner that still does not finish is then ended itself. Either way the step
 # fails: a run that needed ending did not pass.
+#
+# Windows has no process groups, so there windows-test-processes.ps1 lists the
+# runner's process tree and finds and ends its workers instead.
 set -uo pipefail
 
 deadline=$1
@@ -24,8 +27,23 @@ fi
 
 here=$(cd "$(dirname "$0")" && pwd)
 
+case "${OSTYPE:-}" in
+    msys* | cygwin*) windows=1 ;;
+    *) windows= ;;
+esac
+
+# The runner's process tree on Windows, ending some of it when asked (see
+# windows-test-processes.ps1).
+windows_processes() {
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass         -File "$(cygpath -w "$here/windows-test-processes.ps1")" -Root "$runner_winpid" "$@" || true
+}
+
 "$@" &
 runner=$!
+runner_winpid=
+if [ -n "$windows" ]; then
+    runner_winpid=$(cat "/proc/$runner/winpid" 2>/dev/null || true)
+fi
 
 while kill -0 "$runner" 2>/dev/null; do
     if [ "$(date +%s)" -lt "$deadline" ]; then
@@ -35,6 +53,20 @@ while kill -0 "$runner" 2>/dev/null; do
 
     echo
     echo "::error::the test run was still going at its deadline; ending its workers so the runner reports where each one stood"
+    waited=0
+    if [ -n "$windows" ]; then
+        windows_processes -End Workers
+        while kill -0 "$runner" 2>/dev/null && [ "$waited" -lt 120 ]; do
+            sleep 5
+            waited=$((waited + 5))
+        done
+        if kill -0 "$runner" 2>/dev/null; then
+            echo "::error::the runner was still going ${waited}s after its deadline; ending it"
+            windows_processes -End Tree
+        fi
+        wait "$runner" 2>/dev/null
+        exit 1
+    fi
     "$here/report-stalled-run.sh"
 
     # A worker runs under a shell of its own that leads its process group (see
@@ -55,7 +87,6 @@ while kill -0 "$runner" 2>/dev/null; do
                 }
             }
         }')
-    waited=0
     if [ -n "$workers" ]; then
         echo "ending workers: $(echo $workers)"
         kill -TERM $workers 2>/dev/null || true
