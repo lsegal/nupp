@@ -415,15 +415,19 @@ jobs:
       # executes, so an approximate restore can only save time, never reuse a
       # stale pass. Never-cache suites (timing, process lifecycle, measurement)
       # execute regardless; see `neverCache` in tests/groups.lua.
+      #
+      # Keyed apart from the fast gate's store: on Linux that job saves its key
+      # for this run first, and a cache key is written once, so sharing it would
+      # drop every pass this job adds.
       - name: Restore the recorded test results
         uses: actions/cache/restore@v4
         with:
           path: build/test-runner/.nupp-test-results
           key: >-
-            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
+            nupp-test-results-integration-${{ runner.os }}-${{ runner.arch }}-${{
             github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-
+            nupp-test-results-integration-${{ runner.os }}-${{ runner.arch }}-
 
       # Suite durations are what the process lanes are packed from. A clean
       # runner without them packs blind and the busiest shard decides the wall
@@ -756,7 +760,7 @@ jobs:
         with:
           path: build/test-runner/.nupp-test-results
           key: >-
-            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
+            nupp-test-results-integration-${{ runner.os }}-${{ runner.arch }}-${{
             github.run_id }}-${{ github.run_attempt }}
 
       # Saved whatever the suite concluded. A failing run still measured every
