@@ -190,15 +190,12 @@ local function merge(into, generated, label)
     into.entries[#into.entries + 1] = renamed
 end
 
-function M.semantics(options)
-    options = options or {}
-    local primitives = require("tests.integration.simd.primitives")
-    local reducers = require("tests.integration.simd.reducers")
+local function semanticSegments()
     local core = {2, 3, 8, 17, 33, 64, "preferred"}
     local memory = {2, 3, 4, 8, 16, 32, 64, "preferred"}
     local transpose = {2, 3, 8, 17, 33, 64}
-    local into = {files = {}, probes = {}, coverage = {}, entries = {}}
-    local segments = {
+
+    return {
         {"operations", {"lanes"}, M.types, core},
         {"memory", {"memory"}, {"float", "number", "int8", "int16", "int32", "int64"}, memory},
         {"transpose", {"transpose"}, {"float", "int8", "int16", "int32", "int64"}, transpose},
@@ -213,21 +210,53 @@ function M.semantics(options)
         {"float_bits", {"bitpatterns", "bitmemory"}, {"float", "number"}, core},
         {"masks", {"masks"}, M.types, core},
         {"maps", {"maps"}, {"float", "number"}, core},
+        {"reducers", nil, M.types, core},
     }
-    for _, segment in ipairs(segments) do
-        merge(
-            into,
-            primitives.generate({
-                families = segment[2],
-                types = segment[3],
-                lanes = segment[4],
-                batchSize = 8,
-                target = options.target,
-            }),
-            segment[1]
-        )
+end
+
+--- Names the independently buildable parts of the semantic pack, in pack
+--- order. Each builds and runs on its own, so a harness can spread them out.
+function M.semanticSegments()
+    local names = {}
+    for _, segment in ipairs(semanticSegments()) do
+        names[#names + 1] = segment[1]
     end
-    merge(into, reducers.generate({types = M.types, lanes = core}), "reducers")
+
+    return names
+end
+
+--- Generates the semantic pack, or only the named segments of it.
+function M.semantics(options)
+    options = options or {}
+    local primitives = require("tests.integration.simd.primitives")
+    local reducers = require("tests.integration.simd.reducers")
+    local wanted
+    if options.segments then
+        wanted = {}
+        for _, name in ipairs(options.segments) do
+            wanted[name] = true
+        end
+    end
+    local into = {files = {}, probes = {}, coverage = {}, entries = {}}
+    for _, segment in ipairs(semanticSegments()) do
+        local name = segment[1]
+        if not wanted or wanted[name] then
+            if wanted then
+                wanted[name] = nil
+            end
+            local generated = segment[2]
+                and primitives.generate({
+                    families = segment[2],
+                    types = segment[3],
+                    lanes = segment[4],
+                    batchSize = 8,
+                    target = options.target,
+                })
+                or reducers.generate({types = segment[3], lanes = segment[4]})
+            merge(into, generated, name)
+        end
+    end
+    assert(not wanted or next(wanted) == nil, "unknown semantic segment " .. tostring(wanted and next(wanted)))
     local top = {"local function run(): number", "    local cases = 0"}
     for _, entry in ipairs(into.entries) do
         top[#top + 1] = '    cases = cases + require("' .. entry .. '").run()'
@@ -549,6 +578,30 @@ function M.witnesses(pack, identity, generated)
     end
 
     return result
+end
+
+local BOUNDARY_SEGMENTS = {
+    ["mask-64-lanes"] = "masks",
+    ["avx512-gather-scatter"] = "memory",
+    ["neon-field-pairs"] = "memory",
+}
+
+--- Names the semantic segment whose execution proves a semantic witness, so
+--- a harness that runs the segments separately emits each witness once, from
+--- the run that earned it. The segment is the one validateSemanticCoverage
+--- reads that witness's evidence from.
+function M.semanticWitnessSegment(witness)
+    local dimensions = witness.dimensions
+    if witness.obligation == "simd.operation-semantics" then
+        local family = dimensions.operationCase:match("^([^/]+)/")
+        return family == "floating-special" and "float_bits" or family == "reducers" and "reducers" or "operations"
+    elseif witness.obligation == "simd.conversions" then
+        return "conversions"
+    elseif witness.obligation == "simd.representation-boundary" then
+        return BOUNDARY_SEGMENTS[dimensions.boundary] or "operations"
+    end
+
+    return "operations"
 end
 
 return M

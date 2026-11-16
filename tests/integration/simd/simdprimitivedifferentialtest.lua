@@ -150,8 +150,44 @@ local function checkWork(pack, report)
     end
 end
 
+-- Each semantic segment is its own build and run, so the pool spreads the
+-- pack across cores instead of one case holding a core for the whole pack.
+local rows = {{name = "nativeSpeciesInventory", pack = "species", ceiling = "species"}}
+for _, segment in ipairs(packs.semanticSegments()) do
+    rows[#rows + 1] = {
+        name = "nativeSemanticConformance_" .. segment,
+        pack = "semantics",
+        segment = segment,
+        ceiling = "semantics/" .. segment,
+    }
+end
+
+local semanticWitnesses = {}
+
+-- Witnesses are validated against the whole pack, then each segment emits
+-- the ones its own run proves.
+local function witnesses(row, identity, generated)
+    if row.pack == "species" then
+        return packs.witnesses("species", identity, generated)
+    end
+    local key = identity.host .. "/" .. identity.compiler .. "/" .. identity.tier
+    local all = semanticWitnesses[key]
+    if not all then
+        all = packs.witnesses("semantics", identity, packs.semantics())
+        semanticWitnesses[key] = all
+    end
+    local result = {}
+    for _, witness in ipairs(all) do
+        if packs.semanticWitnessSegment(witness) == row.segment then
+            result[#result + 1] = witness
+        end
+    end
+
+    return result
+end
+
 local generatedCases = test.suite.cases(
-    {{name = "nativeSpeciesInventory", pack = "species"}, {name = "nativeSemanticConformance", pack = "semantics"}},
+    rows,
     function(row)
         return row.name
     end,
@@ -159,8 +195,8 @@ local generatedCases = test.suite.cases(
         local capability = runner.nativeCapability()
         test.suite.requirecapability("compiler.llvm", capability.compilerVersion ~= nil, capability)
         test.suite.requirecapability("cpu." .. capability.tier, capability.available, capability)
-        local generated = row.pack == "species" and packs.species() or packs.semantics()
-        local key = fixtureKey(row.pack, generated, capability)
+        local generated = row.pack == "species" and packs.species() or packs.semantics({segments = {row.segment}})
+        local key = fixtureKey(row.ceiling, generated, capability)
         local _, report, reused = test.suite.fixture(key, function(directory)
             local complete = runner.native(generated, {
                 directory = directory,
@@ -171,6 +207,7 @@ local generatedCases = test.suite.cases(
 
             return {
                 pack = row.pack,
+                segment = row.segment,
                 tier = complete.tier,
                 host = complete.host,
                 cases = complete.cases,
@@ -193,9 +230,10 @@ local generatedCases = test.suite.cases(
         )
         assert(report.cases == report.scalarCases and report.probes == report.scalarProbes)
         assert(report.nativeCalls > 0 and report.scalarCalls > 0 and #report.artifacts > 0)
-        checkWork(row.pack, report)
+        checkWork(row.ceiling, report)
         test.suite.fact("simd.native.pack", {
             pack = row.pack,
+            segment = row.segment,
             tier = report.tier,
             routes = {"simd", "scalar-c"},
             cases = report.cases,
@@ -204,7 +242,7 @@ local generatedCases = test.suite.cases(
             routeIdentity = report.routeIdentity,
         })
         local identity = {host = hostClass(report.host), compiler = capability.compilerDialect, tier = report.tier,}
-        for _, witness in ipairs(packs.witnesses(row.pack, identity, generated)) do
+        for _, witness in ipairs(witnesses(row, identity, generated)) do
             test.suite.fact("coverage.witness", witness)
         end
         test.suite.metric("generated.source", report.work.generatedSourceBytes, "bytes")
