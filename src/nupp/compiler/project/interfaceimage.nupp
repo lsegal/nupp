@@ -825,8 +825,9 @@ export function decode(image: any, options: DecodeOptions?): (any?, string?)
                     nominalMap[key] = nominal
                 end
                 built[index] = nominal
-                -- The reader's own declaration already has the surface its own check gave
-                -- it, so only a declaration this image allocated is filled from the image.
+                -- The reader's own declaration already has the surface its own check
+                -- gave it, so only a declaration this image allocated is filled from
+                -- the image.
                 if not node.external and carriedOwn == nil then
                     declarations[#declarations + 1] = index
                 end
