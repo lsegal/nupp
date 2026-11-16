@@ -699,6 +699,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'nupp-worker-dumps') | Out-Null
 
+      # Kept 10 minutes inside the job's timeout, as on the other platforms, so
+      # a hung run is ended with its process tree listed and its workers named
+      # while the job can still say so. The suite takes about two hours here
+      # when it passes.
       - name: Run the compiler suite
         if: runner.os == 'Windows'
         shell: bash
@@ -713,7 +717,9 @@ jobs:
           NUPP_TEST_BASH=$(cygpath -w "$bash_path")
           NUPP_TEST_SH=$(cygpath -w "$sh_path")
           export NUPP_TEST_BASH NUPP_TEST_SH
-          ./bin/nupp test --scope=all \
+          deadline=$((NUPP_JOB_STARTED + (${{ matrix.timeout }} - 10) * 60))
+          .github/scripts/suite-deadline.sh "$deadline" -- \
+            ./bin/nupp test --scope=all \
             --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
 
       # What the suite saved, named in the log so a reader knows what the

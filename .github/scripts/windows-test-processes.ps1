@@ -102,20 +102,23 @@ public static class NuppTestEnd {
     static extern bool TerminateProcess(IntPtr process, uint code);
     [DllImport("kernel32.dll")]
     static extern bool CloseHandle(IntPtr handle);
-    public static bool End(int id, uint code) {
+    public static int Terminate(int id, int code) {
         IntPtr process = OpenProcess(0x0001, false, id);
-        if (process == IntPtr.Zero) return false;
-        try { return TerminateProcess(process, code); } finally { CloseHandle(process); }
+        if (process == IntPtr.Zero) return 0;
+        try { return TerminateProcess(process, (uint)code) ? 1 : 0; } finally { CloseHandle(process); }
     }
 }
 '@
 
 function End-Process($process) {
     $id = [int]$process.ProcessId
-    if ([NuppTestEnd]::End($id, 143)) {
+    $ended = [NuppTestEnd]::Terminate($id, 143)
+    if ($ended -eq 1) {
         "ended $id $($process.Name)"
-    } else {
+    } elseif (Get-Process -Id $id -ErrorAction SilentlyContinue) {
         "could not end $id $($process.Name)"
+    } else {
+        "$id $($process.Name) had already exited"
     }
 }
 
