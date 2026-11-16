@@ -4167,6 +4167,20 @@ restoreLane = function()
     restore(package.preload, laneBaseline.preload)
     restore(_G, laneBaseline.globals)
     package.path, package.cpath = laneBaseline.path, laneBaseline.cpath
+    -- `debug.log` publishes one warning function, as the global `warn` and as the
+    -- `warn` module, and loads on the first warning rather than at startup. A Nupp
+    -- lane keeps the module a piece loaded but puts the global back, and a piece
+    -- that loads a fresh copy can leave `warn` holding that copy's function, so
+    -- the next piece saw two. Point both at the module the lane kept.
+    if embedded or sharedQueuePieces then
+        local log = package.loaded["debug.log"]
+        if type(log) == "table" and type(log.warner) == "function" then
+            if package.loaded["warn"] ~= nil then
+                package.loaded["warn"] = log.warner
+            end
+            rawset(_G, "warn", log.warner)
+        end
+    end
 end
 
 --- What this process took off the queue, so the parent can tell work that was
