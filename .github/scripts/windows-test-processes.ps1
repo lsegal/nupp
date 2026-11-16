@@ -1,6 +1,6 @@
 # What a Windows test run is running, and a way to end its workers.
 #
-#   windows-test-processes.ps1 -Root PID [-End Workers|Tree]
+#   windows-test-processes.ps1 -Root PID [-End Workers|Tree] [-Links FILE]
 #
 # The deadline in suite-deadline.sh finds a worker through the process group
 # its shell leads (see `groupedWorker` in tests/run.lua). Windows has no such
@@ -19,30 +19,60 @@
 # on a failure, it is not one.
 param(
     [Parameter(Mandatory = $true)][int]$Root,
-    [ValidateSet('', 'Workers', 'Tree')][string]$End = ''
+    [ValidateSet('', 'Workers', 'Tree')][string]$End = '',
+    [string]$Links = ''
 )
 
 $ErrorActionPreference = 'Continue'
 
+# A process's parent is the one Windows records while that one is still
+# running. Git Bash runs a command by forking a copy of itself that then starts
+# the command and exits, so the parent Windows records for a shell's command is
+# usually gone: a `sleep` a test left running would not be found under its
+# worker at all. LINKS is a file of "PID PARENT" Windows process ids from Git
+# Bash's own process table, which keeps the shell as the parent; it stands in
+# for a parent that has exited. It is not preferred outright, because a shell
+# that runs a Windows program in place of itself stays behind as the parent
+# Windows records, and its own entry there names the shell's parent instead.
 $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
 $byId = @{}
-$children = @{}
+$parentOf = @{}
 foreach ($process in $all) {
     $byId[[int]$process.ProcessId] = $process
-    $parent = [int]$process.ParentProcessId
+    $parentOf[[int]$process.ProcessId] = [int]$process.ParentProcessId
+}
+if ($Links -and (Test-Path $Links)) {
+    foreach ($line in Get-Content $Links) {
+        $pair = $line.Trim() -split '\s+'
+        if ($pair.Count -ne 2) { continue }
+        $process = $byId[[int]$pair[0]]
+        if (-not $process) { continue }
+        $recorded = $byId[$parentOf[[int]$pair[0]]]
+        # Windows reuses process ids, so a recorded parent younger than its
+        # child is some later process that took the id of one that exited.
+        if (-not $recorded -or $recorded.CreationDate -gt $process.CreationDate) {
+            $parentOf[[int]$pair[0]] = [int]$pair[1]
+        }
+    }
+}
+$children = @{}
+foreach ($id in $parentOf.Keys) {
+    $parent = $parentOf[$id]
     if (-not $children.ContainsKey($parent)) {
         $children[$parent] = New-Object System.Collections.ArrayList
     }
-    [void]$children[$parent].Add($process)
+    [void]$children[$parent].Add($byId[$id])
 }
 
 # Breadth first, so a worker is always met before anything it started. Windows
 # reuses process ids, so a child created before its supposed parent is not one.
+$depthOf = @{}
 function Get-Descendants([int]$id) {
     $found = New-Object System.Collections.ArrayList
     $queue = New-Object System.Collections.Queue
     $queue.Enqueue($id)
     $seen = @{ $id = $true }
+    $depthOf[$id] = 0
     while ($queue.Count -gt 0) {
         $current = $queue.Dequeue()
         if (-not $children.ContainsKey($current)) { continue }
@@ -52,6 +82,7 @@ function Get-Descendants([int]$id) {
             $owner = $byId[$current]
             if ($owner -and $child.CreationDate -lt $owner.CreationDate) { continue }
             $seen[$childId] = $true
+            $depthOf[$childId] = $depthOf[$current] + 1
             [void]$found.Add($child)
             $queue.Enqueue($childId)
         }
@@ -67,7 +98,7 @@ function Format-Process($process, [string]$indent) {
     $line = $process.CommandLine
     if (-not $line) { $line = $process.Name }
     if ($line.Length -gt 400) { $line = $line.Substring(0, 400) + '...' }
-    '{0}{1,7} {2,7} {3,9} {4,8:N0}K  {5}' -f $indent, $process.ProcessId, $process.ParentProcessId, $age,
+    '{0}{1,7} {2,7} {3,9} {4,8:N0}K  {5}' -f $indent, $process.ProcessId, $parentOf[[int]$process.ProcessId], $age,
         ($process.WorkingSetSize / 1KB), $line
 }
 
@@ -81,13 +112,7 @@ $tree = Get-Descendants $Root
 '    PID    PPID       AGE  WORKING  COMMAND'
 Format-Process $rootProcess ''
 foreach ($process in $tree) {
-    $depth = 0
-    $up = [int]$process.ParentProcessId
-    while ($up -ne $Root -and $byId.ContainsKey($up) -and $depth -lt 32) {
-        $depth++
-        $up = [int]$byId[$up].ParentProcessId
-    }
-    Format-Process $process ('  ' * ($depth + 1))
+    Format-Process $process ('  ' * $depthOf[[int]$process.ProcessId])
 }
 
 if (-not $End) { exit 0 }
@@ -136,10 +161,10 @@ $workers = @()
 foreach ($process in $tree) {
     if (-not (& $isWorker $process)) { continue }
     $nested = $false
-    $up = [int]$process.ParentProcessId
+    $up = $parentOf[[int]$process.ProcessId]
     while ($up -ne $Root -and $byId.ContainsKey($up)) {
         if (& $isWorker $byId[$up]) { $nested = $true; break }
-        $up = [int]$byId[$up].ParentProcessId
+        $up = $parentOf[$up]
     }
     if (-not $nested) { $workers += $process }
 }

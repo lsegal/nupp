@@ -33,9 +33,18 @@ case "${OSTYPE:-}" in
 esac
 
 # The runner's process tree on Windows, ending some of it when asked (see
-# windows-test-processes.ps1).
+# windows-test-processes.ps1). Git Bash's process table is passed along for
+# the parents Windows does not record.
 windows_processes() {
-    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass         -File "$(cygpath -w "$here/windows-test-processes.ps1")" -Root "$runner_winpid" "$@" || true
+    local links
+    links=$(mktemp)
+    ps -e | awk '
+        NR > 1 { winpid[$1] = $4; parent[$1] = $2 }
+        END { for (pid in winpid) if (parent[pid] in winpid) print winpid[pid], winpid[parent[pid]] }' >"$links"
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+        -File "$(cygpath -w "$here/windows-test-processes.ps1")" \
+        -Root "$runner_winpid" -Links "$(cygpath -w "$links")" "$@" || true
+    rm -f "$links"
 }
 
 "$@" &
