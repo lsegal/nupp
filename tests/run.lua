@@ -893,7 +893,7 @@ for _, argument in ipairs(arg) do
     elseif argument:match("^%-%-jobs=") then
         jobs = tonumber(argument:match("^%-%-jobs=(%d+)$"))
         if not jobs or jobs < 1 then
-            io.stderr:write("nupp: --jobs takes a positive thread count\n")
+            io.stderr:write("nupp: --jobs takes a positive worker count\n")
             os.exit(2)
         end
     elseif argument:match("^%-%-queue=") then
@@ -2368,7 +2368,7 @@ end
 -- coverage is collected -- the shards would race each other for the one counter file
 -- that `NUPP_COVERAGE_FILE` names.
 
---- How many threads to make by default: one per processor.
+--- How many Nupp workers to start by default: one per processor.
 ---
 --- It was two per processor, from a measurement on eight cores -- 71s at one per
 --- core, 63s at two. That machine no longer stands for this one. On eighteen
@@ -2949,9 +2949,9 @@ then
                 local running = {}
                 local scope = workers.__scope()
                 -- A worker state cannot redirect process-owned descriptors safely.
-                -- Keep inherited output quiet for the threaded phase; ordinary Lua
-                -- output is captured in its state, process-writing suites are in the
-                -- process-worker queues, and progress has its own saved descriptor.
+                -- Keep inherited output quiet while the workers run; ordinary Lua
+                -- output is captured in its state, and progress has its own saved
+                -- descriptor.
                 local pause = workerPause(#lanes)
                 local restoreOutput = silenceProcessOutput()
                 -- Each lane gets a worker of its own rather than a share of the
@@ -3233,10 +3233,10 @@ then
             end
         end
 
-        -- Every suite is a function call on one thread pool in this process,
-        -- sized to the machine's cores. A heavy suite the plan split into slices
-        -- is several entries on the same queue, so its cases spread over the pool
-        -- too.
+        -- Every suite is a function call in this process, dealt out to Nupp
+        -- workers (one per core), each running it against the one loaded
+        -- compiler. A heavy suite the plan split into slices is several entries
+        -- on the same queue, so its cases spread over the workers too.
         local workerCount = jobs or defaultJobs()
         local queue = prepareQueue(
             suites,
@@ -3248,7 +3248,7 @@ then
             workerCount
         )
         if queue then
-            beginPhase(("%d suites across %d threads"):format(#suites, #queue.lanes))
+            beginPhase(("%d suites across %d Nupp workers"):format(#suites, #queue.lanes))
             marked = true
             collectQueue(queue, startFanOut(queue.lanes))
         end
