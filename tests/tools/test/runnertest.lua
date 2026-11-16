@@ -1671,6 +1671,62 @@ function M.workersDivideAQueueBetweenThem()
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- Windows refuses to remove a file another process holds open, so a worker can
+-- win a piece and then fail to retire it (#341). The claim marker decides who
+-- runs it: the worker that won runs it, and the next worker leaves it alone.
+function M.workersKeepAClaimedPieceTheyCannotRetire()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests/nested")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/queue")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+
+    local order = {"alphatest", "betatest", "gammatest"}
+    for index, spec in ipairs(order) do
+        write(("%s/tests/nested/%s.lua"):format(dir, spec), "return {only = function() end}\n")
+        write(("%s/queue/piece-%d"):format(dir, index), spec .. "\n")
+    end
+    write(dir .. "/queue/order", table.concat(order, "\n") .. "\n")
+    write(
+        dir .. "/host.lua",
+        (
+            [=[
+local remove = os.remove
+os.remove = function(path)
+    if tostring(path):match("piece%%-%%d+$") then
+        return nil, path .. ": Permission denied", 13
+    end
+    return remove(path)
+end
+arg = {[0] = %q, "--json", "--queue=" .. %q, "--no-color"}
+local report = dofile(arg[0])
+io.write(table.concat(report.claimed or {}, ","), "\n", report.total, "\n", report.passed, "\n")
+]=]
+        ):format(dir .. "/tests/run.lua", dir .. "/queue")
+    )
+
+    local seen, ran = {}, 0
+    for worker = 1, 2 do
+        local output = run(dir .. "/host.lua")
+        local claimed, total, passed = output:match("([%w,]*)\n(%d+)\n(%d+)\n$")
+        test(claimed, "worker " .. worker .. " did not finish:\n" .. output)
+        test.eq(passed, total, output)
+        for spec in claimed:gmatch("[^,]+") do
+            test.eq(seen[spec], nil, spec .. " was claimed twice")
+            seen[spec] = true
+        end
+        ran = ran + tonumber(total)
+    end
+    test.eq(ran, #order, "every piece ran exactly once")
+    for index, spec in ipairs(order) do
+        assert(seen[spec], spec .. " was never claimed")
+        local piece = io.open(("%s/queue/piece-%d"):format(dir, index), "rb")
+        test(piece, "the removal was meant to fail")
+        piece:close()
+    end
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 -- A Nupp worker state past its heap bound hands the rest of its queue to a fresh
 -- state (#287). At a bound of 0 every suite gets a state of its own, and each lane
 -- still reports once: one state per suite it ran, plus the last, which found the

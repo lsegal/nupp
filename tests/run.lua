@@ -3831,11 +3831,15 @@ then
                 local waiting = true
                 local tail = math.max(1, math.floor(#sharedQueue.lanes / 4))
                 while waiting do
+                    -- Counted by the claim markers rather than the pieces: a
+                    -- piece held open here is one a worker on Windows cannot
+                    -- retire, and one it failed to retire is still taken (#341).
                     local pieces = 0
                     for index = 1, #sharedQueue.order do
-                        local piece = io.open(("%s/piece-%d"):format(sharedQueue.path, index), "rb")
-                        if piece then
-                            piece:close()
+                        local taken = io.open(("%s/taken-%d"):format(sharedQueue.path, index), "rb")
+                        if taken then
+                            taken:close()
+                        else
                             pieces = pieces + 1
                         end
                     end
@@ -4272,8 +4276,12 @@ local function takeWork()
                 won = os.rename(piece, mine)
             end
             if won then
+                -- The marker is the claim, so retiring the piece is tidying only.
+                -- Windows refuses to remove a file another process has open, and
+                -- an indexer or virus scanner can be holding this one (#341); a
+                -- worker that has won the piece runs it whether or not it went.
                 if exclusiveCreate then
-                    assert(os.remove(piece), "cannot retire a claimed test queue piece")
+                    os.remove(piece)
                 end
                 took, cursor = index, index
                 break
