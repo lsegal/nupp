@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `nupp fixpoint` now also holds the compiler's native half to the fixpoint:
+  stages two and three each lower the native provider, the host and the
+  embedding library to LLVM IR, which must match, and each runs on the
+  provider the stage before it linked. `--json` reports them as `native` and
+  `nativeRelinked`.
+
 - When a record's method is defined in a module other than the one that
   declares it, other modules now always see the declared signature. Before,
   modules checked after the defining module saw the definition's signature
