@@ -81,14 +81,13 @@ function M.partialFailedSkippedAndRecentRunsCannotPopulateTheStore()
         options.selected = {}
         test.eq(next(assert(cacheModule.open(options)).packages), nil)
         options.selected = {{name = "alphatest"}}
-        local clock = os.time
-        -- Each open spawns shells, which on a loaded Windows runner can take
-        -- longer than the recency window. Hold the clock at the fixture's own
-        -- modification time so the window is measured from the write alone.
+        -- Each open spawns shells, which can take longer than the recency
+        -- window on Windows, so the clock stands at the fixture's own second.
         fs.writeFile(root .. "/tests/one/fixture", "first")
         local _, _, modified = files.stat(root .. "/tests/one/fixture")
+        local clock, written = os.time, math.floor(tonumber(modified) / 1000)
         os.time = function()
-            return math.floor(tonumber(modified) / 1000)
+            return written
         end
         local recent, entry = opened(options)
         test.eq(entry.recent, true)

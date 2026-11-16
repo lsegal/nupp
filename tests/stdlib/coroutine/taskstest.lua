@@ -95,27 +95,42 @@ function M.spawnHandsItsArgumentsToTheBody()
 end
 
 function M.childrenRunConcurrentlyAndAwaitAnswersEachOne()
-    local started = os.monotonic()
+    -- Each child waits until it has seen the other one running, so the scope can only
+    -- finish if both are live at once. The deadline is only a hang guard: a serialized
+    -- implementation reaches it instead of hanging the suite.
+    local guard = os.monotonic() + 10000
+    local aRunning, bRunning = false, false
+    local function waitFor(running)
+        while not running() do
+            assert(os.monotonic() < guard, "the children serialized")
+            time.sleep(1)
+        end
+    end
     local first, second
     scoped(nil, function(scope)
         -- Library order again: the named overload takes the callable first, and the
         -- compiler routes it to this member so the two need no runtime test.
         local a = scope:_spawnNamed(
             function()
-                time.sleep(40)
+                aRunning = true
+                waitFor(function()
+                    return bRunning
+                end)
                 return "a"
             end,
             "a"
         )
         local b = scope:spawn(function()
-            time.sleep(40)
+            bRunning = true
+            waitFor(function()
+                return aRunning
+            end)
             return "b"
         end)
         first, second = a:await(), b:await()
     end)
     testAssert.eq(first, "a", "the first child's result")
     testAssert.eq(second, "b", "the second child's result")
-    assert(os.monotonic() - started < 70, "the children serialized")
 end
 
 function M.awaitingTwiceObservesOneSettlement()

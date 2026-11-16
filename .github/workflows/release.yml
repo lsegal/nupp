@@ -121,9 +121,13 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v4
 
-      - name: Build pinned host dependencies
+      # The kit carries the native provider, a Nupp program this checkout's
+      # compiler builds, so there has to be one first.
+      - name: Build the compiler
         shell: bash
-        run: ./scripts/toolchain --all
+        run: |
+          ./scripts/toolchain --all
+          ./bin/nupp --version
 
       - name: Build and record the link kit
         shell: bash
