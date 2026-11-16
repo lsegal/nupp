@@ -1660,7 +1660,7 @@ return M
 
     local function plan()
         local command = (
-            "cd %q && %sNUPP_TEST_BUILD=%q %q widetest cheaptest plaintest --jobs=2 --timings=0 --no-color 2>&1"
+            "cd %q && %sNUPP_TEST_BUILD=%q %q widetest cheaptest plaintest --jobs=2 --timings=1 --no-color 2>&1"
         ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
         local output, invocation = capturedRun(command)
         test.eq(invocation.status, 0, "the planned run succeeded" .. evidence(invocation))
