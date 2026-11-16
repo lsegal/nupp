@@ -644,9 +644,10 @@ function M.browserHttpRejectsMalformedSharedInputsBeforeEffects()
 end
 
 function M.nativeHttpDispatchDrainsAfterAWakerRaises()
-    local closed = {connects = 0}
+    local closed = {opens = 0, connects = 0}
     local net = {
         connect = function()
+            closed.opens = closed.opens + 1
             return {}
         end,
         connectpoll = function()
@@ -686,8 +687,18 @@ function M.nativeHttpDispatchDrainsAfterAWakerRaises()
         }))
     end
     -- A connect that never completes, under a deadline that has passed by the
-    -- poll, fails the transfer and wakes every waiter it has.
-    local transfer = request(1)
+    -- poll, fails the transfer and wakes every waiter it has. The clock stands
+    -- still while it is sent: a millisecond lost between the request's deadline
+    -- and its first step would time it out before it ever connected.
+    local monotonic = os.monotonic
+    local started = monotonic()
+    os.monotonic = function()
+        return started
+    end
+    local sent, transfer = pcall(request, 1)
+    os.monotonic = monotonic
+    assert(sent, transfer)
+    testAssert.eq(closed.opens, 1, "the first transfer connected before its deadline")
     local woke = {head = false, body = false, upload = false}
     transfer:onHead(function()
         woke.head = true
@@ -701,7 +712,6 @@ function M.nativeHttpDispatchDrainsAfterAWakerRaises()
     transfer:onUpload(function()
         woke.upload = true
     end)
-    local started = os.monotonic()
     repeat
     until os.monotonic() - started >= 5
 
