@@ -1699,23 +1699,23 @@ os.remove = function(path)
     return remove(path)
 end
 arg = {[0] = %q, "--json", "--queue=" .. %q, "--no-color"}
-local report = dofile(arg[0])
-io.write(table.concat(report.claimed or {}, ","), "\n", report.total, "\n", report.passed, "\n")
+dofile(arg[0])
 ]=]
         ):format(dir .. "/tests/run.lua", dir .. "/queue")
     )
 
+    local json = require("testjson")
     local seen, ran = {}, 0
     for worker = 1, 2 do
         local output = run(dir .. "/host.lua")
-        local claimed, total, passed = output:match("([%w,]*)\n(%d+)\n(%d+)\n$")
-        test(claimed, "worker " .. worker .. " did not finish:\n" .. output)
-        test.eq(passed, total, output)
-        for spec in claimed:gmatch("[^,]+") do
+        local decoded, report = pcall(json.decode, output:match("{.*}") or "")
+        test(decoded and type(report) == "table", "worker " .. worker .. " did not finish:\n" .. output)
+        test.eq(report.passed, report.total, output)
+        for _, spec in ipairs(report.claimed or {}) do
             test.eq(seen[spec], nil, spec .. " was claimed twice")
             seen[spec] = true
         end
-        ran = ran + tonumber(total)
+        ran = ran + report.total
     end
     test.eq(ran, #order, "every piece ran exactly once")
     for index, spec in ipairs(order) do
