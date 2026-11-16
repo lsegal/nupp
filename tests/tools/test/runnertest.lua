@@ -1723,6 +1723,11 @@ dofile(arg[0])
         local piece = io.open(("%s/queue/piece-%d"):format(dir, index), "rb")
         test(piece, "the removal was meant to fail")
         piece:close()
+        -- Created with the mode it was asked for, or the run cannot read its
+        -- own claims back: `open` is variadic, which arm64 macOS passes apart.
+        local taken, why = io.open(("%s/queue/taken-%d"):format(dir, index), "rb")
+        test(taken, "the claim marker cannot be read back: " .. tostring(why))
+        taken:close()
     end
     os.execute("rm -rf " .. string.format("%q", dir))
 end
