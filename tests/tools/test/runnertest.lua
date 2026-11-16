@@ -2628,6 +2628,7 @@ function M.windowsRunnerCommandsKeepBashWhenASuiteReplacesPopen()
     environment = setmetatable(
         {
             package = {config = "\\", loaded = {}},
+            reservedTempNames = {},
             io = {
                 open = io.open,
                 popen = function()
@@ -2680,7 +2681,11 @@ function M.windowsRunnerCommandsKeepBashWhenASuiteReplacesPopen()
     test.eq(read(path), "printf 'piece report'\n")
     test.eq(pipe:read("*a"), "piece report")
     test.eq(pipe:close(), true)
-    test.eq(io.open(path, "rb"), nil, "closing the pipe removes its script")
+    -- The process can outlive the pipe, so its script goes with the reserved
+    -- names at exit.
+    local reserved = environment.reservedTempNames
+    test.eq(reserved[#reserved], path, "the script is reserved for removal at exit")
+    os.remove(path)
 end
 
 -- The runner loads the result cache under its own chunk name. Its
