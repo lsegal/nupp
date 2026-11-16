@@ -130,12 +130,29 @@ function imports.new(environment: any?, enabled: boolean?): any
             env = candidate
         end
         local registry = env.ensureProjectIndex(env)
+
+        -- Checking the file checks every module it reaches, so a file is checked only
+        -- when some path in it could become an import. A path resolving through a
+        -- public module the compiler ships cannot: `builtinAccess` below keeps it as
+        -- written whatever the checker says. The project may declare the same name
+        -- (`own`), which is why the bundled answer is asked first. Without this nearly
+        -- every source was checked, and `nupp fmt --check` over the tree cost a
+        -- whole-tree check per process (#360).
+        local function publicBundled(moduleName: string): boolean
+            local shipped = env.bundled and env.bundled[moduleName]
+
+            return shipped ~= nil
+                and shipped ~= false
+                and env.bundledInternal ~= nil
+                and not env.bundledInternal(moduleName)
+        end
+
         local possible = false
         for _, path in ipairs(candidates) do
             local prefix = path
             while prefix do
                 local shipped = env.bundled and env.bundled[prefix]
-                if registry.declaredModules[prefix] or shipped and shipped.declared then
+                if (registry.declaredModules[prefix] or shipped and shipped.declared) and not publicBundled(prefix) then
                     possible = true
                     break
                 end
@@ -164,12 +181,8 @@ function imports.new(environment: any?, enabled: boolean?): any
             if entry and root.definition and root.definition == entry.definition then
                 return true
             end
-            local shipped = moduleName and env.bundled and env.bundled[moduleName]
 
-            return shipped ~= nil
-                and shipped ~= false
-                and env.bundledInternal ~= nil
-                and not env.bundledInternal(moduleName)
+            return moduleName ~= nil and publicBundled(moduleName)
         end
 
         local uses: {Use} = {}
