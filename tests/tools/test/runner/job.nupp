@@ -25,11 +25,13 @@ export function run(
     -- The parent routes direct shell users through reusable process workers. If a
     -- transitive call escapes that classification, fail the case instead of
     -- turning it into a run that never reports an answer.
+    if os.getenv("NUPP_TEST_ONE_PROCESS") == nil then
     os.execute = function(): nil
         error("nupp: os.execute requires a process worker", 2)
     end
     io.popen = function(): nil
         error("nupp: io.popen requires a process worker", 2)
+    end
     end
 
     local getenv = os.getenv

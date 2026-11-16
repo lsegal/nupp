@@ -3096,6 +3096,9 @@ do
 end
 
 local function suiteLane(suiteInfo)
+    if os.getenv("NUPP_TEST_ONE_PROCESS") then
+        return "shared"
+    end
     if processIsolated(suiteInfo) then
         return "isolated"
     end
