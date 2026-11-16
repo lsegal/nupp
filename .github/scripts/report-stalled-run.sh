@@ -10,7 +10,7 @@
 # failure, it is not one.
 set -uo pipefail
 
-ps -A -o pid,ppid,pgid,stat,etime,command \
+ps -A -ww -o pid,ppid,pgid,stat,etime,command \
     | grep -E 'nupp-test|tests/run|luajit|bin/nupp' | grep -v grep || true
 if command -v sample >/dev/null 2>&1; then
     for pid in $(pgrep -f 'nupp-test|tests/run' || true); do

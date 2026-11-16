@@ -29,7 +29,7 @@ runner=$!
 
 while kill -0 "$runner" 2>/dev/null; do
     if [ "$(date +%s)" -lt "$deadline" ]; then
-        sleep 20
+        sleep 5
         continue
     fi
 
@@ -39,34 +39,35 @@ while kill -0 "$runner" 2>/dev/null; do
 
     # A worker runs under a shell of its own that leads its process group (see
     # `groupedWorker` in tests/run.lua). Those shells are the only ones whose
-    # command names `nupp_reap` at group depth 1; the worker is whichever of
-    # their children is not a copy of the shell itself. Ending the worker lets
-    # its shell write the worker's status, which the runner reads back.
-    workers=$(ps -A -o pid=,ppid=,command= | awk '
+    # command names `nupp_reap` at group depth 1; the worker is their child
+    # that is not a copy of the shell, and the shell's own parent is not one
+    # either -- that rules out the subshell it watches its parent from. Ending
+    # the worker lets its shell write the worker's status, which the runner
+    # reads back.
+    workers=$(ps -A -ww -o pid=,ppid=,command= | awk '
         { pid = $1; parent = $2; $1 = ""; $2 = ""; command[pid] = $0; parentOf[pid] = parent }
         END {
             for (pid in command) {
                 up = parentOf[pid]
                 if (command[up] ~ /NUPP_TEST_GROUP_DEPTH=1 / && command[up] ~ /nupp_reap/ \
-                    && command[pid] !~ /nupp_reap/) {
+                    && command[parentOf[up]] !~ /nupp_reap/ && command[pid] !~ /nupp_reap/) {
                     print pid
                 }
             }
         }')
+    waited=0
     if [ -n "$workers" ]; then
         echo "ending workers: $(echo $workers)"
         kill -TERM $workers 2>/dev/null || true
+        while kill -0 "$runner" 2>/dev/null && [ "$waited" -lt 120 ]; do
+            sleep 5
+            waited=$((waited + 5))
+        done
     else
-        echo "no worker processes found; ending the runner"
+        echo "no worker processes found"
     fi
-
-    waited=0
-    while kill -0 "$runner" 2>/dev/null && [ "$waited" -lt 120 ]; do
-        sleep 5
-        waited=$((waited + 5))
-    done
     if kill -0 "$runner" 2>/dev/null; then
-        echo "::error::the runner did not finish within ${waited}s of its workers ending; ending it"
+        echo "::error::the runner was still going ${waited}s after its deadline; ending it"
         "$here/report-stalled-run.sh"
         kill -TERM "$runner" 2>/dev/null || true
         sleep 10

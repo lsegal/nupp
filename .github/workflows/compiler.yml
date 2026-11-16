@@ -626,7 +626,7 @@ jobs:
         # still says "core dumped". Raising it here is what makes the step
         # below able to ask a crashed worker anything at all.
         #
-        # The deadline sits 15 minutes inside the job's timeout. A job that runs
+        # The deadline sits 10 minutes inside the job's timeout. A job that runs
         # out of time, or is cancelled by hand, skips the steps that would say
         # where a hung run stood; this ends the run first, samples what it left
         # running and ends its workers, so the runner names each one and the
@@ -635,7 +635,7 @@ jobs:
         run: |
           set -euo pipefail
           ulimit -c unlimited || true
-          deadline=$((NUPP_JOB_STARTED + (${{ matrix.timeout }} - 15) * 60))
+          deadline=$((NUPP_JOB_STARTED + (${{ matrix.timeout }} - 10) * 60))
           if [ "$RUNNER_OS" = Linux ]; then
             .github/scripts/suite-deadline.sh "$deadline" -- \
               ./bin/nupp test --scope=all --lane=isolated \
