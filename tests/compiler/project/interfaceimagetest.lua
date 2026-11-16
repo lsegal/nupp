@@ -442,6 +442,67 @@ function M.referencesAnotherFilesIndexedDeclarationByKey()
     end
 end
 
+-- A carried library declaration is described in full, because the writer owns no
+-- file a reader indexes. A reader that declares the key itself uses its own and
+-- leaves it as its own check made it, rather than allocating a copy under that key
+-- for its later check of the library to meet.
+function M.usesTheReadersOwnCarriedDeclaration()
+    local key = "bytes\0" .. "120\0record"
+    local library = T.nominal("Buffer", "record", key)
+    library.fieldOrder = {"size"}
+    library.fieldDefs, library.writeFieldDefs = {}, {}
+    library.staticFieldDefs, library.staticWriteFieldDefs = {}, {}
+    library.byname = {size = T.integer}
+    local image = assert(encode({consumer = semantic("consumer", library)}))
+    local described = false
+    for _, node in ipairs(image.descriptor.types) do
+        if node.nominal and node.declarationKey == key then
+            assert(not node.external, "a carried declaration is not a project-index reference")
+            described = true
+        end
+    end
+    assert(described, "the image describes the carried declaration")
+
+    local own = T.nominal("Buffer", "record", key)
+    own.byname = {length = T.integer}
+    local asked = {}
+    local loaded = assert(
+        interfaceimage.decode(image, {
+            nominals = {},
+            carried = function(wanted)
+                asked[#asked + 1] = wanted
+                if wanted == key then
+                    return own
+                end
+
+                return nil
+            end,
+        })
+    )
+    testAssert.eq(loaded.consumer.exports.types.Value, own, "the reader's own declaration")
+    testAssert.eq(own.byname.size, nil, "the image's members are not written over the reader's")
+    testAssert.eq(own.byname.length, T.integer, "the reader's own members stay")
+    assert(#asked > 0, "the reader was asked for the carried key")
+
+    local decoded, problem = interfaceimage.decode(image, {
+        nominals = {},
+        carried = function(wanted)
+            if wanted == key then
+                return nil, "carried module bytes does not check"
+            end
+            return nil
+        end,
+    })
+    testAssert.eq(decoded, nil, "a reader that cannot produce its own declaration")
+    assert(problem:find("does not check", 1, true), problem)
+
+    -- With no environment to ask, the image's description is all there is.
+    local alone = assert(interfaceimage.decode(image, {nominals = {}}))
+    local copy = alone.consumer.exports.types.Value
+    assert(copy ~= own and copy ~= library, "a reader with no environment allocates the declaration")
+    testAssert.eq(copy.byname.size, T.integer, "from the image's members")
+end
+
 function M.givesEveryNominalItsOwnIdWhateverItsKey()
     local first = T.nominal("Twin", "record", "/project/sample.nupp\0" .. "1\0record")
     local second = T.nominal("Twin", "record", "/project/sample.nupp\0" .. "1\0record")
@@ -676,6 +737,59 @@ function M.failedCompletionBatchesRestoreEnclosingRefreshScope()
     testAssert.eq(outerRefreshes, 1, "nested failure restores the enclosing visited set")
     first.byname.afterFailure = T.boolean
     testAssert.eq(generics.instantiate(first, bindings).byname.afterFailure, T.boolean)
+end
+
+function M.selfContainedCallableInputsSurviveInterfaceImages()
+    local relations = require("nupp.compiler.types.relations")
+    local constrained = T.func({T.selfContained(T.string)}, {T.nil_}, false, {"takes"})
+    local ordinary = T.func({T.string}, {T.nil_}, false, {"takes"})
+    local loaded, image = roundTrip(constrained)
+    testAssert.eq(loaded.params[1], T.selfContained(T.string))
+    assert(not relations.isA(loaded, ordinary), "an imported function cannot forget its input requirement")
+    assert(relations.isA(ordinary, loaded), "an ordinary consumer accepts every self-contained input")
+    local encodedAgain = assert(encode({sample = semantic("sample", loaded)}))
+    testAssert.eq(stable(encodedAgain.descriptor), stable(image.descriptor), "the cache codec preserves the contract")
+    testAssert.eq(stable(encodedAgain.modules), stable(image.modules), "the module roots preserve the contract")
+end
+
+function M.selfContainedGenericAliasesSurviveInterfaceImages()
+    local parameter = T.typevar("Element", "interface-image:self-contained")
+    local alias = T.genericAlias("Independent", T.selfContained(parameter), {parameter}, {T.any}, nil, nil, {"type"})
+    local loaded = roundTrip(alias)
+    testAssert.eq(loaded.body.tag, "selfcontained")
+    local applied = generics.materialize(loaded.body, {[loaded.typeParams[1]] = T.string})
+    testAssert.eq(applied, T.selfContained(T.string), "substitution retains the imported requirement")
+    local reduced, why = generics.reduce(applied, {})
+    testAssert.eq(why, nil)
+    testAssert.eq(reduced, T.selfContained(T.string), "normalization retains the imported requirement")
+    local descriptor = reflection.describe(reduced)
+    testAssert.eq(descriptor.kind, "selfcontained", "reflection retains the qualifier")
+    testAssert.eq(
+        descriptor.types[descriptor.types[descriptor.root].element].kind,
+        "string",
+        "reflection retains its payload"
+    )
+end
+
+function M.selfContainedInputsSurviveNarrowingAndKeepTheirMethodIdentity()
+    local narrowing = require("nupp.compiler.types.narrowing")
+    local optional = T.selfContained(T.optional(T.string))
+    testAssert.eq(T.union({T.selfContained(T.string), T.nil_}), optional, "nullable union contract")
+    local truthy, falsy = narrowing.truthiness(optional)
+    testAssert.eq(truthy, T.selfContained(T.string), "truthy contract")
+    testAssert.eq(falsy, T.selfContained(T.nil_), "falsy contract")
+    testAssert.eq(narrowing.subtract(optional, T.nil_), T.selfContained(T.string), "subtracted contract")
+    local literal = T.literal("kept", T.string)
+    local other = T.literal("removed", T.string)
+    local finite = T.selfContained(T.union({literal, other}))
+    testAssert.eq(narrowing.withoutMember(finite, other), T.selfContained(literal), "removed member contract")
+    local methodslots = require("nupp.compiler.lua.methodslots")
+    local stringInput = T.func({T.selfContained(T.string)}, {T.nil_}, false, {"takes"})
+    local numberInput = T.func({T.selfContained(T.number)}, {T.nil_}, false, {"takes"})
+    assert(
+        methodslots.parameters(stringInput) ~= methodslots.parameters(numberInput),
+        "different self-contained payloads must not share an overload slot"
+    )
 end
 
 return M

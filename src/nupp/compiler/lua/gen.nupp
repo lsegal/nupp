@@ -645,6 +645,21 @@ export function generate(
         return bound, {}, nil, {}
     end
     local out = {}
+    do
+        local function resetLibraryEmission(node: any): nil
+            if not node or cst.isToken(node) then
+                return
+            end
+            if node.kind == "cdefFunc" then
+                node.nativeLibraryEmitted = nil
+            end
+            for _, child in ipairs(node) do
+                resetLibraryEmission(child)
+            end
+        end
+
+        resetLibraryEmission(result.root)
+    end
     local capabilityResolution = capabilities.resolve()
     --[[
     The fixed-width scalar members that lower to inline BitOp rather than to a
@@ -2821,12 +2836,22 @@ export function generate(
 
     -- Publishes cleanup terminals to the registry under their declaration identity.
     -- `after` selects the registrations written: nil for all of them, and true or
-    -- false for the ones marked to follow the statement or to precede it.
+    -- false for the ones marked to follow the statement or to precede it. A
+    -- terminal written through a builtin root reads the root's implementing module,
+    -- as any other read of that root does.
     function pluck.emitRegistrations(list, line, after: boolean?, declarationName: string?)
         for _, registration in ipairs(list or {}) do
             if after == nil or (registration.after and true or false) == after then
                 local cleanup = registration.cleanup
-                e(("%s[%q]=%s;"):format(cleanupRegistry(), cleanup.key, declarationName or cleanup.name), line)
+                local terminal = declarationName or cleanup.name
+                local lowering = registration.lowering
+                if not declarationName and lowering then
+                    terminal = compilerModuleName(lowering.module)
+                    for _, member in ipairs(lowering.members) do
+                        terminal = terminal .. "." .. member
+                    end
+                end
+                e(("%s[%q]=%s;"):format(cleanupRegistry(), cleanup.key, terminal), line)
             end
         end
     end
@@ -5865,11 +5890,27 @@ export function generate(
                 local reinit = x.automaticOwnerReinit
                 local slot = not reinit.field and automaticSlot(reinit) or nil
                 x.automaticOwnerReinit = nil
-                pluck.loweredFunction("(function(__p) ", sourceLine(x), pluck.reasons.reinit)
+                -- A call can stand last in an assignment list, where Lua spreads
+                -- its results over the remaining targets. Pass them through, or
+                -- `owner, count = f()` reinitializes the owner and drops the count.
+                local spreads = kind == "call" or kind == "methodCall"
+                pluck.loweredFunction(
+                    spreads and "(function(__p, ...) " or "(function(__p) ",
+                    sourceLine(x),
+                    pluck.reasons.reinit
+                )
                 if slot then
                     e(slot .. "=__p; ")
                 end
-                e(active .. "=true; return __p end)(")
+                -- An owner moved in, as in `frame = a`, is the target's from here
+                -- on. Clear the source's flag too, or its region closes the value
+                -- the target now holds.
+                local source = ownershipMoveOf(x)
+                local sourceActive = source and activeFlag(source) or nil
+                if sourceActive and sourceActive ~= active then
+                    e(sourceActive .. "=false; ")
+                end
+                e(active .. (spreads and "=true; return __p, ... end)(" or "=true; return __p end)("))
                 emit(x)
                 e(")")
                 x.automaticOwnerReinit = reinit
@@ -6962,6 +7003,10 @@ export function generate(
             return
 
         elseif kind == "cdefFunc" then
+            if x.nativeLibraryProblem and not (x.nativeLibraryName and pluck.hotLibraries[x.nativeLibraryName]) then
+                emitDepth.diag(x.fromLib or x.name, "NUPP2912", x.nativeLibraryProblem)
+                return
+            end
             needsFfi = true
             local name = x.name.text
             -- `emit` already closes over `require` for materialization. Resolve the
@@ -6976,12 +7021,30 @@ export function generate(
             -- symbols come from the default namespace unless a library is named, in
             -- which case they resolve through a cached ffi.load
             local ns = "__nuppFfi.C"
-            if x.fromLib then
+            if not (x.nativeLibraryName and x.resolvedLibrary == "<default>") and (x.fromLib or x.resolvedLibrary) then
                 needsLibs = true
-                local authored = x.fromLib.text:match('^"(.*)"$') or x.fromLib.text:match("^'(.*)'$")
-                local mapped = authored and pluck.hotLibraries[authored] or nil
-                ns = mapped and ("__nuppLib(%q)"):format(mapped) or ("__nuppLib(%s)"):format(x.fromLib.text)
+                local authored = x.nativeLibraryName
+                if authored == nil and x.fromLib then
+                    authored = lexer.stringValue(x.fromLib.text)
+                    if authored == nil then
+                        local literal = loadstring("return " .. x.fromLib.text)
+                        if literal then
+                            local ok, value = pcall(literal)
+                            if ok and type(value) == "string" then
+                                authored = value
+                            end
+                        end
+                    end
+                end
+                local mapped = authored and pluck.hotLibraries[authored]
+                    or x.resolvedLibrary and pluck.hotLibraries[x.resolvedLibrary]
+                    or nil
+                local library = mapped or x.resolvedLibrary
+                local expression = library and ("%q"):format(library) or (x.fromLib as lexer.Token).text
+                local label = x.nativeLibraryName and (", %q"):format(x.nativeLibraryName) or ""
+                ns = ("__nuppLib(%s%s)"):format(expression, label)
             end
+            x.nativeLibraryEmitted = true
             local storage = "const "
             if emitDepth.spill and emitDepth.spill.decls[x] then
                 storage = ""
@@ -10342,8 +10405,24 @@ export function generate(
     if not installingManaged then
         pluck.needRuntimeEffect("runtime.managed")
     end
+    -- `nupp.runtime.managed` publishes a `warn` that loads `debug.log` on its first
+    -- call, so only a module that names the global pays for loading it at startup
+    -- and carries it in its closure. A field or method spelled `warn` is not the
+    -- global; nor is a key or an assignment target. A local that shadows it costs
+    -- one eager load and nothing more.
     if not installingManaged and (result.declaredModuleName or result.moduleName) ~= "debug.log" then
-        pluck.needRuntimeEffect("runtime.warn")
+        local tokens = result.tokens or {}
+        for index, tok in ipairs(tokens) do
+            local previous, following = tokens[index - 1], tokens[index + 1]
+            if tok.kind == "name"
+                and tok.text == "warn"
+                and not (previous and (previous.text == "." or previous.text == ":" or previous.text == "?."))
+                and not (following and following.text == "=")
+            then
+                pluck.needRuntimeEffect("runtime.warn")
+                break
+            end
+        end
     end
     local runtimeEffects = emittedFeatureEffects
     local canSuspend = native.expand(runtimeEffects)["runtime.suspension"] == true
@@ -10502,27 +10581,77 @@ export function generate(
         -- Anything without the `@` is a library name for the platform loader to
         -- find, which is what an ordinary `cdef ... from` means and is left
         -- exactly as it was.
-        code = "const __nuppLibCache = {}; "
-            .. "const __nuppLibRoots = rawget(_G, '__nuppLibraryRoots') or {}; "
-            .. "rawset(_G, '__nuppLibraryRoots', __nuppLibRoots); "
-            .. "const function __nuppLib(n) "
-            .. "local l = __nuppLibCache[n] if not l then "
-            .. "local rel = n:match('^@(.+)$') "
-            .. "if rel then "
-            .. "local here = debug.getinfo(1, 'S').source:match('^@(.*)$') "
-            .. "local dir = here and here:match('^(.*)[/\\\\]') or '.' "
-            .. "local from = dir "
-            .. "for _ = 0, 8 do "
-            .. "local at = dir .. '/' .. rel "
-            .. "local probe = io.open(at, 'rb') "
-            .. "if probe then probe:close() l = __nuppFfi.load(at) break end "
-            .. "dir = dir .. '/..' "
-            .. "end "
-            .. "if not l then error('cannot find ' .. rel .. ' at or above ' .. from"
-            .. " .. '; the compiled library has to travel with the module that calls it', 0) end "
-            .. "else l = __nuppFfi.load(n) end "
-            .. "__nuppLibCache[n] = l __nuppLibRoots[l] = true end return l end; "
-            .. code
+        code = (
+            [==[
+const __nuppLibCache = {};
+const __nuppLibRoots = rawget(_G, '__nuppLibraryRoots') or {};
+rawset(_G, '__nuppLibraryRoots', __nuppLibRoots);
+const function __nuppLib(n, logical)
+    local l = __nuppLibCache[n]
+    if not l then
+        local function failure(path, why)
+            error('cannot load native library ' .. tostring(logical or n) .. ' from ' .. path .. ': ' .. tostring(why), 0)
+        end
+        local function load(path)
+            local preload, previousError
+            if __nuppFfi.os == 'Windows' and path:find('[/\\]') then
+                __nuppFfi.cdef('int __stdcall MultiByteToWideChar(unsigned int, unsigned long, const char *, int, uint16_t *, int); unsigned long __stdcall GetFullPathNameW(const uint16_t *, unsigned long, uint16_t *, uint16_t **); void * __stdcall LoadLibraryExW(const uint16_t *, void *, unsigned long); unsigned long __stdcall GetLastError(void); void __stdcall SetLastError(unsigned long); unsigned long __stdcall FormatMessageA(unsigned long, const void *, unsigned long, unsigned long, char *, unsigned long, void *); int __stdcall FreeLibrary(void *);')
+                local kernel = __nuppFfi.C
+                previousError = kernel.GetLastError()
+                local function windowsWhy()
+                    local number = kernel.GetLastError()
+                    local buffer = __nuppFfi.new('char[?]', 2048)
+                    local length = kernel.FormatMessageA(0x1200, nil, number, 0, buffer, 2048, nil)
+                    return length > 0 and __nuppFfi.string(buffer, length) or ('Windows loader error ' .. tonumber(number))
+                end
+                local length = kernel.MultiByteToWideChar(65001, 8, path, -1, nil, 0)
+                if length == 0 then failure(path, windowsWhy()) end
+                local wide = __nuppFfi.new('uint16_t[?]', length)
+                if kernel.MultiByteToWideChar(65001, 8, path, -1, wide, length) == 0 then failure(path, windowsWhy()) end
+                length = kernel.GetFullPathNameW(wide, 0, nil, nil)
+                if length == 0 then failure(path, windowsWhy()) end
+                local absolute = __nuppFfi.new('uint16_t[?]', length)
+                local written = kernel.GetFullPathNameW(wide, length, absolute, nil)
+                if written == 0 or written >= length then failure(path, windowsWhy()) end
+                preload = kernel.LoadLibraryExW(absolute, nil, 8)
+                if preload == nil then failure(path, windowsWhy()) end
+            end
+            local ok, loaded = pcall(__nuppFfi.load, path)
+            if not ok then
+                if preload ~= nil then
+                    __nuppFfi.C.FreeLibrary(preload)
+                    __nuppFfi.C.SetLastError(previousError)
+                end
+                failure(path, loaded)
+            end
+            if preload ~= nil then
+                __nuppLibRoots[preload] = true
+                __nuppFfi.C.SetLastError(previousError)
+            end
+            return loaded
+        end
+        local rel = n:match('^@(.+)$')
+        if rel then
+            local here = debug.getinfo(1, 'S').source:match('^@(.*)$')
+            local dir = here and here:match('^(.*)[/\\]') or '.'
+            local from = dir
+            for _ = 0, 8 do
+                local at = dir .. '/' .. rel
+                local probe = io.open(at, 'rb')
+                if probe then probe:close() l = load(at) break end
+                dir = dir .. '/..'
+            end
+            if not l then failure(n, 'cannot find ' .. rel .. ' at or above ' .. from .. '; the compiled library has to travel with the module that calls it') end
+        else
+            l = load(n)
+        end
+        __nuppLibCache[n] = l
+        __nuppLibRoots[l] = true
+    end
+    return l
+end;
+]==]
+        ):gsub("[\r\n]+", " ") .. code
     end
     if needsCloneTab then
         -- `next` rather than `pairs`, and a metatable carried across by hand, because a

@@ -226,6 +226,22 @@ renders as escaped text without highlighting.
 Inside a checkout, run `./bin/nupp`. Everywhere else, either put the checkout's
 `bin` on your path, or build a self-contained binary.
 
+On Windows, `bin/nupp` is a shell script that `cmd.exe` and other programs
+cannot start, so `bin/nupp.cmd` runs it under Git Bash. With `bin` on `PATH`,
+a project task whose argv names `nupp` and a program that spawns the checkout's
+launcher by path both reach the checkout. It uses `NUPP_BASH` when set and
+otherwise the `bash.exe` beside the Git on `PATH`, never a bare `bash`, which on
+Windows is the WSL launcher. `bin/nupp` exports `NUPP_BASH` as the Git Bash it
+runs under, so a launcher the compiler starts uses the same one, and the test
+runner uses it when `NUPP_TEST_BASH` is unset. A project that builds targets
+with native facilities needs the checkout rather than the self-contained binary.
+
+Ending a process started through `bin/nupp.cmd` ends `cmd.exe` and leaves the
+`bash.exe` and LuaJIT compiler under it running. A host that kills or times out
+the compiler, such as an editor restarting a language server, either starts the
+built compiler directly or ends the whole process tree, through a job object or
+`taskkill /T`.
+
 ## Self-contained binary
 
 ```bash
