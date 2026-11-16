@@ -343,6 +343,12 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.classify.outputs.integration-matrix) }}
     steps:
+      # The compiler suite's own deadline is counted from here, so it always
+      # lands before `timeout-minutes` however long the steps ahead of it took.
+      - name: Note when the job started
+        shell: bash
+        run: echo "NUPP_JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Check out the repository
         uses: actions/checkout@v5
 
@@ -619,14 +625,24 @@ jobs:
         # the soft limit is zero, so the kernel writes nothing and the shell
         # still says "core dumped". Raising it here is what makes the step
         # below able to ask a crashed worker anything at all.
+        #
+        # The deadline sits 10 minutes inside the job's timeout. A job that runs
+        # out of time, or is cancelled by hand, skips the steps that would say
+        # where a hung run stood; this ends the run first, samples what it left
+        # running and ends its workers, so the runner names each one and the
+        # suite it was in. On macOS this step alone takes close to three hours
+        # when it passes, so a two-hour run is not a stalled one.
         run: |
           set -euo pipefail
           ulimit -c unlimited || true
+          deadline=$((NUPP_JOB_STARTED + (${{ matrix.timeout }} - 10) * 60))
           if [ "$RUNNER_OS" = Linux ]; then
-            ./bin/nupp test --scope=all --lane=isolated \
+            .github/scripts/suite-deadline.sh "$deadline" -- \
+              ./bin/nupp test --scope=all --lane=isolated \
               --exclude-group=external-corpus,measurement,wasm-conformance
           else
-            ./bin/nupp test --scope=all \
+            .github/scripts/suite-deadline.sh "$deadline" -- \
+              ./bin/nupp test --scope=all \
               --exclude-group=external-corpus,measurement,wasm-conformance
           fi
 
@@ -637,23 +653,18 @@ jobs:
       # systemd rather than leaving them in a directory. Only runs when the
       # step above failed, and never fails the job itself: this reports on a
       # failure, it is not one.
-      # A run that stops making progress is cancelled by the job timeout with
-      # nothing said about where it stood: every macOS leg from a7deafd88 on
-      # sat at "shell suites joining" for an hour with one Nupp worker that
-      # had finished its suites and never exited. Steps still run after a
-      # cancellation, so this one lists what the run left running and samples
-      # each test process, which names the call it is blocked in.
+      # A run that stops making progress used to be ended by the job timeout
+      # with nothing said about where it stood: every macOS leg from a7deafd88
+      # on sat at "shell suites joining" for an hour with one Nupp worker that
+      # had finished its suites and never exited. The suite step's deadline now
+      # reports that itself; this lists whatever a failed run left running and
+      # samples each test process, which names the call it is blocked in. A
+      # force-cancelled job skips it, as it skips every remaining step.
       - name: Report a stalled run
         if: (failure() || cancelled()) && runner.os == 'macOS'
         continue-on-error: true
         shell: bash
-        run: |
-          ps -axo pid,ppid,pgid,stat,etime,command \
-            | grep -E 'nupp-test|tests/run|luajit|bin/nupp' | grep -v grep || true
-          for pid in $(pgrep -f 'nupp-test|tests/run' || true); do
-            echo "=== sample $pid"
-            sample "$pid" 2 -file /dev/stdout 2>/dev/null | head -60 || true
-          done
+        run: .github/scripts/report-stalled-run.sh
 
       - name: Report a crashed worker
         if: failure() && runner.os == 'Linux'
