@@ -231,7 +231,9 @@ function M.laterEnvironmentsShareTheCheckedPrelude()
     table.sort(differing)
     test.eq(table.concat(differing, " "), "", "every global type is the same object")
     test.eq(second.stringLib, first.stringLib, "and so is the string library")
-    test.eq(second.preludeStamp, first.preludeStamp, "beside the same stored prelude, if there is one")
+    -- The interface stores stay with an environment that read the stored
+    -- prelude itself; one that takes a shared prelude checks modules from source.
+    test.eq(second.preludeStamp, nil, "without the stored prelude's stamp")
 
     assert(second.globals ~= first.globals, "each environment owns its globals")
     assert(second.globals.string ~= first.globals.string, "and their entries")
