@@ -611,6 +611,11 @@ jobs:
           set -euo pipefail
           ulimit -c unlimited || true
           deadline=$(($(date +%s) + NUPP_SUITE_SECONDS))
+          # The runner stops itself 30 seconds before the halt, says which
+          # suites finished, how long each took and which were still running,
+          # and records their timings (#351).
+          NUPP_TEST_DEADLINE=$((deadline - 30))
+          export NUPP_TEST_DEADLINE
           .github/scripts/suite-deadline.sh "$deadline" -- \
             ./bin/nupp test --scope=all \
             --exclude-group=external-corpus,measurement,wasm-conformance
@@ -686,6 +691,11 @@ jobs:
           NUPP_TEST_SH=$(cygpath -w "$sh_path")
           export NUPP_TEST_BASH NUPP_TEST_SH
           deadline=$(($(date +%s) + NUPP_SUITE_SECONDS))
+          # The runner stops itself 30 seconds before the halt, says which
+          # suites finished, how long each took and which were still running,
+          # and records their timings (#351).
+          NUPP_TEST_DEADLINE=$((deadline - 30))
+          export NUPP_TEST_DEADLINE
           .github/scripts/suite-deadline.sh "$deadline" -- \
             ./bin/nupp test --scope=all \
             --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
