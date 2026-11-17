@@ -65,6 +65,19 @@ local function errorsOf(src)
     return codes, diags
 end
 
+-- Whether `code` is among `diags`. A fixture can draw a second report on the
+-- same name -- `reflect` also names project modules in this repository -- and
+-- reports at one position are ordered by code, not by which one matters here.
+local function reports(diags, code)
+    for _, diag in ipairs(diags) do
+        if (diag.code or diag) == code then
+            return true
+        end
+    end
+
+    return false
+end
+
 -- Compiles, loads and runs, so that what is asserted is the program's behaviour rather
 -- than the shape of the text that produced it.
 local function run(src, ...)
@@ -646,7 +659,7 @@ function M.compilerTypeIntrinsicsRequireTheTypesNamespace()
     for _, name in ipairs({"reflect", "sizeof", "alignof", "offsetof"}) do
         local argument = name == "offsetof" and 'int32, "value"' or "int32"
         local codes = errorsOf(("return comptime do return %s(%s) end"):format(name, argument))
-        testAssert.eq(codes[1], "NUPP2410", name .. " is not a bare comptime global")
+        assert(reports(codes, "NUPP2410"), name .. " is not a bare comptime global: " .. table.concat(codes, ", "))
     end
 end
 
@@ -699,7 +712,7 @@ return comptime do return types.offsetof(Value, name) end
         layoutEnv("x86_64-unknown-linux-gnu"),
         {strict = false}
     )
-    testAssert.eq(dynamic[1].code, "NUPP2410", "runtime locals remain unavailable")
+    assert(reports(dynamic, "NUPP2410"), "runtime locals remain unavailable")
 end
 
 function M.evaluatesAnArithmeticBlock()
