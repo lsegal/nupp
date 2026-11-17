@@ -1608,7 +1608,17 @@ local function buildModules(root: string, outDir: string, config: Config, target
     --
     -- A carried module takes no part in const specialization: it can serve no body
     -- a new caller asks for, and every body it calls was planned with it.
+    local compilerGeneration: any = nil
+    local function loadedGeneration(): any
+        if compilerGeneration == nil then
+            local bundled = require("nupp.compiler.bundled")
+            compilerGeneration = cache.loadState(join(bundled.moduleDir(), "../../.nupp-state.json"))
+        end
+
+        return compilerGeneration
+    end
     local carriesOwnSources: boolean? = nil
+    local ownSourceText: {[string]: string} = {}
     local function carriesOwnSource(name: string, path: string): boolean
         if carriesOwnSources == nil then
             local bundled = require("nupp.compiler.bundled")
@@ -1618,8 +1628,17 @@ local function buildModules(root: string, outDir: string, config: Config, target
                 and not config._coverage
                 and fs.absolute(join(root, outDir)) ~= fs.absolute(join(bundled.moduleDir(), "../.."))
         end
+        if not carriesOwnSources then
+            return false
+        end
+        local text = inc.fileText(path)
+        local record = loadedGeneration().modules[name]
+        if text == nil or type(record) ~= "table" or record.sourceHash ~= contentDigest(text as string) then
+            return false
+        end
+        ownSourceText[name] = text as string
 
-        return carriesOwnSources == true and inc.fileText(path) == currentCarriedSource(name)
+        return true
     end
     -- Carried once the build can carry, ahead of the modules it compiles.
     local carriedSeeds: {[string]: string} = {}
@@ -1980,7 +1999,6 @@ local function buildModules(root: string, outDir: string, config: Config, target
     local addingCarriedRuntime: {[string]: boolean} = {}
     local carriedRuntime: {[string]: boolean} = {}
     local runtimeSourceRoot = join(root, join(outDir, "cache/runtime-source"))
-    local compilerGeneration: any = nil
     local function addCarriedRuntime(name: string): boolean
         if browserTarget then
             return false
@@ -2004,12 +2022,9 @@ local function buildModules(root: string, outDir: string, config: Config, target
         end
         local bundled = require("nupp.compiler.bundled")
         local modulePath = name:gsub("%.", "/") .. ".lua"
-        if compilerGeneration == nil then
-            compilerGeneration = cache.loadState(join(bundled.moduleDir(), "../../.nupp-state.json"))
-        end
         local text = modules.currentCarriedArtifact(
-            compilerGeneration.modules[name],
-            currentCarriedSource(name),
+            loadedGeneration().modules[name],
+            ownSourceText[name] or currentCarriedSource(name),
             readFile(join(bundled.moduleDir(), "../../" .. modulePath)),
             contentDigest
         )
