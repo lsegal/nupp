@@ -2758,24 +2758,11 @@ local function planWork(list, shards, timings)
     -- not packed last behind everything.
     local average = counted > 0 and known / counted or 1
 
-    -- What `tests/groups.lua` says a heavy suite costs when this run has no
-    -- measurement of it. A run with no timings file packed every suite at the
-    -- same guess, so the order was alphabetical and nothing was sliced: on a
-    -- macOS runner `aotclitest` alone was a two-hour piece in one lane, and
-    -- `benchprojectstest`, the one case of over an hour, started whenever a lane
-    -- happened to come free (#355). An estimate never stands in for a
-    -- measurement, and it is left out of the average an unmeasured suite gets.
-    local estimates = repositoryPolicy and repositoryPolicy.estimates or {}
-
     local planned = 0
     local costs = {}
     for _, suite in ipairs(list) do
-        local estimate = estimates[suite.name]
-        if tonumber(timings[suite.name]) or type(estimate) ~= "table" or not tonumber(estimate.seconds) then
-            estimate = nil
-        end
-        local cost = tonumber(timings[suite.name]) or (estimate and estimate.seconds * 1000) or average
-        costs[#costs + 1] = {name = suite.name, cost = cost, estimate = estimate}
+        local cost = tonumber(timings[suite.name]) or average
+        costs[#costs + 1] = {name = suite.name, cost = cost}
         planned = planned + cost
     end
 
@@ -2807,10 +2794,6 @@ local function planWork(list, shards, timings)
             pieces = math.ceil(item.cost / target)
             if #names > 0 then
                 pieces = math.min(pieces, #names)
-            elseif item.estimate then
-                -- With no cases measured, the estimate says how far the suite's
-                -- weight spreads: one long case does not, many short ones do.
-                pieces = math.min(pieces, item.estimate.slices or 1)
             end
         end
         local info = byName[item.name]
