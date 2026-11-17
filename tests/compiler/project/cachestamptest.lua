@@ -1136,4 +1136,109 @@ function M.storedProjectInterfacesAreSharedByEverySpellingOfTheRoot()
     assert(after == kept, "the other spelling of the root (" .. other .. ") kept its own interfaces again")
 end
 
+-- A compiler laid out as a checkout's built tree, `<root>/build/nupp/...`, with the
+-- completed build's stamp beside it, and the run's variables pointed wherever the
+-- case says. Each call loads the module afresh, as each command of a run does.
+local function runFixture()
+    local dir = tempProject({
+        ["build/nupp/compiler/project/fingerprint.lua"] = compiledFingerprintSource(),
+        ["build/nupp/compiler/one.lua"] = "return 1\n",
+        ["build/nupp/tools/two.lua"] = "return 2\n",
+        ["build/.nupp-complete"] = "first\n",
+    })
+    local fixture = {dir = dir, answers = dir .. "/answers"}
+
+    function fixture.load(env)
+        local getenv = os.getenv
+        local prior = package.loaded["nupp.compiler.project.fingerprint"]
+        os.getenv = function(name)
+            if env[name] ~= nil then
+                return env[name] or nil
+            end
+            return getenv(name)
+        end
+        local ok, result = pcall(function()
+            local isolated = dofile(dir .. "/build/nupp/compiler/project/fingerprint.lua")
+            return {
+                isolated = isolated,
+                tool = isolated.toolFingerprint(),
+                subsystem = isolated.subsystemFingerprint({"nupp.compiler.one"}),
+            }
+        end)
+        os.getenv = getenv
+        package.loaded["nupp.compiler.project.fingerprint"] = prior
+        assert(ok, result)
+
+        return result
+    end
+
+    function fixture.inRun(root)
+        return {NUPP_LAUNCHER_RUN_ROOT = root or dir, NUPP_TOOLCHAIN_ANSWERS = fixture.answers}
+    end
+
+    function fixture.edit(path, text)
+        editFixture(dir, path, text)
+    end
+
+    return fixture
+end
+
+-- Every command of a test run used to hash the run's compiler again, a few tenths
+-- of a second of each fresh project's build. The launcher promises the tree does not
+-- change while the run lasts, so a later command reuses what the first worked out --
+-- until the build stamp says the compiler is another one.
+function M.aTestRunKeepsItsCompilersFingerprintsForTheCommandsAfterTheFirst()
+    local fixture = runFixture()
+    local run = fixture.inRun()
+    local first = fixture.load(run)
+    fixture.edit("build/nupp/tools/two.lua", "return 22\n")
+    fixture.edit("build/nupp/compiler/one.lua", "return 11\n")
+    local later = fixture.load(run)
+    local outside = fixture.load({NUPP_LAUNCHER_RUN_ROOT = false, NUPP_TOOLCHAIN_ANSWERS = false})
+    fixture.edit("build/.nupp-complete", "second\n")
+    local rebuilt = fixture.load(run)
+    os.execute("rm -rf '" .. fixture.dir .. "'")
+
+    assert(later.tool == first.tool, "a later command of the run hashed the compiler again")
+    assert(later.subsystem == first.subsystem, "a later command of the run read the module graph again")
+    assert(outside.tool ~= first.tool, "outside a run the compiler's fingerprint was not computed")
+    assert(outside.subsystem ~= first.subsystem, "outside a run a subsystem's fingerprint was not computed")
+    assert(rebuilt.tool == outside.tool, "a rebuilt compiler was answered from the one before it")
+    assert(rebuilt.subsystem == outside.subsystem, "a rebuilt compiler's subsystem came from the one before")
+end
+
+-- A build of the run's own tree is about to replace what the kept answers
+-- describe, so it drops them, even when the stamp it writes ends up the same.
+function M.buildingTheRunsTreeForgetsItsKeptFingerprints()
+    local fixture = runFixture()
+    local run = fixture.inRun()
+    local first = fixture.load(run)
+    fixture.edit("build/nupp/compiler/one.lua", "return 11\n")
+    local getenv = os.getenv
+    os.getenv = function(name)
+        return run[name] or getenv(name)
+    end
+    local ok, err = pcall(first.isolated.forgetRunFingerprints, fixture.dir .. "/build")
+    os.getenv = getenv
+    assert(ok, err)
+    local after = fixture.load(run)
+    os.execute("rm -rf '" .. fixture.dir .. "'")
+
+    assert(after.subsystem ~= first.subsystem, "the run's tree was rebuilt and its old answers were believed")
+end
+
+-- Only the run's compiler is promised not to change. A compiler some test builds
+-- elsewhere during the run, or one whose build is not finished, keeps nothing.
+function M.onlyTheRunsFinishedCompilerKeepsFingerprints()
+    local fixture = runFixture()
+    local other = fixture.load(fixture.inRun(fixture.dir .. "/elsewhere"))
+    os.remove(fixture.dir .. "/build/.nupp-complete")
+    local building = fixture.load(fixture.inRun())
+    local kept = os.rename(fixture.answers, fixture.answers)
+    os.execute("rm -rf '" .. fixture.dir .. "'")
+
+    assert(other.tool and building.tool, "the fingerprints were not computed")
+    assert(not kept, "a compiler that is not the run's finished one kept fingerprints for the run")
+end
+
 return M
