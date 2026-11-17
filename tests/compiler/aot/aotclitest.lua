@@ -2840,6 +2840,12 @@ function M.scatterProvesAConstantNonWrappingProgression()
         "--triple aarch64-apple-darwin --features neon --emit llvm indexed.nupp"
     )
     test.eq(reverseStatus, 0, reverseOut)
+end
+
+-- Apart from the progressions it proves, so the five compiles are two cases
+-- rather than one piece of work a worker holds for a minute (#382).
+function M.scatterRefusesAProgressionThatRepeatsOrWraps()
+    local source = INDEXED_SIMD:gsub("scatterunchecked%(output, indices", "scatter(output, positions:iota(1, 2)")
     for _, progression in ipairs({"1, 0", "4294967295, 1", "1, 4294967295"}) do
         local rejected = source:gsub("positions:iota%(1, 2%)", "positions:iota(" .. progression .. ")")
         local failed = project{["indexed.nupp"] = rejected}
@@ -3421,7 +3427,7 @@ end
 -- A vector in an entry's signature makes it native-only: admitted, reported as
 -- such, lowered as a vector-typed function, and given a stub where its wrapper
 -- would have been. A species, which has no run-time value, still cannot be
--- answered.
+-- answered (`aSpeciesCannotCrossAnEntryResult`).
 function M.vectorSignaturesAreNativeOnlyEntries()
     local source = [[
 local array = table.Array
@@ -3445,10 +3451,12 @@ return {ones = ones, twice = twice}
     test.eq(code, 0, out)
     assert(out:find("ones, kernel, explicit simd, native-only", 1, true), out)
     assert(out:find("twice, kernel, explicit simd, native-only", 1, true), out)
-    local llvm = run(dir, "--triple aarch64-apple-darwin --features neon --emit llvm vectors.nupp")
+    -- The LLVM IR and the binding out of one report rather than one compile each.
+    local decoded, raw, loweredCode = lowered(dir, "--triple aarch64-apple-darwin --features neon --json vectors.nupp")
+    test.eq(loweredCode, 0, raw)
+    local llvm, binding = decoded.llvm, decoded.binding
     assert(llvm:find("\ndefine hidden <4 x float> @ks_twice__neon%(<4 x float> %%p_value%)"), llvm)
     assert(llvm:find("\ndefine hidden <4 x float> @ks_ones__neon%(%)"), llvm)
-    local binding = run(dir, "--triple aarch64-apple-darwin --features neon --emit binding vectors.nupp")
     assert(not binding:find("cdef function ks_twice", 1, true), "no foreign declaration: " .. binding)
     assert(
         binding:find("local function twice(value: Vector<float, Preferred>): Vector<float, Preferred>", 1, true),
@@ -3456,7 +3464,10 @@ return {ones = ones, twice = twice}
     )
     assert(binding:find("twice is a native-only AOT entry", 1, true), binding)
     assert(not binding:find("entries[twice] = true", 1, true), "not a compiled Lua entry: " .. binding)
+end
 
+-- Its own case, so the compile it costs is not added to the one above (#382).
+function M.aSpeciesCannotCrossAnEntryResult()
     local species = project{
         [
             "species.nupp"
@@ -5321,13 +5332,9 @@ return {rearrange = rearrange, preferred = preferred}
     assert(asm:match("kernel: [^\n]* [1-9]%d* vector"), asm)
 end
 
-function M.transposeRejectsNonSquareMixedAndPreferredRows()
-    for _, case in ipairs({
-        {shape = ", 4", value = "s:splat(2.0)", reason = "square tile"},
-        {shape = "", value = "s:splat(2.0)", reason = "fixed-width rows"},
-        {shape = ", 2", value = "3.0", reason = "SIMD vector rows"},
-        {shape = ", 2", value = "other:splat(2)", reason = "same vector type"},
-    }) do
+-- Each refusal is a compile of its own, so the four are two cases (#382).
+local function transposeRefuses(cases)
+    for _, case in ipairs(cases) do
         local source = (
             [[
 local array = table.Array
@@ -5346,6 +5353,20 @@ return {bad = bad}
         local out, code = run(dir, "--json badtranspose.nupp")
         assert(code ~= 0 and out:find(case.reason, 1, true), out)
     end
+end
+
+function M.transposeRejectsNonSquareAndPreferredRows()
+    transposeRefuses({
+        {shape = ", 4", value = "s:splat(2.0)", reason = "square tile"},
+        {shape = "", value = "s:splat(2.0)", reason = "fixed-width rows"},
+    })
+end
+
+function M.transposeRejectsScalarAndMixedRows()
+    transposeRefuses({
+        {shape = ", 2", value = "3.0", reason = "SIMD vector rows"},
+        {shape = ", 2", value = "other:splat(2)", reason = "same vector type"},
+    })
 end
 
 local CONDITIONAL_SCAN = [[
