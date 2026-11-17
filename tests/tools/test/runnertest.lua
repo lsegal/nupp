@@ -1216,6 +1216,39 @@ return M
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- A worker's records cross a message that refuses a repeated table, so one case
+-- handing the same evidence to two capabilities used to lose every result its
+-- worker held: Linux CI reported 207 suites as unrun from two such workers (#375).
+function M.sharedCapabilityEvidenceCrossesTheWorkerMessage()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+    write(
+        dir .. "/tests/sharedevidencetest.lua",
+        [[
+local test = require("assert")
+local M = {}
+function M.sharesEvidence()
+    local evidence = {tier = "scalar", flags = {"a", "b"}}
+    test.suite.requirecapability("compiler.first", true, evidence)
+    test.suite.requirecapability("cpu.second", true, evidence)
+end
+function M.passes() end
+return M
+]]
+    )
+    local command = (
+        "cd %q && %sNUPP_TEST_BUILD=%q %q sharedevidencetest --jobs=2 --timings=0 --no-color 2>&1"
+    ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+    local output, invocation = capturedRun(command)
+    test.eq(invocation.status, 0, "shared evidence crossed the worker message" .. evidence(invocation))
+    test.matches(output, "Nupp worker")
+    test.matches(output, "2 tests, 2 passed")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 -- A run with no `--jobs` starts one Nupp worker per processor and no more
 -- (#351). The machine here is made to report two, so nine suites share two
 -- workers. Windows asks the processor count of a shell the shim does not reach.
