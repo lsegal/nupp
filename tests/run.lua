@@ -271,6 +271,24 @@ local function markRunning(name)
         file:close()
     end
 end
+
+-- Beside the running files, each state also logs every suite it starts and
+-- finishes as it goes. A worker's report only crosses over when the worker is
+-- done, so this log is what a run stopped at its deadline (`NUPP_TEST_DEADLINE`)
+-- can still say about the suites that finished, the ones still running and how
+-- long each took. Kept out of the running directory, whose every file the
+-- launching command reads as a suite that never finished.
+local finishedDir = runningDir and runningDir ~= "" and (runningDir .. "-log") or nil
+local function logSuite(...)
+    if not finishedDir then
+        return
+    end
+    local file = io.open(finishedDir .. "/" .. processSalt, "ab")
+    if file then
+        file:write(table.concat({...}, "\t"), "\n")
+        file:close()
+    end
+end
 local shardSalt = ((os.getenv("NUPP_CACHE_DIR") or ""):match("shard%-(%d+)") or "0") .. "-" .. processSalt
 local handedOut = 0
 local reservedTempNames = {}
@@ -3095,6 +3113,95 @@ then
         -- to close. Out here rather than in `fanOut` because it is read after it.
         local marked = false
 
+        -- A run asked to stop by a time (`NUPP_TEST_DEADLINE`, a Unix time) ends
+        -- itself there and says what it got through: the suites that finished and
+        -- what each took, the ones still running, and how many never started. The
+        -- finished suites' times are recorded like a complete run's, so the next
+        -- run packs from them. The workers are threads of this process, so
+        -- nothing outside it can end them one by one and leave it to report.
+        local deadline = tonumber(os.getenv("NUPP_TEST_DEADLINE") or "")
+        if finishedDir then
+            os.execute("rm -rf '" .. finishedDir .. "' && mkdir -p '" .. finishedDir .. "'")
+        end
+
+        local function stopAtDeadline(restoreOutput)
+            local finished, running, failed = {}, {}, 0
+            local listing = finishedDir and io.popen("ls '" .. finishedDir .. "' 2>/dev/null")
+            local names = listing and listing:read("*a") or ""
+            if listing then
+                listing:close()
+            end
+            for name in names:gmatch("[^\r\n]+") do
+                local file = io.open(finishedDir .. "/" .. name, "rb")
+                for line in (file and file:read("*a") or ""):gmatch("[^\r\n]+") do
+                    local fields = {}
+                    for field in (line .. "\t"):gmatch("([^\t]*)\t") do
+                        fields[#fields + 1] = field
+                    end
+                    if fields[1] == "start" then
+                        running[fields[2]] = tonumber(fields[3]) or os.time()
+                    elseif fields[1] == "done" then
+                        running[fields[2]] = nil
+                        finished[#finished + 1] = {
+                            suite = fields[2],
+                            casesMs = tonumber(fields[3]) or 0,
+                            hooksMs = tonumber(fields[4]) or 0,
+                            loadMs = tonumber(fields[5]) or 0,
+                        }
+                        failed = failed + (tonumber(fields[6]) or 0)
+                    end
+                end
+                if file then
+                    file:close()
+                end
+            end
+            local seen = {}
+            for _, record in ipairs(finished) do
+                seen[record.suite] = true
+            end
+            for name in pairs(running) do
+                seen[name] = true
+            end
+            local unstarted = 0
+            for _, info in ipairs(suites) do
+                unstarted = unstarted + (seen[info.name] and 0 or 1)
+            end
+            local function cost(record)
+                return record.casesMs + record.hooksMs + record.loadMs
+            end
+            table.sort(finished, function(a, b)
+                return cost(a) > cost(b)
+            end)
+            local work = 0
+            for _, record in ipairs(finished) do
+                work = work + cost(record)
+            end
+            local still = {}
+            for name, since in pairs(running) do
+                still[#still + 1] = {name = name, seconds = os.time() - since}
+            end
+            table.sort(still, function(a, b)
+                return a.seconds > b.seconds
+            end)
+            local out = {
+                (
+                    "\nDeadline: stopped after %.1fs; %d suites finished (%.1fs of suite work, %d failed tests), %d running, %d never started\n"
+                ):format((now() - started) / 1000, #finished, work / 1000, failed, #still, unstarted),
+            }
+            for _, entry in ipairs(still) do
+                out[#out + 1] = ("  running  %-40s %6ds\n"):format(entry.name, entry.seconds)
+            end
+            for _, record in ipairs(finished) do
+                out[#out + 1] = ("  finished %-40s %7.1fs\n"):format(record.suite, cost(record) / 1000)
+            end
+            restoreOutput()
+            progressWrite("\n")
+            io.stdout:write(table.concat(out))
+            io.stdout:flush()
+            rememberTimings(finished, {})
+            os.exit(1)
+        end
+
         local function beginPhase(text)
             if marked then
                 progressWrite("\n")
@@ -3225,6 +3332,9 @@ then
                 local function collect()
                     local completed, reports = pcall(function()
                         while not tend() do
+                            if deadline and os.time() >= deadline then
+                                stopAtDeadline(restoreOutput)
+                            end
                             pauseBriefly()
                         end
                         local reports = {}
@@ -3641,7 +3751,24 @@ end
 
 local function runSuite(suiteInfo, slices)
     markRunning(suiteInfo.name)
+    logSuite("start", suiteInfo.name, os.time())
+    local before, firstResult = #suiteRecords, #results + 1
     local ok, problem = pcall(executeSuite, suiteInfo, slices)
+    local record = suiteRecords[#suiteRecords]
+    if #suiteRecords > before and record then
+        local failed = 0
+        for index = firstResult, #results do
+            failed = failed + (results[index].status == "failed" and 1 or 0)
+        end
+        logSuite(
+            "done",
+            suiteInfo.name,
+            tonumber(record.casesMs) or 0,
+            tonumber(record.hooksMs) or 0,
+            tonumber(record.loadMs) or 0,
+            failed
+        )
+    end
     markRunning(nil)
     if not ok then
         error(problem, 0)
