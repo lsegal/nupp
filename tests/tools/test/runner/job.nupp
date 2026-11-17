@@ -34,12 +34,14 @@ export function run(
     -- somewhere else.
 
     local getenv = os.getenv
+    -- Where the commands a case starts keep their stores: the process
+    -- environment's, which tests/run.lua names for the run. This state's own
+    -- compiler keeps the lane's.
+    local commands = getenv("NUPP_CACHE_DIR")
+    rawset(_G, "__NUPP_TEST_COMMAND_CACHE", commands ~= "" and commands or nil)
     os.getenv = function(name)
         if name == "NUPP_CACHE_DIR" then
-            -- The run's one store when the run named it, which is what every
-            -- command a case starts inherits; this lane's only otherwise.
-            local named = getenv(name)
-            return named ~= nil and named ~= "" and named or cacheDir
+            return cacheDir
         elseif name == "NUPP_COMPTIME_WORKER_CHILD" then
             -- This Lua state is already isolated on a Nupp worker lane. A
             -- second long-lived compiler subprocess adds no isolation and can
