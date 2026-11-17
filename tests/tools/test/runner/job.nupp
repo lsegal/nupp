@@ -36,7 +36,10 @@ export function run(
     local getenv = os.getenv
     os.getenv = function(name)
         if name == "NUPP_CACHE_DIR" then
-            return cacheDir
+            -- The run's one store when the run named it, which is what every
+            -- command a case starts inherits; this lane's only otherwise.
+            local named = getenv(name)
+            return named ~= nil and named ~= "" and named or cacheDir
         elseif name == "NUPP_COMPTIME_WORKER_CHILD" then
             -- This Lua state is already isolated on a Nupp worker lane. A
             -- second long-lived compiler subprocess adds no isolation and can

@@ -2517,6 +2517,31 @@ local timingsPath = buildRoot .. "/.nupp-test-times.json"
 --- is a miss rather than a wrong answer.
 local shardCacheRoot = buildRoot .. "/.nupp-test-cache"
 
+-- One store for every compiler a run starts. The compiler-wide stores -- the
+-- prelude, the standard-library interfaces, headers -- are keyed by what they
+-- were computed from, so they are the same answer for every temporary project a
+-- case builds; each project's own results stay in its build directory. When
+-- each lane was a process, the lane's store was in its environment and every
+-- command a case started inherited it. The lanes are threads of this process
+-- now, and a command started from one had no store but its project's, so each
+-- temporary project checked `simd` and the rest of the standard library from
+-- source again: five seconds a command (#351). Named in the process
+-- environment before any worker starts, so the workers and everything they
+-- start agree on it.
+if not embedded and (os.getenv("NUPP_CACHE_DIR") or "") == "" then
+    -- Absolute, because every command a case starts runs in a directory of its own.
+    local shared = require("nupp.compiler.fs").absolute(shardCacheRoot .. "/commands")
+    os.execute("mkdir -p '" .. shared .. "'")
+    local ffi = require("ffi")
+    if ffi.os == "Windows" then
+        pcall(ffi.cdef, "int _putenv_s(const char *, const char *);")
+        ffi.C._putenv_s("NUPP_CACHE_DIR", shared)
+    else
+        pcall(ffi.cdef, "int setenv(const char *, const char *, int);")
+        ffi.C.setenv("NUPP_CACHE_DIR", shared, 1)
+    end
+end
+
 local recordedOnce = nil
 
 local function recorded()
