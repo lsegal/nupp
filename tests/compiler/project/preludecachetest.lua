@@ -256,6 +256,28 @@ function M.laterEnvironmentsShareTheCheckedPrelude()
     os.execute("rm -rf '" .. dir .. "'")
 end
 
+-- A type variable is interned, so checking a prelude anywhere in the process binds
+-- the shared prelude's `self` to that check's own nominal. An environment taking
+-- the shared prelude puts back what it had: otherwise a `@debug(skip = true)`
+-- field read as one with no binding, depending on which suite ran first.
+function M.aSharedPreludeKeepsItsOwnSelfBindings()
+    local dir = project()
+    local first = envMod.new(dir)
+    local nominal = nil
+    for _, t in pairs(first.globalTypes) do
+        if type(t) == "table" and t.tag == "nominal" and t.selfType ~= nil then
+            nominal = t
+            break
+        end
+    end
+    assert(nominal, "the prelude declares a nominal with a self binder")
+    local before = nominal.selfType.bound
+    envMod.new(dir, {sharedPrelude = false})
+    envMod.new(dir)
+    assert(nominal.selfType.bound == before, "the shared prelude's self binder is bound as it was")
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
 -- A stored prelude is true only of the type identity it was written from.
 --
 -- An arena key spells a type by its parts' ids, and a nominal's id is a number
