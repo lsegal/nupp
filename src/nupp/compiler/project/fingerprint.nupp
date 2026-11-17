@@ -92,6 +92,89 @@ local function bundled(): boolean
     return (source:match("[^/\\]*$") or "") ~= "fingerprint.lua"
 end
 
+--- The directory one test run keeps this compiler's fingerprints in, or nil.
+---
+--- Every command a suite runs starts a compiler that hashes its own tree again,
+--- which is a few tenths of a second of a fresh project's build, and a run issues
+--- thousands of them. The launcher already promises that the run's compiler
+--- (`NUPP_LAUNCHER_RUN_ROOT`) does not change while the run lasts, so the run's
+--- `NUPP_TOOLCHAIN_ANSWERS` directory keeps each answer for the commands after it.
+---
+--- Only the run's own compiler, and only while its build is complete: a compiler
+--- built somewhere else in the run, or one being rebuilt, computes its own as
+--- before. Answers are named by the completed build's stamp, so a rebuild that
+--- changes the compiler names new ones, and `forgetRunFingerprints` drops the old
+--- ones when the run's tree is rebuilt at all.
+local runDirectoryMemo: any = nil
+
+local function sameDirectory(left: string, right: string): boolean
+    left, right = fs.canonical(left), fs.canonical(right)
+    if package.config:sub(1, 1) == "\\" then
+        return left:lower() == right:lower()
+    end
+
+    return left == right
+end
+
+local function runDirectory(): string?
+    if runDirectoryMemo == nil then
+        runDirectoryMemo = false
+        local answers = os.getenv("NUPP_TOOLCHAIN_ANSWERS")
+        local runRoot = os.getenv("NUPP_LAUNCHER_RUN_ROOT")
+        if answers and answers ~= "" and runRoot and runRoot ~= "" and not bundled() then
+            -- `<root>/build/nupp/compiler`, and the build's stamp is in `build`.
+            local built = dirname(dirname(compilerDir()))
+            local root = dirname(built)
+            local stamp = readFile(join(built, ".nupp-complete"))
+            if stamp and stamp ~= "" and sameDirectory(root, runRoot as string) then
+                local key = fingerprint.contentDigest()(fs.canonical(root) .. "\0" .. stamp)
+                runDirectoryMemo = join(join(answers as string, "fingerprints"), key)
+            end
+        end
+    end
+
+    return runDirectoryMemo or nil
+end
+
+--- `compute()`, kept for the rest of the run under `name` when the running
+--- compiler is the run's (see `runDirectory`), and computed every time otherwise.
+function fingerprint.runRemembered(name: string, compute: function(): string): string
+    local directory = runDirectory()
+    if directory == nil then
+        return compute()
+    end
+    local place = join(directory as string, fingerprint.contentDigest()(name))
+    local kept = readFile(place)
+    if kept and kept ~= "" then
+        return kept as string
+    end
+    local answer = compute()
+    -- Best effort: a run that cannot keep one computes it again next time.
+    fs.writeFile(place, answer)
+
+    return answer
+end
+
+--- Drops the run's kept fingerprints when `buildDir` is the run's compiler tree,
+--- because a build of it is about to rewrite what they describe. This process
+--- stops keeping any as well: it may be the build, and its next answers describe
+--- a tree that is being replaced.
+function fingerprint.forgetRunFingerprints(buildDir: string): nil
+    local answers = os.getenv("NUPP_TOOLCHAIN_ANSWERS")
+    local runRoot = os.getenv("NUPP_LAUNCHER_RUN_ROOT")
+    if not answers or answers == "" or not runRoot or runRoot == "" then
+        return
+    end
+    if not sameDirectory(buildDir, join(runRoot as string, "build")) then
+        return
+    end
+    runDirectoryMemo = false
+    local kept = join(answers as string, "fingerprints")
+    for _, path in ipairs(listFiles(kept)) do
+        os.remove(path)
+    end
+end
+
 -- The running compiler cannot change while it is running, so the answer is computed
 -- once. Listing the tree shells out to `find`, and a build that asks twice was paying
 -- for a second process to be told the same thing.
@@ -141,10 +224,20 @@ local function runtimeParts(root: string, files: {string}, digest: function(stri
     return parts
 end
 
+local computeToolFingerprint: function((function(string): string)?): string
+
 local function toolFingerprint(contentDigest: (function(string): string)?): string
     if toolFingerprintMemo then
         return toolFingerprintMemo
     end
+    toolFingerprintMemo = fingerprint.runRemembered("tool", function(): string
+        return computeToolFingerprint(contentDigest)
+    end)
+
+    return toolFingerprintMemo
+end
+
+computeToolFingerprint = function(contentDigest: (function(string): string)?): string
     local digest = contentDigest or hash.digest
     -- The toolchain is two trees, the compiler and the tools built on it, and both
     -- decide what a build writes: `nupp.tools.build` is where an artifact is put
@@ -176,9 +269,8 @@ local function toolFingerprint(contentDigest: (function(string): string)?): stri
         parts[#parts + 1] = relative .. "\0" .. (hashFile(path, digest) or "missing")
     end
     table.sort(parts)
-    toolFingerprintMemo = digest(table.concat(parts, "\0"))
 
-    return toolFingerprintMemo
+    return digest(table.concat(parts, "\0"))
 end
 
 local besideToolMemo: string? = nil
@@ -743,6 +835,7 @@ function fingerprint.sharedCacheDir(fallback: string?): string?
 end
 
 local subsystemMemo: {[string]: string} = {}
+local computeSubsystem: function({string}, string?, function(string): string, boolean?): string
 
 --- The digest of a part of the compiler: the named modules, and everything they
 --- require, and nothing else.
@@ -777,6 +870,20 @@ function fingerprint.subsystemFingerprint(
     if remembered then
         return remembered
     end
+    local answer = fingerprint.runRemembered("subsystem\0" .. memoKey, function(): string
+        return computeSubsystem(ordered, cacheDir, digest, readOnly)
+    end)
+    subsystemMemo[memoKey] = answer
+
+    return answer
+end
+
+computeSubsystem = function(
+    ordered: {string},
+    cacheDir: string?,
+    digest: function(string): string,
+    readOnly: boolean?
+): string
     local graph = moduleGraph(cacheDir, digest, readOnly)
     local answer = nil
     if graph then
@@ -815,7 +922,6 @@ function fingerprint.subsystemFingerprint(
     -- The whole of what the graph covers, when it cannot say which part: the
     -- compiler and tools alone would miss an edit to the runtime beside them.
     answer = answer or graphFingerprint(digest)
-    subsystemMemo[memoKey] = answer
 
     return answer as string
 end
@@ -856,26 +962,32 @@ function fingerprint.declarationFingerprint(
     if own and declarationMemo ~= nil then
         return declarationMemo as string
     end
-    local digest = contentDigest or hash.digest
-    local list = listDeclarations or require("nupp.compiler.bundledlist").list
-    local read = readDeclaration or require("nupp.compiler.bundled").source
-    local checked: {[string]: boolean} = {}
-    for _, file in ipairs(require("nupp.compiler.project.carried").files()) do
-        checked[file] = true
-    end
-    local parts = {}
-    for _, relative in ipairs(list("")) do
-        if checked[relative] or relative:match("%.nupp$") and not relative:match("^/templates/") then
-            parts[#parts + 1] = relative .. "\0" .. (read(relative) or "missing")
+
+    local function compute(): string
+        local digest = contentDigest or hash.digest
+        local list = listDeclarations or require("nupp.compiler.bundledlist").list
+        local read = readDeclaration or require("nupp.compiler.bundled").source
+        local checked: {[string]: boolean} = {}
+        for _, file in ipairs(require("nupp.compiler.project.carried").files()) do
+            checked[file] = true
         end
-    end
-    table.sort(parts)
-    local answer = digest(table.concat(parts, "\0"))
-    if own then
-        declarationMemo = answer
+        local parts = {}
+        for _, relative in ipairs(list("")) do
+            if checked[relative] or relative:match("%.nupp$") and not relative:match("^/templates/") then
+                parts[#parts + 1] = relative .. "\0" .. (read(relative) or "missing")
+            end
+        end
+        table.sort(parts)
+
+        return digest(table.concat(parts, "\0"))
     end
 
-    return answer
+    if not own then
+        return compute()
+    end
+    declarationMemo = fingerprint.runRemembered("declarations", compute)
+
+    return declarationMemo as string
 end
 
 fingerprint.hashFile = hashFile

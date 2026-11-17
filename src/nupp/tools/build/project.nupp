@@ -509,6 +509,7 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
     if not opts.checkOnly then
         os.remove(completionPath)
         os.remove(pendingCompletionPath)
+        fingerprint.forgetRunFingerprints(join(root, outDir))
     end
     local newState = cache.emptyState()
     -- Every cache key below this line goes through one digest. A native host has a

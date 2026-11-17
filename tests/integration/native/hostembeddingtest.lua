@@ -4,7 +4,8 @@ local test = require("assert")
 
 local HERE = require("helpers.paths").absoluteTests
 local ROOT = HERE .. "/.."
-local FEATURES = "lpeg,native-checksum,native-compression,native-files,native-net,native-process,native-time,native-tls,workers"
+local embeddingSdk = require("helpers.embeddingsdk")
+local FEATURES = embeddingSdk.FEATURES
 
 local M = {}
 
@@ -34,19 +35,13 @@ local function temporary()
     return path
 end
 
-local cachedSdk
-
 local function sdk()
-    if cachedSdk then
-        return cachedSdk
+    local library, problem = embeddingSdk.path(ROOT)
+    if not library then
+        test.suite.skip("the embedding SDK could not be built: " .. problem)
     end
-    local status, output = run(("cd %s && ./scripts/toolchain host-library %s"):format(quote(ROOT), FEATURES))
-    if status ~= 0 then
-        test.suite.skip("the embedding SDK could not be built: " .. output)
-    end
-    cachedSdk = assert(output:match("([^\r\n]+)%s*$"), "toolchain named no SDK")
 
-    return cachedSdk
+    return library
 end
 
 local function fixture(directory)

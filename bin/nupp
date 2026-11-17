@@ -31,7 +31,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Only a finished build counts: a build of this tree removes its stamp before
 # writing anything, and a command arriving then takes the ordinary path, which
 # waits for that build rather than loading a compiler halfway rewritten.
-# `build` and `clean` always take the ordinary path, since they are the writer.
+# A `build` or `clean` of this tree is its writer and always takes the ordinary
+# path. One of another project -- the temporary projects the suites build, a
+# thousand of them a run -- writes nothing here, and asking the run's questions
+# again was most of what each of those commands cost.
 COMMAND=${1:-}
 [ -n "${NUPP_LAUNCHER_OS:-}" ] && LAUNCHER_OS=$NUPP_LAUNCHER_OS || LAUNCHER_OS=$(uname -s 2>/dev/null)
 LUA_ROOT="$ROOT"
@@ -45,7 +48,8 @@ RUN_READY=no
 if [ -n "${NUPP_LAUNCHER_RUN_ROOT:-}" ] && [ "$NUPP_LAUNCHER_RUN_ROOT" = "$LUA_ROOT" ] \
     && [ -f "$ROOT/build/.nupp-complete" ] && [ -f "$ROOT/build/nupp/tools/main.lua" ]; then
     case "$COMMAND" in
-        build|clean) ;;
+        build|clean)
+            [ "$(pwd -P 2>/dev/null)" = "$(cd "$ROOT" 2>/dev/null && pwd -P)" ] || RUN_READY=yes ;;
         *) RUN_READY=yes ;;
     esac
 fi

@@ -89,8 +89,10 @@ function M.helperSeedsOnlyReusableWorktreeState()
     assert(
         os.execute(
             (
-                "mkdir -p %s/scripts %s/src %s/build/cache " .. "%s/build/nupp/tools %s/build/lib %s/.rocks %s/tests"
+                "mkdir -p %s/scripts %s/src %s/build/cache %s/build/test-runner "
+                .. "%s/build/nupp/tools %s/build/lib %s/.rocks %s/tests"
             ):format(
+                quote(origin),
                 quote(origin),
                 quote(origin),
                 quote(origin),
@@ -115,7 +117,7 @@ function M.helperSeedsOnlyReusableWorktreeState()
     write(origin .. "/src/log.nupp", "return true\n")
     write(origin .. "/build/log.lua", "checkout-owned output\n")
     write(origin .. "/build/cache/checks.buf", "compiler-cache\n")
-    write(origin .. "/build/.nupp-test-times.json", '{"suites":{"slow":10}}\n')
+    write(origin .. "/build/test-runner/.nupp-test-times.json", '{"suites":{"slow":10}}\n')
     write(origin .. "/build/nupp/tools/main.lua", "return true\n")
     write(origin .. "/build/nupp.lua", "return true\n")
     write(origin .. "/build/lib/native", "library\n")
@@ -140,7 +142,7 @@ function M.helperSeedsOnlyReusableWorktreeState()
     assert(os.execute(command) == 0, "worktree helper failed")
     assert(read(task .. "/.rocks/sentinel") == "rocks\n", "the dependency link did not reach the origin")
     assert(read(task .. "/build/cache/checks.buf") == "compiler-cache\n", "the incremental cache was not seeded")
-    assert(read(task .. "/build/.nupp-test-times.json"):find('"slow":10', 1, true), "test timings were not seeded")
+    assert(read(task .. "/build/test-runner/.nupp-test-times.json"):find('"slow":10', 1, true), "test timings were not seeded")
     assert(read(task .. "/build/nupp/tools/main.lua") == "return true\n", "a current compiler was not seeded")
     for _, name in ipairs({"serde", "bytes", "io"}) do
         assert(

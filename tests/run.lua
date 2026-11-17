@@ -3302,6 +3302,69 @@ then
         end
     end
 end
+-- Builds a selected suite shares with others, made once here before any case
+-- starts (#371). Cold, the embedding SDK is the better part of a minute, and
+-- built lazily it was charged to whichever case asked for it first. tests/groups.lua
+-- names each build's helper module, whose `command(root)` is a shell command
+-- printing the build's path last; the builds run side by side. The path is
+-- exported as the helper's `variable`, so the workers this run starts need
+-- not ask the toolchain again (a cache hit is still seconds on Windows). A
+-- failure is reported and the run goes on: the suites ask the same helper,
+-- which skips them with the toolchain's output.
+if not listing and #shard == 0 and not queueDir and not embedded and repositoryPolicy and repositoryPolicy.prerequisites then
+    local selected = {}
+    for _, info in ipairs(suites) do
+        selected[info.name] = true
+    end
+    local started = {}
+    for _, prerequisite in ipairs(repositoryPolicy.prerequisites) do
+        for _, name in ipairs(prerequisite.suites) do
+            if selected[name] then
+                local helper = require(prerequisite.module)
+                started[#started + 1] = {
+                    prerequisite = prerequisite,
+                    helper = helper,
+                    before = now(),
+                    pipe = io.popen(helper.command(dir .. "/..") .. " 2>&1; printf '\n__status__:%s' $?"),
+                }
+                break
+            end
+        end
+    end
+    for _, build in ipairs(started) do
+        local output = build.pipe and build.pipe:read("*a") or ""
+        if build.pipe then
+            build.pipe:close()
+        end
+        local status = tonumber(output:match("__status__:(%d+)%s*$"))
+        local seconds = (now() - build.before) / 1000
+        if status ~= 0 then
+            io.stderr:write(
+                ("nupp: cannot prepare %s for %s (%.1fs); its suites will report why:\n%s\n"):format(
+                    build.prerequisite.name,
+                    table.concat(build.prerequisite.suites, ", "),
+                    seconds,
+                    output:gsub("\n__status__:%d+%s*$", "")
+                )
+            )
+        else
+            local path = output:gsub("\n__status__:%d+%s*$", ""):match("([^\r\n]+)%s*$")
+            if path and build.helper.variable then
+                local ffi = require("ffi")
+                if ffi.os == "Windows" then
+                    pcall(ffi.cdef, "int _putenv_s(const char *, const char *);")
+                    ffi.C._putenv_s(build.helper.variable, path)
+                else
+                    pcall(ffi.cdef, "int setenv(const char *, const char *, int);")
+                    ffi.C.setenv(build.helper.variable, path, 1)
+                end
+            end
+        end
+        if status == 0 and verbose then
+            io.stderr:write(("prepared %s in %.1fs\n"):format(build.prerequisite.name, seconds))
+        end
+    end
+end
 if #shard == 0
     and #suites > 0
     and chosenCaseCount == 0

@@ -1411,7 +1411,33 @@ local function buildModules(root: string, outDir: string, config: Config, target
             return previous.dependencies as {string}
         end
 
-        return inc.moduleDependencies(path)
+        -- A staged copy of a carried source names the same modules in every project,
+        -- and finding them means checking it. A fresh project has no previous record,
+        -- so each one checked the runtime it links only to learn what it requires.
+        -- Remembered in the shared store, keyed by the bytes the names come from.
+        local file = envMod.isStagedBundledSource(inc.env, name, path) and inc.env.bundledImplementation(name) or nil
+        local text = file and require("nupp.compiler.bundled").source(file) or nil
+        if text == nil or inc.fileText(path) ~= text then
+            return inc.moduleDependencies(path)
+        end
+        local store = envMod.openStore(
+            inc.env,
+            "runtimeDependencyStore",
+            "runtimeDependencyStoreOpened",
+            "runtime-dependencies.buf",
+            {"nupp.compiler.check", "nupp.compiler.project.incremental"}
+        )
+        local key = contentDigest(name .. "\0" .. text)
+        local remembered = store and store.get(key) or nil
+        if type(remembered) == "table" then
+            return remembered as {string}
+        end
+        local names = inc.moduleDependencies(path)
+        if store then
+            store.put(key, names)
+        end
+
+        return names
     end
 
     -- Browser artifacts stage the carried modules because they run in a different

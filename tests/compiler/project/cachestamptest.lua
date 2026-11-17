@@ -370,7 +370,20 @@ end
 -- build in the same process never wrote the store and every later command lexed the
 -- compiler again.
 function M.aCallerWithSomewhereToKeepTheGraphKeepsItAfterOneThatHadNot()
-    assert(fingerprint.subsystemFingerprint({"nupp.tools.fmt"}), "computed with nowhere to keep it")
+    -- Outside a run: inside one, an answer the run kept needs no graph at all.
+    local getenv, prior = os.getenv, package.loaded["nupp.compiler.project.fingerprint"]
+    os.getenv = function(name)
+        if name == "NUPP_TOOLCHAIN_ANSWERS" then
+            return nil
+        end
+        return getenv(name)
+    end
+    local ok, fingerprint = pcall(dofile, ROOT .. "/build/nupp/compiler/project/fingerprint.lua")
+    local computed = ok and fingerprint.subsystemFingerprint({"nupp.tools.fmt"})
+    os.getenv = getenv
+    package.loaded["nupp.compiler.project.fingerprint"] = prior
+    assert(ok, fingerprint)
+    assert(computed, "computed with nowhere to keep it")
     local dir = os.tmpname()
     os.remove(dir)
     os.execute("mkdir -p '" .. dir .. "'")
@@ -973,6 +986,100 @@ function M.aStoredStandardLibraryInterfaceChecksTheSameAsItsSource()
     assert(bypassed == fromSource, "bypassing the store reported differently:\n" .. bypassed .. "\n" .. fromSource)
 end
 
+-- A project build keeps the standard library's interfaces too (#358). Every
+-- project has a manifest, and a build stages the carried runtime it links into
+-- its own directory; module resolution answered the name `nupp` with the one and
+-- found the other on a path, and either was taken for a project file shadowing
+-- the standard library, so no project build ever stored or read the interfaces.
+-- The runtime's own imports are kept beside them, so the next fresh project
+-- links it without checking it, and builds the same module either way.
+function M.aFreshProjectBuildReusesTheStandardLibraryAnotherOneChecked()
+    local files = {
+        ["nupp.lua"] = 'return {include = {"src"}, build = {targets = {lib = {\n'
+            .. '    kind = "modules", entries = {"greet"}, outDir = "build/lib",\n}}}}\n',
+        ["src/greet.nupp"] = 'module greet\n\nconst json = require("serde.json")\n\n'
+            .. "export function parse(text: string): any\n    local value = json.decodevalue(text)\n    return value\nend\n",
+    }
+    local shared = tempProject({})
+
+    local function build(prefix)
+        local dir = tempProject(files)
+        local pipe = assert(
+            io.popen(
+                ("cd '%s' && %sNUPP_CACHE_DIR='%s' '%s' build --target lib 2>&1; echo \"__exit__:$?\""):format(
+                    dir,
+                    prefix,
+                    shared,
+                    NUPP
+                )
+            )
+        )
+        local output = pipe:read("*a")
+        pipe:close()
+        local file = io.open(dir .. "/build/lib/greet.lua", "rb")
+        local generated = file and file:read("*a") or nil
+        if file then
+            file:close()
+        end
+        os.execute("rm -rf '" .. dir .. "'")
+        assert(output:match("__exit__:0%s*$"), "the project did not build:\n" .. output)
+
+        return assert(generated, "the build wrote no module:\n" .. output)
+    end
+
+    -- The first build keeps the prelude, the second the interfaces checked against
+    -- it, and the third is a fresh project reading both back.
+    local fromSource = build("")
+    build("")
+    local stdlibStored = exists(shared .. "/stdlib.buf")
+    local runtimeStored = exists(shared .. "/runtime-dependencies.buf")
+    local hydrated = build("")
+    local bypassed = build("NUPP_NO_STDLIB_CACHE=1 ")
+    os.execute("rm -rf '" .. shared .. "'")
+
+    assert(stdlibStored, "a project build did not store the standard library's interfaces")
+    assert(runtimeStored, "a project build did not keep the imports of the runtime it links")
+    assert(hydrated == fromSource, "the stored interfaces built a different module")
+    assert(bypassed == fromSource, "bypassing the store built a different module")
+end
+
+-- A stored image holds every module it was checked with (#358). A project check
+-- keeps bundled modules in the incremental graph rather than the environment's
+-- own table, and the image used to be read off that table: a project that only
+-- required `simd` stored `simd` and not the `nupp.mem.span` it was checked
+-- against. The next project checked that one from source beside the stored
+-- `simd`, and a span it made was not a span to `simd`.
+function M.aStoredImageCarriesTheModulesItsInterfacesNamed()
+    local shared = tempProject({})
+
+    local function check(source)
+        local dir = tempProject({["nupp.lua"] = 'return {include = {"src"}}\n', ["src/k.nupp"] = source})
+        local pipe = assert(
+            io.popen(("cd '%s' && NUPP_CACHE_DIR='%s' '%s' check 2>&1; echo \"__exit__:$?\""):format(dir, shared, NUPP))
+        )
+        local output = pipe:read("*a")
+        pipe:close()
+        os.execute("rm -rf '" .. dir .. "'")
+
+        return output
+    end
+
+    local widen = 'module k\nlocal span = require("bytes.span")\nlocal array = table.Array\n'
+        .. 'local simd = require("simd")\n\n'
+        .. "export function widen(exclusive out: span.WriteSpan<number>, borrows input: span.Span<int8>): nil\n"
+        .. "    local source = assert(simd.species(array.int8, 16))\n"
+        .. "    local wide = assert(simd.species(array.number, 16))\n"
+        .. "    wide:store(out, 1, wide:convert(source:load(input, 1)))\nend\n"
+    -- The first keeps the prelude; the second checks `simd` and stores it; the third
+    -- reads it back beside whatever the second left out.
+    check("module k\nexport const x = 1\n")
+    check('module k\nlocal simd = require("simd")\nexport const s = simd\n')
+    local output = check(widen)
+    os.execute("rm -rf '" .. shared .. "'")
+
+    assert(output:match("__exit__:0%s*$"), "a span did not reach the stored simd:\n" .. output)
+end
+
 -- A single-file compile inside a project reads its dependencies' checked interfaces
 -- back from the build directory (#277). What it says and what it generates are the
 -- same as checking the graph from source, with `NUPP_NO_INTERFACE_CACHE`, and an
@@ -1119,6 +1226,111 @@ function M.storedProjectInterfacesAreSharedByEverySpellingOfTheRoot()
     assert(kept, "the checked project interfaces were not stored")
     assert(again == first, "the other spelling compiled differently:\n" .. again .. "\n" .. first)
     assert(after == kept, "the other spelling of the root (" .. other .. ") kept its own interfaces again")
+end
+
+-- A compiler laid out as a checkout's built tree, `<root>/build/nupp/...`, with the
+-- completed build's stamp beside it, and the run's variables pointed wherever the
+-- case says. Each call loads the module afresh, as each command of a run does.
+local function runFixture()
+    local dir = tempProject({
+        ["build/nupp/compiler/project/fingerprint.lua"] = compiledFingerprintSource(),
+        ["build/nupp/compiler/one.lua"] = "return 1\n",
+        ["build/nupp/tools/two.lua"] = "return 2\n",
+        ["build/.nupp-complete"] = "first\n",
+    })
+    local fixture = {dir = dir, answers = dir .. "/answers"}
+
+    function fixture.load(env)
+        local getenv = os.getenv
+        local prior = package.loaded["nupp.compiler.project.fingerprint"]
+        os.getenv = function(name)
+            if env[name] ~= nil then
+                return env[name] or nil
+            end
+            return getenv(name)
+        end
+        local ok, result = pcall(function()
+            local isolated = dofile(dir .. "/build/nupp/compiler/project/fingerprint.lua")
+            return {
+                isolated = isolated,
+                tool = isolated.toolFingerprint(),
+                subsystem = isolated.subsystemFingerprint({"nupp.compiler.one"}),
+            }
+        end)
+        os.getenv = getenv
+        package.loaded["nupp.compiler.project.fingerprint"] = prior
+        assert(ok, result)
+
+        return result
+    end
+
+    function fixture.inRun(root)
+        return {NUPP_LAUNCHER_RUN_ROOT = root or dir, NUPP_TOOLCHAIN_ANSWERS = fixture.answers}
+    end
+
+    function fixture.edit(path, text)
+        editFixture(dir, path, text)
+    end
+
+    return fixture
+end
+
+-- Every command of a test run used to hash the run's compiler again, a few tenths
+-- of a second of each fresh project's build. The launcher promises the tree does not
+-- change while the run lasts, so a later command reuses what the first worked out --
+-- until the build stamp says the compiler is another one.
+function M.aTestRunKeepsItsCompilersFingerprintsForTheCommandsAfterTheFirst()
+    local fixture = runFixture()
+    local run = fixture.inRun()
+    local first = fixture.load(run)
+    fixture.edit("build/nupp/tools/two.lua", "return 22\n")
+    fixture.edit("build/nupp/compiler/one.lua", "return 11\n")
+    local later = fixture.load(run)
+    local outside = fixture.load({NUPP_LAUNCHER_RUN_ROOT = false, NUPP_TOOLCHAIN_ANSWERS = false})
+    fixture.edit("build/.nupp-complete", "second\n")
+    local rebuilt = fixture.load(run)
+    os.execute("rm -rf '" .. fixture.dir .. "'")
+
+    assert(later.tool == first.tool, "a later command of the run hashed the compiler again")
+    assert(later.subsystem == first.subsystem, "a later command of the run read the module graph again")
+    assert(outside.tool ~= first.tool, "outside a run the compiler's fingerprint was not computed")
+    assert(outside.subsystem ~= first.subsystem, "outside a run a subsystem's fingerprint was not computed")
+    assert(rebuilt.tool == outside.tool, "a rebuilt compiler was answered from the one before it")
+    assert(rebuilt.subsystem == outside.subsystem, "a rebuilt compiler's subsystem came from the one before")
+end
+
+-- A build of the run's own tree is about to replace what the kept answers
+-- describe, so it drops them, even when the stamp it writes ends up the same.
+function M.buildingTheRunsTreeForgetsItsKeptFingerprints()
+    local fixture = runFixture()
+    local run = fixture.inRun()
+    local first = fixture.load(run)
+    fixture.edit("build/nupp/compiler/one.lua", "return 11\n")
+    local getenv = os.getenv
+    os.getenv = function(name)
+        return run[name] or getenv(name)
+    end
+    local ok, err = pcall(first.isolated.forgetRunFingerprints, fixture.dir .. "/build")
+    os.getenv = getenv
+    assert(ok, err)
+    local after = fixture.load(run)
+    os.execute("rm -rf '" .. fixture.dir .. "'")
+
+    assert(after.subsystem ~= first.subsystem, "the run's tree was rebuilt and its old answers were believed")
+end
+
+-- Only the run's compiler is promised not to change. A compiler some test builds
+-- elsewhere during the run, or one whose build is not finished, keeps nothing.
+function M.onlyTheRunsFinishedCompilerKeepsFingerprints()
+    local fixture = runFixture()
+    local other = fixture.load(fixture.inRun(fixture.dir .. "/elsewhere"))
+    os.remove(fixture.dir .. "/build/.nupp-complete")
+    local building = fixture.load(fixture.inRun())
+    local kept = os.rename(fixture.answers, fixture.answers)
+    os.execute("rm -rf '" .. fixture.dir .. "'")
+
+    assert(other.tool and building.tool, "the fingerprints were not computed")
+    assert(not kept, "a compiler that is not the run's finished one kept fingerprints for the run")
 end
 
 return M

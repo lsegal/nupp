@@ -17,8 +17,11 @@ local platforms = {
     {
         variable = "SELECTED_MACOS",
         -- A cold native-provider build and the broad suite need room on a
-        -- three-core runner.
-        entry = {name = "macOS arm64", os = "macos-15", timeout = 240, artifact = "macos-arm64"},
+        -- three-core runner. The same revision's passing jobs took 163 to 206
+        -- minutes in November 2026, and others ran past a 230-minute suite
+        -- deadline with nothing hung (#355): hosted macOS speed varies about
+        -- twofold, so the timeout sits above the slow end, not the typical one.
+        entry = {name = "macOS arm64", os = "macos-15", timeout = 300, artifact = "macos-arm64"},
     },
     {
         variable = "SELECTED_WINDOWS",
