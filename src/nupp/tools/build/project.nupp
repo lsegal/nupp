@@ -1581,10 +1581,9 @@ function project.test(root: string?, args: {string}?, opts: project.TestOptions?
     if #unfinished > 0 then
         table.sort(unfinished)
         io.stderr:write(
-            ("nupp: the test process exited (status %d) while running %s\n"):format(
-                code,
-                table.concat(unfinished, ", ")
-            )
+            (
+                "nupp: the test process exited (status %d) while running %s\n"
+            ):format(code, table.concat(unfinished, ", "))
         )
         if code == 0 then
             code = 1
