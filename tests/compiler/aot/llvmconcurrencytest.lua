@@ -7,7 +7,6 @@
 -- native code side by side (#357).
 
 local codegen = require("nupp.compiler.aot.llvm.codegen")
-local links = require("helpers.codegenlinks")
 
 local M = {}
 
@@ -18,18 +17,22 @@ entry:
 }
 ]]
 
-local LANES = 4
+-- Enough links queued across the pool's lanes that several are always running
+-- at once.
+local LINKS = 64
 
-local ROUNDS = 12
+local function scratch(suffix)
+    return require("nupp.compiler.process").tmpname() .. suffix
+end
 
 -- On a Windows host an ELF link leaves the process unable to exit through its
 -- static destructors, so there the lanes link through lld-link alone.
 local function elfObject()
     if package.config:sub(1, 1) == "\\" then
-        return ""
+        return nil
     end
     local compiled = assert(codegen.compile(KERNEL, "scale", {triple = "x86_64-unknown-linux-gnu"}))
-    local path = require("nupp.compiler.process").tmpname() .. ".o"
+    local path = scratch(".o")
     local file = assert(io.open(path, "wb"))
     file:write(compiled.object)
     file:close()
@@ -42,21 +45,34 @@ function M.lldLinksFromSeveralStatesAtOnce()
         return
     end
     local object = elfObject()
-    local workers = require("nupp.workers")
-    local scope = workers.__scope()
-    local tasks = {}
+    local scope = require("nupp.workers").__scope()
+    local outputs = {}
     local ok, problem = pcall(function()
-        for lane = 1, LANES do
-            tasks[lane] = scope:worker(links.links, object, ROUNDS)
+        local tasks = {}
+        for index = 1, LINKS do
+            local output = scratch(".a")
+            outputs[#outputs + 1] = output
+            if object ~= nil and index % 2 == 0 then
+                tasks[index] = scope:spawn(codegen.link, {"ld.lld", "-shared", object, "-o", output})
+            else
+                local names = {{"GetCurrentProcess"}, {"TerminateProcess"}}
+                tasks[index] = scope:spawn(codegen.importLibrary, "kernel32.dll", output, names)
+            end
         end
-        for lane, task in ipairs(tasks) do
-            local done = task:await()
-            local expected = object == "" and ROUNDS or 2 * ROUNDS
-            assert(done == expected, ("lane %d: %s"):format(lane, tostring(done)))
+        for index, task in ipairs(tasks) do
+            local first, second = task:await()
+            if object ~= nil and index % 2 == 0 then
+                assert(first ~= nil, ("link %d: %s"):format(index, tostring(second)))
+            else
+                assert(first == nil, ("import library %d: %s"):format(index, tostring(first)))
+            end
         end
     end)
     pcall(scope.close, scope)
-    if object ~= "" then
+    for _, output in ipairs(outputs) do
+        os.remove(output)
+    end
+    if object ~= nil then
         os.remove(object)
     end
     assert(ok, problem)

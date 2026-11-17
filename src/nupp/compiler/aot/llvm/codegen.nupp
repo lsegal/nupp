@@ -289,23 +289,31 @@ unsigned long nuppcg_WaitForSingleObject(void *handle, unsigned long millisecond
 int nuppcg_ReleaseMutex(void *handle) __asm__("ReleaseMutex");
 ]]
     else
-        ffi.cdef[[
+        -- Intel macOS keeps the 32-bit-inode `stat` under the plain names.
+        local inode64 = ffi.os == "OSX" and ffi.arch == "x64" and "$INODE64" or ""
+        ffi.cdef(
+            (
+                [[
 int nuppcg_getpid(void) __asm__("getpid");
 int nuppcg_lockcreat(const char *path, unsigned int mode) __asm__("creat");
-int nuppcg_open(const char *path, int flags) __asm__("open");
+int nuppcg_fstat(int fd, void *buffer) __asm__("fstat%s");
+int nuppcg_stat(const char *path, void *buffer) __asm__("stat%s");
 int nuppcg_flock(int fd, int operation) __asm__("flock");
 int nuppcg_unlink(const char *path) __asm__("unlink");
 int nuppcg_lockclose(int fd) __asm__("close");
 ]]
+            ):format(inode64, inode64)
+        )
     end
 end
 
 --- `flock`'s operations, the same on Linux and macOS.
 const LOCK_EX = 2
 
-const LOCK_NB = 4
-
 const LOCK_UN = 8
+
+--- Room for a `struct stat`, far more than Linux or macOS lays one out in.
+const STAT_WORDS = 32
 
 --- The lock file a POSIX process's states share, named for the process.
 local function lockPath(): string
@@ -315,17 +323,27 @@ local function lockPath(): string
         directory = "/tmp"
     end
 
-    return ("%s/nupp-codegen-%d.lock"):format(
-        ((directory as string):gsub("/+$", "")) as string,
-        tonumber(C.nuppcg_getpid()) as integer
-    )
+    return (
+        "%s/nupp-codegen-%d.lock"
+    ):format(((directory as string):gsub("/+$", "")) as string, tonumber(C.nuppcg_getpid()) as integer)
+end
+
+--- Whether `fd` is still the file at `path`. `st_ino` is the second 8-byte
+--- word of `struct stat` on Linux (x86-64 and AArch64) and on macOS alike.
+local function stillAt(fd: integer, path: string): boolean
+    local C: any = ffi.C
+    local locked: any = ffi.new("uint64_t[?]", STAT_WORDS)
+    local named: any = ffi.new("uint64_t[?]", STAT_WORDS)
+
+    return C.nuppcg_fstat(fd, locked) == 0 and C.nuppcg_stat(path, named) == 0 and locked[1] == named[1]
 end
 
 --- Takes the POSIX lock: `flock` on the process's lock file, which conflicts
 --- between two descriptors of one process as it does between processes. The
 --- holder removes the file before letting go, so a waiter that wins a file no
---- longer at the path (its own probe of the path is not refused) starts over.
+--- longer at the path starts over on whatever is there now.
 --- @return the locked descriptor
+--- @raises string when the lock file cannot be opened
 local function lockFile(path: string): integer
     local C: any = ffi.C
     while true do
@@ -334,12 +352,7 @@ local function lockFile(path: string): integer
             error("cannot open the code generator's lock " .. path, 0)
         end
         if C.nuppcg_flock(fd, LOCK_EX) == 0 then
-            local probe = tonumber(C.nuppcg_open(path, 0)) as integer
-            local current = probe >= 0 and C.nuppcg_flock(probe, LOCK_EX | LOCK_NB) ~= 0
-            if probe >= 0 then
-                C.nuppcg_lockclose(probe)
-            end
-            if current then
+            if stillAt(fd, path) then
                 return fd
             end
             C.nuppcg_flock(fd, LOCK_UN)
@@ -350,18 +363,19 @@ end
 
 --- A held lock: the descriptor and path a POSIX process locked, which
 --- Windows, holding its mutex, leaves empty.
-record Held
+local record Held
     fd: integer
     path: string
 end
 
 --- Takes the process-wide lock `exclusive` describes.
+--- @raises string when the lock cannot be had
 local function acquire(): Held
     declareLock()
     local C: any = ffi.C
     if windows then
         if mutex == nil then
-            local name = ("Local\nupp-codegen-%d"):format(tonumber(C.nuppcg_GetCurrentProcessId()) as integer)
+            local name = ("Local\\nupp-codegen-%d"):format(tonumber(C.nuppcg_GetCurrentProcessId()) as integer)
             mutex = C.nuppcg_CreateMutexA(nil, 0, name)
             if mutex == nil then
                 error("cannot create the code generator's lock " .. name, 0)
@@ -394,6 +408,7 @@ end
 --- all, which a second link replaces and then frees under the first (#357) --
 --- while module state such as `initialized` is this state's alone, so only a
 --- lock the operating system names for the process keeps two states apart.
+--- @raises string when the lock cannot be had, or whatever `work` raises
 local function exclusive(work: function(): any): any
     if held > 0 then
         return work()
@@ -418,7 +433,14 @@ local function initialized(backend: codegen.Backend): codegen.Backend
         exclusive(function(): nil
             local C: any = backend.C
             for _, target in ipairs({"AArch64", "X86", "WebAssembly"}) do
-                for _, part in ipairs({"TargetInfo", "Target", "TargetMC", "AsmPrinter", "AsmParser", "Disassembler"}) do
+                for _, part in ipairs({
+                    "TargetInfo",
+                    "Target",
+                    "TargetMC",
+                    "AsmPrinter",
+                    "AsmParser",
+                    "Disassembler"
+                }) do
                     C["nuppcg_LLVMInitialize" .. target .. part]()
                 end
             end
