@@ -123,6 +123,44 @@ function M.respectsShadowedPackageRoots()
     assert(output:find('return files.read("b"), fake', 1, true), output)
 end
 
+-- Checking a file checks every module it reaches, so a file whose paths cannot
+-- come out of the check as imports is left unchecked (#360): one read through a
+-- parameter or an inert local, or through a public module the compiler ships.
+function M.checksAFileOnlyWhenAPathCouldBecomeAnImport()
+    withUserModules(function(env)
+        local original = check.check
+        local calls = 0
+        check.check = function(...)
+            calls = calls + 1
+            return original(...)
+        end
+        local ok, problem = pcall(function()
+            -- Each source, and the path it keeps as written.
+            local unchanged = {
+                {'local function fake(app)\nreturn app.files.read("a")\nend\nreturn fake\n', "app.files.read"},
+                {'local app = {files = {read = print}}\nreturn app.files.read("a")\n', "app.files.read"},
+                {
+                    'local function each(apps)\nfor _, app in ipairs(apps) do\napp.files.read("a")\nend\nend\nreturn each\n',
+                    "app.files.read",
+                },
+                {'return io.http.file("a")\n', "io.http.file"},
+            }
+            for _, case in ipairs(unchanged) do
+                calls = 0
+                local output = formatted(case[1], env)
+                assert(output:find(case[2], 1, true) and not output:find("require", 1, true), output)
+                assert(calls == 0, ("checked a file with nothing to import:\n%s"):format(case[1]))
+            end
+            calls = 0
+            local output = formatted('local function fake(app)\nreturn app\nend\nreturn app.files.read("b"), fake\n', env)
+            assert(calls > 0, "a module path was not checked")
+            assert(output:find('return files.read("b"), fake', 1, true), output)
+        end)
+        check.check = original
+        assert(ok, problem)
+    end)
+end
+
 function M.avoidsTheLeafNameOfAQualifiedDeclaration()
     withUserModules(function(env)
         local output = formatted(

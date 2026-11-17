@@ -11,6 +11,7 @@ local lexer = require("nupp.compiler.syntax.lexer")
 local envMod = require("nupp.compiler.project.env")
 local check = require("nupp.compiler.check")
 local hash = require("nupp.compiler.hash")
+local builtinExtensions = require("nupp.compiler.builtinextensions")
 
 local imports = {}
 local type Use = {
@@ -82,6 +83,277 @@ local function typeImport(moduleName: string, member: string, alias: string, run
     return "const {" .. selection .. "} = require(" .. string.format("%q", moduleName) .. ")"
 end
 
+-- Initializers that give a local no namespace identity. The checker carries one
+-- from a name, a path, or a `require` of a builtin extension root (`local t = table`
+-- makes `t.Pool` a module member), so those are left out.
+const INERT_INITIALIZERS = {
+    number = true,
+    string = true,
+    istring = true,
+    dedentString = true,
+    trueExpr = true,
+    falseExpr = true,
+    nilExpr = true,
+    vararg = true,
+    tableExpr = true,
+    funcExpr = true,
+    shortfn = true,
+    binop = true,
+    unop = true,
+    bracketIndex = true,
+    safeBracket = true,
+    methodCall = true,
+}
+
+-- Nodes whose own name tokens are uses, members, fields, labels, or bindings read
+-- below. A name token directly under any other node may be bound by it.
+const NAME_CONTEXTS = {
+    name = true,
+    dotIndex = true,
+    safeIndex = true,
+    methodCall = true,
+    fieldNamed = true,
+    namedArg = true,
+    tname = true,
+    localStmt = true,
+    localFuncStmt = true,
+    param = true,
+    forinStmt = true,
+    fornumStmt = true,
+    labelStmt = true,
+    gotoStmt = true,
+    bindingEntry = true,
+    moduleStmt = true,
+}
+
+-- The module a `require("name")` call names, when the callee is the plain name.
+local function requiredName(node: any): string?
+    if node.kind ~= "call" or not node.obj or node.obj.kind ~= "name" or node.obj.token.text ~= "require" then
+        return nil
+    end
+    local args = node.args
+    local exprs = args and args.exprs
+    local literal = args and (args.str or exprs and #exprs == 1 and exprs[1].kind == "string" and exprs[1].token)
+    local text = literal and literal.text
+
+    return text and (text:match('^"([%w_.]+)"$') or text:match("^'([%w_.]+)'$")) or nil
+end
+
+-- Whether checking the file could turn anything in it into an import: whether some
+-- path or name in it could come out of the check qualified with a module that
+-- `builtinAccess` does not keep as written.
+--
+-- A name read through a local the checker gives no namespace identity -- a
+-- parameter, a loop variable, a local function, a local initialised as above -- is
+-- never qualified, and neither is any path it starts. A type path needs the module
+-- it spells to exist, unless it is `T.Type` through a local `T` holding a `require`.
+-- Anything else that could resolve is assumed to, so this only ever says no where
+-- the check would have produced nothing.
+local function couldImport(root: any, env: any, registry: any, publicBundled: function(string): boolean): boolean
+    local function declared(name: string): boolean
+        local shipped = env.bundled and env.bundled[name]
+
+        return (registry.declaredModules[name] or shipped and shipped.declared) and not publicBundled(name)
+    end
+
+    local function anyDeclaredPrefix(path: {any}): boolean
+        local prefix: string? = spelling(path)
+        while prefix do
+            if declared(prefix) then
+                return true
+            end
+            prefix = prefix:match("^(.*)%.[^.]+$")
+        end
+
+        return false
+    end
+
+    -- Names spelled where something other than the forms read below may bind them:
+    -- a switch arm, a capture, a declaration. Such a binding may hide a local holding
+    -- a module, so a type path through that name is not excused by one.
+    local rebindable = {}
+    walk(root, function(node: any): nil
+        if not NAME_CONTEXTS[node.kind] then
+            for _, child in ipairs(node) do
+                if cst.isToken(child) and child.kind == "name" then
+                    rebindable[child.text] = true
+                end
+            end
+        end
+    end)
+
+    local function lookup(frame: any, name: string): any
+        local current = frame
+        while current do
+            local found = current.vars[name]
+            if found then
+                return found
+            end
+            current = current.parent
+        end
+
+        return nil
+    end
+
+    local function binding(init: any, frame: any): any
+        if init
+            and init.kind == "call"
+            and init.obj
+            and init.obj.kind == "name"
+            and init.obj.token.text == "require"
+        then
+            local moduleName = requiredName(init)
+            if not moduleName or rebindable.require or lookup(frame, "require") then
+                return {inert = false}
+            end
+
+            return {
+                inert = registry.declaredModules[moduleName] and not builtinExtensions.has(moduleName) and true
+                or false,
+                holder = true,
+            }
+        end
+
+        return {inert = init == nil or INERT_INITIALIZERS[init.kind] == true or init.kind == "call"}
+    end
+
+    local function nested(frame: any): any
+        return {vars = {}, parent = frame}
+    end
+
+    local ALIAS = {inert = false}
+
+    -- Locals a statement declares other than as one of its own block's statements,
+    -- such as under `export`: not modelled, so they only hide what they shadow.
+    local function hideDeclared(node: any, frame: any): nil
+        for _, child in ipairs(node) do
+            if not cst.isToken(child) then
+                local kind = child.kind
+                if kind == "localStmt" then
+                    for _, token in ipairs(child.names or {}) do
+                        frame.vars[token.text] = ALIAS
+                    end
+                elseif kind == "localFuncStmt" and child.name then
+                    frame.vars[child.name.text] = ALIAS
+                end
+                if kind ~= "block" and kind ~= "funcbody" and kind ~= "shortfn" then
+                    hideDeclared(child, frame)
+                end
+            end
+        end
+    end
+
+    local existing = {}
+
+    local function moduleExists(moduleName: string): boolean
+        if existing[moduleName] == nil then
+            local shipped = env.bundled and env.bundled[moduleName]
+            existing[moduleName] = shipped ~= nil and shipped ~= false or envMod.findModulePath(env, moduleName) ~= nil
+        end
+
+        return existing[moduleName]
+    end
+
+    local could = false
+    local visit: any = nil
+
+    local function visitChildren(node: any, frame: any, body: any?, bodyFrame: any?): nil
+        for _, child in ipairs(node) do
+            if could then
+                return
+            end
+            if not cst.isToken(child) then
+                visit(child, child == body and bodyFrame or frame)
+            end
+        end
+    end
+
+    visit = function(node: any, frame: any): nil
+        local kind = node.kind
+        if kind == "name" then
+            local text = node.token.text
+            local bound = lookup(frame, text)
+            if bound and not bound.inert
+                or not bound and not (env.globals and env.globals[text]) and declared(text)
+            then
+                could = true
+            end
+            return
+        elseif kind == "dotIndex" then
+            local start = node.obj
+            while start and start.kind == "dotIndex" do
+                start = start.obj
+            end
+            local bound = start and start.kind == "name" and lookup(frame, start.token.text) or nil
+            if bound and not bound.inert or not bound and anyDeclaredPrefix(names(node)) then
+                could = true
+                return
+            end
+        elseif kind == "tname" then
+            local path = names(node)
+            if #path > 1 then
+                local moduleName = spelling(path, #path - 1)
+                local holder = #path == 2 and not rebindable[path[1].text] and lookup(frame, path[1].text)
+                if not (holder and holder.holder) and moduleExists(moduleName) and not publicBundled(moduleName) then
+                    could = true
+                    return
+                end
+            end
+        elseif kind == "block" then
+            local inner = nested(frame)
+            for _, statement in ipairs(node) do
+                if could then
+                    return
+                end
+                if not cst.isToken(statement) then
+                    if statement.kind == "localFuncStmt" then
+                        if statement.name then
+                            inner.vars[statement.name.text] = {inert = true}
+                        end
+                        visit(statement, inner)
+                    elseif statement.kind == "localStmt" then
+                        visit(statement, inner)
+                        local exprs = statement.exprs or {}
+                        for index, token in ipairs(statement.names or {}) do
+                            local init = exprs[index] or exprs[#exprs]
+                            inner.vars[token.text] = statement.pattern and ALIAS or binding(init, inner)
+                        end
+                    else
+                        visit(statement, inner)
+                        hideDeclared(statement, inner)
+                    end
+                end
+            end
+            return
+        elseif kind == "funcbody" or kind == "shortfn" then
+            local inner = nested(frame)
+            for _, param in ipairs(node.params or {}) do
+                if param.name then
+                    inner.vars[param.name.text] = {inert = true}
+                end
+            end
+            visitChildren(node, inner)
+            return
+        elseif kind == "fornumStmt" or kind == "forinStmt" then
+            local inner = nested(frame)
+            for _, token in ipairs(kind == "fornumStmt" and {node.var} or node.names or {}) do
+                inner.vars[token.text] = {inert = true}
+            end
+            visitChildren(node, frame, node.body, inner)
+            return
+        end
+        visitChildren(node, frame)
+    end
+
+    -- A chunk the parser recovered into several blocks has no single scope to read.
+    if root.kind == "chunk" and #(root.blocks or {}) ~= 1 then
+        return true
+    end
+    visit(root, nested(nil))
+
+    return could
+end
+
 -- The verdict depends on module interfaces as well as the file's own bytes.
 -- Full source digests also cover exports whose types depend on checked bodies.
 function imports.key(env: any): string
@@ -130,29 +402,12 @@ function imports.new(environment: any?, enabled: boolean?): any
             env = candidate
         end
         local registry = env.ensureProjectIndex(env)
-
-        -- Checking the file checks every module it reaches, so a file is checked only
-        -- when some path in it could become an import. A path resolving through a
-        -- public module the compiler ships cannot: `builtinAccess` below keeps it as
-        -- written whatever the checker says. The project may declare the same name
-        -- (`own`), which is why the bundled answer is asked first. Without this nearly
-        -- every source was checked, and `nupp fmt --check` over the tree cost a
-        -- whole-tree check per process (#360).
-        local function publicBundled(moduleName: string): boolean
-            local shipped = env.bundled and env.bundled[moduleName]
-
-            return shipped ~= nil
-                and shipped ~= false
-                and env.bundledInternal ~= nil
-                and not env.bundledInternal(moduleName)
-        end
-
         local possible = false
         for _, path in ipairs(candidates) do
             local prefix = path
             while prefix do
                 local shipped = env.bundled and env.bundled[prefix]
-                if (registry.declaredModules[prefix] or shipped and shipped.declared) and not publicBundled(prefix) then
+                if registry.declaredModules[prefix] or shipped and shipped.declared then
                     possible = true
                     break
                 end
@@ -163,6 +418,23 @@ function imports.new(environment: any?, enabled: boolean?): any
             end
         end
         if not possible then
+            return source
+        end
+
+        local function publicBundled(moduleName: string): boolean
+            local shipped = env.bundled and env.bundled[moduleName]
+
+            return shipped ~= nil
+                and shipped ~= false
+                and env.bundledInternal ~= nil
+                and not env.bundledInternal(moduleName)
+        end
+
+        -- Checking the file checks every module it reaches: most of the compiler for
+        -- most of its own files, and `nupp fmt --check` over the tree cost a whole-tree
+        -- check per process (#360). So the file is checked only when something in it
+        -- could still come out of the check as an import below.
+        if not couldImport(parsed.root, env, registry, publicBundled) then
             return source
         end
 
