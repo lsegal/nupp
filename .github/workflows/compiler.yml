@@ -592,7 +592,6 @@ jobs:
       # it -- does not hold the checkout's build lock while every other test's
       # nupp waits on it.
       - name: Stamp the compiler binary
-        if: runner.os != 'Linux'
         shell: bash
         run: ./bin/nupp build --target dist
 
