@@ -18,10 +18,10 @@
 -- the file skips with the reason rather than failing over a missing toolchain.
 local json = require("testjson")
 local test = require("assert")
+local stampedBinary = require("helpers.stampedbinary")
 
 local HERE = require("helpers.paths").absoluteTests
 local ROOT = HERE .. "/.."
-local BINARY_TARGET = "dist"
 
 local M = {}
 
@@ -67,50 +67,11 @@ local function makeDir()
     return dir
 end
 
--- The binary is stamped once for the whole file, and only when the one already
--- there is not the compiler in `src`: stamping is the expensive part, and a build
--- started from inside the suite is a build running beside forty other processes
--- that are reading the same output directory. Once per tree is the most this can
--- cost, and a run after `nupp build --target dist` costs nothing at all.
-local PRODUCED = "/build/dist/nupp"
-
---- Whether anything the binary was stamped from has been written since.
----
---- Reuse is only sound while the artifact still answers for the tree under test.
---- One older than its sources answers for a tree nobody has any more, and the
---- difference it reports then reads as a defect in whatever change is being tested
---- rather than as the stale file it is. A `find` that cannot answer is treated as
---- stale, since stamping again costs a minute and believing this one costs a
---- debugging session.
-local function stampedBeforeItsSources(produced)
-    local out, status = run(("find '%s/src' '%s/nupp.lua' -newer '%s' -print"):format(ROOT, ROOT, produced))
-
-    return status ~= 0 or out:match("%S") ~= nil
-end
-
-local built, buildProblem
-
-local function stampedBinary()
-    if built or buildProblem then
-        return built, buildProblem
-    end
-    local produced = ROOT .. PRODUCED
-    if readFile(produced) and not stampedBeforeItsSources(produced) then
-        built = produced
-        return built, nil
-    end
-    local out, status = run(("cd '%s' && ./bin/nupp build --target %s"):format(ROOT, BINARY_TARGET))
-    if status ~= 0 or not readFile(produced) then
-        buildProblem = ("`nupp build --target %s` did not produce a binary:\n%s"):format(BINARY_TARGET, out:sub(-800))
-        return nil, buildProblem
-    end
-    built = produced
-
-    return built, nil
-end
-
+-- The binary is stamped once per run, by the runner before any case starts, or
+-- by the first case to ask when the suite runs on its own. Stamping is the
+-- expensive part: charged to one case it took 148 s on Linux CI (#383).
 local function binaryOrSkip()
-    local binary, problem = stampedBinary()
+    local binary, problem = stampedBinary.path(ROOT)
     if not binary then
         test.suite.skip("no stamped binary to test: " .. problem)
     end
