@@ -896,9 +896,9 @@ stdlibtest nettest netnativetest tlstest httpnativetest
 -- whenever one of those suites is selected, so a cold build is never charged to
 -- the case that asked first (#371, #383). `module` is a helper whose
 -- `command(root)` builds it, or names the cached build; the suites ask the same
--- helper for the result. A `background` build is started without holding up the cases, for one
--- that takes minutes and holds no lock other suites wait on; its suites are
--- dealt last and wait for it (tests/run.lua).
+-- helper for the result. A `background` build is started without holding up
+-- the cases, for one that takes minutes and holds no lock other suites wait on;
+-- its suites are dealt last and wait for it (tests/run.lua).
 local prerequisites = {
     {name = "the embedding SDK", module = "helpers.embeddingsdk", suites = {"hostembeddingtest", "hostchanneltest"}},
     {name = "the stamped compiler binary", module = "helpers.stampedbinary", suites = {"hostbinarytest"}},
