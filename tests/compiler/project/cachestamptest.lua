@@ -370,7 +370,20 @@ end
 -- build in the same process never wrote the store and every later command lexed the
 -- compiler again.
 function M.aCallerWithSomewhereToKeepTheGraphKeepsItAfterOneThatHadNot()
-    assert(fingerprint.subsystemFingerprint({"nupp.tools.fmt"}), "computed with nowhere to keep it")
+    -- Outside a run: inside one, an answer the run kept needs no graph at all.
+    local getenv, prior = os.getenv, package.loaded["nupp.compiler.project.fingerprint"]
+    os.getenv = function(name)
+        if name == "NUPP_TOOLCHAIN_ANSWERS" then
+            return nil
+        end
+        return getenv(name)
+    end
+    local ok, fingerprint = pcall(dofile, ROOT .. "/build/nupp/compiler/project/fingerprint.lua")
+    local computed = ok and fingerprint.subsystemFingerprint({"nupp.tools.fmt"})
+    os.getenv = getenv
+    package.loaded["nupp.compiler.project.fingerprint"] = prior
+    assert(ok, fingerprint)
+    assert(computed, "computed with nowhere to keep it")
     local dir = os.tmpname()
     os.remove(dir)
     os.execute("mkdir -p '" .. dir .. "'")

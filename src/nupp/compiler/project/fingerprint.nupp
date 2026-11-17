@@ -954,6 +954,7 @@ function fingerprint.declarationFingerprint(
     if own and declarationMemo ~= nil then
         return declarationMemo as string
     end
+
     local function compute(): string
         local digest = contentDigest or hash.digest
         local list = listDeclarations or require("nupp.compiler.bundledlist").list
@@ -966,6 +967,7 @@ function fingerprint.declarationFingerprint(
 
         return digest(table.concat(parts, "\0"))
     end
+
     if not own then
         return compute()
     end
