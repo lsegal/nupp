@@ -812,8 +812,10 @@ end
 -- A test run is one build of the tree. The launcher checks the compiler, the
 -- provider and the interpreter once for `nupp test` and hands that down, so a
 -- command a test starts goes straight to the compiler: no toolchain query, no
--- interpreter probe, no rebuild. `build` still takes the ordinary path, since it
--- is the writer the others would have to wait for.
+-- interpreter probe, no rebuild. A `build` of the tree itself still takes the
+-- ordinary path, since it is the writer the others would have to wait for; a
+-- build of another project -- every temporary project a suite builds -- writes
+-- nothing here and goes straight to the compiler like any other command.
 function M.aTestRunsCommandsUseTheBuildTheRunChecked()
     local directory = temporary()
     local root = directory .. "/root"
@@ -853,8 +855,13 @@ function M.aTestRunsCommandsUseTheBuildTheRunChecked()
             .. "    \"$NUPP_ROOT/bin/nupp\" check || exit 1\n"
             .. "    cp \"$LOG/toolchain\" \"$LOG/toolchain-check\"\n"
             .. "    cp \"$LOG/luajit\" \"$LOG/luajit-check\"\n"
-            .. "    \"$NUPP_ROOT/bin/nupp\" build || exit 1\n"
+            .. "    (cd \"$NUPP_ROOT\" && \"$NUPP_ROOT/bin/nupp\" build) || exit 1\n"
             .. "    cp \"$LOG/luajit\" \"$LOG/luajit-build\"\n"
+            .. "    : > \"$LOG/toolchain\"; : > \"$LOG/luajit\"\n"
+            .. "    mkdir -p \"$LOG/project\" && cd \"$LOG/project\" || exit 1\n"
+            .. "    \"$NUPP_ROOT/bin/nupp\" build || exit 1\n"
+            .. "    cp \"$LOG/toolchain\" \"$LOG/toolchain-project\"\n"
+            .. "    cp \"$LOG/luajit\" \"$LOG/luajit-project\"\n"
             .. "fi\n"
     )
     assert(os.execute("chmod +x " .. quote(root .. "/bin/nupp") .. " " .. quote(root .. "/scripts/toolchain")
@@ -893,7 +900,10 @@ function M.aTestRunsCommandsUseTheBuildTheRunChecked()
     assert(read(directory .. "/toolchain-check") == "", "a test's command asked the toolchain again:\n"
         .. read(directory .. "/toolchain-check"))
     assert(read(directory .. "/luajit-check") == "", "a test's command probed the interpreter again")
-    assert(read(directory .. "/luajit-build") == "selected\n", "a build inside the run skipped the checks")
+    assert(read(directory .. "/luajit-build") == "selected\n", "a build of the tree inside the run skipped the checks")
+    assert(read(directory .. "/toolchain-project") == "", "another project's build asked the toolchain again:\n"
+        .. read(directory .. "/toolchain-project"))
+    assert(read(directory .. "/luajit-project") == "", "another project's build probed the interpreter again")
     os.execute("rm -rf " .. quote(directory))
 end
 

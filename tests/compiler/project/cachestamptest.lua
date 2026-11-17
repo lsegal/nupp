@@ -894,6 +894,100 @@ function M.aStoredStandardLibraryInterfaceChecksTheSameAsItsSource()
     assert(bypassed == fromSource, "bypassing the store reported differently:\n" .. bypassed .. "\n" .. fromSource)
 end
 
+-- A project build keeps the standard library's interfaces too (#358). Every
+-- project has a manifest, and a build stages the carried runtime it links into
+-- its own directory; module resolution answered the name `nupp` with the one and
+-- found the other on a path, and either was taken for a project file shadowing
+-- the standard library, so no project build ever stored or read the interfaces.
+-- The runtime's own imports are kept beside them, so the next fresh project
+-- links it without checking it, and builds the same module either way.
+function M.aFreshProjectBuildReusesTheStandardLibraryAnotherOneChecked()
+    local files = {
+        ["nupp.lua"] = 'return {include = {"src"}, build = {targets = {lib = {\n'
+            .. '    kind = "modules", entries = {"greet"}, outDir = "build/lib",\n}}}}\n',
+        ["src/greet.nupp"] = 'module greet\n\nconst json = require("serde.json")\n\n'
+            .. "export function parse(text: string): any\n    local value = json.decodevalue(text)\n    return value\nend\n",
+    }
+    local shared = tempProject({})
+
+    local function build(prefix)
+        local dir = tempProject(files)
+        local pipe = assert(
+            io.popen(
+                ("cd '%s' && %sNUPP_CACHE_DIR='%s' '%s' build --target lib 2>&1; echo \"__exit__:$?\""):format(
+                    dir,
+                    prefix,
+                    shared,
+                    NUPP
+                )
+            )
+        )
+        local output = pipe:read("*a")
+        pipe:close()
+        local file = io.open(dir .. "/build/lib/greet.lua", "rb")
+        local generated = file and file:read("*a") or nil
+        if file then
+            file:close()
+        end
+        os.execute("rm -rf '" .. dir .. "'")
+        assert(output:match("__exit__:0%s*$"), "the project did not build:\n" .. output)
+
+        return assert(generated, "the build wrote no module:\n" .. output)
+    end
+
+    -- The first build keeps the prelude, the second the interfaces checked against
+    -- it, and the third is a fresh project reading both back.
+    local fromSource = build("")
+    build("")
+    local stdlibStored = exists(shared .. "/stdlib.buf")
+    local runtimeStored = exists(shared .. "/runtime-dependencies.buf")
+    local hydrated = build("")
+    local bypassed = build("NUPP_NO_STDLIB_CACHE=1 ")
+    os.execute("rm -rf '" .. shared .. "'")
+
+    assert(stdlibStored, "a project build did not store the standard library's interfaces")
+    assert(runtimeStored, "a project build did not keep the imports of the runtime it links")
+    assert(hydrated == fromSource, "the stored interfaces built a different module")
+    assert(bypassed == fromSource, "bypassing the store built a different module")
+end
+
+-- A stored image holds every module it was checked with (#358). A project check
+-- keeps bundled modules in the incremental graph rather than the environment's
+-- own table, and the image used to be read off that table: a project that only
+-- required `simd` stored `simd` and not the `nupp.mem.span` it was checked
+-- against. The next project checked that one from source beside the stored
+-- `simd`, and a span it made was not a span to `simd`.
+function M.aStoredImageCarriesTheModulesItsInterfacesNamed()
+    local shared = tempProject({})
+
+    local function check(source)
+        local dir = tempProject({["nupp.lua"] = 'return {include = {"src"}}\n', ["src/k.nupp"] = source})
+        local pipe = assert(
+            io.popen(("cd '%s' && NUPP_CACHE_DIR='%s' '%s' check 2>&1; echo \"__exit__:$?\""):format(dir, shared, NUPP))
+        )
+        local output = pipe:read("*a")
+        pipe:close()
+        os.execute("rm -rf '" .. dir .. "'")
+
+        return output
+    end
+
+    local widen = 'module k\nlocal span = require("bytes.span")\nlocal array = table.Array\n'
+        .. 'local simd = require("simd")\n\n'
+        .. "export function widen(exclusive out: span.WriteSpan<number>, borrows input: span.Span<int8>): nil\n"
+        .. "    local source = assert(simd.species(array.int8, 16))\n"
+        .. "    local wide = assert(simd.species(array.number, 16))\n"
+        .. "    wide:store(out, 1, wide:convert(source:load(input, 1)))\nend\n"
+    -- The first keeps the prelude; the second checks `simd` and stores it; the third
+    -- reads it back beside whatever the second left out.
+    check("module k\nexport const x = 1\n")
+    check('module k\nlocal simd = require("simd")\nexport const s = simd\n')
+    local output = check(widen)
+    os.execute("rm -rf '" .. shared .. "'")
+
+    assert(output:match("__exit__:0%s*$"), "a span did not reach the stored simd:\n" .. output)
+end
+
 -- A single-file compile inside a project reads its dependencies' checked interfaces
 -- back from the build directory (#277). What it says and what it generates are the
 -- same as checking the graph from source, with `NUPP_NO_INTERFACE_CACHE`, and an

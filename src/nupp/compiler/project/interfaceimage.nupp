@@ -201,16 +201,34 @@ local function syntaxOf(node: any): any
         copy[position] = syntaxOf(child)
         copies[child] = copy[position]
     end
+
+    -- A field naming a child is the same table as that child in a tree the parser
+    -- made, and a separate one in a copy read back from an image. Copied either
+    -- way: matching by identity alone dropped `token` from a hydrated literal
+    -- default the second time it was stored, and the alias it belonged to lost
+    -- the default with it (#358).
+    local function syntaxCopy(value: any): any
+        if copies[value] ~= nil then
+            return copies[value]
+        end
+        if type(value) == "table" and type(value.kind) == "string" then
+            return syntaxOf(value)
+        end
+
+        return nil
+    end
+
     for key, value in pairs(node) do
+        local named = type(key) == "string" and key ~= "kind" and type(value) == "table" and syntaxCopy(value) or nil
         if type(key) == "string" and key ~= "kind" then
             if type(value) == "string" or type(value) == "number" or type(value) == "boolean" then
                 copy[key] = value
-            elseif copies[value] ~= nil then
-                copy[key] = copies[value]
+            elseif named ~= nil then
+                copy[key] = named
             elseif type(value) == "table" and #(value as {any}) > 0 then
                 local list: {any} = {}
                 for position, member in ipairs(value as {any}) do
-                    list[position] = copies[member]
+                    list[position] = syntaxCopy(member)
                 end
                 if #list == #(value as {any}) then
                     copy[key] = list
