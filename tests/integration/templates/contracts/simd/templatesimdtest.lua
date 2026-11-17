@@ -3,17 +3,28 @@ local testAssert = fixture.testAssert
 local NUPP = fixture.NUPP
 local shell = fixture.shell
 local SCAFFOLD_STORE = fixture.SCAFFOLD_STORE
-local scaffoldAndVerify = fixture.scaffoldAndVerify
 local withDevelopmentRocks = fixture.withDevelopmentRocks
 
 local M = {}
 
-function M.theBrowserSimdTemplateChecksBuildsAndTests()
-    -- Its default keeps the scalar kernel as Lua. The package task is what asks
-    -- for scalar and SIMD128 AOT, so ordinary init/check/build/test remains a
-    -- useful path on a machine that has not installed Emscripten yet.
-    scaffoldAndVerify("browser-simd", "sample-browser-simd", nil, function(into)
-        withDevelopmentRocks(into)
+-- Its default keeps the scalar kernel as Lua. The package task is what asks for
+-- scalar and SIMD128 AOT, so ordinary init/check/build/test remains a useful path
+-- on a machine that has not installed Emscripten yet.
+
+function M.theBrowserSimdTemplateChecks()
+    fixture.scaffoldChecks("browser-simd", "sample-browser-simd", withDevelopmentRocks)
+end
+
+function M.theBrowserSimdTemplateBuilds()
+    fixture.scaffoldBuilds("browser-simd", "sample-browser-simd", withDevelopmentRocks)
+end
+
+function M.theBrowserSimdTemplatePassesItsTests()
+    fixture.scaffoldTests("browser-simd", "sample-browser-simd", withDevelopmentRocks)
+end
+
+function M.theBrowserSimdTemplateAdmitsBothAotTiers()
+    fixture.inScaffold("browser-simd", "sample-browser-simd", withDevelopmentRocks, function(into)
         local config = assert(loadfile(into .. "/nupp.lua"))()
         testAssert.eq(config.build.targets.scalar.aotFeatures.maximum, "scalar", "the fallback is scalar Wasm AOT")
         testAssert.eq(

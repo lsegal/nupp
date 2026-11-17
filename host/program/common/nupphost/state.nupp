@@ -268,10 +268,10 @@ local function setup(L: voidptr): int32
         return 0
     end
     installHostRecord(L)
-    if not addFeatures(L, record, build.FEATURES) then
+    if not addFeatures(L, record, build.features()) then
         return 0
     end
-    if build.LPEG then
+    if build.lpeg() then
         nuppHostStatePreload(L, "lpeg", build.nuppHostBuildOpenLpeg)
     end
     @unsafe do

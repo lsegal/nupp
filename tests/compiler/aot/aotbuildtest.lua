@@ -7874,44 +7874,59 @@ function M.entryOnlyAotTargetsCheckOnlyTheirDependencyClosure()
     assert(reached, "AOT bodies reached through an entry dependency are emitted")
 end
 
-function M.directSoaViewsRunAgainstTheSameLuaOracleAndReuseNativeObjects()
+--- A project around the SoA integration program, with its native target asking
+--- for `policy`. Each SoA case starts from its own, so the pool can run them
+--- side by side: as one case they were four builds in a row, about a minute
+--- and a half of one worker.
+local function soaProject(policy)
     local dir = os.tmpname()
     os.remove(dir)
     assert(os.execute(("mkdir -p %q"):format(dir .. "/src")) == 0)
-
     local function write(name, text)
         local handle = assert(io.open(dir .. "/" .. name, "wb"))
         handle:write(text)
         handle:close()
     end
-
     write("src/main.nupp", assert(read(NATIVE_HERE .. "/integration/aot/soa/main.nupp")))
-    local expected
-    for _, policy in ipairs({"off", "require"}) do
-        write(
-            "nupp.lua",
-            (
-                [=[
+    write(
+        "nupp.lua",
+        (
+            [=[
 return {include={"src"},build={targets={native={kind="bundle",entries={"main"},
     outDir="build/native",output="dist/app.lua",aot=%q}}}}
 ]=]
-            ):format(policy)
-        )
-        local out, code = build(dir)
-        test.eq(code, 0, policy .. " SoA build at " .. dir .. ": " .. out)
-        local pipe = assert(io.popen(("cd %q && %q run dist/app.lua 2>&1"):format(dir, NUPP)))
-        local answer = pipe:read("*a"):gsub("%s+$", "")
-        pipe:close()
-        assert(answer:match("^SoA native results%s+%d"), policy .. " at " .. dir .. ": " .. answer)
-        if expected then
-            test.eq(answer, expected, "identical SoA input and all resulting columns")
-        else
-            expected = answer
-        end
-    end
-    local code = assert(read(dir .. "/build/native/main.lua"))
+        ):format(policy)
+    )
+
+    return dir, write
+end
+
+--- Builds and runs the SoA program, and returns what it printed.
+local function soaAnswer(dir, policy)
+    local out, code = build(dir)
+    test.eq(code, 0, policy .. " SoA build at " .. dir .. ": " .. out)
+    local pipe = assert(io.popen(("cd %q && %q run dist/app.lua 2>&1"):format(dir, NUPP)))
+    local answer = pipe:read("*a"):gsub("%s+$", "")
+    pipe:close()
+    assert(answer:match("^SoA native results%s+%d"), policy .. " at " .. dir .. ": " .. answer)
+
+    return answer
+end
+
+function M.directSoaViewsRunAgainstTheSameLuaOracle()
+    local dir = soaProject("off")
+    local expected = soaAnswer(dir, "off")
+    local required = soaProject("require")
+    test.eq(soaAnswer(required, "require"), expected, "identical SoA input and all resulting columns")
+    local code = assert(read(required .. "/build/native/main.lua"))
     assert(code:find("__nuppAotCompiled", 1, true), "required AOT installed the native wrappers")
     assert(not code:find("ffi.copy", 1, true), "entry/exit must not copy row payloads")
+end
+
+function M.directSoaViewsReuseNativeObjectsOnAWarmBuild()
+    local dir = soaProject("require")
+    local out, code = build(dir)
+    test.eq(code, 0, "require SoA build at " .. dir .. ": " .. out)
     local pipe = assert(
         io.popen(("cd %q && NUPP_CACHE_DIR=%q %q build --target native --json 2>&1"):format(dir, cacheFor(dir), NUPP))
     )
@@ -7921,6 +7936,10 @@ return {include={"src"},build={targets={native={kind="bundle",entries={"main"},
     test.eq(result.ok, true, "warm SoA build")
     test.eq(result.timing.aot.compiledObjects, 0, "unchanged source mapping reuses native artifacts")
     test.eq(result.timing.aot.reusedObjects, result.timing.aot.units, "every SoA object reused")
+end
+
+function M.requiredAotRejectsWholeSoaRows()
+    local dir, write = soaProject("require")
     write(
         "src/main.nupp",
         [[

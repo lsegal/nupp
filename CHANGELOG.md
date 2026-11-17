@@ -8,6 +8,13 @@
   it. A cold `nupp fmt --check` over a quarter of this repository went from
   about 250 seconds to about 30 on Windows, with the same results.
 
+- Two worker lanes of one process that link native code at the same time no
+  longer corrupt each other. lld runs in process and keeps its state in
+  process globals, so overlapping links freed each other's state, failed with
+  "lld stopped with status 1 and no message", or crashed the process with an
+  access violation. Links, LLVM target setup and the POSIX compile fork now
+  take one lock for the whole process.
+
 - On Windows, a `nupp test` worker no longer dies with `cannot retire a
   claimed test queue piece`, which left every suite it would have run
   reported as `<unrun>`. The run's own progress check held queue pieces open,
