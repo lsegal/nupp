@@ -40,12 +40,18 @@ local function elfObject()
     return path
 end
 
+-- Lanes need a worker host, which the runner's Nupp worker states run in. The
+-- scope comes from the provider `nupp.workers` selects, opened directly as
+-- workerstartuptest reaches the host, so the suite stays among those states.
 function M.lldLinksFromSeveralStatesAtOnce()
     if not codegen.available() then
         return
     end
+    if package.preload["nupp.workers.native"] == nil and package.loaded["nupp.workers.native"] == nil then
+        return
+    end
     local object = elfObject()
-    local scope = require("nupp.workers").__scope()
+    local scope = require("nupp.runtime.provider.workers").openscope()
     local outputs = {}
     local ok, problem = pcall(function()
         local tasks = {}
