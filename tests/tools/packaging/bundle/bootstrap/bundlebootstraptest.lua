@@ -30,6 +30,48 @@ function M.aBootstrapCompilerRetainsPublicRuntimeArtifacts()
     assert(result == "return 17", "a bootstrap compiler can reuse its public runtime without a module directory")
 end
 
+function M.aCompilerCarryingPayloadFindsItsModulesFromTheExecutable()
+    local dir = tempProject({
+        ["build/test-runner/main.lua"] = "return 1",
+        ["build/test-runner/nupp/compiler/bundled.lua"] = "return {}",
+    })
+    local target = {kind = "binary", outDir = "build/test-runner", entries = {"main"}}
+    local modules = {
+        main = {output = dir .. "/build/test-runner/main.lua"},
+        ["nupp.compiler.bundled"] = {output = dir .. "/build/test-runner/nupp/compiler/bundled.lua"},
+    }
+    local text = assert(packaging.bundleText(dir, {}, target, nil, modules, false, {}, nil, false, nil, "test-runner"))
+    local plain = assert(
+        packaging.bundleText(dir, {}, target, nil, {main = modules.main}, false, {}, nil, false, nil, "test-runner")
+    )
+    os.execute("rm -rf '" .. dir .. "'")
+    assert(text:find('rawset(_G, "__nuppPayloadModuleRoot", "test-runner")', 1, true), text)
+    assert(not plain:find("__nuppPayloadModuleRoot", 1, true), "a payload without the compiler records nothing")
+
+    -- A stamped payload names its chunk for the executable, and a worker state's for
+    -- nothing; either way the modules are found from the executable the host names.
+    local source = assert(readFile(HERE .. "/../build/nupp/compiler/bundled.lua"))
+    local savedRoot, savedExecutable = rawget(_G, "__nuppPayloadModuleRoot"), rawget(_G, "__NUPP_EXECUTABLE")
+    rawset(_G, "__nuppPayloadModuleRoot", "test-runner")
+    rawset(_G, "__NUPP_EXECUTABLE", "/work/build/nupp-test")
+    local function moduleDirAs(chunkName)
+        return pcall(function()
+            return assert(loadstring(source, chunkName))().moduleDir()
+        end)
+    end
+    local ok, carried = moduleDirAs("@/work/build/nupp-test")
+    local okWorker, worker = moduleDirAs("=nupp-worker")
+    local okLua, fromFile = moduleDirAs("@/work/build/nupp/compiler/bundled.lua")
+    rawset(_G, "__nuppPayloadModuleRoot", savedRoot)
+    rawset(_G, "__NUPP_EXECUTABLE", savedExecutable)
+    assert(ok, carried)
+    assert(okWorker, worker)
+    assert(okLua, fromFile)
+    assert(carried == "/work/build/test-runner/nupp/compiler", carried)
+    assert(worker == "/work/build/test-runner/nupp/compiler", worker)
+    assert(fromFile == "/work/build/nupp/compiler", "a module loaded from its file keeps its own directory")
+end
+
 function M.compilerHostPreambleMasksUniversalStubFeaturesBeforeUserCode()
     local dir = tempProject({
         [

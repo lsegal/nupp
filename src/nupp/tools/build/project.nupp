@@ -1042,7 +1042,9 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
         local moduleRoot: string? = nil
         if target.kind == "binary" then
             local name = target.name or opts.target or (target.platforms and "default") or target.kind
-            local executableDir = normalize(dirname(binaryOutput(root, target, name, outDir, selectedPlatform, opts.outDir ~= nil)))
+            local executableDir = normalize(
+                dirname(binaryOutput(root, target, name, outDir, selectedPlatform, opts.outDir ~= nil))
+            )
             local modulesDir = normalize(join(root, outDir))
             if modulesDir == executableDir then
                 moduleRoot = "."
