@@ -1089,7 +1089,8 @@ function M.theEmbeddingSdkIsANativeNuppProgram()
     assert(io.open(ROOT .. "/host/program/common/nuppembed/abi.nupp", "rb"), "the embedding ABI is not Nupp source")
     assert(not io.open(ROOT .. "/native/crates/host/Cargo.toml", "rb"), "the Rust host crate is back")
     assert(
-        driver:find('"$ROOT/bin/nupp" aot --emit static-library --output "$(native_path "$ne_out/libnuppembed.a")"', 1, true),
+        driver:find('build_host_library embedding "$ne_luajit"', 1, true)
+            and driver:find('"$ROOT/bin/nupp" aot --emit static-library --output "$(native_path "$HOST_LIBRARY_OUT")"', 1, true),
         "the embedding library is not compiled by this tree's compiler"
     )
     assert(not driver:find("nupp-native-host", 1, true), "the toolchain still builds the Rust host crate")

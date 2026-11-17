@@ -1795,26 +1795,24 @@ host_stub_exports() {
     hx_embedding=${3:-}
     hx_include=$(cat "$hx_luajit/.include")
     hx_version=$(sed -n 's/^#define LUAJIT_VERSION_SYM[ 	]*//p' "$hx_include/luajit.h" | tr -d '\r')
-    hx_applies=false
-    while IFS= read -r hx_line; do
-        hx_line=$(printf '%s' "$hx_line" | tr -d '\r' | sed 's/^[ 	]*//; s/[ 	]*$//')
-        case "$hx_line" in
-            ''|'#'*) continue ;;
-            '['*']')
-                hx_applies=false
-                for hx_section in $(printf '%s' "$hx_line" | tr -d '[]'); do
-                    case ",always,$hx_features," in
-                        *,"$hx_section",*) hx_applies=true ;;
-                    esac
-                done
-                continue
-                ;;
-            nupp_*) [ -n "$hx_embedding" ] || continue ;;
-        esac
-        [ "$hx_applies" = true ] || continue
-        [ "$hx_line" = LUAJIT_VERSION_SYM ] && hx_line=$hx_version
-        printf '%s\n' "$hx_line"
-    done < "$ROOT/host/include/nupp.exports"
+    # One pass, not a pipeline per line: a fork costs tens of milliseconds on
+    # Windows, and every host and kit reads the whole list (#361).
+    awk -v features=",always,$hx_features," -v embedding="$hx_embedding" -v version="$hx_version" '
+        { sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+        $0 == "" || /^#/ { next }
+        /^\[.*\]$/ {
+            applies = 0
+            count = split(substr($0, 2, length($0) - 2), sections, /[ \t]+/)
+            for (i = 1; i <= count; i++) {
+                if (sections[i] != "" && index(features, "," sections[i] ",")) applies = 1
+            }
+            next
+        }
+        /^nupp_/ && embedding == "" { next }
+        !applies { next }
+        $0 == "LUAJIT_VERSION_SYM" { $0 = version }
+        { print }
+    ' "$ROOT/host/include/nupp.exports"
 }
 
 # What the stub executable exports, and nothing of LLVM, lld or C++: exported,
