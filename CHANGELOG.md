@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Two worker lanes of one process that link native code at the same time no
+  longer corrupt each other. lld runs in process and keeps its state in
+  process globals, so overlapping links freed each other's state, failed with
+  "lld stopped with status 1 and no message", or crashed the process with an
+  access violation. Links, LLVM target setup and the POSIX compile fork now
+  take one lock for the whole process.
+
 - `nupp fixpoint` now also holds the compiler's native half to the fixpoint:
   stages two and three each lower the native provider, the host and the
   embedding library to LLVM IR, which must match, and each runs on the
