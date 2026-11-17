@@ -447,17 +447,53 @@ function M.everyCommandReportsABrokenManifestAsACodedFailure()
     os.execute("rm -rf '" .. good .. "' '" .. broken .. "' '" .. none .. "'")
 end
 
-function M.everyCommandAnswersWithoutAManifestOrSaysWhy()
-    local good, broken, none = failureProjects()
-    for _, argv in ipairs({"check", "build", "clean", "task --list", "fixpoint"}) do
-        holdsTheContract(none, argv, {code = "NUPP0002", where = "no manifest"})
-    end
-    holdsTheContract(none, "test", {runner = true, where = "no manifest"})
-    -- A directory without `nupp.lua` is a supported configuration for these.
-    for _, argv in ipairs({"lints", "lsp symbols", "check good.nupp"}) do
-        holdsTheContract(none, argv, {expectOk = true, where = "no manifest"})
-    end
-    os.execute("rm -rf '" .. good .. "' '" .. broken .. "' '" .. none .. "'")
+--- Holds one command to the contract in a directory without `nupp.lua`.
+---
+--- One case per command rather than one for all of them, so the pool runs them
+--- side by side and a slow one is named by its own case.
+local function holdsTheContractWithoutAManifest(argv, options)
+    local none = tempProject({["good.nupp"] = GOOD})
+    options.where = "no manifest"
+    local ok, why = pcall(holdsTheContract, none, argv, options)
+    os.execute("rm -rf '" .. none .. "'")
+    assert(ok, why)
+end
+
+function M.checkWithoutAManifestSaysWhy()
+    holdsTheContractWithoutAManifest("check", {code = "NUPP0002"})
+end
+
+function M.buildWithoutAManifestSaysWhy()
+    holdsTheContractWithoutAManifest("build", {code = "NUPP0002"})
+end
+
+function M.cleanWithoutAManifestSaysWhy()
+    holdsTheContractWithoutAManifest("clean", {code = "NUPP0002"})
+end
+
+function M.taskListWithoutAManifestSaysWhy()
+    holdsTheContractWithoutAManifest("task --list", {code = "NUPP0002"})
+end
+
+function M.fixpointWithoutAManifestSaysWhy()
+    holdsTheContractWithoutAManifest("fixpoint", {code = "NUPP0002"})
+end
+
+function M.testWithoutAManifestSaysWhy()
+    holdsTheContractWithoutAManifest("test", {runner = true})
+end
+
+-- A directory without `nupp.lua` is a supported configuration for these.
+function M.lintsAnswerWithoutAManifest()
+    holdsTheContractWithoutAManifest("lints", {expectOk = true})
+end
+
+function M.lspSymbolsAnswerWithoutAManifest()
+    holdsTheContractWithoutAManifest("lsp symbols", {expectOk = true})
+end
+
+function M.checkingAFileAnswersWithoutAManifest()
+    holdsTheContractWithoutAManifest("check good.nupp", {expectOk = true})
 end
 
 function M.everyCommandReportsAnUnknownNameAsACodedFailure()
