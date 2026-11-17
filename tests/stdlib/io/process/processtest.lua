@@ -1662,8 +1662,7 @@ function M.luaGcRetainsTheChildWhileAStreamIsReachable()
     local backend = fakeBackend({out = {"retained"}, err = {}, outDelay = 4})
     local weak
 
-    -- Finish the frame that held the stream before checking unreachability;
-    -- a JIT trace may retain a register after its source local is set to nil.
+    -- Finish the frame that held the stream before checking unreachability.
     local function readWhileReachable()
         local child = spawnOn(backend, {args = {"fixture"}})
         local stream = child.stdout
@@ -1690,7 +1689,8 @@ function M.luaGcRetainsTheChildWhileAStreamIsReachable()
         for _ = 1, 4 do
             collectgarbage("collect")
         end
-        assert(weak[1] == nil and backend.state.reaped, "an unreachable process releases its child and pump")
+        assert(weak[1] == nil, "the process becomes unreachable after its last stream")
+        assert(backend.state.reaped, "an unreachable process releases its child and pump")
     end)
     if weak and weak[1] ~= nil then
         weak[1]:_drop()

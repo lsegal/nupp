@@ -1,0 +1,349 @@
+--[[
+The modules the compiler carries and checks by name, and the carried file each
+one is read from.
+
+Two readers need the same answer. The project environment resolves a `require`
+of one of these names to its file, and the declaration fingerprint stamps
+stored checks with the content of every file a check can read. Kept here, the
+two cannot drift: a module added to either map is resolved and stamped at once.
+]]
+module nupp.compiler.project.carried
+
+-- Bundled module declarations (require("ffi") etc.). One relative path
+-- reaches them whether they are on disk beside the compiled modules or carried
+-- inside the stage-0 bundle.
+export const declarations: {[string]: string} = {
+    ["bit"] = "/decls/bit.d.nupp",
+    ["ffi"] = "/decls/ffi.d.nupp",
+    ["lpeg"] = "/decls/lpeg.d.nupp",
+    -- The jit.* submodules are require()-only: LuaJIT registers them under
+    -- package.loaded without putting them on the `jit` table, so they are modules
+    -- here rather than fields in the prelude.
+    ["jit.util"] = "/decls/jit/util.d.nupp",
+    ["jit.profile"] = "/decls/jit/profile.d.nupp",
+    ["jit.zone"] = "/decls/jit/zone.d.nupp",
+    ["jit.vmdef"] = "/decls/jit/vmdef.d.nupp",
+    ["nupp.workers.native"] = "/nupp/workers/native.d.nupp",
+}
+-- The standard library, which is this compiler's own Nupp rather than a description
+-- of someone else's C. It is typed already, so there is nothing to declare a second
+-- time: the implementation is the surface, and a project outside this tree reads
+-- exactly the source that went into the binary it is running. A hand-written
+-- `.d.nupp` beside it would be a second copy with nothing holding the two together.
+-- Each is read from the file its name spells, under the compiler's modules:
+-- `a.b` from `/a/b.nupp`, or `/a/b/init.nupp` or `/a/b.lua` for the names listed
+-- as such. Spelled out, the paths cost the browser compiler bundle bytes its
+-- startup mailbox does not have to spare.
+local MODULES: {
+    string
+} = {
+    "bytes.internal.sharedbytes",
+    "bytes.internal.bytestypes",
+    "bytes.span",
+    "coroutine.host",
+    "io.internal.files.messages",
+    "io.net.internal.contracts",
+    "io.net.internal.tls",
+    "nupp.runtime.rawcoroutine",
+    "nupp.runtime.standardcoroutine",
+    "warn",
+    "types.derive",
+    "types.reflect",
+    "own",
+    "nupp.runtime.workersprovider",
+    "nupp.runtime.timeprovider",
+    "nupp.io.http.contracts",
+    "nupp.runtime.provider.nativegpurelease",
+    "nupp.gpu.operations",
+    "nupp.runtime.provider.nativegpu",
+    "nupp.runtime.provider.gpudevice",
+    "nupp.runtime.provider.gpucosts",
+    "nupp.runtime.provider.wgpu",
+    "nupp.gpu.contracts",
+    "nupp.gpu.api",
+    "nupp.gpu.types",
+    "nupp.runtime.provider.nativehttp",
+    "bytes._representation",
+    "nupp.workers.contracts",
+    "nupp.workers.internal.support",
+    "nupp.workers.internal.channeltypes",
+    "nupp.workers.internal.valuecodec",
+    "nupp.runtime.provider.channels",
+    "nupp.runtime.browser.channels",
+    "nupp.runtime.provider.workers",
+    "nupp.runtime.uuidprovider",
+    "nupp.runtime.provider.nativeuuid",
+    "nupp.runtime.provider.nativestorage",
+    "nupp.runtime.structvalue",
+    "nupp.runtime.provider.suspension",
+    "nupp.suspension.cancellation",
+    "nupp.suspension.contracts",
+    "nupp.suspension.selected",
+    "nupp.runtime.provider.nativeprocess",
+    "io.internal.process.contracts",
+    "nupp.runtime.provider.nativetls",
+    "nupp.io.tls.wire",
+    "nupp.io.tls.engine",
+    "nupp.io.tls.roots",
+    "nupp.io.tls.crypto.aes",
+    "nupp.io.tls.crypto.chacha",
+    "nupp.io.tls.crypto.hash",
+    "nupp.io.tls.crypto.bignum",
+    "nupp.io.tls.crypto.der",
+    "nupp.io.tls.crypto.ecc",
+    "nupp.io.tls.crypto.curve25519",
+    "nupp.io.tls.crypto.rsa",
+    "nupp.io.tls.crypto.keys",
+    "nupp.io.tls.crypto.x509",
+    "nupp.runtime.provider.nativenet",
+    "nupp.runtime.provider.nativesocket",
+    "nupp.io.net.contracts",
+    "nupp.gpu.internal",
+    "nupp.gpu.layoutfacts",
+    "nupp.runtime.browser.webgpu.internal",
+    "nupp.runtime.browser.uri",
+    "nupp.io.uri.whatwg",
+    "nupp.io.uri.idna",
+    "nupp.io.uri.idnatables",
+    "nupp.io.uri.provider",
+    "nupp.io.net.internal",
+    "nupp.io.net.types",
+    "io.internal.fileformat",
+    "io.internal.fileviews",
+    "io.internal.portablefile",
+    "io.internal.process.types",
+    "io.net.internal.tlstypes",
+    "nupp.io.http.messages",
+    "nupp.io.internal.bytes",
+    "nupp.io.internal.ownedreader",
+    "nupp.io.internal.scalars",
+    "nupp.io.http.internal.transport",
+    "nupp.runtime.bitops",
+    "nupp.runtime.provider.nativetime",
+    "nupp.runtime.provider.nativeplatform",
+    "nupp.runtime.provider.nativepath",
+    "nupp.runtime.provider.nativeuri",
+    "nupp.runtime.packages",
+    "nupp.runtime.contracts",
+    "serde.json.internal.contracts",
+    "nupp.codec.json.number",
+    "nupp.codec.json.internal.writerprotocol",
+    "io.internal.contracts",
+    "nupp.io.path.pathtext",
+    "nupp.runtime.provider.lunajson",
+    "nupp.compiler.targetbindings",
+    "nupp.runtime.bindings.files",
+    "nupp.runtime.bindings.http",
+    "nupp.runtime.bindings.gpu",
+    "nupp.runtime.bindings.host",
+    "nupp.runtime.bindings.suspension",
+    "nupp.runtime.bindings.system",
+    "nupp.runtime.bindings.entropy",
+    "nupp.runtime.optional",
+    "nupp.runtime.bindings.clock",
+    "nupp.runtime.bindings.workers",
+    "nupp.runtime.target",
+    "nupp.derive",
+    "io.cli",
+    "assert",
+    "nupp.runtime.standardio",
+    "nupp.cli.internal.optparser",
+    "nupp.cli.internal.decode",
+    "nupp.cli.internal.terminal",
+    "nupp.cli.internal.tablebuilder",
+    "nupp.cli.internal.application",
+    "nupp.compiler.runtime.extensions",
+    "debug.profile.zone",
+    "nupp.mem.indexed",
+    "nupp.mem.span",
+    "simd",
+    "math.internal.random",
+    "nupp.runtime.entropy",
+    "nupp.runtime.reflectionshape",
+    "nupp.array.internal.layout",
+    "nupp.array.internal.api",
+    "nupp.array",
+    "nupp.util.internal.structpool",
+    "nupp.util.internal.pool",
+    "events",
+    "nupp.serde.internal.json.values",
+    "nupp.codec.json.provider",
+    "nupp.codec.json.aot",
+    "nupp.codec.json.internal.decode",
+    "nupp.codec.json.internal.decoder.fused",
+    "nupp.codec.json.internal.decoder.eager",
+    "nupp.codec.json.internal.decoder.serde",
+    "nupp.codec.json.internal.builder",
+    "nupp.serde.internal.accessors",
+    "nupp.serde.internal.context",
+    "serde.debug",
+    "nupp.serde.internal.declaration",
+    "nupp.serde.internal.json.defaults",
+    "nupp.serde.internal.document",
+    "nupp.serde.internal.documentcodec",
+    "nupp.serde.internal.documentreader",
+    "nupp.serde.internal.documentwriter",
+    "nupp.serde.internal.aggregate",
+    "nupp.serde.internal.readplan",
+    "nupp.serde.internal.errors",
+    "serde.adapters",
+    "serde.codec",
+    "serde.document",
+    "nupp.serde.internal.json.compiled",
+    "nupp.serde.internal.json.encoder",
+    "nupp.serde.internal.json.diagnostic",
+    "nupp.serde.internal.json.document",
+    "nupp.serde.internal.json.extensions",
+    "nupp.serde.internal.json.lower",
+    "nupp.serde.internal.json.plan",
+    "nupp.serde.internal.json.reader",
+    "nupp.serde.internal.json.syntax",
+    "nupp.serde.internal.json.writer",
+    "nupp.serde.internal.list",
+    "nupp.serde.internal.memo",
+    "nupp.serde.internal.indexed",
+    "serde.native",
+    "nupp.serde.internal.native.reader",
+    "nupp.serde.internal.native.writer",
+    "nupp.serde.internal.numbers",
+    "nupp.serde.internal.persistence",
+    "nupp.serde.internal.publication",
+    "nupp.serde.internal.scalar",
+    "nupp.serde.internal.structure",
+    "nupp.serde.internal.timestamps",
+    "nupp.serde.internal.value",
+    "nupp.serde.internal.view",
+    "nupp.digest.internal.streaming",
+    "nupp.runtime.provider.tablestruct",
+    "nupp.runtime.storage",
+    "nupp.runtime.managed",
+    "nupp.runtime.browser.effects",
+    "nupp.runtime.browser.response",
+    "nupp.runtime.browser.crypto",
+    "nupp.runtime.browser.memory",
+    "nupp.runtime.browser.http",
+    "nupp.runtime.browser.path",
+    "nupp.runtime.browser.suspension",
+    "nupp.runtime.browser.time",
+    "utf8",
+    "nupp.runtime.native",
+    "nupp.runtime.clocks",
+    "nupp.runtime.standardos",
+    "nupp.runtime.standardtable",
+    "nupp.runtime.standardmath",
+    "nupp.tasks",
+    "nupp.digest.checksum",
+    "nupp.digest.digest",
+    "nupp.digest.mac",
+    "nupp.util.internal.encoding",
+    "nupp.gpu.layout",
+    "nupp.gpu.limits",
+    "nupp.digest.internal.macprovider",
+    "nupp.runtime.provider.digest",
+    "nupp.runtime.provider.checksum",
+    "nupp.runtime.provider.mac",
+    "nupp.runtime.provider.nativecrypto",
+    "nupp.runtime.provider.nativesystem",
+    "nupp.digest.internal.digestprovider",
+    "nupp.digest.internal.contracts",
+    "nupp.digest.internal.context",
+    "nupp.digest.internal.catalog",
+    "nupp.digest.internal.builtin",
+    "nupp.digest.internal.words",
+    "nupp.digest.internal.constants",
+    "nupp.digest.internal.checksumprovider",
+    "nupp.checksum.internal.builtin",
+    "nupp.checksum.internal.crc",
+    "nupp.compression",
+    "nupp.compression.contracts",
+    "nupp.compression.deflate",
+    "nupp.compression.inflate",
+    "nupp.runtime.provider.nativecompression",
+    "nupp.util.internal.hash",
+    "nupp.util.internal.uuid",
+    "nupp.runtime.system",
+    "nupp.runtime.systeminfo",
+    "os.host",
+    "nupp.host.internal.values",
+    "nupp.runtime.provider.nativehost",
+    "nupp.runtime.browser.host",
+    "nupp.runtime.browser.hostwire",
+    "nupp.runtime.browser.system",
+    "nupp.util.internal.bitset",
+    "nupp.util.internal.store",
+    "debug.log",
+    "nupp.suspension.host",
+    "nupp.compiler.runtime.math",
+    "nupp.compiler.runtime.reflect",
+    "nupp.compiler.runtime.typewitness",
+    "nupp.runtime.hotreload",
+    "serde.valuebuilder",
+    "nupp.serde.internal.valuebuilder",
+    "io.internal.boundedcache",
+    "io.internal.path",
+    "io.internal.pathtypes",
+    "nupp.io.path.provider",
+    "io.internal.uritypes",
+    "io.internal.uri",
+    "io.internal.files.path",
+    "io.internal.files.contracts",
+}
+
+local INIT_MODULES: {
+    string
+} = {
+    "io.internal.files",
+    "io.http",
+    "io.net",
+    "types",
+    "io.gpu",
+    "debug.profile",
+    "bytes",
+    "nupp",
+    "serde",
+    "serde.json",
+    "nupp.time",
+    "nupp.suspension",
+    "io.internal.process",
+    "nupp.workers",
+    "nupp.io.http",
+    "nupp.io.net",
+    "nupp.io",
+}
+
+local LUA_MODULES: {
+    string
+} = {
+    "nupp.array.internal.storage",
+    "nupp.serde.internal.identity",
+    "nupp.serde.internal.binarycodec",
+    "nupp.io.internal.nativebuffer",
+}
+
+local function located(names: {string}, suffix: string, found: {[string]: string}): {[string]: string}
+    for _, name in ipairs(names) do
+        found[name] = "/" .. (name:gsub("%.", "/")) .. suffix
+    end
+
+    return found
+end
+
+export const implementations: {
+    [string]: string
+} = located(LUA_MODULES, ".lua", located(INIT_MODULES, "/init.nupp", located(MODULES, ".nupp", {})))
+
+--- Returns every carried file named by either map, sorted.
+---
+--- @return the files, by the spelling `nupp.compiler.bundled` reads
+export function files(): {string}
+    local found: {string} = {}
+    for _, file in pairs(declarations) do
+        found[#found + 1] = file
+    end
+    for _, file in pairs(implementations) do
+        found[#found + 1] = file
+    end
+    table.sort(found)
+
+    return found
+end

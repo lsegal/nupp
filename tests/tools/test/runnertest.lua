@@ -175,6 +175,76 @@ return M
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- A suite that requires a carried library by a name the checker cannot see is
+-- the first thing to load it. The runtime loader hands the compile step the
+-- module's name and carried source, which `nupp run` compiles and the runner
+-- once read as a path to a file named after the module.
+function M.aNuppSuiteLoadsACarriedLibraryAtRunTime()
+    local dir = os.tmpname()
+    os.remove(dir)
+    local fs = require("nupp.compiler.fs")
+    assert(fs.mkdir(dir .. "/tests"))
+    assert(fs.mkdir(dir .. "/src"))
+    write(dir .. "/nupp.lua", 'return {include = {"src"}, build = {entries = {"main"}}}\n')
+    write(dir .. "/src/main.nupp", "return true\n")
+    write(
+        dir .. "/tests/carriedtest.nupp",
+        [[
+local M = {}
+function M.loadsEvents(): nil
+    local name = "ev" .. "ents"
+    local loaded = require(name) as any
+    assert(loaded.MessageBus ~= nil, "events has no MessageBus")
+end
+return M
+]]
+    )
+    local output, invocation = capturedRun(("cd %q && %q test --json 2>/dev/null"):format(dir, NUPP))
+    test.eq(invocation.status, 0, "the carried library did not load" .. evidence(invocation))
+    local report = require("testjson").decode(output)
+    test.eq(report.passed, 1, output)
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
+function M.aNuppSuiteChecksAProjectLibraryLoadedAtRunTime()
+    local dir = os.tmpname()
+    os.remove(dir)
+    local fs = require("nupp.compiler.fs")
+    assert(fs.mkdir(dir .. "/tests"))
+    assert(fs.mkdir(dir .. "/src"))
+    write(dir .. "/nupp.lua", 'return {include = {"src"}, build = {entries = {"main"}}}\n')
+    write(dir .. "/src/main.nupp", "return true\n")
+    write(
+        dir .. "/src/createproject.lua",
+        [[
+return function()
+    local source = assert(io.open("src/runtimevalue.nupp", "wb"))
+    source:write("return {value = missingRuntimeProjectValue}\n")
+    source:close()
+end
+]]
+    )
+    write(
+        dir .. "/tests/projecttest.nupp",
+        [[
+local M = {}
+function M.loadsProject(): nil
+    local create = require("createproject") as any
+    create()
+    local name = "runtime" .. "value"
+    assert((require(name) as any) ~= nil)
+end
+return M
+]]
+    )
+    local output, invocation = capturedRun(("cd %q && %q test --json 2>/dev/null"):format(dir, NUPP))
+    os.execute("rm -rf " .. string.format("%q", dir))
+    test.eq(invocation.status, 1, "the project library was not checked strictly" .. evidence(invocation))
+    local report = require("testjson").decode(output)
+    test.eq(report.failed, 1, output)
+    test.matches(report.tests[1].failure.message, "error compiling nupp module 'runtimevalue'.-type errors")
+end
+
 function M.rejectsDuplicateSuiteBasenamesAcrossDirectoriesAndLanguages()
     local dir = os.tmpname()
     os.remove(dir)
@@ -2463,6 +2533,94 @@ function M.windowsShellSurvivesLaterStandardIOLoad()
     test.eq(received[1][2], path)
     test.eq(read(path), "echo hi; printf '%s' $?\n")
     test.eq(pipe:close(), true)
+    os.remove(path)
+end
+
+-- A worker that has not loaded the standard I/O module yet loads it before the
+-- wrapper goes over it, so a suite's string commands reach Bash for the whole
+-- run. A suite that installs `io.popen` again while it runs, as the process
+-- suites do, does not take the runner's own commands with it.
+function M.windowsRunnerCommandsKeepBashWhenASuiteReplacesPopen()
+    local source = read(ROOT .. "/tests/run.lua")
+    local first = assert(source:find("-- The suites predate Windows support", 1, true))
+    first = assert(source:find('if package.config:sub(1, 1)', first, true))
+    local last = assert(source:find("local caseDefinitions", first, true))
+    local setup = source:sub(first, last - 1)
+    local received, path
+
+    local function standardPopen(command, mode)
+        received = {command, mode}
+        return {
+            read = function()
+                return "piece report"
+            end,
+            close = function()
+                return true
+            end,
+        }
+    end
+
+    local environment
+    environment = setmetatable(
+        {
+            package = {config = "\\", loaded = {}},
+            reservedTempNames = {},
+            io = {
+                open = io.open,
+                popen = function()
+                    error("the CRT popen was used")
+                end
+            },
+            os = {
+                execute = function()
+                end,
+                getenv = function(name)
+                    if name == "NUPP_TEST_BASH" then
+                        return "C:/Program Files/Git/bin/bash.exe"
+                    end
+                end,
+                tmpname = function()
+                    path = os.tmpname() .. ".sh";
+                    return path:sub(1, -4)
+                end,
+                remove = os.remove,
+            },
+            -- What loading the standard I/O module does to the process.
+            require = function(name)
+                test.eq(name, "nupp.runtime.standardio")
+                local module = {popen = standardPopen}
+                environment.package.loaded[name] = module
+                environment.io.popen = standardPopen
+
+                return module
+            end,
+        },
+        {__index = _G}
+    )
+    environment._G = environment
+    assert(setfenv(assert(loadstring(setup, "@nupp:test-runner")), environment))()
+    test.eq(environment.package.loaded["nupp.runtime.standardio"].popen, standardPopen)
+    assert(environment.io.popen ~= standardPopen, "the wrapper is over the module's io.popen")
+
+    -- A suite installs its own while it runs.
+    local process = {}
+    environment.io.popen = function()
+        return process
+    end
+    test.eq(environment.io.popen("printf suite", "r"), process, "the suite gets what it installed")
+
+    local pipe = environment.__NUPP_TEST_POPEN("printf 'piece report'", "r")
+    test.eq(type(received[1]), "table", "the runner's launch starts Bash directly")
+    test.eq(received[1][1], "C:/Program Files/Git/bin/bash.exe")
+    test.eq(received[1][2], path)
+    test.eq(received[2], "r")
+    test.eq(read(path), "printf 'piece report'\n")
+    test.eq(pipe:read("*a"), "piece report")
+    test.eq(pipe:close(), true)
+    -- The process can outlive the pipe, so its script goes with the reserved
+    -- names at exit.
+    local reserved = environment.reservedTempNames
+    test.eq(reserved[#reserved], path, "the script is reserved for removal at exit")
     os.remove(path)
 end
 

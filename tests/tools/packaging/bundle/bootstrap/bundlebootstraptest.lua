@@ -20,10 +20,12 @@ function M.aBootstrapCompilerRetainsPublicRuntimeArtifacts()
     local savedArtifacts = rawget(_G, "__nuppCompilerModuleArtifacts")
     local savedMain, savedMainLoaded = package.preload["nupp.tools.main"], package.loaded["nupp.tools.main"]
     local savedLog, savedLogLoaded = package.preload["debug.log"], package.loaded["debug.log"]
+    local savedWarn = rawget(_G, "warn")
     package.loaded["nupp.tools.main"] = nil
     local ok, result = pcall(assert(loadstring(text)))
     package.preload["nupp.tools.main"], package.loaded["nupp.tools.main"] = savedMain, savedMainLoaded
     package.preload["debug.log"], package.loaded["debug.log"] = savedLog, savedLogLoaded
+    rawset(_G, "warn", savedWarn)
     rawset(_G, "__nuppCompilerModuleArtifacts", savedArtifacts)
     os.execute("rm -rf '" .. dir .. "'")
     assert(ok, result)

@@ -188,6 +188,72 @@ function M.dynamicSdkLinksAndRunsFromC()
     end
 end
 
+local UUID_COMPONENT_MANIFEST = [[
+return {
+    include = {"src"},
+    build = {
+        kind = "component",
+        description = "A component that generates UUIDs",
+        entries = {"game"},
+        exports = {"game.answer"},
+    },
+}
+]]
+
+local UUID_COMPONENT_SOURCE = [[
+module game
+
+local function canonical(id: string, version: string): nil
+    assert(#id == 36, id)
+    assert(id:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-[89ab]%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"), id)
+    assert(id:sub(15, 15) == version, id)
+end
+
+export function answer(value: integer): integer
+    canonical(os.uuid(4), "4")
+    canonical(os.uuid(7), "7")
+    return value + 1
+end
+]]
+
+-- A component reaches UUIDs through `os.uuid` without naming a provider. UUIDs
+-- are Nupp over the platform clock and randomness, so an SDK carries them with
+-- no feature of its own.
+function M.aComponentGeneratingUuidsRunsThroughTheDynamicSdk()
+    local directory, library = temporary(), sdk()
+    local project = directory .. "/project"
+    assert(os.execute("mkdir -p " .. quote(project .. "/src")) == 0)
+    write(project .. "/nupp.lua", UUID_COMPONENT_MANIFEST)
+    write(project .. "/src/game.nupp", UUID_COMPONENT_SOURCE)
+    local status, output = run(("cd %s && %s build"):format(quote(project), quote(ROOT .. "/bin/nupp")))
+    assert(status == 0, output)
+    local executable = directory .. "/embed-uuid"
+    local link, environment
+    if jit.os == "Windows" then
+        executable = executable .. ".exe"
+        link = quote(library .. "/libnupp.dll.a")
+        environment = "PATH=" .. quote(library) .. ':"$PATH" '
+    else
+        link = "-L" .. quote(library) .. " -lnupp -Wl,-rpath," .. quote(library)
+        environment = ""
+    end
+    status, output = run(
+        (
+            "%s -std=c11 -I%s %s %s -o %s"
+        ):format(quote(compiler()), quote(library), quote(ROOT .. "/host/examples/embed.c"), link, quote(executable))
+    )
+    assert(status == 0, output)
+    -- The runner names its own provider in NUPP_NATIVE_LIBRARY, and the runtime
+    -- would load that one instead of the SDK's.
+    status, output = run(
+        (
+            "cd %s && unset NUPP_NATIVE_LIBRARY && %s%s %s"
+        ):format(quote(directory), environment, quote(executable), quote(project .. "/build/component.nuppc"))
+    )
+    assert(status == 0, output)
+    assert(output:find("game.answer(41) = 42", 1, true), output)
+end
+
 -- A standalone program links the way `nupp build` links one: lld, in process,
 -- against the link kit for this machine.
 function M.staticApplicationHostLinksFromAKitAndRuns()

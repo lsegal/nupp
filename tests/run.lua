@@ -645,7 +645,10 @@ if package.config:sub(1, 1) == "\\" then
     -- step as the empty string, which is true in Lua, so a bare `assert` let it
     -- through and every shelled-out command became `""` instead.
     local bash = os.getenv("NUPP_TEST_BASH")
-    assert(bash and bash ~= "", "NUPP_TEST_BASH must name Git Bash on Windows")
+    if not bash or bash == "" then
+        bash = os.getenv("NUPP_BASH")
+    end
+    assert(bash and bash ~= "", "NUPP_TEST_BASH or NUPP_BASH must name Git Bash on Windows")
     local nativeMarker = "__NUPP_WINDOWS_COMMAND__"
     _G.__NUPP_TEST_CMD_MARKER = nativeMarker
     _G.__NUPP_TEST_BASH = bash
@@ -690,6 +693,14 @@ if package.config:sub(1, 1) == "\\" then
         return ('""%s" "%s""'):format(bash:gsub('"', '\\"'), path:gsub('"', '\\"'))
     end
 
+    local function shellExecute(command)
+        local path = script(command)
+        local result = rawExecute(invocation(path))
+        os.remove(path)
+
+        return result
+    end
+
     os.execute = function(command)
         if type(command) ~= "string" then
             return rawExecute(command)
@@ -709,25 +720,11 @@ if package.config:sub(1, 1) == "\\" then
                 return a, b, c
             end
         end
-        local path = script(command)
-        local result = rawExecute(invocation(path))
-        os.remove(path)
 
-        return result
+        return shellExecute(command)
     end
 
-    io.popen = function(command, mode)
-        if type(command) ~= "string" then
-            return rawPopen(command, mode)
-        end
-        if command:sub(1, #nativeMarker) == nativeMarker then
-            return rawPopen(command:sub(#nativeMarker + 1), mode)
-        end
-        local caller = debug.getinfo(2, "S")
-        local source = caller and caller.source:gsub("\\", "/") or ""
-        if not usesTestShell(source) then
-            return rawPopen(command, mode)
-        end
+    local function shellPopen(command, mode)
         if command == "pwd" then
             local unread = true
             return {
@@ -789,6 +786,38 @@ if package.config:sub(1, 1) == "\\" then
 
         return proxy
     end
+
+    io.popen = function(command, mode)
+        if type(command) ~= "string" then
+            return rawPopen(command, mode)
+        end
+        if command:sub(1, #nativeMarker) == nativeMarker then
+            return rawPopen(command:sub(#nativeMarker + 1), mode)
+        end
+        local caller = debug.getinfo(2, "S")
+        local source = caller and caller.source:gsub("\\", "/") or ""
+        if not usesTestShell(source) then
+            return rawPopen(command, mode)
+        end
+
+        return shellPopen(command, mode)
+    end
+
+    -- The runner's own commands reach Bash through these rather than through the
+    -- globals above, which a suite may replace while it runs.
+    _G.__NUPP_TEST_POPEN = shellPopen
+    _G.__NUPP_TEST_EXECUTE = shellExecute
+end
+
+-- Every POSIX command the runner itself runs goes through these. On Windows they
+-- are the test shell's launchers, which nothing later in the process replaces;
+-- elsewhere they are whatever `io.popen` and `os.execute` are when called.
+local function runnerPopen(command, mode)
+    return (rawget(_G, "__NUPP_TEST_POPEN") or io.popen)(command, mode)
+end
+
+local function runnerExecute(command)
+    return (rawget(_G, "__NUPP_TEST_EXECUTE") or os.execute)(command)
 end
 
 local caseDefinitions = setmetatable({}, {__mode = "k"})
@@ -1247,7 +1276,7 @@ do
                     },
                     "; "
                 )
-                os.execute(watcher)
+                runnerExecute(watcher)
             end)
         end
         if grouping and ffi.os ~= "Windows" then
@@ -1713,7 +1742,12 @@ local function loadSuite(suite)
     if not code then
         error("cannot compile Nupp test suite " .. path .. ": " .. tostring(compileErr), 0)
     end
-    local removeLoader = require("nupp.compiler.runtime").install(env, function(modulePath, e)
+    -- A carried module arrives with its name and source, and its path is only its
+    -- name: compiling that path as a file looked for a file called `events`.
+    local removeLoader = require("nupp.compiler.runtime").install(env, function(modulePath, e, moduleName, source)
+        if source ~= nil then
+            return compile.module(modulePath, e, settings, moduleName, source, false)
+        end
         return compile.module(modulePath, e, settings)
     end)
     local chunk, loadErr = loadstring(code, "@" .. path)
@@ -2409,7 +2443,7 @@ end
 --- so run order swamped the effect. One per core is the setting that does not
 --- oversubscribe, and `--jobs=N` is there for a machine that wants otherwise.
 local function defaultJobs()
-    local handle = io.popen("getconf _NPROCESSORS_ONLN 2>/dev/null")
+    local handle = runnerPopen("getconf _NPROCESSORS_ONLN 2>/dev/null")
     local text = handle and handle:read("*l") or nil
     if handle then
         handle:close()
@@ -2648,7 +2682,7 @@ local function rememberTimings(records, cases)
     end
     local file = io.open(timingsPath, "wb")
     if not file then
-        os.execute("mkdir -p " .. string.format("%q", buildRoot))
+        runnerExecute("mkdir -p " .. string.format("%q", buildRoot))
         file = io.open(timingsPath, "wb")
     end
     if file then
@@ -3123,7 +3157,7 @@ then
                     for _, lane in ipairs(lanes) do
                         local index = children + 1
                         children = index
-                        madeShardRoot = madeShardRoot or os.execute("mkdir -p '" .. shardCacheRoot .. "'") ~= nil
+                        madeShardRoot = madeShardRoot or runnerExecute("mkdir -p '" .. shardCacheRoot .. "'") ~= nil
                         local child = {
                             label = lane.label,
                             arg = lane.arg,
@@ -3328,12 +3362,12 @@ then
             )
             predictions[executionLane] = prediction
             if not madeShardRoot then
-                assert(os.execute("mkdir -p '" .. shardCacheRoot .. "'") == 0, "cannot create the test queue root")
+                assert(runnerExecute("mkdir -p '" .. shardCacheRoot .. "'") == 0, "cannot create the test queue root")
                 madeShardRoot = true
             end
             local ticket = os.tmpname():match("[^/\\]+$") or tostring(#order)
             local queue = shardCacheRoot .. "/queue-" .. ticket
-            assert(os.execute("mkdir '" .. queue .. "'") == 0, "cannot reserve a unique test queue")
+            assert(runnerExecute("mkdir '" .. queue .. "'") == 0, "cannot reserve a unique test queue")
             local listing = assert(io.open(queue .. "/order", "wb"))
             listing:write(table.concat(order, "\n") .. "\n")
             listing:close()
@@ -3364,7 +3398,7 @@ then
                 return
             end
             absorb(collect())
-            os.execute("rm -rf '" .. queue.path .. "'")
+            runnerExecute("rm -rf '" .. queue.path .. "'")
 
             -- Work nobody reported having run. A worker that dies holding a piece
             -- takes it with it, and silently doing less than requested is a failure.
@@ -3693,6 +3727,20 @@ restoreLane = function()
     end
     restore(package.preload, laneBaseline.preload)
     package.path, package.cpath = laneBaseline.path, laneBaseline.cpath
+    -- `debug.log` publishes one warning function, as the global `warn` and as the
+    -- `warn` module, and loads on the first warning rather than at startup. A Nupp
+    -- lane keeps the module a piece loaded but puts the global back, and a piece
+    -- that loads a fresh copy can leave `warn` holding that copy's function, so
+    -- the next piece saw two. Point both at the module the lane kept.
+    if embedded then
+        local log = package.loaded["debug.log"]
+        if type(log) == "table" and type(log.warner) == "function" then
+            if package.loaded["warn"] ~= nil then
+                package.loaded["warn"] = log.warner
+            end
+            rawset(_G, "warn", log.warner)
+        end
+    end
 end
 
 --- What this process took off the queue, so the parent can tell work that was

@@ -1192,6 +1192,12 @@ function M.networkTlsAndCompressionAreHostFeatures()
         driver:find('host_features="$host_features,native-compression"', 1, true),
         "a compression host does not select the compression feature"
     )
+    -- UUIDs are Nupp over the platform clock and randomness, so the name an
+    -- upstream embedding SDK passes for them is accepted and selects nothing.
+    assert(
+        driver:find("base|native-checksum|native-time|native-uuid|uuid) ;;", 1, true),
+        "a UUID host is not accepted as a built-in feature"
+    )
     for _, obsolete in ipairs({"libuv", "mbedtls"}) do
         assert(not driver:lower():find(obsolete, 1, true), "the toolchain still provisions " .. obsolete)
     end

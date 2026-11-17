@@ -7,6 +7,8 @@ proveNative(module, function()
     local value, status = fused.decodeEager('["native proof",123]', nil, {}, {})
     assert(status == 0 and value[1] == "native proof" and value[2] == 123, "native proof decode failed")
 end)
+-- The provider supplies the public markers, shapes, and diagnostics around
+-- this artifact's three compiled decoder entries.
 package.loaded["nupp.codec.json.internal.decoder.fused"] = fused
 package.loaded["nupp.codec.json.aot"] = nil
 -- The corpus loads the codec over the compiled decoder above. The compiler's
@@ -20,6 +22,23 @@ if not package.searchpath("nupp.codec.json.aot", package.path) then
         0
     )
 end
+local provider = require("nupp.codec.json.aot")
+proveNative(module, function()
+    local value = provider.pull('{"id":7}', {id = true})
+    assert(value.id == 7, "native pull proof failed")
+end)
+proveNative(module, function()
+    local schema = provider.compileserde(
+        {
+            kind = "structure",
+            access = "dynamic",
+            fields = {{wire = "id", name = "id", required = true, target = {kind = "integer"}}},
+        },
+        "reject"
+    )
+    local value, problem = provider.decodeserde(schema, '{"id":7}')
+    assert(value and value[1] == 7 and problem == nil, "native serde proof failed")
+end)
 local suite = dofile("../../tests/stdlib/serde/json/jsonfuseddifferentialtest.lua")
 local names = {}
 for name in pairs(suite) do
