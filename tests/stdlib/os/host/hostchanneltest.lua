@@ -90,10 +90,6 @@ end
 -- The embedding half
 ----------------------------------------------------------------------------
 
--- The SDK features the hosted runtime needs: time for scope deadlines, and
--- nothing else the scenarios reach.
-local SDK_FEATURES = "lpeg"
-
 local function run(command)
     local pipe = assert(io.popen(command .. " 2>&1; printf '\n__status__:%s' $?"))
     local output = pipe:read("*a")
@@ -122,11 +118,11 @@ local function nativeDriver()
     if jit.os == "Windows" then
         check.suite.skip("the contract driver uses POSIX clocks")
     end
-    local status, output = run(("cd %s && ./scripts/toolchain host-library %s"):format(shellQuote(ROOT), SDK_FEATURES))
-    if status ~= 0 then
-        check.suite.skip("the Rust embedding SDK could not be built: " .. output)
+    -- hostembeddingtest's SDK, so a run builds one for both.
+    local library, problem = require("helpers.embeddingsdk").path(ROOT)
+    if not library then
+        check.suite.skip("the embedding SDK could not be built: " .. problem)
     end
-    local library = assert(output:match("([^\r\n]+)%s*$"), "toolchain named no SDK")
     local directory = os.tmpname()
     os.remove(directory)
     local project = directory .. "/component"
@@ -134,7 +130,7 @@ local function nativeDriver()
     copy(HERE .. "/stdlib/os/host/fixtures/component/nupp.lua", project .. "/nupp.lua")
     copy(HERE .. "/stdlib/os/host/fixtures/component/src/contract.nupp", project .. "/src/contract.nupp")
     copy(HERE .. "/stdlib/os/host/fixtures/component/src/hostevents.nupp", project .. "/src/hostevents.nupp")
-    status, output = run(("cd %s && %s build"):format(shellQuote(project), shellQuote(ROOT .. "/bin/nupp")))
+    local status, output = run(("cd %s && %s build"):format(shellQuote(project), shellQuote(ROOT .. "/bin/nupp")))
     check.eq(status, 0, "the contract component did not build:\n" .. output)
     local link = assert(io.open(library .. "/link.json", "rb"))
     local manifest = require("testjson").decode(link:read("*a"))

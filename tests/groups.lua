@@ -892,4 +892,12 @@ never("Live network and socket conformance.", [[
 stdlibtest nettest netnativetest tlstest httpnativetest
 ]])
 
-return groups, {scopes = scopes, packages = packages, neverCache = neverCache}
+-- Builds several suites share, made once by the runner before any case starts
+-- whenever one of those suites is selected. `module` is a helper whose
+-- `command(root)` builds it, or names the cached build; the suites ask the same
+-- helper for the result.
+local prerequisites = {
+    {name = "the embedding SDK", module = "helpers.embeddingsdk", suites = {"hostembeddingtest", "hostchanneltest"}},
+}
+
+return groups, {scopes = scopes, packages = packages, neverCache = neverCache, prerequisites = prerequisites}
