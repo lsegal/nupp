@@ -82,6 +82,26 @@ function M.warmingBundledMetadataPreservesProjectModulePrecedence()
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- A project root's `nupp.lua` is its manifest (#358). Resolved as the module
+-- `nupp` it shadowed the standard library's for every project, which turned off
+-- the standard-library interface store for all of them. A `nupp.lua` in an
+-- include root is still an ordinary module file.
+function M.aProjectManifestIsNotTheModuleNamedNupp()
+    local dir = tempProject({["nupp.lua"] = 'return {include = {"."}}\n'})
+    local env = compilerEnv.new(dir, {cache = false})
+    testAssert.eq(compilerEnv.findModulePath(env, "nupp"), nil, "the manifest answered for the module `nupp`")
+    os.execute("rm -rf " .. string.format("%q", dir))
+
+    local nested = tempProject({
+        ["nupp.lua"] = 'return {include = {"src"}}\n',
+        ["src/nupp.lua"] = "return {}\n",
+    })
+    local nestedEnv = compilerEnv.new(nested, {cache = false})
+    local found = compilerEnv.findModulePath(nestedEnv, "nupp")
+    assert(found and found:match("src/nupp%.lua$"), "an include root's nupp.lua is a module: " .. tostring(found))
+    os.execute("rm -rf " .. string.format("%q", nested))
+end
+
 function M.releasedModuleTreesKeepTheInterfaceDependentsRead()
     local files = {
         ["nupp.lua"] = 'return {include = {"."}}\n',
