@@ -209,10 +209,9 @@ reports it is usually already testing somebody else's commit. `git push
   about nine minutes. `--json` reports a record per test — name, status,
   duration, and the failure's message, file and line.
 - `./bin/nupp test --list-groups` names the suite groups, and `--group=NAME`
-  runs one. `--lane=shared` is the hundred-odd suites that share a process and
-  finish in half a minute; `--exclude-group=NAME` is how a later broad run
-  covers what an earlier focused one did not. `--list-suites` prints what a
-  selection would run without running it.
+  runs one. `--exclude-group=NAME` is how a later broad run covers what an
+  earlier focused one did not. `--list-suites` prints what a selection would
+  run without running it.
 - Run the suites that cover what changed, not the whole suite. Changes to the
   documentation generator are covered by `doctest`; match other suites to the
   area in the same way. The full suite is for changes that reach broadly — the
