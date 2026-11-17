@@ -3267,9 +3267,12 @@ end
 -- Builds a selected suite shares with others, made once here before any case
 -- starts (#371). Cold, the embedding SDK is the better part of a minute, and
 -- built lazily it was charged to whichever case asked for it first. tests/groups.lua
--- names each build's helper module, whose `command(root)` is a shell command;
--- the builds run side by side. A failure is reported and the run goes on: the
--- suites ask the same helper, which skips them with the toolchain's output.
+-- names each build's helper module, whose `command(root)` is a shell command
+-- printing the build's path last; the builds run side by side. The path is
+-- exported as the helper's `variable`, so the workers this run starts need
+-- not ask the toolchain again (a cache hit is still seconds on Windows). A
+-- failure is reported and the run goes on: the suites ask the same helper,
+-- which skips them with the toolchain's output.
 if not listing and #shard == 0 and not queueDir and not embedded and repositoryPolicy and repositoryPolicy.prerequisites then
     local selected = {}
     for _, info in ipairs(suites) do
@@ -3282,6 +3285,7 @@ if not listing and #shard == 0 and not queueDir and not embedded and repositoryP
                 local helper = require(prerequisite.module)
                 started[#started + 1] = {
                     prerequisite = prerequisite,
+                    helper = helper,
                     before = now(),
                     pipe = io.popen(helper.command(dir .. "/..") .. " 2>&1; printf '\n__status__:%s' $?"),
                 }
@@ -3305,7 +3309,20 @@ if not listing and #shard == 0 and not queueDir and not embedded and repositoryP
                     output:gsub("\n__status__:%d+%s*$", "")
                 )
             )
-        elseif verbose then
+        else
+            local path = output:gsub("\n__status__:%d+%s*$", ""):match("([^\r\n]+)%s*$")
+            if path and build.helper.variable then
+                local ffi = require("ffi")
+                if ffi.os == "Windows" then
+                    pcall(ffi.cdef, "int _putenv_s(const char *, const char *);")
+                    ffi.C._putenv_s(build.helper.variable, path)
+                else
+                    pcall(ffi.cdef, "int setenv(const char *, const char *, int);")
+                    ffi.C.setenv(build.helper.variable, path, 1)
+                end
+            end
+        end
+        if status == 0 and verbose then
             io.stderr:write(("prepared %s in %.1fs\n"):format(build.prerequisite.name, seconds))
         end
     end
