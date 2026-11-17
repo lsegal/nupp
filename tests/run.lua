@@ -252,6 +252,25 @@ do
         processSalt = stateSalt .. "-" .. tostring(os.time())
     end
 end
+-- Where `nupp test` looks once the process has exited. Every state running
+-- suites keeps one file there naming the suite it is executing, so a crash that
+-- takes the whole process down is still reported against that suite.
+local runningDir = rawget(_G, "__NUPP_TEST_RUNNING") or os.getenv("NUPP_TEST_RUNNING")
+local runningFile = runningDir and runningDir ~= "" and (runningDir .. "/" .. processSalt) or nil
+local function markRunning(name)
+    if not runningFile then
+        return
+    end
+    if name == nil then
+        os.remove(runningFile)
+        return
+    end
+    local file = io.open(runningFile, "wb")
+    if file then
+        file:write(name, "\n")
+        file:close()
+    end
+end
 local shardSalt = ((os.getenv("NUPP_CACHE_DIR") or ""):match("shard%-(%d+)") or "0") .. "-" .. processSalt
 local handedOut = 0
 local reservedTempNames = {}
@@ -605,14 +624,17 @@ end
 -- paths for the Windows programs those commands start.
 if package.config:sub(1, 1) == "\\" then
     -- Loading the runtime's I/O module assigns its own `io.popen` over the one
-    -- installed below. A process worker reaches its first suite before anything
+    -- installed below. A Nupp worker reaches its first suite before anything
     -- has loaded it, so the first compiler module a suite required replaced the
-    -- Bash route and later pipes went to cmd.exe. Load it now, so the route
-    -- wraps it instead. A shared worker lane refuses pipes anyway: leave its
-    -- refusal in place rather than loading a working popen over it.
-    if not package.loaded["nupp.runtime.standardio"] and not rawget(_G, "__NUPP_TEST_EMBEDDED") then
+    -- Bash route and later pipes went to cmd.exe -- `pwd` among them, which
+    -- then answered `/r` rather than `R:/` (#351). Load it now, so the route
+    -- wraps it instead.
+    if not package.loaded["nupp.runtime.standardio"] then
         pcall(require, "nupp.runtime.standardio")
     end
+    -- The compile service route stays with the main state, as it does on POSIX
+    -- (`routeCompileCommands`).
+    local embedded = rawget(_G, "__NUPP_TEST_EMBEDDED")
     local rawExecute, rawPopen = os.execute, io.popen
     local standardIO = package.loaded["nupp.runtime.standardio"]
     local nativePopen = standardIO and rawPopen == standardIO.popen
@@ -632,11 +654,8 @@ if package.config:sub(1, 1) == "\\" then
             or source:match("^@?tests/") ~= nil
     end
 
-    -- Asked for when a test wants it, not while this file loads. `io.popen` is
-    -- refused in a shared worker lane, and a `pwd` nothing has asked for yet is
-    -- no reason to be refused: reading it eagerly failed every Nupp worker on
-    -- Windows the moment the suite got far enough to start one, and took every
-    -- suite in those lanes down as unrun with it.
+    -- Asked for when a test wants it, not while this file loads: a `pwd`
+    -- nothing has asked for yet is no reason to start a process.
     local cwdValue
 
     local function currentDirectory()
@@ -680,10 +699,8 @@ if package.config:sub(1, 1) == "\\" then
         if not usesTestShell(source) then
             return rawExecute(command)
         end
-        -- Only where pipes are allowed: a shared worker lane refuses them, and a
-        -- command the service ran would be one the lane never let start. The route
-        -- is absent when runnertest loads this block on its own.
-        if nativePopen and routedExecute then
+        -- The route is absent when runnertest loads this block on its own.
+        if nativePopen and not embedded and routedExecute then
             local handled, a, b, c = routedExecute(command)
             if handled then
                 return a, b, c
@@ -734,7 +751,7 @@ if package.config:sub(1, 1) == "\\" then
                 end,
             }
         end
-        if nativePopen and routedPopen then
+        if nativePopen and not embedded and routedPopen then
             local pipe = routedPopen(command, mode)
             if pipe then
                 return pipe
@@ -804,15 +821,6 @@ local shard = {}
 local chosenGroups = {}
 local excludedNames = {}
 local excludedGroups = {}
--- Which execution lane to keep: `shared` runs in Nupp worker states, `shell`
--- shares reusable process workers, and `isolated` needs a process boundary
--- around its runtime state. A full run combines the latter two on one process
--- worker queue, but they remain separate answers to `--lane`.
---
--- Several may be named at once, `--lane=isolated,shell`. One run of several
--- lanes is one build of the compiler, runner and provider they all use, where a
--- run per lane repeated it for each.
-local chosenLanes = nil
 local scope = nil
 local fresh = false
 local audit = false
@@ -823,33 +831,12 @@ local listing = nil
 -- queue rather than a list. Empty means "decide for yourself" the same way an
 -- empty shard does.
 local queueDir = nil
--- An isolated queue worker is a supervisor only. It claims work dynamically,
--- but runs every claimed piece in a new process so process-global state cannot
--- cross the suite boundary.
-local freshQueuePieces = os.getenv("NUPP_TEST_FRESH_QUEUE_PIECES") == "1"
-local supervisedPiece = os.getenv("NUPP_TEST_SUPERVISED_PIECE") == "1"
--- The live Lua heap, in megabytes, past which a Nupp worker state stops taking
--- work once its suite is done. The parent replaces it with a fresh state on the
--- same queue. A state kept what every suite it ran left behind, so the shared
--- lane's process outgrew a 7 GB macOS runner, and each suite after that ran
--- slower than the last (#287). A state holds about 280 MB once the compiler is
--- loaded and settled at 300-625 MB without a bound, so 256 retires it after a
--- few suites. `NUPP_TEST_WORKER_HEAP_MB` overrides it; 0 retires a state after
--- every suite.
-local workerHeapLimit = (tonumber(os.getenv("NUPP_TEST_WORKER_HEAP_MB") or "") or 256) * 1024
 -- The collector pause the parent chose for this worker state, from what memory
 -- each of its states has to itself. See `workerPause` below.
 if embedded and rawget(_G, "__NUPP_TEST_GC_PAUSE") then
     collectgarbage("setpause", rawget(_G, "__NUPP_TEST_GC_PAUSE"))
 end
--- Set when this state stopped taking work for that reason.
-local retired = false
 local jobs = nil
--- Workers for one lane only, from `--jobs=shell:2`. A lane whose suites start
--- children of their own -- the shell lane's cold native builds -- can want fewer
--- than the rest, and saying so here keeps it in the same run rather than a run
--- of its own that builds everything again.
-local laneJobs = {}
 local colorMode = "auto"
 local colorSeen = false
 local colorProblem = nil
@@ -902,17 +889,10 @@ for _, argument in ipairs(arg) do
     elseif argument:match("^%-%-timings=") then
         timingRows = tonumber(argument:match("^%-%-timings=(%d+)$")) or timingRows
     elseif argument:match("^%-%-jobs=") then
-        for spec in argument:sub(#"--jobs=" + 1):gmatch("[^,]+") do
-            local named, count = spec:match("^(%a+):(%d+)$")
-            if named then
-                if named ~= "shared" and named ~= "shell" and named ~= "isolated" then
-                    io.stderr:write("nupp: --jobs=LANE:N needs a lane of shared, shell, or isolated\n")
-                    os.exit(2)
-                end
-                laneJobs[named] = tonumber(count)
-            else
-                jobs = tonumber(spec:match("^(%d+)$"))
-            end
+        jobs = tonumber(argument:match("^%-%-jobs=(%d+)$"))
+        if not jobs or jobs < 1 then
+            io.stderr:write("nupp: --jobs takes a positive worker count\n")
+            os.exit(2)
         end
     elseif argument:match("^%-%-queue=") then
         queueDir = argument:sub(#"--queue=" + 1)
@@ -931,15 +911,6 @@ for _, argument in ipairs(arg) do
     elseif argument:match("^%-%-exclude%-group=") then
         for name in argument:sub(#"--exclude-group=" + 1):gmatch("[^,]+") do
             excludedGroups[#excludedGroups + 1] = name
-        end
-    elseif argument:match("^%-%-lane=") then
-        chosenLanes = chosenLanes or {}
-        for named in argument:sub(#"--lane=" + 1):gmatch("[^,]+") do
-            if named ~= "shared" and named ~= "shell" and named ~= "isolated" then
-                io.stderr:write("nupp: --lane must be shared, shell, or isolated\n")
-                os.exit(2)
-            end
-            chosenLanes[named] = true
         end
     elseif argument == "--list-suites" then
         listing = "suites"
@@ -1201,6 +1172,9 @@ do
         -- the outer run was invoked, which is what happened the first time CI
         -- ran this variable across a whole group rather than one suite.
         stopExporting("NUPP_TEST_TRACE_CASES")
+        -- The directory a run names its executing suites in belongs to that run.
+        -- A nested runner a case starts must not leave its own suites there.
+        stopExporting("NUPP_TEST_RUNNING")
         -- A worker leads a process group of its own, which everything its cases
         -- start joins, so the parent can end every one of them together: see
         -- `groupedWorker`. Read once and unexported for the same reason as the two
@@ -1344,11 +1318,11 @@ do
             -- File descriptors belong to the process, not to a Lua state. Redirecting
             -- them from several worker threads would make one test capture another's
             -- output and occasionally restore the wrong descriptor. Worker jobs keep
-            -- Lua failures associated with their cases; suites that specifically test
-            -- runner capture stay in the process-isolated lane below.
+            -- Lua failures associated with their cases by capturing in the state.
             local active = {stdout = {}, stderr = {}}
             rawset(_G, "__NUPP_TEST_CAPTURE", active)
             local originalPrint, originalWrite = print, io.write
+            local defaultOutput = io.output()
             local originalStdout, originalStderr = io.stdout, io.stderr
             local fileOut, fileErr = assert(io.tmpfile()), assert(io.tmpfile())
             io.stdout, io.stderr = fileOut, fileErr
@@ -1360,6 +1334,11 @@ do
                 active.stdout[#active.stdout + 1] = table.concat(values, "\t") .. "\n"
             end
             io.write = function(...)
+                -- A case that points `io.output` at a file or a process is testing
+                -- where `io.write` goes, so it goes there (#351).
+                if io.output() ~= defaultOutput then
+                    return originalWrite(...)
+                end
                 for index = 1, select("#", ...) do
                     active.stdout[#active.stdout + 1] = tostring(select(index, ...))
                 end
@@ -1423,14 +1402,6 @@ do
 end
 
 local failureWrite = progressWrite
-
-if supervisedPiece then
-    -- The supervisor owns the one progress mark for this queue piece. The fresh
-    -- child still captures case output normally, but stays silent on the shared
-    -- progress stream so a many-case suite remains one scheduling mark.
-    progressWrite = function()
-    end
-end
 
 local RESET = "\27[0m"
 
@@ -1910,74 +1881,8 @@ local function call(fn)
     return audited(fn)
 end
 
---- The shell that runs one worker: the command, in a process group of its own,
---- and the whole group ended once it is done, leaving its exit status in
---- `$nupp_status` for what follows.
----
---- A case that starts a process which outlives it -- a server left running, a
---- child that ignores its parent going away, one spinning in a native loop --
---- used to outlive the run as well. Holding the worker's standard output, it
---- kept this end's read of the report waiting forever; holding nothing, it
---- spun for days on a core nobody knew was taken. The worker makes itself the
---- group's leader (`NUPP_TEST_PROCESS_GROUP`), everything it starts is born
---- into that group, and whatever of it is still there when the worker has
---- exited is ended: asked first, because a nested worker's shell has a group of
---- its own to end in turn, and then made to.
----
---- The same happens when this shell is told to stop, and when the runner that
---- started it is gone -- killed on its own, as a timeout wrapper does, with
---- nothing left to read what the worker writes. A shell cannot put a background
---- command in a group of its own everywhere (`dash` declines `set -m` without a
---- terminal), which is why the worker does it itself.
----
---- Windows has no process groups to end, so there the worker runs as before.
----
---- The grace shrinks with depth. A worker's group holds the shells of any
---- workers it started in turn, each ending a group of its own when asked; were
---- the outer grace no longer than theirs, it could end a shell part way through
---- ending its group and leave that group behind. So each level is given a
---- second less than the one that started it.
-local groupDepth = tonumber(os.getenv("NUPP_TEST_GROUP_DEPTH") or "") or 0
-
-local function groupedWorker(worker)
-    if package.config:sub(1, 1) == "\\" then
-        return worker .. "; nupp_status=$?"
-    end
-    local grace = math.max(1, 6 - groupDepth)
-
-    return table.concat(
-        {
-            "nupp_reap() { kill -0 -$1 2>/dev/null || return 0; kill -TERM -$1 2>/dev/null; nupp_waited=0;"
-            .. " while kill -0 -$1 2>/dev/null && [ $nupp_waited -lt "
-            .. grace
-            .. " ]; do sleep 1;"
-            .. " nupp_waited=$((nupp_waited + 1)); done; kill -KILL -$1 2>/dev/null; }",
-            ("NUPP_TEST_PROCESS_GROUP=1 NUPP_TEST_GROUP_DEPTH=%d %s & nupp_worker=$!"):format(groupDepth + 1, worker),
-            "trap 'nupp_reap $nupp_worker; kill -KILL $nupp_worker 2>/dev/null; exit 143' HUP INT TERM",
-            "( while kill -0 $PPID 2>/dev/null && kill -0 $nupp_worker 2>/dev/null; do sleep 2; done;"
-            .. " kill -0 $PPID 2>/dev/null || { nupp_reap $nupp_worker; kill -KILL $nupp_worker 2>/dev/null; } )"
-            .. " </dev/null >/dev/null 2>&1 & nupp_watch=$!",
-            "wait $nupp_worker; nupp_status=$?",
-            "kill $nupp_watch 2>/dev/null",
-            "nupp_reap $nupp_worker",
-        },
-        "; "
-    )
-end
-
 local function shellQuote(value)
     return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
-end
-
--- Windows CRT descriptors cannot be named across process boundaries. Its
--- workers report through inherited stderr, which is copied to the crash log
--- while the final JSON keeps its own stdout pipe.
-local function workerErrors(command, errors)
-    if package.config:sub(1, 1) == "\\" then
-        return ("{ { %s; } 2>&1 1>&3 | tee %s >&2; } 3>&1"):format(command, shellQuote(errors))
-    end
-
-    return ("{ %s; } 2>%s"):format(command, shellQuote(errors))
 end
 
 local resolveFixture
@@ -2470,18 +2375,7 @@ end
 -- coverage is collected -- the shards would race each other for the one counter file
 -- that `NUPP_COVERAGE_FILE` names.
 
---- The fewest workers a run makes by default, whatever the machine reports.
----
---- Hosted CI runners report three or four processors, and one per core on those
---- left every lane four wide or narrower. A worker spends most of its time waiting
---- on child processes -- compiles, links, the programs it runs -- rather than on a
---- processor, so eight is the floor on every machine and every lane. A memory
---- footprint that cannot hold eight workers is a footprint to fix (#250), not a
---- reason to lower this. `--jobs=N` still overrides it for a run that wants fewer.
-local minimumJobs = 8
-
---- How many workers to make by default: one per processor, and never fewer than
---- `minimumJobs`.
+--- How many Nupp workers to start by default: one per processor.
 ---
 --- It was two per processor, from a measurement on eight cores -- 71s at one per
 --- core, 63s at two. That machine no longer stands for this one. On eighteen
@@ -2501,7 +2395,7 @@ local function defaultJobs()
     end
     local found = tonumber(text or "")
 
-    return math.max(minimumJobs, found and found >= 1 and math.floor(found) or 1)
+    return found and found >= 1 and math.floor(found) or 1
 end
 
 --- The machine's physical memory in bytes, or nil when it cannot be read.
@@ -2866,257 +2760,6 @@ local function planWork(list, shards, timings)
     }
 end
 
--- A Nupp worker owns a Lua state, not the process around that state. Suites that
--- touch process-wide facilities therefore keep the isolated lane. Looking at the
--- source as well as a short hard list makes the safe choice the default when a
--- new suite reaches one. Shell calls instead choose reusable process workers:
--- several suites share each worker, and a failed case does not end its queue.
-local processIsolated, usesShell
-do
-    local PROCESS_ISOLATED = {
-        -- Debug type witnesses and schema extensions need a fresh runtime context.
-        serdedebugcontracttest = true,
-        contractprojecttest = true,
-        evalfilesystemtest = true,
-        evalcatalogtest = true,
-        evalsemanticstest = true,
-        templateresolutiontest = true,
-        templatesubstitutiontest = true,
-        templatemanifesttest = true,
-        templatevariabletest = true,
-        templatetreetest = true,
-        templatesandboxtest = true,
-        templatepathtest = true,
-        templateresourcetest = true,
-        templateremotetest = true,
-        templatetest = true,
-        templatelibtest = true,
-        templatebrowsertest = true,
-        templatesimdtest = true,
-        templatelovetest = true,
-        templategametest = true,
-
-        bundlefactorytest = true,
-        bundlecomponenttest = true,
-        bundlebootstraptest = true,
-        bundleprovidertest = true,
-        bundlesignaturetest = true,
-        bundlepayloadtest = true,
-        bundleworkertest = true,
-        bundleschedulertest = true,
-        bundlefailuretest = true,
-        bundlescopetest = true,
-        bundleregiontest = true,
-        bundlebuffertest = true,
-        bundleforktest = true,
-        bundlelifetimetest = true,
-        bundlechanneltest = true,
-        bundlededicatedtest = true,
-
-        deriveinternalprovidertest = true,
-        deriveexportprovidertest = true,
-        derivepublicprovidertest = true,
-        deriveexternalprovidertest = true,
-
-        derivediagnostictest = true,
-        deriveidentitytest = true,
-        derivelimittest = true,
-        deriveemissiontest = true,
-
-        derivemanifesttest = true,
-        derivetecstest = true,
-
-        -- These exercise worker hosting or runner descriptor behavior even when the
-        -- operation is built as a source fixture rather than called by the Lua test.
-        bundletest = true,
-        comptimetest = true,
-        publicclitest = true,
-        -- Their compiler fixtures reach build commands through shared helpers, so the
-        -- process call is not text in the suite for the source scan below to find.
-        deriveacceptancetest = true,
-        deriveprovidertest = true,
-        derivetest = true,
-        eventschecktest = true,
-        logtest = true,
-        runtimereflectiontest = true,
-        serdetest = true,
-        typeleveltest = true,
-        -- Imports cheadertest as a fixture; its top level asks the shell for an
-        -- absolute checkout path on hosts where debug information is relative.
-        hotreloadguaranteetest = true,
-        projectlinktest = true,
-        spipackagetest = true,
-        spitest = true,
-        profiletest = true,
-        runnertest = true,
-        -- These execute generated ownership cleanups. Their providers are registered
-        -- in process-global runtime tables, so a reused worker state is not their
-        -- isolation boundary even though the cases themselves do not shell out.
-        streamadapterstest = true,
-        nativefoundationstest = true,
-        soatest = true,
-        -- Rebuilds the math runtime through the process root and exercises LuaJIT's
-        -- wide FFI operations. A long-lived shell worker can retain JIT and FFI
-        -- state from unrelated suites even after its Lua globals are restored.
-        fixedwidthtest = true,
-        -- Builds and installs the URI provider by replacing the runtime root global.
-        uritest = true,
-    }
-
-    local processCalls = {
-        'require("nupp.workers")',
-        "require('nupp.workers')",
-        'require("io.internal.process")',
-        "require('io.internal.process')",
-        'require("debug.profile")',
-        "require('debug.profile')",
-        -- Reaching into the loader is process-shaped whether or not a process is
-        -- started. A suite that clears a module to prove it loads lazily, injects a
-        -- loader, or writes a global through `rawset` is mutating what every other
-        -- suite in that state sees. None of these move a suite today -- every suite
-        -- that does one of them already shells out as well -- and that is exactly
-        -- why they belong here: the next one to be written might not.
-        "package.loaded",
-        "package.preload",
-        "package.loadlib",
-        "rawset(_G,",
-    }
-
-    local shellCalls = {"os.execute", "io.popen",}
-    local SHELLING = {
-        projectcrossaggregatetest = true,
-        projectcrosscontracttest = true,
-        projectexportedlayouttest = true,
-        projectbinaryfilesystemtest = true,
-        projectbundlelayouttest = true,
-        projectcrossrefusaltest = true,
-        projectaotlinktest = true,
-        projectlayoutcachetest = true,
-        projectprocessbinarytest = true,
-        buildprogresstest = true,
-        buildprogressspecializationtest = true,
-        buildprogressclitest = true,
-
-        fmttreetest = true,
-        fmttree2test = true,
-        fmttree3test = true,
-        fmttree4test = true,
-
-        fmtclitest = true,
-        fmtoptionclitest = true,
-        fmtcacheclitest = true,
-
-        benchgpuprocesstest = true,
-        benchrecordsprocesstest = true,
-        benchschemaprocesstest = true,
-        benchprotocolprocesstest = true,
-        benchsuiteprocesstest = true,
-        benchhistoryprocesstest = true,
-        benchrunnertest = true,
-        benchpilotprocesstest = true,
-        benchselectionprocesstest = true,
-
-        projecthashtest = true,
-        projectaotscopetest = true,
-        projectmoduletest = true,
-        projectpathtest = true,
-        projectprocesstest = true,
-        projectmaterializationtest = true,
-        projectmanifesttest = true,
-        projectcrosstest = true,
-        projectnativetest = true,
-        projecttest = true,
-        projectchecktest = true,
-        projectinvalidationtest = true,
-        projectctest = true,
-        projectbinarytest = true,
-        projectfixpointtest = true,
-        projectaottest = true,
-        projectclinktest = true,
-        projectcargotest = true,
-        projectgeneratortest = true,
-        projectfilesystemtest = true,
-        projectrocktest = true,
-        projecttestcommandtest = true,
-        projecttasktest = true,
-        projectsyntaxtest = true,
-
-        serdecontracttest = true,
-        serdecapabilitycontracttest = true,
-        -- Shelling happens in the helper so source inspection would otherwise rely
-        -- on an explanatory comment retaining the implementation's exact spelling.
-        simdfleetequivalencetest = true,
-        simdnativealgorithmdifferentialtest = true,
-        simdprimitivedifferentialtest = true,
-        simdwasmalgorithmdifferentialtest = true,
-        simdwasmtimeconformancetest = true,
-    }
-    local sourceBySuite = {}
-
-    local function suiteSource(suiteInfo)
-        if not suiteInfo then
-            return nil
-        end
-        local cached = sourceBySuite[suiteInfo.name]
-        if cached ~= nil then
-            return cached
-        end
-        local file = io.open(dir .. "/" .. suiteInfo.path, "rb")
-        if not file then
-            return nil
-        end
-        local source = file:read("*a") or ""
-        file:close()
-        sourceBySuite[suiteInfo.name] = source
-
-        return source
-    end
-
-    local function sourceContains(suiteInfo, calls)
-        local source = suiteSource(suiteInfo)
-        if source == nil then
-            return false
-        end
-        for _, call in ipairs(calls) do
-            if source:find(call, 1, true) then
-                return true
-            end
-        end
-
-        return false
-    end
-
-    processIsolated = function(suiteInfo)
-        if not suiteInfo or PROCESS_ISOLATED[suiteInfo.name] then
-            return suiteInfo ~= nil
-        end
-
-        return suiteSource(suiteInfo) == nil or sourceContains(suiteInfo, processCalls)
-    end
-
-    usesShell = function(suiteInfo)
-        return suiteInfo ~= nil and (SHELLING[suiteInfo.name] or sourceContains(suiteInfo, shellCalls))
-    end
-end
-
-local function suiteLane(suiteInfo)
-    if processIsolated(suiteInfo) then
-        return "isolated"
-    end
-
-    return usesShell(suiteInfo) and "shell" or "shared"
-end
-
-if chosenLanes then
-    local kept = {}
-    for _, suiteInfo in ipairs(suites) do
-        if chosenLanes[suiteLane(suiteInfo)] then
-            kept[#kept + 1] = suiteInfo
-        end
-    end
-    suites = kept
-end
-
 if listing == "suites" then
     for _, info in ipairs(suites) do
         io.stdout:write(info.name .. "\n")
@@ -3330,19 +2973,12 @@ end
 if #shard == 0
     and #suites > 0
     and chosenCaseCount == 0
-    and ((workerHost and not processIsolated(only and byName[only])) or (#chosen ~= 1 and #suites > 1 and jobs ~= 1))
+    and workerHost
     and not coverage
     and not audit
 then
     do
         local json = testJson
-        local shareable, alone, shelling = {}, {}, {}
-        for _, suiteInfo in ipairs(suites) do
-            local selectedLane = suiteLane(suiteInfo)
-            local into = selectedLane == "isolated" and alone or selectedLane == "shell" and shelling or shareable
-            into[#into + 1] = suiteInfo
-        end
-
         local children = 0
         local madeShardRoot = false
         -- Whether any worker wrote a mark, so this end knows whether there is a line
@@ -3376,16 +3012,16 @@ then
         --- because a store is written whole: children sharing one file would take
         --- turns discarding each other's entries. A suite running on its own has no
         --- one to share with and keeps the warm store this process was started with.
-        local function startFanOut(lanes, ownCache, isolated, executionLane)
-            if workerHost and ownCache and not isolated then
+        local function startFanOut(lanes)
+            do
                 local workers = require("nupp.workers")
                 local job = require("job")
                 local running = {}
                 local scope = workers.__scope()
                 -- A worker state cannot redirect process-owned descriptors safely.
-                -- Keep inherited output quiet for the threaded phase; ordinary Lua
-                -- output is captured in its state, process-writing suites are in the
-                -- process-worker queues, and progress has its own saved descriptor.
+                -- Keep inherited output quiet while the workers run; ordinary Lua
+                -- output is captured in its state, and progress has its own saved
+                -- descriptor.
                 local pause = workerPause(#lanes)
                 local restoreOutput = silenceProcessOutput()
                 -- Each lane gets a worker of its own rather than a share of the
@@ -3403,7 +3039,8 @@ then
                         verbose,
                         colorMode,
                         suiteCatalog,
-                        pause
+                        pause,
+                        runningDir
                     )
                 end
                 local launched, problem = pcall(function()
@@ -3449,9 +3086,8 @@ then
                     into.states = into.states + 1
                 end
 
-                -- Settles whichever lanes have finished without waiting on the
-                -- rest. A state that retired with work left is replaced on the
-                -- same queue and store; answers whether every lane is done.
+                -- Settles whichever threads have finished without waiting on the
+                -- rest; answers whether every one is done.
                 local function tend()
                     local done = true
                     for _, child in ipairs(running) do
@@ -3462,14 +3098,7 @@ then
                                 end)
                                 if ok and type(report) == "table" then
                                     merge(child, report)
-                                    local relaunched, problem = true, nil
-                                    if report.retired then
-                                        relaunched, problem = pcall(launch, child)
-                                    end
-                                    if not relaunched then
-                                        child.failure = "a fresh worker state could not be started: " .. tostring(problem)
-                                    end
-                                    child.finished = not report.retired or not relaunched
+                                    child.finished = true
                                 else
                                     child.failure = tostring(report)
                                     child.finished = true
@@ -3497,7 +3126,7 @@ then
                                     index = child.index,
                                     names = (report.claimed and #report.claimed > 0) and report.claimed
                                     or {child.label},
-                                    executionLane = executionLane,
+                                    executionLane = "shared",
                                     states = report.states,
                                     startedAt = child.startedAt,
                                     collectedAt = now() - started
@@ -3522,171 +3151,6 @@ then
                 end
 
                 return collect, tend
-            end
-
-            local running = {}
-            for _, lane in ipairs(lanes) do
-                do
-                    local index = children + 1
-                    local label = lane.label
-                    children = index
-                    -- The store the children share a parent directory with is made by
-                    -- whoever writes into it, and nothing had yet. A redirect into a
-                    -- directory that is not there fails in the shell, before the child
-                    -- runs, so every one of them would have died saying nothing.
-                    madeShardRoot = madeShardRoot or os.execute("mkdir -p '" .. shardCacheRoot .. "'") ~= nil
-                    -- Kept rather than inherited, so a child that dies can be asked
-                    -- why. One that wrote no report used to say only that, which is the
-                    -- least useful thing known about it: whether it was killed, ran out
-                    -- of memory, or wrote something that was not JSON all read the
-                    -- same.
-                    local errors = ("%s/shard-%d.err"):format(shardCacheRoot, index)
-                    local cache = ownCache and ("NUPP_CACHE_DIR='%s/shard-%d' "):format(shardCacheRoot, index) or ""
-                    -- The shell reports the wait status because this end cannot:
-                    -- LuaJIT's `close` on a pipe answers whether it closed, not what
-                    -- happened to what was on the other side, so a child that was
-                    -- killed and one that exited quietly are the same nil here. `$?`
-                    -- past 128 is the signal, which is the difference between a crash
-                    -- and an OOM kill. `9>&2` copies this process's standard error
-                    -- aside before `2>` sends the worker's to its file, so `3>&9` hands
-                    -- the worker a descriptor that still reaches the terminal. Two
-                    -- destinations, one for marks and one for whatever it says on the
-                    -- way down. Named rather than redirected: on POSIX the worker
-                    -- inherits the descriptor across the fork and writes its marks
-                    -- straight to it, while its standard error still goes to the file
-                    -- this end keeps to ask a dead worker why. A Windows CRT descriptor
-                    -- number is local to one process and does not survive the Rust host
-                    -- -> shell -> LuaJIT boundary. Name inherited stderr there: the
-                    -- surrounding group already sends it to the shard log, keeping JSON
-                    -- stdout intact. workerErrors also forwards that stream live.
-                    -- Without any descriptor, the worker marks into stderr.
-                    local processProgressFd = progressFd and (package.config:sub(1, 1) == "\\" and 2 or progressFd)
-                        or nil
-                    local progress = processProgressFd and ("NUPP_TEST_PROGRESS_FD=%d "):format(processProgressFd) or ""
-                    -- Shell suites run each in a process of its own too (#261). One
-                    -- long-lived shell worker kept what every suite it claimed left
-                    -- behind, growing to 2-4 GB, and eight of them shut down a 16 GB
-                    -- Linux runner twelve minutes into the lane. A fresh process
-                    -- holds a worker to the suite it is running.
-                    local fresh = (executionLane == "isolated" or executionLane == "shell")
-                        and "NUPP_TEST_FRESH_QUEUE_PIECES=1 "
-                        or ""
-                    local invocation = rawget(_G, "__NUPP_TEST_RUNNER_COMMAND") or ("luajit '%s'"):format(arg[0])
-                    local worker = (
-                        "%s%s%s%s --json %s --color=%s%s"
-                    ):format(cache, progress, fresh, invocation, lane.arg, colorMode, verbose and " --verbose" or "")
-                    local command = workerErrors(
-                        groupedWorker(worker) .. '; echo "__status__:$nupp_status" >&2',
-                        errors
-                    )
-                    running[
-                        #running + 1
-                    ] = {
-                        label = label,
-                        errors = errors,
-                        index = index,
-                        startedAt = now() - started,
-                        pipe = io.popen(command, "r")
-                    }
-                end
-            end
-
-            return function()
-                local reports = {}
-                for _, child in ipairs(running) do
-                    if not child.pipe then
-                        reports[#reports + 1] = {failure = "the worker could not be started", names = {child.label}}
-                    else
-                        local text = child.pipe:read("*a")
-                        local _, how, code = child.pipe:close()
-                        local decoded, report = pcall(json.decode, text or "")
-                        if decoded and type(report) == "table" then
-                            -- What the parent knows and the child cannot: which shard
-                            -- this was, when it was started, and when this end finished
-                            -- reading it. The child's own `durationMs` is its wall
-                            -- clock, which is the honest measure -- the pipes are read
-                            -- in order, so when the parent noticed says more about read
-                            -- order than about the shard.
-                            report.shard = {
-                                index = child.index,
-                                names = (report.claimed and #report.claimed > 0) and report.claimed or {child.label},
-                                alone = isolated or nil,
-                                executionLane = executionLane,
-                                startedAt = child.startedAt,
-                                collectedAt = now() - started
-                            }
-                            reports[#reports + 1] = report
-                        else
-                            -- Everything known about the death, in the failure itself.
-                            -- A signal names how it was killed; the tail of its
-                            -- standard error says what it managed to complain about
-                            -- first; the length of what it wrote separates "nothing at
-                            -- all" from "not JSON".
-                            local why = {}
-                            if how then
-                                why[#why + 1] = ("%s %s"):format(tostring(how), tostring(code))
-                            end
-                            local written = text or ""
-                            why[#why + 1] = ("%d bytes on stdout"):format(#written)
-                            if not decoded then
-                                why[#why + 1] = "JSON decode: " .. tostring(report)
-                                if #written > 0 then
-                                    local head = written:sub(1, 1000)
-                                    local tail = #written > 1000 and written:sub(-1000) or nil
-                                    why[#why + 1] = "stdout head: " .. head
-                                    if tail then
-                                        why[#why + 1] = "stdout tail: " .. tail
-                                    end
-                                end
-                            end
-                            local errored = io.open(child.errors, "rb")
-                            if errored then
-                                local said = errored:read("*a") or ""
-                                errored:close()
-                                local status = said:match("__status__:(%d+)")
-                                if status then
-                                    local code = tonumber(status) or 0
-                                    why[#why + 1] = code > 128 and ("killed by signal %d"):format(code - 128)
-                                        or ("exit %d"):format(code)
-                                    said = said:gsub("__status__:%d+%s*$", "")
-                                end
-                                -- The last suite the worker said it was starting. An
-                                -- undecodable report does not prove the worker died: it
-                                -- may have exited normally after a test failure while
-                                -- an inherited writer corrupted stdout. The marks
-                                -- themselves are taken out of what gets printed: there
-                                -- is one per suite, and a lane's worth of them would
-                                -- bury the message they are here to qualify.
-                                local inFlight
-                                for name in said:gmatch("__suite__:([^\n]*)") do
-                                    inFlight = name
-                                end
-                                local inFlightCase
-                                for name in said:gmatch("__case__:([^\n]*)") do
-                                    inFlightCase = name
-                                end
-                                said = said:gsub("__suite__:[^\n]*\n?", "")
-                                said = said:gsub("__case__:[^\n]*\n?", "")
-                                if inFlight then
-                                    why[
-                                        #why + 1
-                                    ] = "last reported " .. inFlight .. (inFlightCase and " / " .. inFlightCase or "")
-                                end
-                                if #said > 0 then
-                                    why[#why + 1] = "stderr: " .. said:sub(-2000)
-                                end
-                            end
-                            reports[
-                                #reports + 1
-                            ] = {
-                                names = {child.label},
-                                failure = "the worker wrote no report (" .. table.concat(why, "; ") .. ")"
-                            }
-                        end
-                    end
-                end
-
-                return reports
             end
         end
 
@@ -3839,96 +3303,25 @@ then
             end
         end
 
+        -- Every suite is a function call in this process, dealt out to Nupp
+        -- workers (one per core), each running it against the one loaded
+        -- compiler. A heavy suite the plan split into slices is several entries
+        -- on the same queue, so its cases spread over the workers too.
         local workerCount = jobs or defaultJobs()
-        local isolatedCount = laneJobs.isolated or workerCount
-        local sharedCount = laneJobs.shared or workerCount
-        local shellCount = laneJobs.shell or workerCount
-        local isolatedQueue = prepareQueue(
-            alone,
-            true,
-            math.min(isolatedCount, #alone),
-            "isolated",
-            nil,
-            nil,
-            isolatedCount
-        )
-        local sharedQueue = prepareQueue(
-            shareable,
+        local queue = prepareQueue(
+            suites,
             false,
-            math.min(sharedCount, #shareable),
+            math.min(workerCount, #suites),
             "shared",
             nil,
             nil,
-            sharedCount
+            workerCount
         )
-        local shellQueue = prepareQueue(
-            shelling,
-            true,
-            math.min(shellCount, #shelling),
-            "shell",
-            nil,
-            nil,
-            shellCount
-        )
-        if isolatedQueue then
-            beginPhase(("%d isolated suites across %d process workers"):format(#alone, #isolatedQueue.lanes))
-        elseif sharedQueue then
-            beginPhase(("%d suites across %d Nupp workers"):format(sharedQueue.count, #sharedQueue.lanes))
-        elseif shellQueue then
-            beginPhase(("%d shell suites across %d process workers"):format(#shelling, #shellQueue.lanes))
+        if queue then
+            beginPhase(("%d suites across %d Nupp workers"):format(#suites, #queue.lanes))
+            marked = true
+            collectQueue(queue, startFanOut(queue.lanes))
         end
-        marked = isolatedQueue ~= nil or sharedQueue ~= nil or shellQueue ~= nil
-
-        -- Process-global suites go first: profiler and runtime-provider state must
-        -- be exercised before worker threads have existed in this process. After
-        -- that, shell users can safely overlap the tail of the Nupp worker queue.
-        if isolatedQueue then
-            collectQueue(isolatedQueue, startFanOut(isolatedQueue.lanes, true, true, "isolated"))
-        end
-        if sharedQueue and isolatedQueue then
-            beginPhase(("%d suites across %d Nupp workers"):format(sharedQueue.count, #sharedQueue.lanes))
-        end
-        local collectShared, tendShared = nil, nil
-        if sharedQueue then
-            collectShared, tendShared = startFanOut(sharedQueue.lanes, true, false, "shared")
-        end
-        local collectShell
-        if shellQueue then
-            if sharedQueue and pauseBriefly then
-                local waiting = true
-                local tail = math.max(1, math.floor(#sharedQueue.lanes / 4))
-                while waiting do
-                    -- Counted by the claim markers rather than the pieces: a
-                    -- piece held open here is one a worker on Windows cannot
-                    -- retire, and one it failed to retire is still taken (#341).
-                    -- Only a marker that is not there is unclaimed; one that
-                    -- cannot be opened still exists.
-                    local pieces = 0
-                    for index = 1, #sharedQueue.order do
-                        local taken, _, code = io.open(("%s/taken-%d"):format(sharedQueue.path, index), "rb")
-                        if taken then
-                            taken:close()
-                        elseif code == 2 then
-                            pieces = pieces + 1
-                        end
-                    end
-                    -- Retired Nupp worker states are replaced here as well, or the
-                    -- pieces they left would never be taken and this would not end.
-                    waiting = pieces > tail and not (tendShared and tendShared())
-                    if waiting then
-                        pauseBriefly()
-                    end
-                end
-                beginPhase(("%d shell suites joining across %d process workers"):format(#shelling, #shellQueue.lanes))
-            elseif sharedQueue then
-                collectQueue(sharedQueue, collectShared)
-                sharedQueue, collectShared = nil, nil
-                beginPhase(("%d shell suites across %d process workers"):format(#shelling, #shellQueue.lanes))
-            end
-            collectShell = startFanOut(shellQueue.lanes, true, true, "shell")
-        end
-        collectQueue(sharedQueue, collectShared)
-        collectQueue(shellQueue, collectShell)
 
         -- Workers mark completed cases without a newline because none can know
         -- whether another lane has a final mark. The parent closes it once both
@@ -3959,7 +3352,7 @@ end
 local restoreLane = function()
 end
 
-local function runSuite(suiteInfo, slices)
+local function executeSuite(suiteInfo, slices)
     local firstResult = #results + 1
     -- Loading is measured with the suite rather than left out of it. A Nupp suite
     -- is compiled here, and a Lua one runs its top level here, so a suite can cost
@@ -4121,6 +3514,15 @@ local function runSuite(suiteInfo, slices)
     end
 end
 
+local function runSuite(suiteInfo, slices)
+    markRunning(suiteInfo.name)
+    local ok, problem = pcall(executeSuite, suiteInfo, slices)
+    markRunning(nil)
+    if not ok then
+        error(problem, 0)
+    end
+end
+
 -- What a queue piece is allowed to leave behind for the next one, which is
 -- nothing it can be seen to have changed.
 --
@@ -4201,106 +3603,6 @@ end
 --- run from work whose worker died holding it.
 local claimed = {}
 
-local function mergePieceReport(report)
-    total = total + (report.total or 0)
-    passed = passed + (report.passed or 0)
-    skipped = skipped + (report.skipped or 0)
-    notExecutedCount = notExecutedCount + (report.notExecuted or 0)
-    failed = failed + (report.failed or 0)
-    for _, record in ipairs(report.tests or {}) do
-        results[#results + 1] = record
-    end
-    for _, record in ipairs(report.suites or {}) do
-        suiteRecords[#suiteRecords + 1] = record
-    end
-end
-
-local function recordPieceFailure(spec, message)
-    local suite = spec:match("^(.-)#") or spec
-    total = total + 1
-    failed = failed + 1
-    results[
-        #results + 1
-    ] = {
-        id = suite .. "/<unrun>",
-        suite = suite,
-        name = "<unrun>",
-        status = "failed",
-        durationMs = 0,
-        failure = {message = message},
-    }
-    reportFailure(results[#results])
-end
-
---- Runs one claimed isolated or shell piece in a new process.
----
---- The long-lived process owns only queue claims and aggregation. The child is
---- handed a shard rather than the queue, so it cannot claim a second piece and
---- no module, FFI registration, or nested global table survives into the next
---- child. The supervisor's cache environment is inherited, retaining the warm
---- per-lane compiler store without retaining its process state.
-local function runFreshPiece(spec)
-    local invocation = rawget(_G, "__NUPP_TEST_RUNNER_COMMAND") or ("luajit '%s'"):format(arg[0])
-    local errors = os.tmpname()
-    local childProgressFd = progressFd and (package.config:sub(1, 1) == "\\" and 2 or progressFd) or nil
-    local progress = childProgressFd and ("NUPP_TEST_PROGRESS_FD=%d "):format(childProgressFd) or ""
-    local worker = (
-        "%sNUPP_TEST_SUPERVISED_PIECE=1 %s --json --shard=%s --color=%s%s"
-    ):format(progress, invocation, shellQuote(spec), colorMode, verbose and " --verbose" or "")
-    local command = workerErrors(
-        ("%s; printf '\n__piece_status__:%%d\n' $nupp_status"):format(groupedWorker(worker)),
-        errors
-    )
-    local pipe = io.popen(command, "r")
-    if not pipe then
-        os.remove(errors)
-        recordPieceFailure(spec, "the piece could not be started")
-        mark("E")
-        return
-    end
-    local text = pipe:read("*a") or ""
-    pipe:close()
-    local status = tonumber(text:match("__piece_status__:(%d+)%s*$"))
-    text = text:gsub("%s*__piece_status__:%d+%s*$", "")
-    local errorFile = io.open(errors, "rb")
-    local stderr = errorFile and (errorFile:read("*a") or "") or ""
-    if errorFile then
-        errorFile:close()
-    end
-    os.remove(errors)
-    local decoded, report = pcall(testJson.decode, text)
-    if not decoded or type(report) ~= "table" then
-        local detail = {
-            "the piece wrote no report",
-            status and ("exit " .. status) or "unreported exit status",
-            #text .. " bytes on stdout",
-        }
-        if not decoded then
-            detail[#detail + 1] = "JSON decode: " .. tostring(report)
-        end
-        if #text > 0 then
-            detail[#detail + 1] = "stdout: " .. text:sub(-2000)
-        end
-        if #stderr > 0 then
-            detail[#detail + 1] = "stderr: " .. stderr:sub(-2000)
-        end
-        recordPieceFailure(spec, table.concat(detail, "; "))
-        mark("E")
-        return
-    end
-
-    local beforePassed = passed
-    local beforeFailed = failed
-    local beforeNotExecuted = notExecutedCount
-    mergePieceReport(report)
-    mark(
-        failed > beforeFailed and "E"
-        or passed > beforePassed and "."
-        or notExecutedCount > beforeNotExecuted and "N"
-        or "S"
-    )
-end
-
 --- Takes work until there is none left.
 ---
 --- Packing the whole run in advance needs the cost of every suite known in
@@ -4361,13 +3663,7 @@ local function takeWork()
         end
         local spec = specs[took]
         claimed[#claimed + 1] = spec
-        if freshQueuePieces then
-            if sharedProgressStream then
-                io.stderr:write("__suite__:", spec, "\n")
-            end
-            runFreshPiece(spec)
-            restoreLane()
-        else
+        do
             local name, index, count = spec:match("^(.-)#(%d+)/(%d+)$")
             name = name or spec
             local suiteInfo = byName[name]
@@ -4397,16 +3693,6 @@ local function takeWork()
                 end
             end
             restoreLane()
-            -- Only a Nupp worker state retires: the parent starts its successor.
-            -- Garbage is collected before deciding, so a state is replaced for
-            -- what it holds rather than for what it has not yet freed.
-            if embedded and collectgarbage("count") > workerHeapLimit then
-                collectgarbage()
-                if collectgarbage("count") > workerHeapLimit then
-                    retired = true
-                    return
-                end
-            end
         end
     end
 end
@@ -4733,7 +4019,6 @@ local report = {
     suites = suiteRecords,
     shards = sharded and sharded.shards or {},
     claimed = #claimed > 0 and claimed or nil,
-    retired = retired or nil
 }
 
 if embedded then

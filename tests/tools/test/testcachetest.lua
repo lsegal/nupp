@@ -264,7 +264,7 @@ function M.selectionAndPresentationDoNotChangePackageKeys()
         ""
     )
     test.eq(cacheModule.flags({"betatest", "--exclude=gamma", "--exclude-group=external", "--color=always"}), "")
-    test.eq(cacheModule.flags({"--lane=shared", "--future-result-option=1"}), "--lane=shared\0--future-result-option=1")
+    test.eq(cacheModule.flags({"--future-mode=a", "--future-result-option=1"}), "--future-mode=a\0--future-result-option=1")
 end
 
 function M.closedContractsInvalidateFixturesGeneratedArtifactsAndChildPrograms()

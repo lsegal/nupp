@@ -280,38 +280,6 @@ jobs:
       - name: Check the compiler
         run: ./bin/nupp check
 
-      # Passing results keyed by each suite's content fingerprint: its files and
-      # everything they load, the built compiler, the platform, the lane and the
-      # flags. A fingerprint that cannot be fully accounted for is a miss and
-      # executes, so an approximate restore can only save time, never reuse a
-      # stale pass. Never-cache suites (timing, process lifecycle, measurement)
-      # execute regardless; see `neverCache` in tests/groups.lua.
-      - name: Restore the recorded test results
-        uses: actions/cache/restore@v4
-        with:
-          path: build/test-runner/.nupp-test-results
-          key: >-
-            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
-            github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Run the shared-process suites
-        run: ./bin/nupp test --scope=all --lane=shared
-
-      # Only from a run that completed: a cancelled or timed-out run skips this.
-      # A failing run still saves, because the store only ever holds packages
-      # that executed and passed under an unchanged fingerprint.
-      - name: Save the recorded test results
-        if: success() || failure()
-        uses: actions/cache/save@v4
-        continue-on-error: true
-        with:
-          path: build/test-runner/.nupp-test-results
-          key: >-
-            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
-            github.run_id }}-${{ github.run_attempt }}
-
       # Saved explicitly rather than through the action's post step, so a run
       # that fails a suite still keeps the compiler build the next run would
       # otherwise redo. The entries validate their own content, so a stale one
@@ -410,15 +378,11 @@ jobs:
             nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-
 
       # Passing results keyed by each suite's content fingerprint: its files and
-      # everything they load, the built compiler, the platform, the lane and the
-      # flags. A fingerprint that cannot be fully accounted for is a miss and
-      # executes, so an approximate restore can only save time, never reuse a
-      # stale pass. Never-cache suites (timing, process lifecycle, measurement)
-      # execute regardless; see `neverCache` in tests/groups.lua.
-      #
-      # Keyed apart from the fast gate's store: on Linux that job saves its key
-      # for this run first, and a cache key is written once, so sharing it would
-      # drop every pass this job adds.
+      # everything they load, the built compiler, the platform and the flags. A
+      # fingerprint that cannot be fully accounted for is a miss and executes,
+      # so an approximate restore can only save time, never reuse a stale pass.
+      # Never-cache suites (timing, process lifecycle, measurement) execute
+      # regardless; see `neverCache` in tests/groups.lua.
       - name: Restore the recorded test results
         uses: actions/cache/restore@v4
         with:
@@ -429,7 +393,7 @@ jobs:
           restore-keys: |
             nupp-test-results-integration-${{ runner.os }}-${{ runner.arch }}-
 
-      # Suite durations are what the process lanes are packed from. A clean
+      # Suite durations are what the worker queue is packed from. A clean
       # runner without them packs blind and the busiest shard decides the wall
       # clock, so this is a scheduling input, not a correctness one: an
       # approximate match is exactly as useful as an exact one.
@@ -597,22 +561,16 @@ jobs:
         shell: bash
         run: ./bin/nupp test --fresh --scope=all --group=measurement
 
-      # No lane names `--jobs`: the runner's default, one worker per core and
-      # never fewer than eight, is the binding setting on every platform. The
-      # hosted runners report three or four cores, so every lane runs eight wide
-      # (#252). A lane that cannot hold eight workers in the runner's memory is a
-      # per-worker footprint to fix (#250), not a reason to name fewer here.
+      # No step names `--jobs`: the runner's default, one Nupp worker per core,
+      # is the binding setting on every platform (#351).
       #
-      # On macOS and Windows every lane runs in one `nupp test`, so the
-      # compiler, the test runner and the native provider are checked and built
-      # once for all of them, and each command a test starts uses that build
-      # rather than checking it again (bin/nupp, "One test run is one build of
-      # this tree").
+      # Every suite runs in one `nupp test`, one process, so the compiler, the
+      # test runner and the native provider are checked and built once for all
+      # of them, and each command a test starts uses that build rather than
+      # checking it again (bin/nupp, "One test run is one build of this tree").
       #
       # `--exclude-group` names what earlier steps in this job already ran, and
       # `wasm-conformance`, which the SIMD conformance workflow runs sharded.
-      # The shared lane is excluded on Linux only, where the fast gate this job
-      # depends on has already run it against the same revision.
       # hostbinarytest stamps this binary once and reuses it while it is newer
       # than its sources. Stamped here, its host build -- a link with LLVM in
       # it -- does not hold the checkout's build lock while every other test's
@@ -640,15 +598,9 @@ jobs:
           set -euo pipefail
           ulimit -c unlimited || true
           deadline=$((NUPP_JOB_STARTED + (${{ matrix.timeout }} - 10) * 60))
-          if [ "$RUNNER_OS" = Linux ]; then
-            .github/scripts/suite-deadline.sh "$deadline" -- \
-              ./bin/nupp test --scope=all --lane=isolated \
-              --exclude-group=external-corpus,measurement,wasm-conformance
-          else
-            .github/scripts/suite-deadline.sh "$deadline" -- \
-              ./bin/nupp test --scope=all \
-              --exclude-group=external-corpus,measurement,wasm-conformance
-          fi
+          .github/scripts/suite-deadline.sh "$deadline" -- \
+            ./bin/nupp test --scope=all \
+            --exclude-group=external-corpus,measurement,wasm-conformance
 
       # A worker killed by a signal says which suite it was in, and on Linux it
       # is killed by SIGSEGV in a different set of suites every run -- so the

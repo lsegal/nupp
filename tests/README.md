@@ -6,7 +6,6 @@ file stem from the repository root:
 ```sh
 ./bin/nupp test doctest
 ./bin/nupp test --group=project
-./bin/nupp test --lane=shared
 ./bin/nupp test --list-suites
 ```
 
@@ -35,7 +34,7 @@ must be unique across directories and languages; duplicate names are errors.
 Directories named `fixtures`, `corpus`, `sessions`, `helpers`, `data`,
 `node_modules`, `.git`, `.rocks`, or `build` are excluded from discovery.
 
-A directory does not choose an execution lane. The runner retains its isolation
+A directory does not choose how a suite runs. The runner retains its isolation
 rules and source checks, and `tests/groups.lua` defines named selections by suite
 name. Use `require("helpers.paths")` in Lua suites for the repository root or
 shared test directory, rather than counting parent directories from a suite.
@@ -49,9 +48,9 @@ change their working directory, and `root` for the absolute repository root.
 The default base is `origin/main`; working-tree and untracked files count too.
 
 `tests/groups.lua` returns named groups and repository policy. Its scope map
-assigns every suite a coverage obligation; `--scope=NAME` selects that obligation,
-while `--lane=NAME` selects its execution constraints. Delivery is explicit and
-CI uses `--scope=all`, reusing recorded passes restored per platform.
+assigns every suite a coverage obligation; `--scope=NAME` selects that obligation.
+Every selected suite runs in one process, dealt out to Nupp workers, one per
+processor. Delivery is explicit and CI uses `--scope=all`, reusing recorded passes restored per platform.
 
 Package result caching is opt-in. Add `cache = true` only after its complete
 inputs are covered, and declare shared files with `inputs`. Dynamic loads,

@@ -1560,7 +1560,38 @@ function project.test(root: string?, args: {string}?, opts: project.TestOptions?
         env.NUPP_TEST_WATCH_PID = tostring(pid)
     end
 
-    return process.run(argv, {cwd = root, env = env, replaceShell = true})
+    -- A test command that runs everything in one process can name what it is
+    -- executing here, one file per thread. Whatever is left when it exits was
+    -- running when the process ended, which is the suite a crash belongs to.
+    local running = fs.absolute(fs.join(root, fs.join(env.NUPP_TEST_BUILD, "running")))
+    for _, stale in ipairs(fs.listFiles(running)) do
+        os.remove(stale)
+    end
+    fs.mkdir(running)
+    env.NUPP_TEST_RUNNING = running
+    local code = process.run(argv, {cwd = root, env = env, replaceShell = true})
+    local unfinished: {string} = {}
+    for _, left in ipairs(fs.listFiles(running)) do
+        local name = fs.readFile(left)
+        if name ~= nil and name:match("%S") then
+            unfinished[#unfinished + 1] = (name:gsub("%s+$", ""))
+        end
+        os.remove(left)
+    end
+    if #unfinished > 0 then
+        table.sort(unfinished)
+        io.stderr:write(
+            ("nupp: the test process exited (status %d) while running %s\n"):format(
+                code,
+                table.concat(unfinished, ", ")
+            )
+        )
+        if code == 0 then
+            code = 1
+        end
+    end
+
+    return code
 end
 
 --- The build `test` asks for, run by another compiler process.
