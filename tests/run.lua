@@ -376,10 +376,13 @@ local function compileServiceClient()
 end
 
 -- How many commands the service has answered, for its own suite to tell which
--- route a command took.
-rawset(_G, "__NUPP_TEST_COMPILE_SERVICE_COUNTS", function()
-    return compileService and (compileService:counts()) or 0
-end)
+-- route a command took. Not in a Nupp worker state, which leaves its commands to
+-- the shell (#384).
+if not embedded then
+    rawset(_G, "__NUPP_TEST_COMPILE_SERVICE_COUNTS", function()
+        return compileService and (compileService:counts()) or 0
+    end)
+end
 
 -- What `os.execute` itself answers for an exit status: Lua 5.2's triple when the
 -- interpreter was built for it, otherwise the C library's `system` status,
@@ -3589,13 +3592,19 @@ restoreLane = function()
         end
     end
 
+    -- Globals follow `package.loaded`. A module a piece loaded stays loaded in a
+    -- Nupp lane, and some publish state through a global when they load:
+    -- `_G.__nuppHotReload`, the runtime's file and process handle registries.
+    -- Removing those while the module stays left the next suite's `require`
+    -- answering a module whose global was gone (#384).
     if embedded then
         repair(package.loaded, laneBaseline.loaded)
+        repair(_G, laneBaseline.globals)
     else
         restore(package.loaded, laneBaseline.loaded)
+        restore(_G, laneBaseline.globals)
     end
     restore(package.preload, laneBaseline.preload)
-    restore(_G, laneBaseline.globals)
     package.path, package.cpath = laneBaseline.path, laneBaseline.cpath
 end
 
