@@ -720,32 +720,16 @@ return {
                 description = "Build the worker-hosted test runner",
                 outDir = "build/test-runner",
                 entries = {"main"},
-                -- Carries the runner and what it statically needs. Lua suites load
-                -- the rest of the compiler and standard library by name after
-                -- discovery, from the compiler build beside the executable, which
-                -- every test run has already built; carrying `src/**` here compiled
-                -- the whole compiler a second time (#396).
-                sources = {"tests/tools/test/runner/main.nupp", "tests/tools/test/runner/job.nupp"},
-
-                nativeFeatures = {workers = true, lpeg = true},
-                resources = RESOURCES,
-                stub = "nupp",
-                output = "build/nupp-test",
-            },
-            -- What `nupp test --coverage` builds instead of `testRunner`: the
-            -- compiler build is not instrumented, so this carries the source set the
-            -- suites test and coverage instruments every module they can load.
-            testRunnerCoverage = {
-                kind = "binary",
-                description = "Build the instrumentable test runner for coverage",
-                outDir = "build/coverage",
-                entries = {"main"},
+                -- Lua suites load project modules by name after discovery, so no
+                -- static entry graph can enumerate what a selected run will need.
+                -- Carry the source set the suites test; coverage then instruments the
+                -- same modules an ordinary runner can load dynamically.
                 sources = {"tests/tools/test/runner/main.nupp", "tests/tools/test/runner/job.nupp", "src/**.nupp"},
 
                 nativeFeatures = {workers = true, lpeg = true},
                 resources = RESOURCES,
                 stub = "nupp",
-                output = "build/coverage/nupp-test",
+                output = "build/nupp-test",
             },
             bootstrapCompiler = {
                 kind = "modules",

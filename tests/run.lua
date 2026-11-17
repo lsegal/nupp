@@ -36,18 +36,6 @@ local modulesRoot = os.getenv("NUPP_TEST_MODULES")
 if modulesRoot and modulesRoot ~= "" then
     package.path = modulesRoot .. "/?.lua;" .. modulesRoot .. "/?/init.lua;" .. package.path
 end
--- The stamped runner carries itself and what it statically needs. The rest of the
--- compiler and standard library a suite loads by name comes from the compiler's
--- build beside the executable, which the run has already built (#396). It is
--- searched ahead of the test build's directory: everything that build still writes
--- is preloaded from the payload anyway, and a file a wider earlier build left there
--- must not shadow the compiler's.
-local hostExecutable = (rawget(_G, "__NUPP_TEST_WORKER_HOST") or rawget(_G, "__NUPP_TEST_EMBEDDED"))
-    and rawget(_G, "__NUPP_EXECUTABLE")
-local hostTree = type(hostExecutable) == "string" and hostExecutable:match("^(.*)[/\\]") or nil
-if hostTree and not package.path:find(hostTree .. "/?.lua;", 1, true) then
-    package.path = hostTree .. "/?.lua;" .. hostTree .. "/?/init.lua;" .. package.path
-end
 
 require("nupp.runtime.standardos")
 
