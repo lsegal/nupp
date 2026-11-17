@@ -64,6 +64,7 @@ local isFatal = diagnosticMod.isFatal
 local aot = {}
 
 local compilerResourceFingerprintMemo: string? = nil
+local computeCompilerResourceFingerprint: function((function(string): string)?): string
 
 --- The compiler-carried sources that can affect AOT checking or code generation.
 ---
@@ -76,6 +77,14 @@ function aot.compilerResourceFingerprint(contentDigest: (function(string): strin
     if compilerResourceFingerprintMemo ~= nil then
         return compilerResourceFingerprintMemo as string
     end
+    compilerResourceFingerprintMemo = compilerFingerprint.runRemembered("aot resources", function(): string
+        return computeCompilerResourceFingerprint(contentDigest)
+    end)
+
+    return compilerResourceFingerprintMemo as string
+end
+
+computeCompilerResourceFingerprint = function(contentDigest: (function(string): string)?): string
     local digest = contentDigest or hash.digest
     local bundled = require("nupp.compiler.bundled")
     local list = require("nupp.compiler.bundledlist").list
@@ -90,9 +99,8 @@ function aot.compilerResourceFingerprint(contentDigest: (function(string): strin
     for _, path in ipairs(paths) do
         parts[#parts + 1] = path .. "\0" .. digest(bundled.source(path) or "missing")
     end
-    compilerResourceFingerprintMemo = digest(table.concat(parts, "\0"))
 
-    return compilerResourceFingerprintMemo as string
+    return digest(table.concat(parts, "\0"))
 end
 
 --- The policies a target may select.
