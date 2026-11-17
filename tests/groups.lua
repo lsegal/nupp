@@ -892,12 +892,15 @@ never("Live network and socket conformance.", [[
 stdlibtest nettest netnativetest tlstest httpnativetest
 ]])
 
--- Builds several suites share, made once by the runner before any case starts
--- whenever one of those suites is selected. `module` is a helper whose
--- `command(root)` builds it, or names the cached build; the suites ask the same
--- helper for the result.
+-- Builds suites need, made once by the runner before any case starts whenever
+-- one of those suites is selected, so a cold build is never charged to the case
+-- that asked first (#371, #383). `module` is a helper whose `command(root)`
+-- builds it, or names the cached build; the suites ask the same helper for the
+-- result.
 local prerequisites = {
     {name = "the embedding SDK", module = "helpers.embeddingsdk", suites = {"hostembeddingtest", "hostchanneltest"}},
+    {name = "the stamped compiler binary", module = "helpers.stampedbinary", suites = {"hostbinarytest"}},
+    {name = "the compiled serde contracts", module = "helpers.serdecontracts", suites = {"serdecontracttest"}},
 }
 
 return groups, {scopes = scopes, packages = packages, neverCache = neverCache, prerequisites = prerequisites}
