@@ -3,8 +3,9 @@ local call = require("helpers.serdecontract").call
 local json = require("testjson")
 local process = require("nupp.compiler.process")
 local fs = require("nupp.compiler.fs")
+local compiledContracts = require("helpers.serdecontracts")
 local HERE = require("helpers.paths").tests
-local NUPP = fs.absolute(HERE .. "/../bin/nupp")
+local ROOT = require("helpers.paths").root
 local PROJECT = fs.absolute(HERE .. "/../bench/serde-spike/contracts")
 local M = {}
 
@@ -26,12 +27,9 @@ function M.externalMembersEraseBehindACheckedBinding()
 end
 
 function M.compiledRecipesMatchVisitorAndRespectRefusals()
-    local native = PROJECT .. "/native-build"
-    local status, output = process.capture({NUPP, "build", "--target", "compiled-contracts", "--json"}, {cwd = native})
-    assert(status == 0, output)
-    local built = json.decode(output)
-    assert(built.ok, output)
-    status, output = process.capture({"luajit", PROJECT .. "/compiled_scope.lua"}, {
+    -- Built once per run, before any case starts (#383).
+    local native = assert(compiledContracts.path(ROOT))
+    local status, output = process.capture({"luajit", PROJECT .. "/compiled_scope.lua"}, {
         cwd = native,
         env = {
             LUA_PATH = native .. "/build/?.lua;" .. fs.absolute(HERE .. "/../build") .. "/?.lua;" .. package.path,
