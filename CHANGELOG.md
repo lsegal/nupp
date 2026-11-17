@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Diagnostics reported at the same position now always come out in the same
+  order, sorted by code and then message. Before, which of two came first
+  could change from one run to the next.
+
+- An incremental build no longer rechecks `debug.log` after every edit. A
+  compiler source staged only to be checked against has no build record, so
+  every module depending on it was treated as having a changed dependency.
+
 - `nupp fmt` type-checks a file only when one of its paths could become an
   import. Before, nearly every file was checked, along with every module it
   reached, so formatting a cold project cost about as much as checking all of
