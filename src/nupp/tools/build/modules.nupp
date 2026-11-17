@@ -1949,6 +1949,24 @@ local function buildModules(root: string, outDir: string, config: Config, target
         return carriedSourceText[name] or nil
     end
 
+    -- A binary built beside the compiler's own build, like this repository's test
+    -- runner, finds the compiler's runtime modules as its own sources. Where the
+    -- source is the very text the compiler was built from, it is the compiler's
+    -- module and is carried like one rather than compiled a second time (#396).
+    -- Never into the compiler's own build, whose records are what is carried, and
+    -- never for coverage, whose modules have to be instrumented.
+    local carriesOwnSources: boolean? = nil
+    local function carriesOwnSource(name: string, path: string): boolean
+        if carriesOwnSources == nil then
+            local bundled = require("nupp.compiler.bundled")
+            carriesOwnSources = target.kind == "binary"
+                and not config._coverage
+                and fs.absolute(join(root, outDir)) ~= fs.absolute(join(bundled.moduleDir(), "../.."))
+        end
+
+        return carriesOwnSources == true and inc.fileText(path) == currentCarriedSource(name)
+    end
+
     local function addCarriedRuntime(name: string): boolean
         if browserTarget then
             return false
@@ -1966,6 +1984,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
         if existing ~= nil
             and not envMod.isDependencyTypePath(inc.env, existing)
             and existing:sub(1, #runtimeSourceRoot + 1) ~= runtimeSourceRoot .. "/"
+            and not carriesOwnSource(name, existing)
         then
             return false
         end
