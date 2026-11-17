@@ -190,15 +190,12 @@ local function merge(into, generated, label)
     into.entries[#into.entries + 1] = renamed
 end
 
-function M.semantics(options)
-    options = options or {}
-    local primitives = require("tests.integration.simd.primitives")
-    local reducers = require("tests.integration.simd.reducers")
+local function semanticSegments()
     local core = {2, 3, 8, 17, 33, 64, "preferred"}
     local memory = {2, 3, 4, 8, 16, 32, 64, "preferred"}
     local transpose = {2, 3, 8, 17, 33, 64}
-    local into = {files = {}, probes = {}, coverage = {}, entries = {}}
-    local segments = {
+
+    return {
         {"operations", {"lanes"}, M.types, core},
         {"memory", {"memory"}, {"float", "number", "int8", "int16", "int32", "int64"}, memory},
         {"transpose", {"transpose"}, {"float", "int8", "int16", "int32", "int64"}, transpose},
@@ -213,21 +210,83 @@ function M.semantics(options)
         {"float_bits", {"bitpatterns", "bitmemory"}, {"float", "number"}, core},
         {"masks", {"masks"}, M.types, core},
         {"maps", {"maps"}, {"float", "number"}, core},
+        {"reducers", nil, M.types, core},
     }
-    for _, segment in ipairs(segments) do
-        merge(
-            into,
-            primitives.generate({
-                families = segment[2],
-                types = segment[3],
-                lanes = segment[4],
-                batchSize = 8,
-                target = options.target,
-            }),
-            segment[1]
-        )
+end
+
+--- Names the independently buildable parts of the semantic pack, in pack
+--- order. Each builds and runs on its own, so a harness can spread them out.
+function M.semanticSegments()
+    local names = {}
+    for _, segment in ipairs(semanticSegments()) do
+        names[#names + 1] = segment[1]
     end
-    merge(into, reducers.generate({types = M.types, lanes = core}), "reducers")
+
+    return names
+end
+
+--- The element types a semantic segment covers.
+function M.semanticSegmentTypes(name)
+    for _, segment in ipairs(semanticSegments()) do
+        if segment[1] == name then
+            return {unpack(segment[3])}
+        end
+    end
+    error("unknown semantic segment " .. tostring(name))
+end
+
+local function only(types, wanted)
+    if not wanted then
+        return types
+    end
+    local keep = {}
+    for _, element in ipairs(wanted) do
+        keep[element] = true
+    end
+    local result = {}
+    for _, element in ipairs(types) do
+        if keep[element] then
+            result[#result + 1] = element
+        end
+    end
+
+    return result
+end
+
+--- Generates the semantic pack, or only the named segments of it, and of
+--- those only the element types `options.types` names.
+function M.semantics(options)
+    options = options or {}
+    local primitives = require("tests.integration.simd.primitives")
+    local reducers = require("tests.integration.simd.reducers")
+    local wanted
+    if options.segments then
+        wanted = {}
+        for _, name in ipairs(options.segments) do
+            wanted[name] = true
+        end
+    end
+    local into = {files = {}, probes = {}, coverage = {}, entries = {}}
+    for _, segment in ipairs(semanticSegments()) do
+        local name = segment[1]
+        local types = only(segment[3], options.types)
+        if (not wanted or wanted[name]) and #types > 0 then
+            if wanted then
+                wanted[name] = nil
+            end
+            local generated = segment[2]
+                and primitives.generate({
+                    families = segment[2],
+                    types = types,
+                    lanes = segment[4],
+                    batchSize = 8,
+                    target = options.target,
+                })
+                or reducers.generate({types = types, lanes = segment[4]})
+            merge(into, generated, name)
+        end
+    end
+    assert(not wanted or next(wanted) == nil, "unknown semantic segment " .. tostring(wanted and next(wanted)))
     local top = {"local function run(): number", "    local cases = 0"}
     for _, entry in ipairs(into.entries) do
         top[#top + 1] = '    cases = cases + require("' .. entry .. '").run()'
@@ -238,6 +297,75 @@ function M.semantics(options)
     into.entries = nil
 
     return into
+end
+
+-- The semantic pack runs as one case per segment and group of element
+-- types, each its own build, so the pool spreads it across cores instead of
+-- one case holding a core for the whole pack. A group shares one build's fixed
+-- cost, so cheap types share a case; the groups keep each case's compile work
+-- about even. A number is how many of the segment's types each case takes.
+local SEMANTIC_CASE_GROUPS = {
+    operations = 2,
+    memory = 2,
+    transpose = 1,
+    conversions = 10,
+    widen = 10,
+    integer_edges = 4,
+    float_bits = 1,
+    masks = 5,
+    maps = 1,
+    -- The floating reducers carry the element contracts and are most of it.
+    reducers = {{"float"}, {"number"}, {"int8", "uint8", "int16", "uint16"}, {"int32", "uint32"}, {"int64", "uint64"}},
+}
+
+local function semanticGroups(segment)
+    local types = M.semanticSegmentTypes(segment)
+    local groups = assert(SEMANTIC_CASE_GROUPS[segment], "no case groups for semantic segment " .. segment)
+    if type(groups) == "number" then
+        local size = groups
+        groups = {}
+        for first = 1, #types, size do
+            groups[#groups + 1] = {unpack(types, first, math.min(first + size - 1, #types))}
+        end
+    end
+    -- Every type in exactly one case, or coverage would quietly shrink.
+    local left = {}
+    for _, element in ipairs(types) do
+        left[element] = true
+    end
+    for _, group in ipairs(groups) do
+        for _, element in ipairs(group) do
+            assert(left[element], segment .. " case groups name " .. element .. " twice or not at all")
+            left[element] = nil
+        end
+    end
+    assert(next(left) == nil, segment .. " case groups miss " .. tostring(next(left)))
+
+    return groups, #types
+end
+
+--- The cases a harness runs the semantic pack as: each names its segment and
+--- element types, and together they cover the pack exactly once.
+function M.semanticCases()
+    local result = {}
+    for _, segment in ipairs(M.semanticSegments()) do
+        local groups, count = semanticGroups(segment)
+        for _, group in ipairs(groups) do
+            local name = "nativeSemanticConformance_" .. segment
+            if #group < count then
+                name = name .. "_" .. table.concat(group, "_")
+            end
+            result[#result + 1] = {
+                name = name,
+                pack = "semantics",
+                segment = segment,
+                types = group,
+                ceiling = "semantics/" .. segment,
+            }
+        end
+    end
+
+    return result
 end
 
 local function witness(id, obligation, dimensions)
@@ -549,6 +677,46 @@ function M.witnesses(pack, identity, generated)
     end
 
     return result
+end
+
+-- The element each operation category's evidence is read from.
+local CATEGORY_ELEMENTS = {
+    floating = "float",
+    ["signed-integer"] = "int8",
+    ["unsigned-integer"] = "uint8",
+    ["wide-signed-integer"] = "int64",
+    ["wide-unsigned-integer"] = "uint64",
+}
+local BOUNDARY_PARTS = {
+    ["target-vector-ceiling"] = {"operations", "int8"},
+    ["mask-64-lanes"] = {"masks", "float"},
+    ["avx512-gather-scatter"] = {"memory", "float"},
+    ["neon-field-pairs"] = {"memory", "float"},
+}
+
+--- Names the semantic segment and element type whose execution proves a
+--- semantic witness, so a harness that builds the pack in parts emits each
+--- witness once, from the part that earned it. They are the records
+--- validateSemanticCoverage reads that witness's evidence from.
+--- @return segment, element
+function M.semanticWitnessPart(witness)
+    local dimensions = witness.dimensions
+    if witness.obligation == "simd.operation-semantics" then
+        local family, category = dimensions.operationCase:match("^([^/]+)/(.+)$")
+        local segment = family == "floating-special" and "float_bits" or family == "reducers" and "reducers"
+            or "operations"
+
+        return segment, assert(CATEGORY_ELEMENTS[category], "unknown operation category " .. tostring(category))
+    elseif witness.obligation == "simd.conversions" then
+        return "conversions", dimensions.source
+    elseif witness.obligation == "simd.representation-boundary" then
+        local part = BOUNDARY_PARTS[dimensions.boundary]
+        if part then
+            return part[1], part[2]
+        end
+    end
+
+    return "operations", "float"
 end
 
 return M
