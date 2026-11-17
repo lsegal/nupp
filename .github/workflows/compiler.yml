@@ -62,6 +62,13 @@ permissions:
 #
 # The event name is in the key so a push cannot cancel the nightly backstop
 # declared above: a scheduled run's `github.ref` is `refs/heads/main` too.
+# The five-minute suite budget (#351) is a hard halt, not a target: a test step
+# still running at five minutes has failed it, and an hour more of it tells
+# nobody anything (#375). Each test step ends its run here through
+# suite-deadline.sh, which names what was still running before it stops.
+env:
+  NUPP_SUITE_SECONDS: 300
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -510,9 +517,11 @@ jobs:
           bash_path=$(command -v bash)
           sh_path=$(dirname "$bash_path")/sh.exe
           test -f "$sh_path"
-          NUPP_TEST_BASH=$(cygpath -w "$bash_path") \
-          NUPP_TEST_SH=$(cygpath -w "$sh_path") \
-          ./bin/nupp test --fresh --scope=all --group=windows-preflight
+          NUPP_TEST_BASH=$(cygpath -w "$bash_path")
+          NUPP_TEST_SH=$(cygpath -w "$sh_path")
+          export NUPP_TEST_BASH NUPP_TEST_SH
+          .github/scripts/suite-deadline.sh "$(($(date +%s) + NUPP_SUITE_SECONDS))" -- \
+            ./bin/nupp test --fresh --scope=all --group=windows-preflight
 
       # Keep the external corpus and the C importer explicit. A configured
       # corpus used to be absent and silently skipped, while an import-c failure
@@ -559,7 +568,9 @@ jobs:
           runner.os == 'Linux'
           && contains(needs.classify.outputs.selection, '"measurement"')
         shell: bash
-        run: ./bin/nupp test --fresh --scope=all --group=measurement
+        run: >-
+          .github/scripts/suite-deadline.sh "$(($(date +%s) + NUPP_SUITE_SECONDS))" --
+          ./bin/nupp test --fresh --scope=all --group=measurement
 
       # No step names `--jobs`: the runner's default, one Nupp worker per core,
       # is the binding setting on every platform (#351).
@@ -588,16 +599,14 @@ jobs:
         # still says "core dumped". Raising it here is what makes the step
         # below able to ask a crashed worker anything at all.
         #
-        # The deadline sits 10 minutes inside the job's timeout. A job that runs
-        # out of time, or is cancelled by hand, skips the steps that would say
-        # where a hung run stood; this ends the run first, samples what it left
+        # The run is halted NUPP_SUITE_SECONDS after this step starts (#375).
+        # Ending it here rather than by the job timeout samples what it left
         # running and ends its workers, so the runner names each one and the
-        # suite it was in. On macOS this step alone takes two to three and a
-        # half hours when it passes, so a two-hour run is not a stalled one.
+        # suite it was in, and the steps that report a stalled run still run.
         run: |
           set -euo pipefail
           ulimit -c unlimited || true
-          deadline=$((NUPP_JOB_STARTED + (${{ matrix.timeout }} - 10) * 60))
+          deadline=$(($(date +%s) + NUPP_SUITE_SECONDS))
           .github/scripts/suite-deadline.sh "$deadline" -- \
             ./bin/nupp test --scope=all \
             --exclude-group=external-corpus,measurement,wasm-conformance
@@ -655,10 +664,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'nupp-worker-dumps') | Out-Null
 
-      # Kept 10 minutes inside the job's timeout, as on the other platforms, so
-      # a hung run is ended with its process tree listed and its workers named
-      # while the job can still say so. The suite takes about two hours here
-      # when it passes.
+      # Halted NUPP_SUITE_SECONDS after it starts, as on the other platforms
+      # (#375), so an over-budget run is ended with its process tree listed and
+      # its workers named while the job can still say so.
       - name: Run the compiler suite
         if: runner.os == 'Windows'
         shell: bash
@@ -673,7 +681,7 @@ jobs:
           NUPP_TEST_BASH=$(cygpath -w "$bash_path")
           NUPP_TEST_SH=$(cygpath -w "$sh_path")
           export NUPP_TEST_BASH NUPP_TEST_SH
-          deadline=$((NUPP_JOB_STARTED + (${{ matrix.timeout }} - 10) * 60))
+          deadline=$(($(date +%s) + NUPP_SUITE_SECONDS))
           .github/scripts/suite-deadline.sh "$deadline" -- \
             ./bin/nupp test --scope=all \
             --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
@@ -883,7 +891,10 @@ jobs:
           ./bin/nupp build --target docs
 
       - name: Regenerate and verify the documentation
-        run: ./bin/nupp test --fresh --scope=all --group=docs
+        shell: bash
+        run: >-
+          .github/scripts/suite-deadline.sh "$(($(date +%s) + NUPP_SUITE_SECONDS))" --
+          ./bin/nupp test --fresh --scope=all --group=docs
 
   # The full LuaJIT browser guest, application packages, browser templates, and
   # generated Pages artifact. Called rather than
