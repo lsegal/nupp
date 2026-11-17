@@ -8,10 +8,22 @@ local HERE = runner.root() .. "/tests"
 local WORK_CEILINGS = {
     -- LLVM compiles and lld links in process, so a build starts no command.
     species = {units = 40, externalCommands = 0, cases = 85000, calls = 3200},
+    -- The semantic pack runs in parts, so each ceiling bounds one case of
+    -- that segment. Together the parts are the 135 units, about 60 million
+    -- cases and 1.6 million calls the pack ran as one case.
+    ["semantics/operations"] = {units = 2, externalCommands = 0, cases = 4300000, calls = 2000},
+    ["semantics/memory"] = {units = 2, externalCommands = 0, cases = 260000, calls = 5800},
+    ["semantics/transpose"] = {units = 1, externalCommands = 0, cases = 25000, calls = 30},
+    ["semantics/conversions"] = {units = 10, externalCommands = 0, cases = 345000, calls = 700},
+    ["semantics/widen"] = {units = 10, externalCommands = 0, cases = 360000, calls = 6200},
+    ["semantics/integer_edges"] = {units = 4, externalCommands = 0, cases = 325000, calls = 500},
+    ["semantics/float_bits"] = {units = 2, externalCommands = 0, cases = 18000000, calls = 88000},
+    ["semantics/masks"] = {units = 5, externalCommands = 0, cases = 2550000, calls = 3400},
+    ["semantics/maps"] = {units = 1, externalCommands = 0, cases = 890000, calls = 420},
     -- The reducer corpus is one loop, seven masked and two mixed modules for
     -- each of the six element types the authored reducers take, each probe
     -- called once per length, selection and scenario.
-    semantics = {units = 135, externalCommands = 0, cases = 60000000, calls = 1650000},
+    ["semantics/reducers"] = {units = 11, externalCommands = 0, cases = 620000, calls = 580000},
 }
 
 local function read(path)
@@ -150,22 +162,13 @@ local function checkWork(pack, report)
     end
 end
 
--- Each semantic segment is its own build and run, so the pool spreads the
--- pack across cores instead of one case holding a core for the whole pack.
-local rows = {{name = "nativeSpeciesInventory", pack = "species", ceiling = "species"}}
-for _, segment in ipairs(packs.semanticSegments()) do
-    rows[#rows + 1] = {
-        name = "nativeSemanticConformance_" .. segment,
-        pack = "semantics",
-        segment = segment,
-        ceiling = "semantics/" .. segment,
-    }
-end
+local rows = packs.semanticCases()
+table.insert(rows, 1, {name = "nativeSpeciesInventory", pack = "species", ceiling = "species"})
 
 local semanticWitnesses = {}
 
--- Witnesses are validated against the whole pack, then each segment emits
--- the ones its own run proves.
+-- Witnesses are validated against the whole pack, then each case emits the
+-- ones its own run proves.
 local function witnesses(row, identity, generated)
     if row.pack == "species" then
         return packs.witnesses("species", identity, generated)
@@ -176,9 +179,14 @@ local function witnesses(row, identity, generated)
         all = packs.witnesses("semantics", identity, packs.semantics())
         semanticWitnesses[key] = all
     end
+    local mine = {}
+    for _, element in ipairs(row.types) do
+        mine[element] = true
+    end
     local result = {}
     for _, witness in ipairs(all) do
-        if packs.semanticWitnessSegment(witness) == row.segment then
+        local segment, element = packs.semanticWitnessPart(witness)
+        if segment == row.segment and mine[element] then
             result[#result + 1] = witness
         end
     end
@@ -195,8 +203,8 @@ local generatedCases = test.suite.cases(
         local capability = runner.nativeCapability()
         test.suite.requirecapability("compiler.llvm", capability.compilerVersion ~= nil, capability)
         test.suite.requirecapability("cpu." .. capability.tier, capability.available, capability)
-        local generated = row.pack == "species" and packs.species() or packs.semantics({segments = {row.segment}})
-        local key = fixtureKey(row.ceiling, generated, capability)
+        local generated = row.pack == "species" and packs.species() or packs.semantics({segments = {row.segment}, types = row.types})
+        local key = fixtureKey(row.name, generated, capability)
         local _, report, reused = test.suite.fixture(key, function(directory)
             local complete = runner.native(generated, {
                 directory = directory,
@@ -208,6 +216,7 @@ local generatedCases = test.suite.cases(
             return {
                 pack = row.pack,
                 segment = row.segment,
+                types = row.types,
                 tier = complete.tier,
                 host = complete.host,
                 cases = complete.cases,
@@ -234,6 +243,7 @@ local generatedCases = test.suite.cases(
         test.suite.fact("simd.native.pack", {
             pack = row.pack,
             segment = row.segment,
+            types = row.types,
             tier = report.tier,
             routes = {"simd", "scalar-c"},
             cases = report.cases,
