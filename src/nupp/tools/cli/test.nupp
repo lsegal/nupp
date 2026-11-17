@@ -477,6 +477,10 @@ end
 --- `--timings[=N]`. Those remain forwarded arguments rather than fields of this
 --- command because a project may configure a different test executable.
 ---
+--- The bundled runner has no Nupp workers, so it runs a project's suites one
+--- at a time in its own process. `--jobs=N` above 1 is accepted there, has no
+--- effect, and says so on standard error.
+---
 --- Coverage uses `build/coverage` without changing the ordinary build cache
 --- and writes under `build/reports/coverage` by default. `--report-json` reads
 --- that report without rebuilding or rerunning tests.

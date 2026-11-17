@@ -7,7 +7,29 @@ local function shellQuote(text: string): string
     return "'" .. text:gsub("'", "'\\''") .. "'"
 end
 
+-- The carried runner shards only inside a worker host, and this process is the
+-- compiler, which carries no Nupp workers (#377). A worker count asked for here
+-- would otherwise be accepted and quietly ignored. The runner still validates
+-- the value; only the last one counts, as it does there.
+local function noteSerialJobs(args: any)
+    local asked: integer? = nil
+    for _, argument in ipairs(args) do
+        local count = tostring(argument):match("^%-%-jobs=(%d+)$")
+        if count ~= nil then
+            asked = math.floor(tonumber(count) as number)
+        end
+    end
+    if asked ~= nil and asked > 1 then
+        io.stderr:write(
+            (
+                "nupp: --jobs=%d has no effect: a project's suites run one at a time, "
+            ):format(asked) .. "because the bundled runner has no Nupp workers\n"
+        )
+    end
+end
+
 export function run(args: any): integer
+    noteSerialJobs(args)
     local compilerRoot = os.getenv("NUPP_COMPILER_ROOT")
     local executable = compilerRoot and compilerRoot .. "/bin/nupp" or tostring(io.cli.args[0] or "nupp")
     local forwarded = {[0] = executable}

@@ -144,10 +144,15 @@ return M
         write(dir .. "/tests/stdlib/" .. name .. "/nested/ignoredtest.nupp", 'error("fixture must not compile")\n')
     end
 
+    -- The bundled runner has no Nupp workers (#377): a project runs its suites one
+    -- at a time whatever `--jobs` says, and says so rather than ignoring it.
     for _, jobs in ipairs({1, 2}) do
+        local errors = os.tmpname()
         local output, invocation = capturedRun(
-            ("cd %q && %q test --jobs=%d --json 2>/dev/null"):format(dir, NUPP, jobs)
+            ("cd %q && %q test --jobs=%d --json 2>%q"):format(dir, NUPP, jobs, errors)
         )
+        local diagnostics = read(errors)
+        os.remove(errors)
         test.eq(invocation.status, 0, "nested suites failed" .. evidence(invocation))
         local report = require("testjson").decode(output)
         test.eq(report.total, 3)
@@ -159,10 +164,13 @@ return M
         test.matches(records["nestedluatest/nested"].file, "tests[/\\]stdlib[/\\]table[/\\]nestedluatest%.lua$")
         test.matches(records["nestednupptest/typed"].file, "tests[/\\]compiler[/\\]check[/\\]nestednupptest%.nupp$")
         test(records["roottest/root"], "root suites remain discoverable")
-        -- Only the checkout's worker host deals suites to Nupp workers; a
-        -- project's bundled runner runs them in-process whatever --jobs says
-        -- (#377). Assert that contract until projects shard again.
-        test.eq(#report.shards, 0, "a project run stays in one process")
+        test.eq(#report.shards, 0, "a project run has no Nupp workers to shard across")
+        local note = diagnostics:find("--jobs=2 has no effect", 1, true)
+        if jobs == 2 then
+            test(note, "an unhonoured worker count is reported" .. evidence(invocation) .. diagnostics)
+        else
+            test.eq(note, nil, diagnostics)
+        end
     end
     os.execute("rm -rf " .. string.format("%q", dir))
 end
