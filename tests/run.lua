@@ -2646,7 +2646,11 @@ end
 --- A suite costing more than a fair share is asked to run in slices, because one suite
 --- longer than the share is on its own the floor however many workers there are: with
 --- `selfFormatStable` whole, the best possible run was fifty seconds at any count.
+---
+--- No piece is planned to carry more than half a minute, whatever the share: a
+--- slice costs its suite's load again and nothing else (#382).
 local function planWork(list, shards, timings)
+    local ceiling = 30000
     local known, counted = 0, 0
     for _, ms in pairs(timings) do
         known = known + ms
@@ -2686,13 +2690,28 @@ local function planWork(list, shards, timings)
         -- four more suites. Halving the target gives the packer pieces it can fit
         -- around each other, and a slice costs only loading its suite again, which
         -- is milliseconds for all but a handful.
+        --
+        -- And no piece's cases over `ceiling`, because half a share grows with
+        -- the run: on Linux CI four workers over fifty minutes of work made it
+        -- more than five minutes, so `aotclitest` at ten went out whole and one
+        -- worker held it for most of the run (#382). Measured on the cases
+        -- alone, since every slice loads the suite again and cutting a suite
+        -- that is mostly loading would only repeat the load.
         local target = share / 2
+        local casesMs = 0
+        for _, ms in pairs(caseCosts) do
+            casesMs = casesMs + (tonumber(ms) or 0)
+        end
+        if #names == 0 then
+            casesMs = item.cost
+        end
         local pieces = 1
         if target > 0 and item.cost > target then
             pieces = math.ceil(item.cost / target)
-            if #names > 0 then
-                pieces = math.min(pieces, #names)
-            end
+        end
+        pieces = math.max(pieces, math.ceil(casesMs / ceiling))
+        if #names > 0 then
+            pieces = math.min(pieces, #names)
         end
         local info = byName[item.name]
         local packageName = info and (info.path:match("^(.*)/") or ".")
