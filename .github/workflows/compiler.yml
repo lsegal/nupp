@@ -634,8 +634,8 @@ jobs:
         # out of time, or is cancelled by hand, skips the steps that would say
         # where a hung run stood; this ends the run first, samples what it left
         # running and ends its workers, so the runner names each one and the
-        # suite it was in. On macOS this step alone takes close to three hours
-        # when it passes, so a two-hour run is not a stalled one.
+        # suite it was in. On macOS this step alone takes two to three and a
+        # half hours when it passes, so a two-hour run is not a stalled one.
         run: |
           set -euo pipefail
           ulimit -c unlimited || true
