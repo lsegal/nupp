@@ -624,14 +624,17 @@ end
 -- paths for the Windows programs those commands start.
 if package.config:sub(1, 1) == "\\" then
     -- Loading the runtime's I/O module assigns its own `io.popen` over the one
-    -- installed below. A process worker reaches its first suite before anything
+    -- installed below. A Nupp worker reaches its first suite before anything
     -- has loaded it, so the first compiler module a suite required replaced the
-    -- Bash route and later pipes went to cmd.exe. Load it now, so the route
-    -- wraps it instead. A shared worker lane refuses pipes anyway: leave its
-    -- refusal in place rather than loading a working popen over it.
-    if not package.loaded["nupp.runtime.standardio"] and not rawget(_G, "__NUPP_TEST_EMBEDDED") then
+    -- Bash route and later pipes went to cmd.exe -- `pwd` among them, which
+    -- then answered `/r` rather than `R:/` (#351). Load it now, so the route
+    -- wraps it instead.
+    if not package.loaded["nupp.runtime.standardio"] then
         pcall(require, "nupp.runtime.standardio")
     end
+    -- The compile service route stays with the main state, as it does on POSIX
+    -- (`routeCompileCommands`).
+    local embedded = rawget(_G, "__NUPP_TEST_EMBEDDED")
     local rawExecute, rawPopen = os.execute, io.popen
     local standardIO = package.loaded["nupp.runtime.standardio"]
     local nativePopen = standardIO and rawPopen == standardIO.popen
@@ -651,11 +654,8 @@ if package.config:sub(1, 1) == "\\" then
             or source:match("^@?tests/") ~= nil
     end
 
-    -- Asked for when a test wants it, not while this file loads. `io.popen` is
-    -- refused in a shared worker lane, and a `pwd` nothing has asked for yet is
-    -- no reason to be refused: reading it eagerly failed every Nupp worker on
-    -- Windows the moment the suite got far enough to start one, and took every
-    -- suite in those lanes down as unrun with it.
+    -- Asked for when a test wants it, not while this file loads: a `pwd`
+    -- nothing has asked for yet is no reason to start a process.
     local cwdValue
 
     local function currentDirectory()
@@ -699,10 +699,8 @@ if package.config:sub(1, 1) == "\\" then
         if not usesTestShell(source) then
             return rawExecute(command)
         end
-        -- Only where pipes are allowed: a shared worker lane refuses them, and a
-        -- command the service ran would be one the lane never let start. The route
-        -- is absent when runnertest loads this block on its own.
-        if nativePopen and routedExecute then
+        -- The route is absent when runnertest loads this block on its own.
+        if nativePopen and not embedded and routedExecute then
             local handled, a, b, c = routedExecute(command)
             if handled then
                 return a, b, c
@@ -753,7 +751,7 @@ if package.config:sub(1, 1) == "\\" then
                 end,
             }
         end
-        if nativePopen and routedPopen then
+        if nativePopen and not embedded and routedPopen then
             local pipe = routedPopen(command, mode)
             if pipe then
                 return pipe
