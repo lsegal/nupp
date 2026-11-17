@@ -84,6 +84,59 @@ function M.anImagedModuleNamesThePreludesOwnTypes()
     testAssert.eq(hydrated.modules["sample.module"].declarationOnly, false, "declaration only")
 end
 
+-- A command that hydrates the image and checks one more module stores the image
+-- again, hydrated modules included (#358). An alias default is kept as the syntax
+-- it was written in, and read back its `token` is a table of its own rather than
+-- the node's child, so storing it a second time dropped it: `bytes.span.Span<T>`
+-- then lost its `"packed"` layout, and indexing one reported NUPP2403.
+function M.aWrittenDefaultSurvivesBeingStoredAgain()
+    local token = {
+        kind = "string",
+        text = '"packed"',
+        offset = 1,
+        line = 1,
+        col = 1,
+        trivia = {},
+        triviaFirst = 1,
+        triviaCount = 0,
+    }
+    local layout = T.constvar("Layout", "string", "sample.alias\0Layout")
+    local element = T.typevar("T", "sample.alias\0T")
+    local alias = T.genericAlias(
+        "Sample",
+        T.number,
+        {element},
+        {},
+        {},
+        {layout},
+        {"type", "const"},
+        {[2] = {kind = "tliteral", token, token = token}}
+    )
+    local env = fakeEnv()
+    env.bundled["sample.module"].exports.types.Sample = alias
+
+    local function stored(from)
+        local data = assert(stdlibimage.encode(from, {"sample.module"}))
+        local hydrated, problem = carrying(data, function()
+            return stdlibimage.hydrate(from)
+        end)
+        assert(hydrated, problem)
+        local semantic = assert(hydrated.semantics["sample.module"])
+        local again = fakeEnv()
+        again.bundled["sample.module"].exports = semantic.exports
+        again.bundled["sample.module"].type = semantic.interface.type
+
+        return semantic.exports.types.Sample, again
+    end
+
+    local once, hydratedEnv = stored(env)
+    local default = once.paramDefaults[2]
+    testAssert.eq(default and default.token and default.token.text, '"packed"', "read back once")
+    local twice = stored(hydratedEnv)
+    default = twice.paramDefaults[2]
+    testAssert.eq(default and default.token and default.token.text, '"packed"', "and after being stored again")
+end
+
 function M.theImageIsByteReproducible()
     local env = fakeEnv()
     local first = assert(stdlibimage.encode(env, {"sample.module"}))
