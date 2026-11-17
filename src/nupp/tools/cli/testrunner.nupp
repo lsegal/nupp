@@ -13,7 +13,7 @@ end
 -- the value; only the last one counts, as it does there.
 local function noteSerialJobs(args: any)
     local asked: integer? = nil
-    for _, argument in ipairs<integer, string>(args) do
+    for _, argument in ipairs(args) do
         local count = tostring(argument):match("^%-%-jobs=(%d+)$")
         if count ~= nil then
             asked = math.floor(tonumber(count) as number)
@@ -21,8 +21,9 @@ local function noteSerialJobs(args: any)
     end
     if asked ~= nil and asked > 1 then
         io.stderr:write(
-            ("nupp: --jobs=%d has no effect: a project's suites run one at a time, "):format(asked)
-                .. "because the bundled runner has no Nupp workers\n"
+            (
+                "nupp: --jobs=%d has no effect: a project's suites run one at a time, "
+            ):format(asked) .. "because the bundled runner has no Nupp workers\n"
         )
     end
 end
