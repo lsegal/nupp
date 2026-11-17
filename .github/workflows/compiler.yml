@@ -974,6 +974,13 @@ jobs:
           NUPP_REQUIRE_CODEGEN: '1'
         run: ./scripts/toolchain --all
 
+      # Built here rather than by the script, so the five minutes the step
+      # below has are spent on the dispatches it checks (#351).
+      - name: Bootstrap the compiler
+        env:
+          NUPP_REQUIRE_CODEGEN: '1'
+        run: ./bin/nupp build
+
       - name: Run exact GPU dispatch and readback
         id: gpu_conformance
         run: .github/scripts/test-gpu-conformance.sh
@@ -1008,6 +1015,14 @@ jobs:
         env:
           NUPP_REQUIRE_CODEGEN: '1'
         run: ./scripts/toolchain --all
+
+      # Built here rather than by the script, so the five minutes the step
+      # below has are spent on the dispatches it checks (#351).
+      - name: Bootstrap the compiler
+        shell: bash
+        env:
+          NUPP_REQUIRE_CODEGEN: '1'
+        run: ./bin/nupp build
 
       # Adapter absence is a failure: Vulkan cannot silently substitute for
       # the retained Windows DX12 contract.
