@@ -1068,6 +1068,74 @@ local function isolatedBuiltFixture(policy)
     return dir
 end
 
+local function read(path)
+    local handle = io.open(path, "rb")
+    if not handle then
+        return nil
+    end
+    local text = handle:read("*a")
+    handle:close()
+
+    return text
+end
+
+--- One build of a project, shared by every case that only reads what it made.
+---
+--- `builtFixture` remembers a build for the rest of one suite run, and a sliced
+--- suite is several runs: each slice that drew one of a fixture's readers paid
+--- for a native compilation and a link again (#381). The runner's fixture store
+--- is shared by every worker and slice, so the first reader builds and the rest
+--- wait for it and read. The key is what was built and the compiler that built
+--- it, so a changed fixture or compiler is a new build rather than a stale one.
+---
+--- Readers only: the store checks a fixture's files on every reuse, so a case
+--- that writes into the directory needs a project of its own.
+local function sharedBuild(label, make)
+    local source = make()
+    local listing = assert(io.popen(("cd %q && find . -type f | LC_ALL=C sort"):format(source)))
+    local parts = {"aotbuildtest-shared-v1", require("nupp.compiler.project.fingerprint").toolFingerprint()}
+    for path in listing:lines() do
+        parts[#parts + 1] = path
+        parts[#parts + 1] = assert(read(source .. "/" .. path:sub(3)))
+    end
+    listing:close()
+    local key = label .. "-" .. require("nupp.compiler.hash").digest(table.concat(parts, "\0"))
+    local dir = test.suite.fixture(key, function(private)
+        assert(os.execute(("cp -R %q/. %q"):format(source, private)) == 0)
+        local pipe = assert(
+            io.popen(
+                (
+                    "cd %q && NUPP_CACHE_DIR=%q NO_COLOR= '%s' build --target native 2>&1; echo \"__exit__:$?\""
+                ):format(private, sharedCache(), NUPP)
+            )
+        )
+        local out = pipe:read("*a")
+        pipe:close()
+        assert(out:match("__exit__:0%s*$"), ("the shared %s fixture builds: %s"):format(label, out))
+
+        return true
+    end)
+    os.execute(("rm -rf %q"):format(source))
+
+    return dir
+end
+
+--- `project(policy)` built once for every case that only reads it. The cases
+--- that rebuild it or write beside it keep `builtFixture`.
+local sharedFixtures = {}
+
+local function sharedFixture(policy)
+    local dir = sharedFixtures[policy]
+    if not dir then
+        dir = sharedBuild("project-" .. policy, function()
+            return project(policy)
+        end)
+        sharedFixtures[policy] = dir
+    end
+
+    return dir
+end
+
 --- The builder fixture, built once per policy, and a script run against it.
 ---
 --- The cases below ask the same two projects -- one that links compiled code and
@@ -1081,9 +1149,9 @@ local builderFixtures = {}
 local function builderAnswer(policy, script)
     local dir = builderFixtures[policy]
     if not dir then
-        dir = builderProject(policy)
-        local out, code = build(dir)
-        test.eq(code, 0, ("the aot=%s builder fixture at %s builds: %s"):format(policy, dir, out))
+        dir = sharedBuild("builder-" .. policy, function()
+            return builderProject(policy)
+        end)
         builderFixtures[policy] = dir
     end
 
@@ -1098,17 +1166,6 @@ end
 --- what it said.
 local function builderReport(label, policy, dir, answer)
     return ("%s (aot=%s fixture at %s): %s"):format(label, policy, dir, answer)
-end
-
-local function read(path)
-    local handle = io.open(path, "rb")
-    if not handle then
-        return nil
-    end
-    local text = handle:read("*a")
-    handle:close()
-
-    return text
 end
 
 -- The standard path normalizer as a public fixture entry, so the same authored
@@ -1191,7 +1248,7 @@ end
 -- staged, and the cases that mutate it take its library away and put it back
 -- rather than touching the staged runtime source.
 function M.cpuOnlyAotDoesNotStageTheGpuRuntime()
-    local dir = builtFixture("require")
+    local dir = sharedFixture("require")
     assert(
         read(dir .. "/build/native/cache/runtime-source/io/gpu/init.nupp") == nil,
         ("a CPU-only AOT target staged the WGPU runtime (require fixture at %s)"):format(dir)
@@ -1202,7 +1259,7 @@ end
 -- Mach-O debug map names objects the same way, so the library a project
 -- builds does not depend on where it is checked out.
 function M.aotArtifactsCarryNoCheckoutPath()
-    local dir = builtFixture("require")
+    local dir = sharedFixture("require")
     local where = ("(require fixture at %s)"):format(dir)
     local pipe = assert(io.popen(("cd %q && ls build/native/aot/src/kernel.*.ll build/native/lib/*"):format(dir)))
     local listed = pipe:read("*a")
@@ -1688,7 +1745,7 @@ function M.offEmitsNothing()
 end
 
 function M.requireWritesTheLlvmUnitBesideTheBuild()
-    local dir = builtFixture("require")
+    local dir = sharedFixture("require")
 
     local tier = firstHostTier()
     local ir = read(tieredUnit(dir, tier))
@@ -1781,9 +1838,9 @@ function M.aotManifestsWriteTheirKeysInSortedOrder()
 end
 
 function M.constGenericAotOmitsTheCarrierAndSpecializesTheBody()
-    local dir = constProject("require")
-    local out, code = build(dir)
-    test.eq(code, 0, out)
+    local dir = sharedBuild("const-require", function()
+        return constProject("require")
+    end)
     local ir = assert(read(tieredUnit(dir, firstHostTier(), "constkernel")))
     assert(ir:match("ks_[0-9a-f]+___nupp_const_doubled_"), "the canonical private key reaches the native symbol")
     assert(not ir:find("p_count", 1, true), "the const carrier is absent from the private native ABI")
@@ -2188,7 +2245,7 @@ function M.theFeatureTierReachesTheBackend()
     -- What this host emits when nothing names a tier is what the shared require
     -- fixture already holds. Building a second copy of the same project to read
     -- it again bought nothing.
-    local unnamed = builtFixture("require")
+    local unnamed = sharedFixture("require")
     local beforeTiers = buildTiers(nil, nil)
 
     -- An LLVM unit's line tables name the directory its source sits in, which
@@ -2247,6 +2304,17 @@ local function withKeys(dir, extra)
     handle:close()
 end
 
+--- An x86 Linux build whose feature range names only a maximum, which two cases
+--- read for what travels below and above it.
+local function avx2CeilingFixture()
+    return sharedBuild("project-require-avx2-ceiling", function()
+        local dir = project("require")
+        withKeys(dir, 'aotTarget = "x86_64-unknown-linux-gnu", aotFeatures = {maximum = "avx2"},')
+
+        return dir
+    end)
+end
+
 function M.x86BuildCarriesEveryTierAndItsDetector()
     local dir = project("require")
     withKeys(dir, 'aotTarget = "x86_64-unknown-linux-gnu",')
@@ -2274,10 +2342,7 @@ function M.x86BuildCarriesEveryTierAndItsDetector()
 end
 
 function M.aFeatureCeilingKeepsItsBaselineFallback()
-    local dir = project("require")
-    withKeys(dir, 'aotTarget = "x86_64-unknown-linux-gnu", aotFeatures = {maximum = "avx2"},')
-    local out, code = build(dir)
-    test.eq(code, 0, out)
+    local dir = avx2CeilingFixture()
     assert(read(tieredUnit(dir, "baseline")), "the fallback travels")
     assert(read(tieredUnit(dir, "avx2")), "the named ceiling travels")
     test.eq(read(tieredUnit(dir, "avx512f")), nil, "nothing wider than the ceiling travels")
@@ -2309,10 +2374,7 @@ function M.aFeatureRangeWithoutAMaximumRunsToTheWidestTier()
 end
 
 function M.aFeatureRangeWithoutAMinimumKeepsItsNarrowestTier()
-    local dir = project("require")
-    withKeys(dir, 'aotTarget = "x86_64-unknown-linux-gnu", aotFeatures = {maximum = "avx2"},')
-    local out, code = build(dir)
-    test.eq(code, 0, out)
+    local dir = avx2CeilingFixture()
     assert(read(tieredUnit(dir, "baseline")), "an absent minimum is the architecture's narrowest tier")
     assert(read(tieredUnit(dir, "avx2")), "the declared maximum travels")
     test.eq(read(tieredUnit(dir, "avx512f")), nil, "and nothing above it")
@@ -2324,26 +2386,6 @@ function M.aFeatureRangeRequiresOneBound()
     local out, code = build(dir)
     test.eq(code, 1, out)
     assert(out:find("aotFeatures needs a minimum, a maximum, or both", 1, true), out)
-end
-
-function M.theStringFeatureFormIsTheMaximum()
-    -- Every manifest written before the range says a bare tier name, and it has
-    -- to keep meaning the ceiling it has always meant.
-    local dir = project("require")
-    withKeys(dir, 'aotTarget = "x86_64-unknown-linux-gnu", aotFeatures = {maximum = "avx2"},')
-    local out, code = build(dir)
-    test.eq(code, 0, out)
-    local ranged = project("require")
-    withKeys(ranged, 'aotTarget = "x86_64-unknown-linux-gnu", aotFeatures = {maximum = "avx2"},')
-    local rangedOut, rangedCode = build(ranged)
-    test.eq(rangedCode, 0, rangedOut)
-    for _, tier in ipairs({"baseline", "avx2", "avx512f"}) do
-        test.eq(
-            read(tieredUnit(dir, tier)) ~= nil,
-            read(tieredUnit(ranged, tier)) ~= nil,
-            tier .. " travels the same either way"
-        )
-    end
 end
 
 -- Explicit SIMD over species wider than any one register: conversions across
@@ -2430,9 +2472,9 @@ return {
 end
 
 function M.aLinuxBaselineChunksFixedFloatingSpecies()
-    local dir = wideSimdProject('aotTarget = "x86_64-unknown-linux-gnu", aotFeatures = {maximum = "avx512f"},')
-    local out, code = build(dir)
-    test.eq(code, 0, out)
+    local dir = sharedBuild("wide-simd-linux-avx512f", function()
+        return wideSimdProject('aotTarget = "x86_64-unknown-linux-gnu", aotFeatures = {maximum = "avx512f"},')
+    end)
     -- LLVM carries a species whole in every tier and its code generator splits
     -- one wider than the tier's registers, so nothing is chunked by hand in the
     -- IR. What stays the backend's is that no exported entry passes a vector,
@@ -2493,9 +2535,9 @@ end
 -- it, and a Windows build for an architecture without those flags does not
 -- carry an x86 one.
 function M.onlyAWindowsX86TargetGivesUpItsWiderRegisters()
-    local dir = wideSimdProject('aotTarget = "x86_64-unknown-linux-gnu", aotFeatures = {maximum = "avx512f"},')
-    local out, code = build(dir)
-    test.eq(code, 0, out)
+    local dir = sharedBuild("wide-simd-linux-avx512f", function()
+        return wideSimdProject('aotTarget = "x86_64-unknown-linux-gnu", aotFeatures = {maximum = "avx512f"},')
+    end)
     -- LLVM reads the ceiling from each function's attributes, and a Linux build
     -- asks for none: the tier's registers are the code generator's.
     local unit = equivalenceMutation.text(
@@ -2891,7 +2933,7 @@ end
 function M.crossCompilingEmitsThatTargetsCode()
     -- What this host emits is what the shared require fixture already holds;
     -- the cross build is the one this case has to run for itself.
-    local host = assert(read(tieredUnit(builtFixture("require"), firstHostTier())))
+    local host = assert(read(tieredUnit(sharedFixture("require"), firstHostTier())))
 
     -- A target this machine is not, whichever machine it is. Naming one
     -- architecture outright would be naming the host on half of them, and a
@@ -3233,7 +3275,7 @@ local function libraryKey(dir)
 end
 
 function M.requireBuildsTheLibraryFromTheLlvmUnits()
-    local dir = builtFixture("require")
+    local dir = sharedFixture("require")
 
     assert(read(tieredUnit(dir, firstHostTier())), "require writes each tier's LLVM unit beside the build")
     assert(read(libraryPath(dir)), "and compiled it into the project's own library")
@@ -4605,7 +4647,7 @@ function M.aProjectWithNoAotFunctionLinksNothing()
 end
 
 function M.theBuiltLibraryLoadsAndComputes()
-    local dir = builtFixture("require")
+    local dir = sharedFixture("require")
 
     -- The point of `require` is that the answer comes out of the object rather
     -- than out of a file listing. Declared by hand here because the wrapper that
@@ -4658,9 +4700,9 @@ function M.theBuiltLibraryLoadsAndComputes()
 end
 
 function M.constGenericDispatcherCallsTheBuiltBodyAndRejectsAnOpenTuple()
-    local dir = constProject("require")
-    local out, code = build(dir)
-    test.eq(code, 0, out)
+    local dir = sharedBuild("const-require", function()
+        return constProject("require")
+    end)
     local generated = assert(read(dir .. "/build/native/constkernel.lua"))
     assert(
         generated:find("local function __nuppConst_doubled_", 1, true),
@@ -6225,18 +6267,7 @@ end
 -- AOT code is compiled by the code generator linked into nupp, and the build
 -- records that it was.
 function M.anAotBuildRunsNoCCompiler()
-    local dir = project("require")
-    local pipe = assert(
-        io.popen(
-            (
-                "cd %q && NUPP_CACHE_DIR=%q NO_COLOR= '%s' " .. "build --target native 2>&1; echo \"__exit__:$?\""
-            ):format(dir, cacheFor(dir), NUPP)
-        )
-    )
-    local out = pipe:read("*a")
-    pipe:close()
-    local code = assert(tonumber(out:match("__exit__:(%d+)%s*$")))
-    test.eq(code, 0, "the build succeeds\n" .. out)
+    local dir = sharedFixture("require")
     local state = assert(read(dir .. "/build/native/.nupp-state.json"))
     assert(state:find('"command":"<llvm>"', 1, true), "and records the code generator it used: " .. state)
 end

@@ -1264,6 +1264,40 @@ return M
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- A runner that has measured nothing guesses every suite at nothing, so a CI
+-- runner with no saved timings sent `aotbuildtest` out whole (#381). The
+-- repository's estimate stands in until a run has measured the suite: 75 s over
+-- the half-minute ceiling is three pieces, where the guess left one.
+function M.anUnmeasuredSuiteIsSlicedFromItsEstimate()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+    write(dir .. "/tests/groups.lua", 'return {}, {scopes = {heavytest = "unit"}, estimates = {heavytest = 75000}}\n')
+    write(
+        dir .. "/tests/heavytest.lua",
+        [[
+local M = {}
+function M.alpha() end
+function M.beta() end
+function M.gamma() end
+function M.delta() end
+function M.epsilon() end
+function M.zeta() end
+return M
+]]
+    )
+    local command = (
+        "cd %q && %sNUPP_TEST_BUILD=%q %q heavytest --jobs=4 --timings=0 --no-color 2>&1"
+    ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+    local output, invocation = capturedRun(command)
+    test.eq(invocation.status, 0, "the estimated suite succeeded" .. evidence(invocation))
+    test.matches(output, "1 suites across 3 Nupp workers")
+    test.matches(output, "6 tests, 6 passed")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 -- A worker's records cross a message that refuses a repeated table, so one case
 -- handing the same evidence to two capabilities used to lose every result its
 -- worker held: Linux CI reported 207 suites as unrun from two such workers (#375).
