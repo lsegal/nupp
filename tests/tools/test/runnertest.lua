@@ -1224,6 +1224,46 @@ return M
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- Half a share grows with the run, so a long run used to leave a ten-minute
+-- suite whole (#382). Two suites of two minutes on eight workers make half a
+-- share a minute: `heavytest` was two pieces and three workers started. Under
+-- the half-minute ceiling it is four pieces and five workers start.
+function M.slicesASuiteOverTheCeilingWhateverTheShare()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+    write(
+        dir .. "/tests/heavytest.lua",
+        [[
+local M = {}
+function M.alpha() end
+function M.beta() end
+function M.gamma() end
+function M.delta() end
+return M
+]]
+    )
+    write(dir .. "/tests/wholetest.lua", "local M = {}\nfunction M.only() end\nreturn M\n")
+    write(
+        dir .. "/build/.nupp-test-times.json",
+        [[
+{"suites":{"heavytest":120000,"wholetest":120000},
+ "cases":{"heavytest":{"alpha":30000,"beta":30000,"gamma":30000,"delta":30000},
+          "wholetest":{"only":120000}}}
+]]
+    )
+    local command = (
+        "cd %q && %sNUPP_TEST_BUILD=%q %q heavytest wholetest --jobs=8 --timings=0 --no-color 2>&1"
+    ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+    local output, invocation = capturedRun(command)
+    test.eq(invocation.status, 0, "the sliced suites succeeded" .. evidence(invocation))
+    test.matches(output, "2 suites across 5 Nupp workers")
+    test.matches(output, "5 tests, 5 passed")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 -- A worker's records cross a message that refuses a repeated table, so one case
 -- handing the same evidence to two capabilities used to lose every result its
 -- worker held: Linux CI reported 207 suites as unrun from two such workers (#375).
