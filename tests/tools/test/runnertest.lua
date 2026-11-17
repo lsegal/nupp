@@ -159,9 +159,10 @@ return M
         test.matches(records["nestedluatest/nested"].file, "tests[/\\]stdlib[/\\]table[/\\]nestedluatest%.lua$")
         test.matches(records["nestednupptest/typed"].file, "tests[/\\]compiler[/\\]check[/\\]nestednupptest%.nupp$")
         test(records["roottest/root"], "root suites remain discoverable")
-        if jobs == 2 then
-            test(#report.shards > 0, "nested suites ran through parallel workers")
-        end
+        -- Only the checkout's worker host deals suites to Nupp workers; a
+        -- project's bundled runner runs them in-process whatever --jobs says
+        -- (#377). Assert that contract until projects shard again.
+        test.eq(#report.shards, 0, "a project run stays in one process")
     end
     os.execute("rm -rf " .. string.format("%q", dir))
 end
