@@ -1647,13 +1647,14 @@ local function buildModules(root: string, outDir: string, config: Config, target
     -- Carried once the build can carry, ahead of the modules it compiles.
     local carriedSeeds: {[string]: string} = {}
 
-    local function seed(name, path)
+    local function seed(name, path, entry: boolean?)
         path = normalize(path)
         if queuedPaths[path] then
             return
         end
         queuedPaths[path] = true
-        if carriesOwnSource(name, path) then
+        -- An entry is the chunk a deliverable starts in, so it is always compiled.
+        if not entry and carriesOwnSource(name, path) then
             carriedSeeds[name] = path
             return
         end
@@ -1697,7 +1698,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
             if not name then
                 return nil, "cannot determine module name for " .. path
             end
-            seed(name, path)
+            seed(name, path, true)
         end
         if #queue == 0 and (target.kind or "modules") ~= "modules" then
             return nil, "build.entries must contain at least one entry"

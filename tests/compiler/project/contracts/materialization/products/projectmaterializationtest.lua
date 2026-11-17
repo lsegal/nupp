@@ -178,6 +178,14 @@ return {include = {"src"}, build = {outDir = "out", default = "app", targets = {
     local covered = json.decode(read(dir .. "/cover/.nupp-state.json"))
     testAssert.eq(covered.modules["nupp.compiler.stable"].compilerRuntime, nil, "coverage compiles it")
 
+    -- An entry is the chunk the binary starts in, so it is compiled even when it is
+    -- the compiler's module.
+    write(dir .. "/nupp.lua", (manifest:gsub('"nupp%.probe"', '"nupp.compiler.stable"')))
+    testAssert.eq(project.build(dir, {outDir = "entry"}), 0)
+    local entry = json.decode(read(dir .. "/entry/.nupp-state.json"))
+    testAssert.eq(entry.modules["nupp.compiler.stable"].compilerRuntime, nil, "the entry is compiled")
+    write(dir .. "/nupp.lua", manifest)
+
     -- Edited, it is no longer the compiler's module.
     write(dir .. "/src/nupp/compiler/stable.nupp", source .. "\n-- edited\n")
     testAssert.eq(project.build(dir, {}), 0)
