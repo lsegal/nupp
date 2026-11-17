@@ -31,14 +31,17 @@ end
 --- treated as stale, since stamping again costs a minute and believing this one
 --- costs a debugging session.
 function M.command(root)
+    local script = [[
+cd %s || exit 1
+if [ ! -f %s ] || ! newer=$(find src nupp.lua -newer %s -print) || [ -n "$newer" ]; then
+    ./bin/nupp build --target %s || exit 1
+fi
+[ -f %s ] || { echo 'the build produced no %s'; exit 1; }
+printf '%%s/%%s\n' "$(pwd -W 2>/dev/null || pwd)" %s]]
     local produced = quote(M.PRODUCED)
-    return table.concat({
-        "cd " .. quote(root),
-        "if [ ! -f " .. produced .. " ] || ! newer=$(find src nupp.lua -newer " .. produced .. " -print)"
-            .. " || [ -n \"$newer\" ]; then ./bin/nupp build --target " .. M.TARGET .. " || exit 1; fi",
-        "[ -f " .. produced .. " ] || { echo 'the build produced no " .. M.PRODUCED .. "'; exit 1; }",
-        "printf '%s/%s\\n' \"$(pwd -W 2>/dev/null || pwd)\" " .. produced,
-    }, " && ")
+
+    -- A subshell, so `exit` ends the script rather than whatever runs it.
+    return "(" .. script:format(quote(root), produced, produced, M.TARGET, produced, M.PRODUCED, produced) .. ")"
 end
 
 local cached, problem

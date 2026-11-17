@@ -15,9 +15,10 @@ local M = {}
 M.PROJECT = "bench/serde-spike/contracts/native-build"
 M.TARGET = "compiled-contracts"
 
---- Where the runner leaves the path of the project it built for this run, or
---- the result of the build it started in the background.
+--- Where the runner leaves the path of the project it built for this run.
 M.variable = "NUPP_TEST_SERDE_CONTRACTS"
+
+--- Where the runner leaves the result of the build it started in the background.
 M.pending = "NUPP_TEST_SERDE_CONTRACTS_PENDING"
 
 local function quote(value)
@@ -27,11 +28,14 @@ end
 --- The shell command that builds the target from ROOT and prints the project's
 --- absolute path last.
 function M.command(root)
-    return table.concat({
-        "cd " .. quote(root .. "/" .. M.PROJECT),
-        "../../../../bin/nupp build --target " .. M.TARGET,
-        "(pwd -W 2>/dev/null || pwd)",
-    }, " && ")
+    return table.concat(
+        {
+            "cd " .. quote(root .. "/" .. M.PROJECT),
+            "../../../../bin/nupp build --target " .. M.TARGET,
+            "(pwd -W 2>/dev/null || pwd)",
+        },
+        " && "
+    )
 end
 
 local cached, problem
