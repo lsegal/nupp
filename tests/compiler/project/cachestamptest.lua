@@ -951,6 +951,43 @@ function M.aFreshProjectBuildReusesTheStandardLibraryAnotherOneChecked()
     assert(bypassed == fromSource, "bypassing the store built a different module")
 end
 
+-- A stored image holds every module it was checked with (#358). A project check
+-- keeps bundled modules in the incremental graph rather than the environment's
+-- own table, and the image used to be read off that table: a project that only
+-- required `simd` stored `simd` and not the `nupp.mem.span` it was checked
+-- against. The next project checked that one from source beside the stored
+-- `simd`, and a span it made was not a span to `simd`.
+function M.aStoredImageCarriesTheModulesItsInterfacesNamed()
+    local shared = tempProject({})
+
+    local function check(source)
+        local dir = tempProject({["nupp.lua"] = 'return {include = {"src"}}\n', ["src/k.nupp"] = source})
+        local pipe = assert(
+            io.popen(("cd '%s' && NUPP_CACHE_DIR='%s' '%s' check 2>&1; echo \"__exit__:$?\""):format(dir, shared, NUPP))
+        )
+        local output = pipe:read("*a")
+        pipe:close()
+        os.execute("rm -rf '" .. dir .. "'")
+
+        return output
+    end
+
+    local widen = 'module k\nlocal span = require("bytes.span")\nlocal array = table.Array\n'
+        .. 'local simd = require("simd")\n\n'
+        .. "export function widen(exclusive out: span.WriteSpan<number>, borrows input: span.Span<int8>): nil\n"
+        .. "    local source = assert(simd.species(array.int8, 16))\n"
+        .. "    local wide = assert(simd.species(array.number, 16))\n"
+        .. "    wide:store(out, 1, wide:convert(source:load(input, 1)))\nend\n"
+    -- The first keeps the prelude; the second checks `simd` and stores it; the third
+    -- reads it back beside whatever the second left out.
+    check("module k\nexport const x = 1\n")
+    check('module k\nlocal simd = require("simd")\nexport const s = simd\n')
+    local output = check(widen)
+    os.execute("rm -rf '" .. shared .. "'")
+
+    assert(output:match("__exit__:0%s*$"), "a span did not reach the stored simd:\n" .. output)
+end
+
 -- A single-file compile inside a project reads its dependencies' checked interfaces
 -- back from the build directory (#277). What it says and what it generates are the
 -- same as checking the graph from source, with `NUPP_NO_INTERFACE_CACHE`, and an
