@@ -8,6 +8,13 @@
   it. A cold `nupp fmt --check` over a quarter of this repository went from
   about 250 seconds to about 30 on Windows, with the same results.
 
+- On Windows, a `nupp test` worker no longer dies with `cannot retire a
+  claimed test queue piece`, which left every suite it would have run
+  reported as `<unrun>`. The run's own progress check held queue pieces open,
+  so a worker that had already claimed one could fail to remove it. Workers
+  now run a claimed piece whether or not its file could be removed, and the
+  run counts what is left by the claims rather than by the pieces.
+
 - `nupp fixpoint` now also holds the compiler's native half to the fixpoint:
   stages two and three each lower the native provider, the host and the
   embedding library to LLVM IR, which must match, and each runs on the

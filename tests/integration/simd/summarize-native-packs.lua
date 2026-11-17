@@ -71,10 +71,10 @@ for line in runner.read(directory .. "/matrix.tsv"):gmatch("[^\r\n]+") do
         local report = runner.json(evidence)
         if family == "packs" then
             assert(report.ok == true and report.failed == 0, "compact harness report failed")
-            local required = {
-                ["simdprimitivedifferentialtest/nativeSpeciesInventory"] = false,
-                ["simdprimitivedifferentialtest/nativeSemanticConformance"] = false,
-            }
+            local required = {["simdprimitivedifferentialtest/nativeSpeciesInventory"] = false}
+            for _, case in ipairs(require("tests.integration.simd.native-packs").semanticCases()) do
+                required["simdprimitivedifferentialtest/" .. case.name] = false
+            end
             for _, case in ipairs(report.tests or {}) do
                 if required[case.id] ~= nil then
                     assert(case.status == "passed", case.id .. " did not execute")
