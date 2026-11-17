@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Diagnostics reported at the same position now always come out in the same
-  order, sorted by code and then message. Before, which of two came first
-  could change from one run to the next.
+- Diagnostics reported at the same position now keep the order they were
+  reported in. Before, the sort could swap them, so which of two came first
+  depended on where it happened to move them.
 
 - An incremental build no longer rechecks `debug.log` after every edit. A
   compiler source staged only to be checked against has no build record, so

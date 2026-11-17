@@ -67,7 +67,8 @@ end
 
 -- Whether `code` is among `diags`. A fixture can draw a second report on the
 -- same name -- `reflect` also names project modules in this repository -- and
--- reports at one position are ordered by code, not by which one matters here.
+-- reports at one position come in the order they were made, which moves with
+-- what the comptime cache already held.
 local function reports(diags, code)
     for _, diag in ipairs(diags) do
         if (diag.code or diag) == code then
