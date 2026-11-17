@@ -2335,6 +2335,24 @@ local function recordResult(suite, name, defined, ok, err, stdout, stderr, elaps
         scope = byName[suite] and byName[suite].scope,
     }
     if context ~= nil then
+        -- A Nupp worker hands its records back through a message, which refuses a
+        -- table that appears twice. JSON does not care, and suites pass one
+        -- evidence table to several requirecapability calls, so a single case
+        -- like that lost every result its worker held (#375). Each record gets
+        -- its own copy; a cycle is left in place for the encode check to report.
+        local function plain(value, path)
+            if type(value) ~= "table" or path[value] then
+                return value
+            end
+            path[value] = true
+            local copied = setmetatable({}, getmetatable(value))
+            for key, item in pairs(value) do
+                copied[plain(key, path)] = plain(item, path)
+            end
+            path[value] = nil
+
+            return copied
+        end
         local metrics = {}
         for _, metric in pairs(context.metrics or {}) do
             metrics[#metrics + 1] = metric
@@ -2342,11 +2360,11 @@ local function recordResult(suite, name, defined, ok, err, stdout, stderr, elaps
         table.sort(metrics, function(a, b)
             return a.name .. "\0" .. (a.unit or "") < b.name .. "\0" .. (b.unit or "")
         end)
-        record.capabilities = #(context.capabilities or {}) > 0 and context.capabilities or nil
-        record.fixtures = #(context.fixtures or {}) > 0 and context.fixtures or nil
-        record.metrics = #metrics > 0 and metrics or nil
+        record.capabilities = #(context.capabilities or {}) > 0 and plain(context.capabilities, {}) or nil
+        record.fixtures = #(context.fixtures or {}) > 0 and plain(context.fixtures, {}) or nil
+        record.metrics = #metrics > 0 and plain(metrics, {}) or nil
         if ok and #(context.facts or {}) > 0 then
-            record.facts = context.facts
+            record.facts = plain(context.facts, {})
         end
         local encodes, encodeProblem = pcall(testJson.encode, record)
         if not encodes then
