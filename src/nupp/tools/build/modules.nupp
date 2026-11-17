@@ -2071,7 +2071,9 @@ local function buildModules(root: string, outDir: string, config: Config, target
         records[
             name
         ] = {
-            sourceHash = artifactHash,
+            -- A module carried from its own source keeps that source's hash, so a
+            -- build that carries from this one finds it current (#389).
+            sourceHash = ownSourceText[name] ~= nil and contentDigest(ownSourceText[name]) or artifactHash,
             interfaceHash = contentDigest("compiler-runtime\0" .. text),
             artifactHash = artifactHash,
             dependencies = required,
