@@ -1988,10 +1988,10 @@ local function buildModules(root: string, outDir: string, config: Config, target
         local bundled = require("nupp.compiler.bundled")
         local modulePath = name:gsub("%.", "/") .. ".lua"
         if compilerGeneration == nil then
-            compilerGeneration = cache.loadState(join(bundled.moduleDir(), "../../.nupp-state.json"))
+            compilerGeneration = cache.loadModuleHashes(join(bundled.moduleDir(), "../../.nupp-state.json"))
         end
         local text = modules.currentCarriedArtifact(
-            compilerGeneration.modules[name],
+            compilerGeneration[name],
             currentCarriedSource(name),
             readFile(join(bundled.moduleDir(), "../../" .. modulePath)),
             contentDigest
