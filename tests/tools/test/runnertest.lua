@@ -1584,6 +1584,67 @@ function M.workersDivideAQueueBetweenThem()
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- Windows refuses to remove a file another process holds open, so a worker can
+-- win a piece and then fail to retire it (#341). The claim marker decides who
+-- runs it: the worker that won runs it, and the next worker leaves it alone.
+function M.workersKeepAClaimedPieceTheyCannotRetire()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests/nested")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/queue")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+
+    local order = {"alphatest", "betatest", "gammatest"}
+    for index, spec in ipairs(order) do
+        write(("%s/tests/nested/%s.lua"):format(dir, spec), "return {only = function() end}\n")
+        write(("%s/queue/piece-%d"):format(dir, index), spec .. "\n")
+    end
+    write(dir .. "/queue/order", table.concat(order, "\n") .. "\n")
+    write(
+        dir .. "/host.lua",
+        (
+            [=[
+local remove = os.remove
+os.remove = function(path)
+    if tostring(path):match("piece%%-%%d+$") then
+        return nil, path .. ": Permission denied", 13
+    end
+    return remove(path)
+end
+arg = {[0] = %q, "--json", "--queue=" .. %q, "--no-color"}
+dofile(arg[0])
+]=]
+        ):format(dir .. "/tests/run.lua", dir .. "/queue")
+    )
+
+    local json = require("testjson")
+    local seen, ran = {}, 0
+    for worker = 1, 2 do
+        local output = run(dir .. "/host.lua")
+        local decoded, report = pcall(json.decode, output:match("{.*}") or "")
+        test(decoded and type(report) == "table", "worker " .. worker .. " did not finish:\n" .. output)
+        test.eq(report.passed, report.total, output)
+        for _, spec in ipairs(report.claimed or {}) do
+            test.eq(seen[spec], nil, spec .. " was claimed twice")
+            seen[spec] = true
+        end
+        ran = ran + report.total
+    end
+    test.eq(ran, #order, "every piece ran exactly once")
+    for index, spec in ipairs(order) do
+        assert(seen[spec], spec .. " was never claimed")
+        local piece = io.open(("%s/queue/piece-%d"):format(dir, index), "rb")
+        test(piece, "the removal was meant to fail")
+        piece:close()
+        -- Created with the mode it was asked for, or the run cannot read its
+        -- own claims back: `open` is variadic, which arm64 macOS passes apart.
+        local taken, why = io.open(("%s/queue/taken-%d"):format(dir, index), "rb")
+        test(taken, "the claim marker cannot be read back: " .. tostring(why))
+        taken:close()
+    end
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 function M.processQueueRestoresModuleGlobalsBetweenPieces()
     local dir = os.tmpname()
     os.remove(dir)

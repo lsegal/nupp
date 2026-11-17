@@ -175,8 +175,15 @@ end
 -- The step restriction ------------------------------------------------------
 
 -- Acceptance: the scaffolded projects actually work -------------------------
+--
+-- `check`, `build`, `test` and `run` each start from a scaffold of their own, so a
+-- template's acceptance is several cases the pool runs side by side rather than
+-- one worker running every cold command in a row. They share SCAFFOLD_STORE, so a
+-- case that comes second still finds what the first compiled.
 
-local function scaffoldAndVerify(name, project, expectedOutput, prepare)
+--- Scaffolds `name` and hands `body` the directory, a label naming it, and the
+--- command prefix that runs `nupp` there.
+local function inScaffold(name, project, prepare, body)
     local into = tempDirectory()
     local plan = assert(template.plan(assert(template.resolve(name)), into, {name = project}))
     assert(template.write(plan))
@@ -184,35 +191,54 @@ local function scaffoldAndVerify(name, project, expectedOutput, prepare)
         prepare(into)
     end
 
-    -- Every command below is about this one scaffold, so each says which
-    -- template it scaffolded and where, rather than leaving a failure to be
-    -- traced back to a directory the message never named.
+    -- Every command is about this one scaffold, so each says which template it
+    -- scaffolded and where, rather than leaving a failure to be traced back to a
+    -- directory the message never named.
     local scaffolded = name .. " scaffolded into " .. into
-    local quoted = "cd '" .. into .. "' && NUPP_CACHE_DIR='" .. SCAFFOLD_STORE .. "' NUPP=" .. NUPP .. " "
-    local ok, out = shell(quoted .. NUPP .. " check")
-    assert(ok, scaffolded .. " does not check:\n" .. out)
-    -- A template is what somebody's first project looks like, so it is held to the
-    -- one formatted spelling, and warns about nothing.
-    assert(not out:find("warning", 1, true), scaffolded .. " checks with warnings:\n" .. out)
-    ok, out = shell(quoted .. NUPP .. " fmt --check")
-    assert(ok, scaffolded .. " is not formatted:\n" .. out)
-    ok, out = shell(quoted .. NUPP .. " build")
-    assert(ok, scaffolded .. " does not build:\n" .. out)
-    -- A build stages the compiler's runtime sources for a portable target, and the
-    -- project's checking must not reach them.
-    ok, out = shell(quoted .. NUPP .. " check")
-    assert(ok, scaffolded .. " does not check once built:\n" .. out)
-    ok, out = shell(quoted .. NUPP .. " test")
-    assert(ok, scaffolded .. " does not pass its own tests:\n" .. out)
-    if expectedOutput then
-        ok, out = shell(quoted .. NUPP .. " run src/main.nupp")
+    local quoted = "cd '" .. into .. "' && NUPP_CACHE_DIR='" .. SCAFFOLD_STORE .. "' NUPP=" .. NUPP .. " " .. NUPP
+    body(into, scaffolded, quoted)
+    remove(into)
+end
+
+local function scaffoldChecks(name, project, prepare)
+    inScaffold(name, project, prepare, function(_, scaffolded, quoted)
+        local ok, out = shell(quoted .. " check")
+        assert(ok, scaffolded .. " does not check:\n" .. out)
+        -- A template is what somebody's first project looks like, so it is held to
+        -- the one formatted spelling, and warns about nothing.
+        assert(not out:find("warning", 1, true), scaffolded .. " checks with warnings:\n" .. out)
+        ok, out = shell(quoted .. " fmt --check")
+        assert(ok, scaffolded .. " is not formatted:\n" .. out)
+    end)
+end
+
+local function scaffoldBuilds(name, project, prepare)
+    inScaffold(name, project, prepare, function(_, scaffolded, quoted)
+        local ok, out = shell(quoted .. " build")
+        assert(ok, scaffolded .. " does not build:\n" .. out)
+        -- A build stages the compiler's runtime sources for a portable target, and
+        -- the project's checking must not reach them.
+        ok, out = shell(quoted .. " check")
+        assert(ok, scaffolded .. " does not check once built:\n" .. out)
+    end)
+end
+
+local function scaffoldTests(name, project, prepare)
+    inScaffold(name, project, prepare, function(_, scaffolded, quoted)
+        local ok, out = shell(quoted .. " test")
+        assert(ok, scaffolded .. " does not pass its own tests:\n" .. out)
+    end)
+end
+
+local function scaffoldRuns(name, project, expectedOutput, prepare)
+    inScaffold(name, project, prepare, function(_, scaffolded, quoted)
+        local ok, out = shell(quoted .. " run src/main.nupp")
         assert(ok, scaffolded .. " does not run:\n" .. out)
         assert(
             out:find(expectedOutput, 1, true),
             scaffolded .. " ran but printed " .. out .. " rather than " .. expectedOutput
         )
-    end
-    remove(into)
+    end)
 end
 
 local function withDevelopmentRocks(into)
@@ -250,6 +276,10 @@ return {
     restoreShared = restoreShared,
     planWhileTampered = planWhileTampered,
     repository = repository,
-    scaffoldAndVerify = scaffoldAndVerify,
+    inScaffold = inScaffold,
+    scaffoldChecks = scaffoldChecks,
+    scaffoldBuilds = scaffoldBuilds,
+    scaffoldTests = scaffoldTests,
+    scaffoldRuns = scaffoldRuns,
     withDevelopmentRocks = withDevelopmentRocks,
 }

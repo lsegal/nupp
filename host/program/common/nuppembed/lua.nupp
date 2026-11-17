@@ -516,7 +516,7 @@ end
 --- Declares each comma-separated feature the library was built with, and
 --- preloads LPeg when it was built with that and the state has libraries.
 export function nuppEmbedLuaAddBuildFeatures(borrows L: voidptr, call: uint64, openLibraries: boolean): int32
-    local list = build.FEATURES
+    local list = build.features()
     local bytes = list as uint8*
     local total = strlen(list) as integer
     local start = 0
@@ -540,7 +540,7 @@ export function nuppEmbedLuaAddBuildFeatures(borrows L: voidptr, call: uint64, o
         end
         at = at + 1
     end
-    if build.LPEG and openLibraries then
+    if build.lpeg() and openLibraries then
         return nuppEmbedLuaPreload(L, call, LPEG_MODULE as uint64, build.nuppHostBuildOpenLpeg)
     end
 

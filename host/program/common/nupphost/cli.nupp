@@ -173,7 +173,7 @@ export function nuppHostCliMain(argc: int32, borrows argv: cstring*): int32
     end
     local lua = L as voidptr
     local enabled = false
-    if build.WORKERS and stamped then
+    if build.workers() and stamped then
         local host = workers.nuppHostWorkersHost(chunk as uint64, chunkLength)
         if host == 0ULL or workers.nuppHostWorkersEnable(lua, record, host) ~= 0 then
             return failed(record, "nupp: ")

@@ -1052,7 +1052,7 @@ do
             ffi.cdef[[
             int _dup(int);
             int _dup2(int, int);
-            int _open(const char *, int, int);
+            int _open(const char *, int, ...);
             int _close(int);
             int fflush(void *);
             int _write(int, const void *, unsigned int);
@@ -1064,7 +1064,7 @@ do
             ffi.cdef[[
             int dup(int);
             int dup2(int, int);
-            int open(const char *, int, int);
+            int open(const char *, int, ...);
             int close(int);
             int fflush(void *);
             long write(int, const void *, unsigned long);
@@ -1082,10 +1082,14 @@ do
         local dup2 = ffi.os == "Windows" and C._dup2 or C.dup2
         local open = ffi.os == "Windows" and C._open or C.open
         local close = ffi.os == "Windows" and C._close or C.close
+        -- `open` is variadic, and arm64 macOS passes variadic arguments on the
+        -- stack, so the mode has to go as a C int through the `...` or the file
+        -- is created with whatever the stack held as its permissions (#341).
+        local mode600 = ffi.new("int", tonumber("600", 8))
         local write = ffi.os == "Windows" and C._write or C.write
         local isatty = ffi.os == "Windows" and C._isatty or C.isatty
         exclusiveCreate = function(path)
-            local fd = open(path, create + exclusive + 1 + binary, tonumber("600", 8))
+            local fd = open(path, create + exclusive + 1 + binary, mode600)
             if fd < 0 then
                 return false
             end
@@ -1115,7 +1119,7 @@ do
 
             flush()
             local savedOut, savedErr = dup(1), dup(2)
-            local null = open(ffi.os == "Windows" and "NUL" or "/dev/null", 1 + binary, 384)
+            local null = open(ffi.os == "Windows" and "NUL" or "/dev/null", 1 + binary, mode600)
             assert(savedOut >= 0 and savedErr >= 0 and null >= 0, "cannot silence worker output")
             assert(dup2(null, 1) >= 0 and dup2(null, 2) >= 0, "cannot redirect worker output")
             close(null)
@@ -3580,8 +3584,12 @@ local function takeWork()
                 won = os.rename(piece, mine)
             end
             if won then
+                -- The marker is the claim, so retiring the piece is tidying only.
+                -- Windows refuses to remove a file another process has open, and
+                -- an indexer or virus scanner can be holding this one (#341); a
+                -- worker that has won the piece runs it whether or not it went.
                 if exclusiveCreate then
-                    assert(os.remove(piece), "cannot retire a claimed test queue piece")
+                    os.remove(piece)
                 end
                 took, cursor = index, index
                 break

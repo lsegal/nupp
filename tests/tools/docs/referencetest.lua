@@ -86,11 +86,29 @@ function M.documentedModuleExamplesUseTheirCanonicalPaths()
     testAssert.eq(examplePath("--[[Shapes.]]\nmodule geom.shapes\n"), "geom/shapes.nupp")
 end
 
-function M.everyExampleChecksClean()
-    local checked, problems = 0, {}
+-- How many cases the reference's examples are checked in. Each example is a
+-- project of its own and a cold check, so the pool runs the parts side by side
+-- rather than one worker checking every example in a row.
+local EXAMPLE_PARTS = 6
+
+function M.theReferenceCarriesExamples()
+    local examples = 0
     for _, section in ipairs(reference.sections) do
         if section.example then
-            checked = checked + 1
+            examples = examples + 1
+        end
+    end
+    assert(examples > 10, "expected the reference to carry examples")
+end
+
+--- Checks every example whose position among the examples falls in `part`.
+local function examplesCheckClean(part)
+    local examples, problems = 0, {}
+    for _, section in ipairs(reference.sections) do
+        if section.example then
+            examples = examples + 1
+        end
+        if section.example and examples % EXAMPLE_PARTS == part - 1 then
             local diagnostics = diagnosticsFor(section)
             if #diagnostics > 0 then
                 local first = diagnostics[1]
@@ -102,8 +120,31 @@ function M.everyExampleChecksClean()
             end
         end
     end
-    assert(checked > 10, "expected the reference to carry examples")
     assert(#problems == 0, table.concat(problems, "\n"))
+end
+
+function M.everyExampleChecksCleanPart1()
+    examplesCheckClean(1)
+end
+
+function M.everyExampleChecksCleanPart2()
+    examplesCheckClean(2)
+end
+
+function M.everyExampleChecksCleanPart3()
+    examplesCheckClean(3)
+end
+
+function M.everyExampleChecksCleanPart4()
+    examplesCheckClean(4)
+end
+
+function M.everyExampleChecksCleanPart5()
+    examplesCheckClean(5)
+end
+
+function M.everyExampleChecksCleanPart6()
+    examplesCheckClean(6)
 end
 
 -- A reference that cites a code nothing can explain sends its reader nowhere.
