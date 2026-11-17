@@ -739,6 +739,18 @@ jobs:
           key: >-
             nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
 
+      # The same timings where a reader can download them. The summary prints
+      # only the slowest fifteen suites, and a run stopped at its deadline
+      # prints none, so this is what says where the rest of the time went.
+      - name: Upload the recorded suite timings
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-timings-${{ runner.os }}-${{ runner.arch }}
+          path: build/test-runner/.nupp-test-times.json
+          if-no-files-found: ignore
+
       # Linux has already saved this key from the fast gate, where the same
       # revision built the same compiler; that save warns and keeps the first
       # entry, which is the right outcome. macOS and Windows have their own
