@@ -90,9 +90,17 @@ end
 
 -- A reporter writing somewhere the test can read. A file is not a terminal, so
 -- it never rewrites a line in place, which is what makes the output comparable.
+-- Made under the default color policy. The policy is process-wide, and in a run
+-- of one process a suite on the same worker may have left it at "always"; the
+-- reporter settles its escapes when it is made, so a file then got colored
+-- lines (#351).
 local function reporterTo(path, mode)
     local stream = assert(io.open(path, "wb"))
-    return progress.new(mode, stream), stream
+    local report = nil
+    terminal.withcolormode("auto", function()
+        report = progress.new(mode, stream)
+    end)
+    return report, stream
 end
 
 local function readAll(path)
