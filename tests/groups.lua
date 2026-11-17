@@ -900,4 +900,21 @@ local prerequisites = {
     {name = "the embedding SDK", module = "helpers.embeddingsdk", suites = {"hostembeddingtest", "hostchanneltest"}},
 }
 
-return groups, {scopes = scopes, packages = packages, neverCache = neverCache, prerequisites = prerequisites}
+
+-- What a suite costs when no run has measured it, in milliseconds: a clean
+-- runner, or a cache that has not been saved yet. The queue planner guesses an
+-- unmeasured suite at the average of the measured ones, which on a runner that
+-- measured nothing is nothing, so a suite that holds a worker for ten minutes
+-- went out as one piece. Only the heaviest need an entry; a recorded timing
+-- always wins over the estimate.
+local estimates = {
+    aotbuildtest = 700 * 1000,
+}
+
+return groups, {
+    scopes = scopes,
+    packages = packages,
+    neverCache = neverCache,
+    prerequisites = prerequisites,
+    estimates = estimates,
+}

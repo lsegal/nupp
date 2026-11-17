@@ -2661,13 +2661,15 @@ local function planWork(list, shards, timings)
         counted = counted + 1
     end
     -- An unmeasured suite is guessed at the average rather than zero, so a new one is
-    -- not packed last behind everything.
+    -- not packed last behind everything. A repository estimate comes first, because
+    -- on a runner that has measured nothing the average is nothing too.
     local average = counted > 0 and known / counted or 1
+    local estimates = repositoryPolicy and repositoryPolicy.estimates or {}
 
     local planned = 0
     local costs = {}
     for _, suite in ipairs(list) do
-        local cost = tonumber(timings[suite.name]) or average
+        local cost = tonumber(timings[suite.name]) or tonumber(estimates[suite.name]) or average
         costs[#costs + 1] = {name = suite.name, cost = cost}
         planned = planned + cost
     end
