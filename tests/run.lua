@@ -2916,22 +2916,63 @@ end
 -- not ask the toolchain again (a cache hit is still seconds on Windows). A
 -- failure is reported and the run goes on: the suites ask the same helper,
 -- which skips them with the toolchain's output.
+--
+-- A `background` build is started here and not waited for (#383). The serde
+-- contracts' AOT build is minutes cold, and waiting for it would leave every
+-- worker idle that long. Its helper's `pending` variable names where the build
+-- writes its output, and a `.status` file beside it once it has finished; the
+-- suites that need it are dealt last, and a case that still gets there first
+-- waits on that file. The runner waits for it before the summary.
 if not listing and #shard == 0 and not queueDir and not embedded and repositoryPolicy and repositoryPolicy.prerequisites then
     local selected = {}
     for _, info in ipairs(suites) do
         selected[info.name] = true
+    end
+    local function export(name, value)
+        local ffi = require("ffi")
+        if ffi.os == "Windows" then
+            pcall(ffi.cdef, "int _putenv_s(const char *, const char *);")
+            ffi.C._putenv_s(name, value)
+        else
+            pcall(ffi.cdef, "int setenv(const char *, const char *, int);")
+            ffi.C.setenv(name, value, 1)
+        end
     end
     local started = {}
     for _, prerequisite in ipairs(repositoryPolicy.prerequisites) do
         for _, name in ipairs(prerequisite.suites) do
             if selected[name] then
                 local helper = require(prerequisite.module)
-                started[#started + 1] = {
-                    prerequisite = prerequisite,
-                    helper = helper,
-                    before = now(),
-                    pipe = io.popen(helper.command(dir .. "/..") .. " 2>&1; printf '\n__status__:%s' $?"),
-                }
+                if prerequisite.background then
+                    local result = os.tmpname():gsub("\\", "/")
+                    export(helper.pending, result)
+                    repositoryPolicy.background = repositoryPolicy.background or {}
+                    repositoryPolicy.deferredSuites = repositoryPolicy.deferredSuites or {}
+                    for _, deferred in ipairs(prerequisite.suites) do
+                        repositoryPolicy.deferredSuites[deferred] = true
+                    end
+                    repositoryPolicy.background[#repositoryPolicy.background + 1] = {
+                        prerequisite = prerequisite,
+                        result = result,
+                        before = now(),
+                        pipe = io.popen(
+                            ("(%s) > '%s.out' 2>&1; printf %%s $? > '%s.part'; mv '%s.part' '%s.status'"):format(
+                                helper.command(dir .. "/.."),
+                                result,
+                                result,
+                                result,
+                                result
+                            )
+                        ),
+                    }
+                else
+                    started[#started + 1] = {
+                        prerequisite = prerequisite,
+                        helper = helper,
+                        before = now(),
+                        pipe = io.popen(helper.command(dir .. "/..") .. " 2>&1; printf '\n__status__:%s' $?"),
+                    }
+                end
                 break
             end
         end
@@ -2955,14 +2996,7 @@ if not listing and #shard == 0 and not queueDir and not embedded and repositoryP
         else
             local path = output:gsub("\n__status__:%d+%s*$", ""):match("([^\r\n]+)%s*$")
             if path and build.helper.variable then
-                local ffi = require("ffi")
-                if ffi.os == "Windows" then
-                    pcall(ffi.cdef, "int _putenv_s(const char *, const char *);")
-                    ffi.C._putenv_s(build.helper.variable, path)
-                else
-                    pcall(ffi.cdef, "int setenv(const char *, const char *, int);")
-                    ffi.C.setenv(build.helper.variable, path, 1)
-                end
+                export(build.helper.variable, path)
             end
         end
         if status == 0 and verbose then
@@ -3226,6 +3260,20 @@ then
             end
             if not order then
                 order, prediction = planWork(list, count, recordedTimings())
+            end
+            -- A suite waiting on a build started in the background goes last, so
+            -- the build has the rest of the run to finish in before a case waits.
+            local deferred = repositoryPolicy and repositoryPolicy.deferredSuites
+            if deferred then
+                local early, late = {}, {}
+                for _, spec in ipairs(order) do
+                    local into = deferred[spec:match("^(.-)#") or spec] and late or early
+                    into[#into + 1] = spec
+                end
+                for _, spec in ipairs(late) do
+                    early[#early + 1] = spec
+                end
+                order = early
             end
             -- The plan starts from suite concurrency, then may split a heavy suite
             -- into several runnable pieces. Those pieces are real parallel work, so
@@ -3750,6 +3798,38 @@ if sharded then
 
         return tostring(a.name) < tostring(b.name)
     end)
+end
+
+-- Builds started in the background are waited for here, so a run leaves none
+-- running behind it and says when one failed even if no case got to ask.
+for _, build in ipairs(repositoryPolicy and repositoryPolicy.background or {}) do
+    if build.pipe then
+        build.pipe:close()
+    end
+    local file = io.open(build.result .. ".status", "rb")
+    local status = file and tonumber(file:read("*a"))
+    if file then
+        file:close()
+    end
+    if status ~= 0 then
+        file = io.open(build.result .. ".out", "rb")
+        local output = file and file:read("*a") or ""
+        if file then
+            file:close()
+        end
+        io.stderr:write(
+            ("nupp: cannot prepare %s for %s:\n%s\n"):format(
+                build.prerequisite.name,
+                table.concat(build.prerequisite.suites, ", "),
+                output:sub(-2000)
+            )
+        )
+    elseif verbose then
+        io.stderr:write(("prepared %s in the background\n"):format(build.prerequisite.name))
+    end
+    os.remove(build.result .. ".out")
+    os.remove(build.result .. ".status")
+    os.remove(build.result)
 end
 
 -- Recorded by the parent after all lanes are collected, so the next run packs

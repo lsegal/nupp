@@ -2,18 +2,23 @@
 --
 -- Its `compiled-contracts` target compiles the serde runtime and fixtures with
 -- `aot = "require"`, which on Linux CI took most of serdecontracttest's 191 s
--- and was charged to the one case that asked for it (#383). The runner builds it
--- before any case starts (the `prerequisites` in tests/groups.lua) and names the
--- project in `variable`. Run without that runner, `path` builds it itself; the
--- build is incremental, so a second one answers from its cache.
+-- and was charged to the one case that asked for it (#383). The runner starts it
+-- in the background when the run begins (the `prerequisites` in tests/groups.lua)
+-- and deals serdecontracttest last, so the build overlaps other suites instead of
+-- holding up the run or a case. Run without that runner, `path` builds it itself;
+-- the build is incremental, so a second one answers from its cache.
+
+local prerequisite = require("helpers.prerequisite")
 
 local M = {}
 
 M.PROJECT = "bench/serde-spike/contracts/native-build"
 M.TARGET = "compiled-contracts"
 
---- Where the runner leaves the path of the project it built for this run.
+--- Where the runner leaves the path of the project it built for this run, or
+--- the result of the build it started in the background.
 M.variable = "NUPP_TEST_SERDE_CONTRACTS"
+M.pending = "NUPP_TEST_SERDE_CONTRACTS_PENDING"
 
 local function quote(value)
     return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
@@ -33,26 +38,16 @@ local cached, problem
 
 --- The built project's directory, or nil and the build's output.
 function M.path(root)
-    if cached or problem then
-        return cached, problem
+    if not cached and not problem then
+        local status, output, path = prerequisite.result(M, root)
+        if status ~= 0 or not path then
+            problem = ("`nupp build --target %s` failed:\n%s"):format(M.TARGET, output:sub(-2000))
+        else
+            cached = path
+        end
     end
-    local prepared = os.getenv(M.variable)
-    if prepared and prepared ~= "" then
-        cached = prepared
-        return cached
-    end
-    local pipe = assert(io.popen(M.command(root) .. " 2>&1; printf '\n__status__:%s' $?"))
-    local output = pipe:read("*a")
-    pipe:close()
-    local status = tonumber(output:match("__status__:(%d+)%s*$"))
-    output = output:gsub("\n__status__:%d+%s*$", "")
-    if status ~= 0 then
-        problem = ("`nupp build --target %s` failed:\n%s"):format(M.TARGET, output:sub(-2000))
-        return nil, problem
-    end
-    cached = assert(output:match("([^\r\n]+)%s*$"), "the build named no project")
 
-    return cached
+    return cached, problem
 end
 
 return M

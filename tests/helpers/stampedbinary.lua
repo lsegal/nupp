@@ -7,6 +7,8 @@
 -- reused while it is newer than its sources, so a run after
 -- `nupp build --target dist` costs nothing at all.
 
+local prerequisite = require("helpers.prerequisite")
+
 local M = {}
 
 M.TARGET = "dist"
@@ -43,28 +45,16 @@ local cached, problem
 
 --- The binary's path, or nil and why there is none.
 function M.path(root)
-    if cached or problem then
-        return cached, problem
+    if not cached and not problem then
+        local status, output, path = prerequisite.result(M, root)
+        if status ~= 0 or not path then
+            problem = ("`nupp build --target %s` did not produce a binary:\n%s"):format(M.TARGET, output:sub(-800))
+        else
+            cached = path
+        end
     end
-    local prepared = os.getenv(M.variable)
-    local file = prepared and prepared ~= "" and io.open(prepared, "rb")
-    if file then
-        file:close()
-        cached = prepared
-        return cached
-    end
-    local pipe = assert(io.popen(M.command(root) .. " 2>&1; printf '\n__status__:%s' $?"))
-    local output = pipe:read("*a")
-    pipe:close()
-    local status = tonumber(output:match("__status__:(%d+)%s*$"))
-    output = output:gsub("\n__status__:%d+%s*$", "")
-    if status ~= 0 then
-        problem = ("`nupp build --target %s` did not produce a binary:\n%s"):format(M.TARGET, output:sub(-800))
-        return nil, problem
-    end
-    cached = assert(output:match("([^\r\n]+)%s*$"), "the stamp named no binary")
 
-    return cached
+    return cached, problem
 end
 
 return M
