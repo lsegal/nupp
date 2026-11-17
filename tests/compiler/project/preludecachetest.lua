@@ -76,8 +76,8 @@ function M.aCachedPreludeAnswersLikeAFreshlyCheckedOne()
     -- Allowed the cache: the first fills it, the second reads it back.
     envMod.new(dir)
     local cached = envMod.new(dir)
-    -- Forbidden it, so it checks the prelude from source.
-    local fresh = envMod.new(dir, {cache = false})
+    -- Forbidden it, and another environment's, so it checks the prelude from source.
+    local fresh = envMod.new(dir, {cache = false, sharedPrelude = false})
 
     test.eq(cached.preludeRuntime, fresh.preludeRuntime, "the generated prelude runtime is the same source")
     test.eq(fresh.preludeRuntime, "", "the empty prelude implementation adds no runtime bootstrap")
@@ -181,7 +181,8 @@ function M.theNextCommandReadsWhatThisOneWrote()
     os.execute("rm -rf '" .. dir .. "'")
 end
 
--- Every environment declares its own nominals, stored prelude or not.
+-- Every environment that checks a prelude declares its own nominals, stored
+-- prelude or not.
 --
 -- This is the invariant a stored prelude is easiest to break. Interning is
 -- process-wide and a nominal's identity is not, so an environment handed the
@@ -191,20 +192,87 @@ end
 -- being able to see an owned value being dropped, sixty cases after the one that
 -- caused it.
 --
--- So only the first environment in a process may read a stored prelude. A second
--- one checks the prelude and declares nominals of its own, which is what this
--- watches for.
+-- So only the first environment in a process may read a stored prelude. One told
+-- not to share a prelude checks it and declares nominals of its own, which is
+-- what this watches for.
 function M.everyEnvironmentDeclaresItsOwnNominals()
     local types = require("nupp.compiler.types")
     local dir = project()
     local first = types.identity().nominal
-    envMod.new(dir)
+    envMod.new(dir, {sharedPrelude = false})
     local afterOne = types.identity().nominal
-    envMod.new(dir)
+    envMod.new(dir, {sharedPrelude = false})
     local afterTwo = types.identity().nominal
     assert(afterOne > first, "an environment declares the prelude's nominals")
-    assert(afterTwo > afterOne, "and a second environment declares its own rather than sharing them")
+    assert(afterTwo > afterOne, "and a second environment declares its own rather than reading the first's")
     os.execute("rm -rf '" .. dir .. "'")
+end
+
+-- Environments in one process that agree on the prelude share it (#395).
+--
+-- Not by reading the image a second time, which is what declares a second set of
+-- nominals, but by holding the objects the first environment built: one object
+-- per nominal however many environments hold it, and no prelude checked again
+-- per environment. What an environment adds to is its own.
+function M.laterEnvironmentsShareTheCheckedPrelude()
+    local types = require("nupp.compiler.types")
+    local dir = project()
+    local first = envMod.new(dir)
+    local before = types.identity().nominal
+    local second = envMod.new(dir)
+    test.eq(types.identity().nominal, before, "a later environment declares no prelude nominals of its own")
+
+    local differing = {}
+    for name, t in pairs(first.globalTypes) do
+        if second.globalTypes[name] ~= t then
+            differing[#differing + 1] = name
+        end
+    end
+    table.sort(differing)
+    test.eq(table.concat(differing, " "), "", "every global type is the same object")
+    test.eq(second.stringLib, first.stringLib, "and so is the string library")
+    test.eq(second.preludeStamp, first.preludeStamp, "beside the same stored prelude, if there is one")
+
+    assert(second.globals ~= first.globals, "each environment owns its globals")
+    assert(second.globals.string ~= first.globals.string, "and their entries")
+    assert(second.globalTypes ~= first.globalTypes, "and its global types")
+    assert(second.annotations.byname ~= first.annotations.byname, "and its annotations")
+    second.globals.sharedPreludeProbe = {t = types.any}
+    second.globalTypes.SharedPreludeProbe = types.any
+    test.eq(first.globals.sharedPreludeProbe, nil, "a global one adds is not another's")
+    test.eq(envMod.new(dir).globalTypes.SharedPreludeProbe, nil, "nor the next one's")
+
+    -- What decides the prelude decides who shares it.
+    local other = envMod.new(dir, {compat = "lua51"})
+    local name, t = next(first.globalTypes)
+    while name ~= nil and not (type(t) == "table" and t.tag == "nominal") do
+        name, t = next(first.globalTypes, name)
+    end
+    assert(name ~= nil, "the prelude declares a nominal type")
+    assert(other.globalTypes[name] ~= t, "a prelude under another profile is checked for it: " .. tostring(name))
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
+-- A standard-library module one environment checked is not checked again by the
+-- next one with the same prelude, unless that one's project shadows it.
+function M.laterEnvironmentsShareCheckedStandardLibraryModules()
+    local dir = project()
+    local first = envMod.new(dir)
+    local kept = first.bundled["jit.zone"]
+    assert(kept and kept.type ~= nil, "the module checks")
+    local second = envMod.new(dir)
+    local shared = second.bundled["jit.zone"]
+    assert(shared and shared ~= kept, "a later environment holds a record of its own")
+    test.eq(shared.type, kept.type, "for the same checked module")
+
+    local shadowing = project()
+    assert(os.execute("mkdir -p '" .. shadowing .. "/jit'") == 0)
+    local file = assert(io.open(shadowing .. "/jit/zone.nupp", "wb"))
+    file:write("return {}\n")
+    file:close()
+    local own = envMod.new(shadowing).bundled["jit.zone"]
+    assert(own and own.type ~= kept.type, "a project that shadows a bundled module checks it against its own")
+    os.execute("rm -rf '" .. dir .. "' '" .. shadowing .. "'")
 end
 
 -- A stored prelude is true only of the type identity it was written from.
