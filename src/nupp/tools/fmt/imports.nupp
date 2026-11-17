@@ -83,27 +83,11 @@ local function typeImport(moduleName: string, member: string, alias: string, run
     return "const {" .. selection .. "} = require(" .. string.format("%q", moduleName) .. ")"
 end
 
--- Initializers that give a local no namespace identity. The checker carries one
--- from a name, a path, or a `require` of a builtin extension root (`local t = table`
--- makes `t.Pool` a module member), so those are left out.
-const INERT_INITIALIZERS = {
-    number = true,
-    string = true,
-    istring = true,
-    dedentString = true,
-    trueExpr = true,
-    falseExpr = true,
-    nilExpr = true,
-    vararg = true,
-    tableExpr = true,
-    funcExpr = true,
-    shortfn = true,
-    binop = true,
-    unop = true,
-    bracketIndex = true,
-    safeBracket = true,
-    methodCall = true,
-}
+-- The builtin namespaces a local can stand for and still reach a module: the checker
+-- qualifies `table.Pool`, `package.providers` and `package.select` through a local
+-- bound to the namespace itself, and a pattern whose source is `package`. A path is
+-- never one of them, so a local bound to a path stands for nothing that matters here.
+const NAMESPACES = {table = true, package = true}
 
 -- Nodes whose own name tokens are uses, members, fields, labels, or bindings read
 -- below. A name token directly under any other node may be bound by it.
@@ -143,17 +127,52 @@ end
 -- path or name in it could come out of the check qualified with a module that
 -- `builtinAccess` does not keep as written.
 --
--- A name read through a local the checker gives no namespace identity -- a
--- parameter, a loop variable, a local function, a local initialised as above -- is
--- never qualified, and neither is any path it starts. A type path needs the module
--- it spells to exist, unless it is `T.Type` through a local `T` holding a `require`.
--- Anything else that could resolve is assumed to, so this only ever says no where
--- the check would have produced nothing.
-local function couldImport(root: any, env: any, registry: any, publicBundled: function(string): boolean): boolean
-    local function declared(name: string): boolean
-        local shipped = env.bundled and env.bundled[name]
+-- A name bound to a local is never qualified itself. A path through one is only when
+-- the local stands for `table` or `package`, `t.Pool` after `local t = table`, and a
+-- pattern only when its source does. A free name or path is qualified only through a
+-- module the project or the compiler declares. A type path needs the module it spells
+-- to exist, unless it is `T.Type` through a local `T` holding a `require`. Anything
+-- this does not model is assumed to resolve, so it only ever says no where the check
+-- would have produced nothing.
+--
+-- Nothing here reads `env.bundled`, which checks the module it is asked for: that
+-- would cost a cold run what the answer is meant to save. A shipped module is known
+-- by name, its privacy by its source, and whether it declares a package only once it
+-- is loaded, so until then it is taken to.
+local function couldImport(root: any, filename: string?, env: any, registry: any): boolean
+    local shippedNames: {[string]: boolean}? = nil
+    if env.bundledModuleNames then
+        shippedNames = {}
+        for _, name in ipairs(env.bundledModuleNames()) do
+            shippedNames[name] = true
+        end
+    end
 
-        return (registry.declaredModules[name] or shipped and shipped.declared) and not publicBundled(name)
+    -- Whether `name` may be a module the compiler ships, and what is known of it.
+    local function shipped(name: string): (boolean, any)
+        local loaded = env.bundled and rawget(env.bundled, name)
+        if loaded then
+            return true, loaded
+        end
+
+        return loaded == nil and (shippedNames == nil or shippedNames[name] == true), nil
+    end
+
+    -- A shipped module `builtinAccess` keeps as written.
+    local function publicBundled(name: string): boolean
+        return shippedNames ~= nil and (shipped(name)) and env.bundledInternal ~= nil and not env.bundledInternal(name)
+    end
+
+    local function declared(name: string): boolean
+        if publicBundled(name) then
+            return false
+        end
+        if registry.declaredModules[name] then
+            return true
+        end
+        local maybe, record = shipped(name)
+
+        return maybe and (record == nil or record.declared == true)
     end
 
     local function anyDeclaredPrefix(path: {any}): boolean
@@ -182,6 +201,9 @@ local function couldImport(root: any, env: any, registry: any, publicBundled: fu
         end
     end)
 
+    local INERT = {namespace = false}
+    local ALIAS = {namespace = true}
+
     local function lookup(frame: any, name: string): any
         local current = frame
         while current do
@@ -195,41 +217,70 @@ local function couldImport(root: any, env: any, registry: any, publicBundled: fu
         return nil
     end
 
+    -- What a local initialised with `init` holds: whether it may stand for a builtin
+    -- namespace, which is how `local t = table` makes `t.Pool` a module member, and
+    -- whether it holds a required module.
     local function binding(init: any, frame: any): any
-        if init
-            and init.kind == "call"
-            and init.obj
-            and init.obj.kind == "name"
-            and init.obj.token.text == "require"
-        then
-            local moduleName = requiredName(init)
-            if not moduleName or rebindable.require or lookup(frame, "require") then
-                return {inert = false}
+        local kind = init and init.kind
+        if kind == "name" then
+            local bound = lookup(frame, init.token.text)
+            if bound then
+                return bound
             end
+            local text = init.token.text
 
-            return {
-                inert = registry.declaredModules[moduleName] and not builtinExtensions.has(moduleName) and true
-                or false,
-                holder = true,
-            }
+            return NAMESPACES[text] and env.globals and env.globals[text] and ALIAS or INERT
+        elseif kind ~= "call" or not init.obj or init.obj.kind ~= "name" or init.obj.token.text ~= "require" then
+            return INERT
+        end
+        local moduleName = requiredName(init)
+        if not moduleName or rebindable.require or lookup(frame, "require") then
+            return ALIAS
+        end
+        -- The checker requires an alias by its canonical name.
+        local path = envMod.findModulePath(env, moduleName)
+        local canonical = path and envMod.moduleNameForPath(env, path)
+        if canonical and canonical ~= moduleName and registry.declaredModules[canonical] then
+            moduleName = canonical
         end
 
-        return {inert = init == nil or INERT_INITIALIZERS[init.kind] == true or init.kind == "call"}
+        return {namespace = NAMESPACES[moduleName] == true and builtinExtensions.has(moduleName), holder = true,}
     end
 
     local function nested(frame: any): any
         return {vars = {}, parent = frame}
     end
 
-    local ALIAS = {inert = false}
+    local could = false
 
-    -- Locals a statement declares other than as one of its own block's statements,
-    -- such as under `export`: not modelled, so they only hide what they shadow.
+    -- Binds what a local statement declares, once its initializers have been read.
+    local function declare(statement: any, frame: any): nil
+        -- A pattern whose source stands for `package` is itself qualified.
+        local source = statement.patternSource
+        local held = source and source.kind == "name" and lookup(frame, source.token.text)
+        if held and held.namespace then
+            could = true
+        end
+        local exprs = statement.exprs or {}
+        local bound = {}
+        for index in ipairs(statement.names or {}) do
+            bound[index] = statement.pattern and ALIAS or binding(exprs[index] or exprs[#exprs], frame)
+        end
+        for index, token in ipairs(statement.names or {}) do
+            frame.vars[token.text] = bound[index]
+        end
+    end
+
+    -- Locals a statement declares other than as one of its own block's statements.
+    -- One under `export` binds as any local does; anything else is not modelled, so
+    -- it only hides what it shadows.
     local function hideDeclared(node: any, frame: any): nil
         for _, child in ipairs(node) do
             if not cst.isToken(child) then
                 local kind = child.kind
-                if kind == "localStmt" then
+                if kind == "localStmt" and node.kind == "exportStmt" then
+                    declare(child, frame)
+                elseif kind == "localStmt" then
                     for _, token in ipairs(child.names or {}) do
                         frame.vars[token.text] = ALIAS
                     end
@@ -244,17 +295,18 @@ local function couldImport(root: any, env: any, registry: any, publicBundled: fu
     end
 
     local existing = {}
+    -- A file's own module is not resolved from inside it, so a type path naming it
+    -- is a declaration of the file's rather than something to import.
+    local current = filename and envMod.moduleNameForPath(env, filename)
 
     local function moduleExists(moduleName: string): boolean
         if existing[moduleName] == nil then
-            local shipped = env.bundled and env.bundled[moduleName]
-            existing[moduleName] = shipped ~= nil and shipped ~= false or envMod.findModulePath(env, moduleName) ~= nil
+            existing[moduleName] = (shipped(moduleName)) or envMod.findModulePath(env, moduleName) ~= nil
         end
 
         return existing[moduleName]
     end
 
-    local could = false
     local visit: any = nil
 
     local function visitChildren(node: any, frame: any, body: any?, bodyFrame: any?): nil
@@ -273,9 +325,7 @@ local function couldImport(root: any, env: any, registry: any, publicBundled: fu
         if kind == "name" then
             local text = node.token.text
             local bound = lookup(frame, text)
-            if bound and not bound.inert
-                or not bound and not (env.globals and env.globals[text]) and declared(text)
-            then
+            if not bound and not (env.globals and env.globals[text]) and declared(text) then
                 could = true
             end
             return
@@ -285,7 +335,7 @@ local function couldImport(root: any, env: any, registry: any, publicBundled: fu
                 start = start.obj
             end
             local bound = start and start.kind == "name" and lookup(frame, start.token.text) or nil
-            if bound and not bound.inert or not bound and anyDeclaredPrefix(names(node)) then
+            if bound and bound.namespace or not bound and anyDeclaredPrefix(names(node)) then
                 could = true
                 return
             end
@@ -294,7 +344,11 @@ local function couldImport(root: any, env: any, registry: any, publicBundled: fu
             if #path > 1 then
                 local moduleName = spelling(path, #path - 1)
                 local holder = #path == 2 and not rebindable[path[1].text] and lookup(frame, path[1].text)
-                if not (holder and holder.holder) and moduleExists(moduleName) and not publicBundled(moduleName) then
+                if not (holder and holder.holder)
+                    and moduleName ~= current
+                    and moduleExists(moduleName)
+                    and not publicBundled(moduleName)
+                then
                     could = true
                     return
                 end
@@ -308,16 +362,12 @@ local function couldImport(root: any, env: any, registry: any, publicBundled: fu
                 if not cst.isToken(statement) then
                     if statement.kind == "localFuncStmt" then
                         if statement.name then
-                            inner.vars[statement.name.text] = {inert = true}
+                            inner.vars[statement.name.text] = INERT
                         end
                         visit(statement, inner)
                     elseif statement.kind == "localStmt" then
                         visit(statement, inner)
-                        local exprs = statement.exprs or {}
-                        for index, token in ipairs(statement.names or {}) do
-                            local init = exprs[index] or exprs[#exprs]
-                            inner.vars[token.text] = statement.pattern and ALIAS or binding(init, inner)
-                        end
+                        declare(statement, inner)
                     else
                         visit(statement, inner)
                         hideDeclared(statement, inner)
@@ -329,7 +379,7 @@ local function couldImport(root: any, env: any, registry: any, publicBundled: fu
             local inner = nested(frame)
             for _, param in ipairs(node.params or {}) do
                 if param.name then
-                    inner.vars[param.name.text] = {inert = true}
+                    inner.vars[param.name.text] = INERT
                 end
             end
             visitChildren(node, inner)
@@ -337,7 +387,7 @@ local function couldImport(root: any, env: any, registry: any, publicBundled: fu
         elseif kind == "fornumStmt" or kind == "forinStmt" then
             local inner = nested(frame)
             for _, token in ipairs(kind == "fornumStmt" and {node.var} or node.names or {}) do
-                inner.vars[token.text] = {inert = true}
+                inner.vars[token.text] = INERT
             end
             visitChildren(node, frame, node.body, inner)
             return
@@ -402,6 +452,14 @@ function imports.new(environment: any?, enabled: boolean?): any
             env = candidate
         end
         local registry = env.ensureProjectIndex(env)
+        -- Checking the file checks every module it reaches: most of the compiler for
+        -- most of its own files, and `nupp fmt --check` over the tree cost a whole-tree
+        -- check per process (#360). So the file is checked only when something in it
+        -- could still come out of the check as an import below. Asked first, because
+        -- the test after it loads the shipped modules it names.
+        if not couldImport(parsed.root, filename, env, registry) then
+            return source
+        end
         local possible = false
         for _, path in ipairs(candidates) do
             local prefix = path
@@ -421,23 +479,6 @@ function imports.new(environment: any?, enabled: boolean?): any
             return source
         end
 
-        local function publicBundled(moduleName: string): boolean
-            local shipped = env.bundled and env.bundled[moduleName]
-
-            return shipped ~= nil
-                and shipped ~= false
-                and env.bundledInternal ~= nil
-                and not env.bundledInternal(moduleName)
-        end
-
-        -- Checking the file checks every module it reaches: most of the compiler for
-        -- most of its own files, and `nupp fmt --check` over the tree cost a whole-tree
-        -- check per process (#360). So the file is checked only when something in it
-        -- could still come out of the check as an import below.
-        if not couldImport(parsed.root, env, registry, publicBundled) then
-            return source
-        end
-
         -- Checking owns and annotates a separate tree. Generated declarations and
         -- synthetic lowering nodes must never become the formatter's input.
         local checked = parser.parse(source, filename)
@@ -453,8 +494,12 @@ function imports.new(environment: any?, enabled: boolean?): any
             if entry and root.definition and root.definition == entry.definition then
                 return true
             end
+            local shipped = moduleName and env.bundled and env.bundled[moduleName]
 
-            return moduleName ~= nil and publicBundled(moduleName)
+            return shipped ~= nil
+                and shipped ~= false
+                and env.bundledInternal ~= nil
+                and not env.bundledInternal(moduleName)
         end
 
         local uses: {Use} = {}
