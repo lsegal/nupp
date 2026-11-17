@@ -1,9 +1,9 @@
 module job
 
--- Runs one dynamically-fed lane in an isolated worker Lua state. Environment
--- lookups are state-local Lua calls even though the underlying process
--- environment is shared, so each lane can retain its own compiler cache without
--- mutating process-wide state.
+-- Runs suites from the run's queue on one thread of the pool, in a Lua state of
+-- its own. Environment lookups are state-local Lua calls even though the
+-- underlying process environment is shared, so each thread can retain its own
+-- compiler cache without mutating process-wide state.
 export function run(
     argument: string,
     cacheDir: string,
@@ -11,26 +11,21 @@ export function run(
     verbose: boolean,
     colorMode: string,
     suiteCatalog: string,
-    gcPause: integer?
+    gcPause: integer?,
+    runningDir: string?
 ): any
     rawset(_G, "__NUPP_TEST_EMBEDDED", true)
     rawset(_G, "__NUPP_TEST_PROGRESS_FD", progressFd)
     rawset(_G, "__NUPP_TEST_LANE_CACHE", cacheDir)
     rawset(_G, "__NUPP_TEST_SUITE_CATALOG", suiteCatalog)
     rawset(_G, "__NUPP_TEST_GC_PAUSE", gcPause)
+    rawset(_G, "__NUPP_TEST_RUNNING", runningDir)
 
-    -- A Nupp worker is a Lua state inside this process. libc's popen walks and
-    -- locks the process-wide stdio table; concurrent calls from worker states can
-    -- each hold one stream while waiting for another and deadlock the entire run.
-    -- The parent routes direct shell users through reusable process workers. If a
-    -- transitive call escapes that classification, fail the case instead of
-    -- turning it into a run that never reports an answer.
-    os.execute = function(): nil
-        error("nupp: os.execute requires a process worker", 2)
-    end
-    io.popen = function(): nil
-        error("nupp: io.popen requires a process worker", 2)
-    end
+    -- A case that starts a program does so from this thread. `io.popen` is the
+    -- runtime's own spawn -- posix_spawn, or CreateProcessW with an explicit
+    -- handle list -- which is safe to call from several threads at once, so
+    -- spawning is something a suite does here rather than a reason to run it
+    -- somewhere else.
 
     local getenv = os.getenv
     os.getenv = function(name)

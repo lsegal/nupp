@@ -268,34 +268,36 @@ function M.classifiesNestedSuitesFromTheirActualSources()
     write(dir .. "/nested/deeper/puretest.lua", "return {passes = function() end}\n")
     write(dir .. "/nested/deeper/shelltest.lua", "return {passes = function() os.execute('exit 0') end}\n")
     write(dir .. "/nested/deeper/isolatedtest.lua", "return {passes = function() package.loaded.sentinel = nil end}\n")
-    test.eq(run(dir .. "/run.lua", "--lane=shared --list-suites"), "puretest\n")
-    test.eq(run(dir .. "/run.lua", "--lane=shell --list-suites"), "shelltest\n")
-    test.eq(run(dir .. "/run.lua", "--lane=isolated --list-suites"), "isolatedtest\n")
-    -- Lanes named together are one run, which is one build for all of them.
-    local together = {}
-    for name in run(dir .. "/run.lua", "--lane=shell,isolated --list-suites"):gmatch("[^\n]+") do
-        together[#together + 1] = name
+    -- Whatever a suite does, it is on the one queue (#351).
+    local listed = {}
+    for name in run(dir .. "/run.lua", "--list-suites"):gmatch("[^\n]+") do
+        listed[#listed + 1] = name
     end
-    table.sort(together)
-    test.eq(table.concat(together, " "), "isolatedtest shelltest")
+    table.sort(listed)
+    test.eq(table.concat(listed, " "), "isolatedtest puretest shelltest")
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
--- `--jobs=LANE:N` sizes one lane and leaves the others at `--jobs=N` or the
--- default; a lane it does not know is refused rather than ignored.
-function M.sizesOneLaneWithoutAnotherRun()
+-- There are no lanes to name (#351): `--jobs` is one worker count, and the
+-- options that used to pick or size a lane are refused rather than ignored.
+function M.refusesLaneOptions()
     local dir = os.tmpname()
     os.remove(dir)
     local fs = require("nupp.compiler.fs")
     assert(fs.mkdir(dir .. "/nested"))
     write(dir .. "/run.lua", read(ROOT .. "/tests/run.lua"))
     write(dir .. "/nested/puretest.lua", "return {passes = function() end}\n")
-    test.eq(run(dir .. "/run.lua", "--jobs=4,shell:2 --list-suites"), "puretest\n")
-    local output, invocation = capturedRun(
-        (MODULES .. "NUPP_TEST_BUILD=build luajit %q --jobs=gpu:2 --list-suites 2>&1"):format(dir .. "/run.lua")
+    test.eq(run(dir .. "/run.lua", "--jobs=4 --list-suites"), "puretest\n")
+    local sized, sizedRun = capturedRun(
+        (MODULES .. "NUPP_TEST_BUILD=build luajit %q --jobs=shell:2 --list-suites 2>&1"):format(dir .. "/run.lua")
     )
-    test.eq(invocation.status, 2, "an unknown lane was accepted" .. evidence(invocation))
-    test.matches(output, "%-%-jobs=LANE:N needs a lane of shared, shell, or isolated")
+    test.eq(sizedRun.status, 2, "a lane size was accepted" .. evidence(sizedRun))
+    test.matches(sized, "%-%-jobs takes a positive worker count")
+    local laned, lanedRun = capturedRun(
+        (MODULES .. "NUPP_TEST_BUILD=build luajit %q --lane=shared --list-suites 2>&1"):format(dir .. "/run.lua")
+    )
+    test.eq(lanedRun.status, 2, "a lane was accepted" .. evidence(lanedRun))
+    test.matches(laned, "unknown test option: %-%-lane=shared")
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
@@ -1100,14 +1102,13 @@ function M.workerHostDogfoodsNuppWorkersForOrdinarySuites()
         "parallel progress is one mark per suite slice, not one per case"
     )
 
-    local popen, popenRun = runWorkerHost("absoluteentrytest --lane=shell --jobs=1 --timings=0")
+    local popen, popenRun = runWorkerHost("absoluteentrytest --jobs=1 --timings=0")
     test.eq(popenRun.status, 0, "the popen run succeeded" .. evidence(popenRun))
-    test.matches(popen, "1 shell suites across 1 process workers")
+    test.matches(popen, "1 suites across 1 Nupp workers")
     test.matches(popen, "1 tests, 1 passed")
 
-    local isolated, isolatedRun = runWorkerHost("processnativetest --lane=isolated --timings=0")
+    local isolated, isolatedRun = runWorkerHost("processnativetest --timings=0")
     test.eq(isolatedRun.status, 0, "the isolated run succeeded" .. evidence(isolatedRun))
-    test.eq(isolated:find("Nupp workers", 1, true), nil, "the native process suite stays off the mechanism it tests")
     local isolatedTotal, isolatedPassed = isolated:match("(%d+) tests, (%d+) passed")
     assert(tonumber(isolatedTotal) and tonumber(isolatedTotal) > 0, "isolated summary is missing: " .. isolated)
     test.eq(isolatedTotal, isolatedPassed, "every discovered native process test passed")
@@ -1136,7 +1137,7 @@ return M
     )
 
     local command = (
-        "cd %q && %sNUPP_TEST_BUILD=%q %q shellingtest --lane=shell --json --timings=0 --no-color 2>/dev/null"
+        "cd %q && %sNUPP_TEST_BUILD=%q %q shellingtest --json --timings=0 --no-color 2>/dev/null"
     ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
     local output, invocation = capturedRun(command)
     local report = require("testjson").decode(output)
@@ -1150,76 +1151,6 @@ return M
     test.matches(report.tests[1].failure.message, "the shell command failed as intended")
     test.eq(report.tests[2].suite, "shellingtest")
     test.eq(report.tests[2].status, "passed")
-    os.execute("rm -rf " .. string.format("%q", dir))
-end
-
-function M.processAndNuppWorkersRunAtTheSameTime()
-    local dir = os.tmpname()
-    os.remove(dir)
-    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
-    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
-
-    local shellMarker = dir .. "/shell-ready"
-    local sharedMarker = dir .. "/shared-ready"
-
-    local function suite(marker, other, shell)
-        return (
-            [=[
-local M = {}
-function M.meetsTheOtherExecutor()
-    %s
-    local ready = assert(io.open(%q, "wb"))
-    ready:write("ready")
-    ready:close()
-    local deadline = os.clock() + 5
-    repeat
-        local found = io.open(%q, "rb")
-        if found then
-            found:close()
-            return
-        end
-    until os.clock() >= deadline
-    error("the other executor did not start")
-end
-return M
-]=]
-        ):format(shell and 'assert(os.execute("exit 0") == 0)' or "", marker, other)
-    end
-
-    write(dir .. "/tests/shellingtest.lua", suite(shellMarker, sharedMarker, true))
-    write(dir .. "/tests/sharedtest.lua", suite(sharedMarker, shellMarker, false))
-    write(
-        dir .. "/tests/isolatedtest.lua",
-        (
-            [=[
-local M = {}
-if false then require("debug.profile") end
-function M.runsBeforeNuppWorkersStart()
-    local started = io.open(%q, "rb")
-    assert(started == nil, "the Nupp lane started before the isolated lane finished")
-end
-return M
-]=]
-        ):format(sharedMarker)
-    )
-
-    local command = (
-        "cd %q && %sNUPP_TEST_BUILD=%q %q shellingtest sharedtest isolatedtest --jobs=2 --json --timings=0 --no-color 2>/dev/null"
-    ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
-    local output, invocation = capturedRun(command)
-    local report = require("testjson").decode(output)
-
-    test.eq(invocation.status, 0, "the overlapping run succeeded" .. evidence(invocation))
-    test.eq(report.total, 3, "all three execution lanes ran")
-    test.eq(report.passed, 3, "isolated work ran first and shell work overlapped")
-    test.eq(#report.shards, 6, "each execution lane reported both planned slices")
-    local reportedLanes = {}
-    for _, suite in ipairs(report.suites) do
-        if suite.executionLane then
-            reportedLanes[suite.executionLane] = true
-        end
-    end
-    test(reportedLanes.isolated and reportedLanes.shared and reportedLanes.shell)
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
@@ -1319,30 +1250,7 @@ function M.unknownRunnerOptionIsRejectedBeforeDiscovery()
     test.eq(output:find("suites across", 1, true), nil, "an unknown option does not start the suite")
 end
 
-function M.indirectSimdProcessesUseTheReusableShellLane()
-    local shell, shellRun = runWorkerHost("--lane=shell --list-suites")
-    test.eq(shellRun.status, 0, "shell lane listing failed" .. evidence(shellRun))
-    test.matches(shell, "simdnativealgorithmdifferentialtest")
-    test.matches(shell, "simdprimitivedifferentialtest")
-    test.matches(shell, "simdwasmalgorithmdifferentialtest")
-    test.matches(shell, "simdwasmtimeconformancetest")
-
-    local shared, sharedRun = runWorkerHost("--lane=shared --list-suites")
-    test.eq(sharedRun.status, 0, "shared lane listing failed" .. evidence(sharedRun))
-    test.matches(shared, "simdreducerdifferentialtest")
-end
-
-function M.fixedWidthRuntimeUsesTheFreshProcessLane()
-    local isolated, isolatedRun = runWorkerHost("--lane=isolated --list-suites")
-    test.eq(isolatedRun.status, 0, "isolated lane listing failed" .. evidence(isolatedRun))
-    test.matches(isolated, "fixedwidthtest")
-
-    local shell, shellRun = runWorkerHost("--lane=shell --list-suites")
-    test.eq(shellRun.status, 0, "shell lane listing failed" .. evidence(shellRun))
-    test.eq(shell:find("fixedwidthtest", 1, true), nil, "fixed-width runtime checks do not reuse a shell process")
-end
-
-function M.caseSlicesDetermineShellWorkerCount()
+function M.caseSlicesDetermineWorkerCount()
     local dir = os.tmpname()
     os.remove(dir)
     assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
@@ -1368,19 +1276,19 @@ return M
 ]]
     )
     local command = (
-        "cd %q && %sNUPP_TEST_BUILD=%q %q shellingtest --lane=shell --jobs=4 --timings=0 --no-color 2>&1"
+        "cd %q && %sNUPP_TEST_BUILD=%q %q shellingtest --jobs=4 --timings=0 --no-color 2>&1"
     ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
     local output, invocation = capturedRun(command)
     test.eq(invocation.status, 0, "the sliced shell suite succeeded" .. evidence(invocation))
-    test.matches(output, "1 shell suites across 2 process workers")
+    test.matches(output, "1 suites across 2 Nupp workers")
     test.matches(output, "4 tests, 4 passed")
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
--- Hosted runners report three or four processors, so one worker per processor
--- left every CI lane narrower than eight. The machine here is made to report two,
--- and a run with no `--jobs` still has to start eight workers for nine suites.
-function M.defaultWorkerCountHasAFloorOfEight()
+-- A run with no `--jobs` starts one Nupp worker per processor and no more
+-- (#351). The machine here is made to report two, so nine suites share two
+-- workers. Windows asks the processor count of a shell the shim does not reach.
+function M.defaultWorkerCountIsOnePerProcessor()
     local dir = os.tmpname()
     os.remove(dir)
     assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
@@ -1397,11 +1305,13 @@ function M.defaultWorkerCountHasAFloorOfEight()
         )
     end
     local command = (
-        'cd %q && PATH=%q:"$PATH" %sNUPP_TEST_BUILD=%q %q --lane=shell --timings=0 --no-color 2>&1'
+        'cd %q && PATH=%q:"$PATH" %sNUPP_TEST_BUILD=%q %q --timings=0 --no-color 2>&1'
     ):format(dir, dir .. "/bin", MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
     local output, invocation = capturedRun(command)
-    test.eq(invocation.status, 0, "the nine shell suites succeeded" .. evidence(invocation))
-    test.matches(output, "9 shell suites across 8 process workers")
+    test.eq(invocation.status, 0, "the nine suites succeeded" .. evidence(invocation))
+    if package.config:sub(1, 1) ~= "\\" then
+        test.matches(output, "9 suites across 2 Nupp workers")
+    end
     test.matches(output, "9 tests, 9 passed")
     os.execute("rm -rf " .. string.format("%q", dir))
 end
@@ -1553,14 +1463,17 @@ return {observesFailure = function()
 end}
 ]=]
     ):format(errors)
-    -- Exercise serial runs, Nupp workers, reusable shell workers, and fresh
-    -- isolated children. The observer waits for another worker's diagnostic.
+    -- Exercise serial runs and Nupp workers, including suites that start
+    -- processes, which run on the same workers (#351). The observer waits for
+    -- another worker's diagnostic. Plain LuaJIT has no Nupp workers, so a copied
+    -- runner there is serial whatever `--jobs` says.
     local selections = {
         {args = "--jobs=1", marker = "", json = false},
         {args = "--jobs=1 --json", marker = "", json = true},
+        {args = "--jobs=2 --json", marker = "", json = true},
         {args = "--jobs=2 --json", marker = "", json = true, host = true},
-        {args = "--jobs=2 --json", marker = '-- os.execute("true")\n', json = true},
-        {args = "--jobs=2 --json", marker = '-- require("io.internal.process")\n', json = true},
+        {args = "--jobs=2 --json", marker = '-- os.execute("true")\n', json = true, host = true},
+        {args = "--jobs=2 --json", marker = '-- require("io.internal.process")\n', json = true, host = true},
     }
     for _, selection in ipairs(selections) do
         write(dir .. "/tests/aearlytest.lua", selection.marker .. failure)
@@ -1585,7 +1498,7 @@ end}
             test.eq(report.total, 2)
             test.eq(report.failed, 1, diagnostics)
             test.eq(report.passed, 1, diagnostics)
-            if selection.args:find("jobs=2", 1, true) then
+            if selection.host and selection.args:find("jobs=2", 1, true) then
                 test.eq(#report.shards, 2)
             end
         else
@@ -1802,54 +1715,6 @@ dofile(arg[0])
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
--- A Nupp worker state past its heap bound hands the rest of its queue to a fresh
--- state (#287). At a bound of 0 every suite gets a state of its own, and each lane
--- still reports once: one state per suite it ran, plus the last, which found the
--- queue empty. A shell suite makes the run replace states while the shell lane
--- waits to join the shared queue's tail.
-function M.nuppWorkerStatesRetireAtTheirHeapBound()
-    local dir = os.tmpname()
-    os.remove(dir)
-    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
-    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
-    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
-    local names = {"alpha", "beta", "gamma", "delta", "epsilon"}
-    for _, name in ipairs(names) do
-        write(
-            ("%s/tests/%stest.lua"):format(dir, name),
-            ("local M = {}\nfunction M.only%s() end\nreturn M\n"):format(name)
-        )
-    end
-    write(dir .. "/tests/zshelltest.lua", '-- os.execute("true")\nreturn {onlyshell = function() end}\n')
-
-    local output, invocation = capturedRun(
-        (
-            "cd %q && %sNUPP_TEST_BUILD=%q NUPP_TEST_WORKER_HEAP_MB=0 %q --jobs=2 --json 2>/dev/null"
-        ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
-    )
-    test.eq(invocation.status, 0, "the recycled lanes did not pass" .. evidence(invocation))
-    local report = require("testjson").decode(output)
-    test.eq(report.total, #names + 1, evidence(invocation))
-    test.eq(report.passed, #names + 1, evidence(invocation))
-    local seen, states, lanes = {}, 0, 0
-    for _, shard in ipairs(report.shards) do
-        if shard.executionLane == "shared" then
-            lanes = lanes + 1
-            for _, spec in ipairs(shard.specs) do
-                test.eq(seen[spec], nil, spec .. " ran twice")
-                seen[spec] = true
-            end
-            states = states + shard.states
-        end
-    end
-    test.eq(lanes, 2, "each lane reports once however many states it went through")
-    for _, name in ipairs(names) do
-        assert(seen[name .. "test"], name .. "test never ran")
-    end
-    test.eq(states, #names + 2, "every suite ran in a state of its own")
-    os.execute("rm -rf " .. string.format("%q", dir))
-end
-
 function M.processQueueRestoresModuleGlobalsBetweenPieces()
     local dir = os.tmpname()
     os.remove(dir)
@@ -1944,170 +1809,6 @@ return M
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
--- A shared lane runs as a process wherever no worker host runs it in this one,
--- which is every project but this repository. Its pieces keep what an earlier
--- piece loaded, as an in-process lane's do: a project module loaded again into
--- a state whose carried modules remember the first load raised there, as a
--- named `types.Key` does. Globals and loaders are still put back.
-function M.sharedProcessQueueKeepsWhatAPieceLoaded()
-    local dir = os.tmpname()
-    os.remove(dir)
-    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
-    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/queue")) == 0)
-    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
-
-    write(dir .. "/tests/lanekept.lua", "return {loads = 0}\n")
-    write(
-        dir .. "/tests/afirstloadtest.lua",
-        [[
-local M = {}
-function M.loadsAModule()
-    _G.laneLeakedGlobal = "left behind"
-    local kept = require("lanekept")
-    kept.loads = kept.loads + 1
-end
-return M
-]]
-    )
-    write(
-        dir .. "/tests/bsecondloadtest.lua",
-        [[
-local M = {}
-function M.findsTheSameModule()
-    assert(rawget(_G, "laneLeakedGlobal") == nil, "a global the previous piece invented")
-    assert(require("lanekept").loads == 1, "the module loaded again")
-end
-return M
-]]
-    )
-    write(dir .. "/queue/order", "afirstloadtest\nbsecondloadtest\n")
-    write(dir .. "/queue/piece-1", "afirstloadtest\n")
-    write(dir .. "/queue/piece-2", "bsecondloadtest\n")
-    local quoted = "'" .. (dir .. "/tests/run.lua"):gsub("'", "'\\''") .. "'"
-    local outputPath = os.tmpname()
-    os.execute(
-        (
-            MODULES .. "NUPP_TEST_SHARED_LANE=1 NUPP_TEST_BUILD=build luajit %s --json --queue=%s >%q 2>/dev/null"
-        ):format(quoted, dir .. "/queue", outputPath)
-    )
-    local output = read(outputPath):gsub("\r\n", "\n")
-    os.remove(outputPath)
-    local report = require("testjson").decode(output)
-    test.eq(report.total, 2, "both queue pieces ran" .. "\n" .. output)
-    test.eq(report.passed, 2, output)
-    os.execute("rm -rf " .. string.format("%q", dir))
-end
-
-function M.isolatedQueuePiecesRunInFreshProcesses()
-    local dir = os.tmpname()
-    os.remove(dir)
-    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
-    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
-    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
-
-    write(
-        dir .. "/tests/isolationmutatortest.lua",
-        [[
-return {mutatesNestedProcessState = function()
-    math.__nupp_runner_isolation_probe = true
-    rawset(_G, "__nupp_runner_top_level_probe", true)
-    local cache = assert(os.getenv("NUPP_CACHE_DIR"), "the supervisor did not provide its lane cache")
-    local marker = assert(io.open("lane-cache", "wb"))
-    marker:write(cache)
-    marker:close()
-end}
-]]
-    )
-    write(
-        dir .. "/tests/isolationobservetest.lua",
-        [[
-return {seesFreshProcessState = function()
-    assert(math.__nupp_runner_isolation_probe == nil, "nested global table state crossed an isolated queue piece")
-    assert(rawget(_G, "__nupp_runner_top_level_probe") == nil, "top-level state crossed an isolated queue piece")
-    local marker = assert(io.open("lane-cache", "rb"))
-    local cache = marker:read("*a")
-    marker:close()
-    assert(cache == os.getenv("NUPP_CACHE_DIR"), "fresh pieces did not inherit the supervisor's lane cache")
-    if false then rawset(_G, "classification-only", true) end
-end}
-]]
-    )
-    write(
-        dir .. "/build/.nupp-test-times.json",
-        [[
-{"suites":{"isolationmutatortest":2000,"isolationobservetest":1000},
- "cases":{"isolationmutatortest":{"mutatesNestedProcessState":2000},
-          "isolationobservetest":{"seesFreshProcessState":1000}}}
-]]
-    )
-    local output, invocation = capturedRun(
-        (
-            "cd %q && %sNUPP_TEST_BUILD=%q %q isolationmutatortest isolationobservetest --lane=isolated --jobs=1 --json 2>/dev/null"
-        ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
-    )
-    test.eq(invocation.status, 0, "isolated queue pieces shared process state" .. evidence(invocation))
-    local report = require("testjson").decode(output)
-    test.eq(report.total, 2)
-    test.eq(report.passed, 2)
-    test.eq(#report.shards, 1, "one supervisor respected --jobs=1")
-    test.eq(#report.shards[1].specs, 2, "the supervisor dynamically claimed both pieces")
-    test.eq(report.shards[1].executionLane, "isolated")
-    test.eq(report.shards[1].tests, 2, "the supervisor aggregated both child reports")
-    os.execute("rm -rf " .. string.format("%q", dir))
-end
-
--- A shell worker that kept one process across its pieces kept everything each of
--- them left in it, and eight of those outgrew a hosted runner's memory (#261). What
--- one piece leaves in its process is the observable part of that: the second suite
--- must not see it.
-function M.shellQueuePiecesRunInFreshProcesses()
-    local dir = os.tmpname()
-    os.remove(dir)
-    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
-    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
-    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
-
-    write(
-        dir .. "/tests/shellmutatortest.lua",
-        [[
-return {leavesStateInItsProcess = function()
-    assert(os.execute("exit 0") == 0)
-    math.__nupp_runner_shell_probe = true
-end}
-]]
-    )
-    write(
-        dir .. "/tests/shellobservetest.lua",
-        [[
-return {seesAProcessOfItsOwn = function()
-    assert(os.execute("exit 0") == 0)
-    assert(math.__nupp_runner_shell_probe == nil, "state crossed from one shell queue piece to the next")
-end}
-]]
-    )
-    write(
-        dir .. "/build/.nupp-test-times.json",
-        [[
-{"suites":{"shellmutatortest":2000,"shellobservetest":1000},
- "cases":{"shellmutatortest":{"leavesStateInItsProcess":2000},
-          "shellobservetest":{"seesAProcessOfItsOwn":1000}}}
-]]
-    )
-    local output, invocation = capturedRun(
-        (
-            "cd %q && %sNUPP_TEST_BUILD=%q %q shellmutatortest shellobservetest --lane=shell --jobs=1 --json 2>/dev/null"
-        ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
-    )
-    test.eq(invocation.status, 0, "shell queue pieces shared a process" .. evidence(invocation))
-    local report = require("testjson").decode(output)
-    test.eq(report.total, 2)
-    test.eq(report.passed, 2)
-    test.eq(#report.shards, 1, "one supervisor respected --jobs=1")
-    test.eq(#report.shards[1].specs, 2, "the supervisor claimed both pieces")
-    test.eq(report.shards[1].executionLane, "shell")
-    os.execute("rm -rf " .. string.format("%q", dir))
-end
-
 -- One word to the shell, whatever it holds: nothing in it is expanded.
 local function shellWord(text)
     return "'" .. text:gsub("'", "'\\''") .. "'"
@@ -2192,7 +1893,7 @@ return {leavesAProcessRunning = linger}
     -- This ordinary nested runner must still isolate the suite.
     local output, invocation = capturedRun(
         (
-            "cd %q && %sNUPP_COVERAGE_FILE=%q NUPP_TEST_BUILD=%q %q lingertest quiettest --lane=isolated --jobs=1 --json 2>/dev/null"
+            "cd %q && %sNUPP_COVERAGE_FILE=%q NUPP_TEST_BUILD=%q %q lingertest quiettest --jobs=1 --json 2>/dev/null"
         ):format(dir, MODULES, dir .. "/inherited-coverage.json", dir .. "/build", ROOT .. "/build/nupp-test")
     )
     local pid = lingeringPid(dir)
@@ -2233,7 +1934,7 @@ end}
                 dir,
                 shellWord(
                     (
-                        "%sNUPP_TEST_BUILD=%q %q stucktest quiettest --lane=isolated --jobs=1 --json & echo $! > runner.pid; wait"
+                        "%sNUPP_TEST_BUILD=%q %q stucktest quiettest --jobs=1 --json & echo $! > runner.pid; wait"
                     ):format(MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
                 )
             )

@@ -44,11 +44,6 @@
           "name": "Check the compiler",
           "compilerModes": ["strict"],
           "guarantees": ["the compiler type-checks its own sources"]
-        },
-        {
-          "name": "Run the shared-process suites",
-          "lane": "shared",
-          "guarantees": ["every suite a Nupp worker can share a process with"]
         }
       ]
     },
@@ -105,9 +100,7 @@
         {
           "name": "Run the compiler suite",
           "excludes": {
-            "groups": ["external-corpus", "windows-preflight"],
-            "lanes": ["shared"]
-          },
+            "groups": ["external-corpus", "windows-preflight"]          },
           "guarantees": ["every suite an earlier step in this job did not run"]
         }
       ]

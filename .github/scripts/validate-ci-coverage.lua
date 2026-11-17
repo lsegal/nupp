@@ -208,22 +208,17 @@ end
 validator.minimumJobs = 8
 
 --- Every `--jobs=N` below the floor a test run in the workflow names, as
---- `line N: text` sentences. The runner's own default never goes below the
---- floor, so a lane only runs narrower because a step asked it to, and this is
---- where that request would be written.
+--- `line N: text` sentences. A run only goes narrower than the floor because a
+--- step asked it to, and this is where that request would be written.
 function validator.narrowTestRuns(text)
     local found = {}
     local number = 0
     for line in ((text:gsub("\r\n", "\n")) .. "\n"):gmatch("(.-)\n") do
         number = number + 1
-        -- `--jobs=N` for every lane, or `--jobs=shell:2,isolated:8` for some.
         local narrow = false
-        for list in line:gmatch("%-%-jobs=([%w:,]+)") do
-            for spec in list:gmatch("[^,]+") do
-                local count = tonumber(spec:match("^%d+$") or spec:match("^%a+:(%d+)$"))
-                if count and count < validator.minimumJobs then
-                    narrow = true
-                end
+        for count in line:gmatch("%-%-jobs=(%d+)") do
+            if tonumber(count) < validator.minimumJobs then
+                narrow = true
             end
         end
         if narrow then
