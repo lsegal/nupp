@@ -1368,6 +1368,79 @@ return M
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- A `background` prerequisite starts with the run and does not hold up its
+-- first suite (#383, #399). This build finishes only once another suite has
+-- started, so a runner that waited for it before dealing any suite would give
+-- up on it after ten seconds and the suite needing it would fail.
+function M.aBackgroundPrerequisiteDoesNotHoldUpTheFirstSuite()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests/helpers")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+    write(dir .. "/tests/helpers/prerequisite.lua", read(ROOT .. "/tests/helpers/prerequisite.lua"))
+    write(
+        dir .. "/tests/groups.lua",
+        [[
+return {}, {
+    scopes = {quicktest = "unit", waitingtest = "unit"},
+    prerequisites = {
+        {name = "the slow build", module = "helpers.slowbuild", suites = {"waitingtest"}, background = true},
+    },
+}
+]]
+    )
+    write(
+        dir .. "/tests/helpers/slowbuild.lua",
+        [[
+local prerequisite = require("helpers.prerequisite")
+local M = {variable = "NUPP_FIXTURE_SLOW_BUILD", pending = "NUPP_FIXTURE_SLOW_BUILD_PENDING"}
+function M.command(root)
+    return ("cd '%s' && i=0; while [ ! -f started ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; "
+        .. "[ -f started ] && echo built-in-the-background"):format(root)
+end
+function M.path(root)
+    -- Asked of the runner only: building it here would hide one that never ran.
+    if (os.getenv(M.variable) or "") == "" and (os.getenv(M.pending) or "") == "" then
+        return nil, "the runner prepared nothing"
+    end
+    local status, output, path = prerequisite.result(M, root)
+    return status == 0 and path or nil, output
+end
+return M
+]]
+    )
+    write(
+        dir .. "/tests/quicktest.lua",
+        [[
+local M = {}
+function M.startsFirst()
+    assert(io.open("started", "wb")):close()
+end
+return M
+]]
+    )
+    write(
+        dir .. "/tests/waitingtest.lua",
+        [[
+local test = require("assert")
+local M = {}
+function M.seesTheBuild()
+    local path, output = require("helpers.slowbuild").path(".")
+    test.eq(path, "built-in-the-background", output)
+end
+return M
+]]
+    )
+    local command = (
+        "cd %q && %sNUPP_TEST_BUILD=%q %q quicktest waitingtest --jobs=2 --timings=0 --no-color 2>&1"
+    ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+    local output, invocation = capturedRun(command)
+    test.eq(invocation.status, 0, "the background build waited for no suite" .. evidence(invocation))
+    test.matches(output, "2 tests, 2 passed")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 -- A worker's records cross a message that refuses a repeated table, so one case
 -- handing the same evidence to two capabilities used to lose every result its
 -- worker held: Linux CI reported 207 suites as unrun from two such workers (#375).
