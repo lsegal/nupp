@@ -12,8 +12,14 @@ export function run(
     colorMode: string,
     suiteCatalog: string,
     gcPause: integer?,
-    runningDir: string?
+    runningDir: string?,
+    executable: string?
 ): any
+    -- The host publishes its executable only to the state it starts the payload
+    -- in. Suites that build projects find the compiler's own build from it (#389).
+    if rawget(_G, "__NUPP_EXECUTABLE") == nil then
+        rawset(_G, "__NUPP_EXECUTABLE", executable)
+    end
     rawset(_G, "__NUPP_TEST_EMBEDDED", true)
     rawset(_G, "__NUPP_TEST_PROGRESS_FD", progressFd)
     rawset(_G, "__NUPP_TEST_LANE_CACHE", cacheDir)

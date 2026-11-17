@@ -113,6 +113,8 @@ end
 ---
 --- @param modules what the build recorded, so the bundle carries the modules it
 ---     compiled rather than everything that has since appeared beside them
+--- @param moduleRoot where the build wrote the modules, relative to the directory
+---     of the file the chunk lands in, when they sit under it
 --- @return the chunk, or nil when one of its parts could not be read
 --- @return why not
 --- @return the resources that had no key a running program could ask for
@@ -126,7 +128,8 @@ local function bundleText(
     runtimeModules: {string}?,
     hostFeatures: {string}?,
     component: boolean?,
-    builtOutDir: string?
+    builtOutDir: string?,
+    moduleRoot: string?
 ): string?, string?, {string}?
     -- A caller may build a target beneath `--output` without changing the
     -- manifest target. Bundle the files that build just wrote, not the target's
@@ -327,6 +330,12 @@ local function bundleText(
             end
         end
         chunks[#chunks + 1] = "})\n"
+    elseif moduleRoot ~= nil and built["nupp.compiler.bundled"] ~= nil then
+        -- A payload that carries the compiler but not its artifacts, like the test
+        -- runner. Every chunk in it is named for the executable, so the compiler
+        -- would look for its build beside the executable rather than where it was
+        -- written, and recheck its own runtime from source in every project (#389).
+        chunks[#chunks + 1] = ("rawset(_G, \"__nuppPayloadModuleRoot\", %q)\n"):format(moduleRoot)
     end
 
     -- Compiler-provided implementation modules are staged after ordinary module

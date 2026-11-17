@@ -3150,7 +3150,8 @@ then
                         colorMode,
                         suiteCatalog,
                         pause,
-                        runningDir
+                        runningDir,
+                        rawget(_G, "__NUPP_EXECUTABLE")
                     )
                 end
                 local launched, problem = pcall(function()
