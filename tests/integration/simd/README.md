@@ -4,7 +4,10 @@
 compiled by nupp's own LLVM, in process, so the only matrix dimension besides
 the host is the tier. Each tier builds two immutable fixtures: a cheap species
 inventory for every public type and lane count, and a representative semantic
-pack for each operation/type/representation class. Each build requests exactly
+pack for each operation/type/representation class. The semantic pack builds
+and runs in parts, one case per segment and group of element types
+(`native-packs.lua`'s `semanticCases`), so the thread pool spreads it across
+cores; together the parts build every probe of the pack once. Each build requests exactly
 one tier (`minimum == maximum`). On x64 it executes baseline, AVX2 and AVX512F
 when the CPU and OS advertise support; arm64 executes NEON. Which tiers an x64
 host has is answered by the feature detector every AOT library carries, built

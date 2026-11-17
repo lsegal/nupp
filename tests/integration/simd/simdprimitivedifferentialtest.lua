@@ -23,7 +23,7 @@ local WORK_CEILINGS = {
     -- The reducer corpus is one loop, seven masked and two mixed modules for
     -- each of the six element types the authored reducers take, each probe
     -- called once per length, selection and scenario.
-    ["semantics/reducers"] = {units = 11, externalCommands = 0, cases = 620000, calls = 580000},
+    ["semantics/reducers"] = {units = 22, externalCommands = 0, cases = 650000, calls = 610000},
 }
 
 local function read(path)
@@ -203,8 +203,9 @@ local generatedCases = test.suite.cases(
         local capability = runner.nativeCapability()
         test.suite.requirecapability("compiler.llvm", capability.compilerVersion ~= nil, capability)
         test.suite.requirecapability("cpu." .. capability.tier, capability.available, capability)
-        local generated = row.pack == "species" and packs.species() or packs.semantics({segments = {row.segment}, types = row.types})
-        local key = fixtureKey(row.name, generated, capability)
+        local generated = row.pack == "species" and packs.species()
+            or packs.semantics({segments = {row.segment}, types = row.types})
+        local key = fixtureKey(row.ceiling, generated, capability)
         local _, report, reused = test.suite.fixture(key, function(directory)
             local complete = runner.native(generated, {
                 directory = directory,
