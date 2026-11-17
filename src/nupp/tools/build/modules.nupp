@@ -2983,11 +2983,36 @@ local function targetScope(root: string, target: Target, session: modules.Sessio
         return inc.moduleDependencies(path)
     end
 
+    -- The scope only ever selects project sources: `aot.emit` reads the files
+    -- under the include roots and keeps the reached ones. A module outside them
+    -- -- the standard library, the runtime, a bundled module -- cannot require
+    -- its way back into the project, so it is reached without being checked
+    -- and generated to find out what it imports. Walking those bodies was most
+    -- of what a small native build cost.
+    local projectRoots: {string} = {}
+    for _, include in ipairs(inc.env.config.include or {}) do
+        projectRoots[#projectRoots + 1] = fs.absolute(join(root, include))
+    end
+    if #projectRoots == 0 then
+        projectRoots[1] = fs.absolute(root)
+    end
+
+    local function inProject(path: string): boolean
+        local absolute = fs.absolute(path)
+        for _, projectRoot in ipairs(projectRoots) do
+            if absolute == projectRoot or absolute:sub(1, #projectRoot + 1) == projectRoot .. "/" then
+                return true
+            end
+        end
+
+        return false
+    end
+
     local cursor: integer = 1
     while cursor <= #queue do
         local path = queue[cursor] as string
         cursor = cursor + 1
-        for _, dependency in ipairs(executableDependencies(path)) do
+        for _, dependency in ipairs(inProject(path) and executableDependencies(path) or {}) do
             local dependencyPath = inc.modulePath(dependency) or session.stageBundled(dependency)
             if dependencyPath ~= nil then
                 seed(dependencyPath as string, dependency)
