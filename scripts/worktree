@@ -50,7 +50,7 @@ copy_if_absent() {
 # These stores validate their own content keys. A stale entry is a miss, so copying
 # them can save work but cannot change an answer.
 copy_if_absent "$ROOT/build/cache" "$TASK_ROOT/build/cache"
-copy_if_absent "$ROOT/build/.nupp-test-times.json" "$TASK_ROOT/build/.nupp-test-times.json"
+copy_if_absent "$ROOT/build/test-runner/.nupp-test-times.json" "$TASK_ROOT/build/test-runner/.nupp-test-times.json"
 
 # Generated compiler output is reusable only when it represents this exact revision
 # and the originating checkout itself considers it current. Touching the copied stamp

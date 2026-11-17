@@ -380,17 +380,18 @@ jobs:
       # Passing results keyed by each suite's content fingerprint: its files and
       # everything they load, the built compiler, the platform and the flags. A
       # fingerprint that cannot be fully accounted for is a miss and executes,
-      # so an approximate restore can only save time, never reuse a stale pass. Never-cache suites (timing, process lifecycle, measurement)
-      # execute regardless; see `neverCache` in tests/groups.lua.
+      # so an approximate restore can only save time, never reuse a stale pass.
+      # Never-cache suites (timing, process lifecycle, measurement) execute
+      # regardless; see `neverCache` in tests/groups.lua.
       - name: Restore the recorded test results
         uses: actions/cache/restore@v4
         with:
-          path: build/.nupp-test-results
+          path: build/test-runner/.nupp-test-results
           key: >-
-            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
+            nupp-test-results-integration-${{ runner.os }}-${{ runner.arch }}-${{
             github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-
+            nupp-test-results-integration-${{ runner.os }}-${{ runner.arch }}-
 
       # Suite durations are what the worker queue is packed from. A clean
       # runner without them packs blind and the busiest shard decides the wall
@@ -399,7 +400,7 @@ jobs:
       - name: Restore the recorded suite timings
         uses: actions/cache/restore@v4
         with:
-          path: build/.nupp-test-times.json
+          path: build/test-runner/.nupp-test-times.json
           key: >-
             nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           restore-keys: |
@@ -591,8 +592,8 @@ jobs:
         # out of time, or is cancelled by hand, skips the steps that would say
         # where a hung run stood; this ends the run first, samples what it left
         # running and ends its workers, so the runner names each one and the
-        # suite it was in. On macOS this step alone takes close to three hours
-        # when it passes, so a two-hour run is not a stalled one.
+        # suite it was in. On macOS this step alone takes two to three and a
+        # half hours when it passes, so a two-hour run is not a stalled one.
         run: |
           set -euo pipefail
           ulimit -c unlimited || true
@@ -709,9 +710,9 @@ jobs:
         uses: actions/cache/save@v4
         continue-on-error: true
         with:
-          path: build/.nupp-test-results
+          path: build/test-runner/.nupp-test-results
           key: >-
-            nupp-test-results-${{ runner.os }}-${{ runner.arch }}-${{
+            nupp-test-results-integration-${{ runner.os }}-${{ runner.arch }}-${{
             github.run_id }}-${{ github.run_attempt }}
 
       # Saved whatever the suite concluded. A failing run still measured every
@@ -721,7 +722,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: build/.nupp-test-times.json
+          path: build/test-runner/.nupp-test-times.json
           key: >-
             nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
 
