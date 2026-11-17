@@ -974,8 +974,8 @@ jobs:
           NUPP_REQUIRE_CODEGEN: '1'
         run: ./scripts/toolchain --all
 
-      # Built here rather than by the script, so the five minutes the step
-      # below has are spent on the dispatches it checks (#351).
+      # Built here rather than by the script, so the conformance step times
+      # dispatch and readback rather than a compiler build (#351).
       - name: Bootstrap the compiler
         env:
           NUPP_REQUIRE_CODEGEN: '1'
@@ -1016,8 +1016,8 @@ jobs:
           NUPP_REQUIRE_CODEGEN: '1'
         run: ./scripts/toolchain --all
 
-      # Built here rather than by the script, so the five minutes the step
-      # below has are spent on the dispatches it checks (#351).
+      # Built here rather than by the script, so the conformance step times
+      # dispatch and readback rather than a compiler build (#351).
       - name: Bootstrap the compiler
         shell: bash
         env:
