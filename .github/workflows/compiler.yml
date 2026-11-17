@@ -551,15 +551,10 @@ jobs:
             NUPP_TEST_SH=$(cygpath -w "$sh_path")
           fi
           ./bin/nupp build --target testRunner
-          # The run takes a few minutes on every platform, so 30 minutes ends
-          # a hang long before the job's timeout would, with its workers named
-          # the way the suite step's deadline names them. It never lands past
-          # that step's own deadline either.
-          deadline=$(($(date +%s) + 30 * 60))
-          job_deadline=$((NUPP_JOB_STARTED + (${{ matrix.timeout }} - 10) * 60))
-          if [ "$job_deadline" -lt "$deadline" ]; then
-            deadline=$job_deadline
-          fi
+          # Halted NUPP_SUITE_SECONDS after the runner build, like every other
+          # test step (#375), with its workers named the way the suite step's
+          # deadline names them. It takes about a minute and a half on Linux.
+          deadline=$(($(date +%s) + NUPP_SUITE_SECONDS))
           .github/scripts/suite-deadline.sh "$deadline" -- \
             ./tests/run --fresh --scope=all --group=external-corpus
 
