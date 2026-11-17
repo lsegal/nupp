@@ -797,15 +797,14 @@ codegen_archive() {
 # its own.
 
 # Sets PREBUILT_OUT to the prebuilt provider when it carries every feature in
-# the list; `codegen` selects nothing and is accepted for the stage-zero
-# compiler that still asks for it.
+# the list.
 prebuilt_provider() {
     requested=$(normalize_features "${1:-}")
     build_prebuilt codegen
     provider_dir=$(dirname "$PREBUILT_OUT")
     [ -f "$provider_dir/features" ] \
         || die "the $PREBUILT_TAG prebuilt code generator carries no provider features; pin a later release (scripts/toolchain.pins)"
-    carried=",$(tr -d ' \r\n' < "$provider_dir/features"),codegen,"
+    carried=",$(tr -d ' \r\n' < "$provider_dir/features"),"
     for feature in $(printf '%s' "$requested" | tr ',' ' '); do
         case "$carried" in
             *",$feature,"*) ;;
@@ -935,13 +934,6 @@ codegen_wanted() {
     return 1
 }
 
-# A provider feature list without `codegen`. The code generator is a library of
-# its own now (codegen-library), but the pinned stage-zero compiler still asks
-# the provider for it, and is answered with the provider it can have.
-without_codegen() {
-    printf '%s\n' "$1" | tr ',' '\n' | grep -v '^codegen$' | tr '\n' ',' | sed 's/,$//'
-}
-
 # --- the native provider -----------------------------------------------------
 
 # The provider, `nupp_native`, is a Nupp native program (native/provider) with
@@ -953,10 +945,9 @@ without_codegen() {
 # once there is a compiler to build it with.
 
 # Checks a provider feature list. Every provider carries `base`, and nothing
-# else is left to select; `codegen` is dropped, because the code generator is
-# a library of its own now but the pinned stage-zero compiler still asks for it.
+# else is left to select.
 provider_features() {
-    for pf_feature in $(without_codegen "$(normalize_features "${1:-}")" | tr ',' ' '); do
+    for pf_feature in $(normalize_features "${1:-}" | tr ',' ' '); do
         [ "$pf_feature" = base ] || die "the native provider has no $pf_feature feature"
     done
 }
@@ -1129,7 +1120,7 @@ embedding_library_filename() {
 # whose entry, `embed.nupp`, names the embedding ABI instead of defining `main`.
 write_embedding_program() {
     mkdir -p "$1"
-    write_host_program "$1" "$2" "$3"
+    write_host_program "$1" "$2"
     {
         printf 'module embed\n\n'
         printf 'const {nupp_config_init} = require("nuppembed.abi")\n\n'
@@ -1144,16 +1135,15 @@ write_embedding_program() {
 # without compiling any of them, and names each one's entry on a line of its
 # own: `program NAME ENTRY`, with `exports NAME FILE` after a program whose
 # shared library exports a fixed list. `nupp fixpoint` compiles them with each
-# stage it builds. The host and the embedding library are written for the
-# features every host can carry, which reach every module they have.
+# stage it builds. The host and the embedding library name no features: those
+# are linked in beside them, so every module they have is reached.
 write_native_sources() {
     ns_out=$1
     rm -rf "$ns_out/provider" "$ns_out/host" "$ns_out/embedding"
     build_luajit
-    ns_features=lpeg,native-compression,native-files,native-net,native-process,native-tls,workers
     write_native_provider_program "$ns_out/provider"
-    write_host_program "$ns_out/host" "$ns_features" "$PREFIX/luajit"
-    write_embedding_program "$ns_out/embedding" "$ns_features" "$PREFIX/luajit"
+    write_host_program "$ns_out/host" "$PREFIX/luajit"
+    write_embedding_program "$ns_out/embedding" "$PREFIX/luajit"
     printf 'program provider %s\n' "$(native_path "$ns_out/provider/main.nupp")"
     printf 'exports provider %s\n' "$(native_path "$ns_out/provider/exports")"
     printf 'program host %s\n' "$(native_path "$ns_out/host/main.nupp")"
@@ -1171,8 +1161,10 @@ build_nupp_embedding() {
     ne_lpeg=${3:-}
     build_native_provider base || die "cannot compile the native provider"
     ne_provider_archive=$NATIVE_PROVIDER_STATIC_OUT
+    build_host_library embedding "$ne_luajit"
+    ne_library=$HOST_LIBRARY_OUT
     ne_digest=$(printf '%s|%s|%s|%s|%s' \
-        nupp-embedding "$ne_features" "$(host_program_digest)" "$ne_provider_archive" "$KEY" \
+        nupp-embedding "$ne_features" "$ne_library" "$ne_provider_archive" "$KEY" \
         | sha256_stdin | cut -c1-16)
     ne_out="$PREFIX/nupp-embedding/$ne_digest"
     NUPP_EMBED_OUT=$ne_out
@@ -1188,14 +1180,11 @@ build_nupp_embedding() {
 
     note "building the Nupp embedding library"
     rm -rf "$ne_out"
-    write_embedding_program "$ne_out/src" "$ne_features" "$ne_luajit"
-    "$ROOT/bin/nupp" aot --emit static-library --output "$(native_path "$ne_out/libnuppembed.a")" \
-        "$(native_path "$ne_out/src/embed.nupp")" >&2 \
-        || die "cannot compile the Nupp embedding library"
-    set -- "$ne_out/libnuppembed.a" "$ne_provider_archive" "$ne_luajit/lib/libluajit-5.1.a"
+    write_host_features "$ne_out" "$ne_features"
+    set -- "$ne_library" "$ne_out/features.a" "$ne_provider_archive" "$ne_luajit/lib/libluajit-5.1.a"
     [ -z "$ne_lpeg" ] || set -- "$@" "$ne_lpeg/lib/liblpeg.a"
     merge_static_archives "$ne_out/libnupp.a" "$@"
-    rm -f "$ne_out/libnuppembed.a"
+    rm -f "$ne_out/features.a"
 
     # The shared library exports host/include/nupp.exports for this feature
     # list and nothing else.
@@ -1640,12 +1629,12 @@ host_string_literal() {
 }
 
 # Writes the generated half of a host program into DIRECTORY: its manifest, its
-# entry, which defines the C `main`, and `nupphost.build`. The features are the
-# host's feature names as `select_host_features` normalized them.
+# entry, which defines the C `main`, and `nupphost.build`. Nothing in it names a
+# feature: the host asks the object `write_host_features` compiles at run time,
+# so one compiled program serves every feature list (#361).
 write_host_program() {
     hp_directory=$1
-    hp_features=$2
-    hp_luajit=$3
+    hp_luajit=$2
     hp_platform=$(host_program_platform)
     mkdir -p "$hp_directory/nupphost"
     # The compiler resolves a relative include against the manifest's own
@@ -1660,29 +1649,25 @@ write_host_program() {
         printf '    return run(argc, argv)\n'
         printf 'end\n'
     } > "$hp_directory/main.nupp"
-    hp_list="native-checksum,native-time"
-    hp_lpeg=false
-    hp_workers=false
-    for hp_feature in $(printf '%s' "$hp_features" | tr ',' ' '); do
-        case "$hp_feature" in
-            lpeg) hp_lpeg=true; hp_list="$hp_list,lpeg" ;;
-            workers) hp_workers=true ;;
-            *) hp_list="$hp_list,$hp_feature" ;;
-        esac
-    done
     {
         printf -- '--- What this host was built with: generated by scripts/toolchain.\n'
         printf 'module nupphost.build\n\n'
-        [ "$hp_lpeg" = false ] || printf 'cdef function luaopen_lpeg(borrows L: voidptr): int32\n\n'
-        printf 'export const FEATURES = "%s"\n' "$hp_list"
-        printf 'export const LPEG = %s\n' "$hp_lpeg"
-        printf 'export const WORKERS = %s\n\n' "$hp_workers"
+        printf 'cdef function nupp_host_build_features(): cstring\n'
+        printf 'cdef function nupp_host_build_lpeg(): int32\n'
+        printf 'cdef function nupp_host_build_workers(): int32\n'
+        printf 'cdef function nupp_host_build_open_lpeg(borrows L: voidptr): int32\n\n'
+        printf -- '--- The comma-separated host features this host was linked with.\n'
+        printf 'export function features(): cstring\n'
+        printf '    return nupp_host_build_features()\n'
+        printf 'end\n\n'
+        printf 'export function lpeg(): boolean\n'
+        printf '    return nupp_host_build_lpeg() ~= 0\n'
+        printf 'end\n\n'
+        printf 'export function workers(): boolean\n'
+        printf '    return nupp_host_build_workers() ~= 0\n'
+        printf 'end\n\n'
         printf 'export function nuppHostBuildOpenLpeg(L: voidptr): int32\n'
-        if [ "$hp_lpeg" = true ]; then
-            printf '    return luaopen_lpeg(L)\n'
-        else
-            printf '    return 0\n'
-        fi
+        printf '    return nupp_host_build_open_lpeg(L)\n'
         printf 'end\n\n'
         printf 'export const VMDEF = '
         host_string_literal "$(host_jit_module "$hp_luajit" vmdef)"
@@ -1692,6 +1677,45 @@ write_host_program() {
         host_string_literal "$(host_jit_module "$hp_luajit" bc)"
         printf '\n'
     } > "$hp_directory/nupphost/build.nupp"
+}
+
+# Compiles the half of a host program its feature list decides into
+# DIRECTORY/features.a: the answers `nupphost.build` asks for, and LPeg's
+# opener when the list has it. The features are the host's feature names as
+# `select_host_features` normalized them. It is a few lines of C, so a new
+# feature list costs a compile and a link rather than a whole native program.
+write_host_features() {
+    hf_directory=$1
+    hf_features=$2
+    hf_list="native-checksum,native-time"
+    hf_lpeg=0
+    hf_workers=0
+    for hf_feature in $(printf '%s' "$hf_features" | tr ',' ' '); do
+        case "$hf_feature" in
+            lpeg) hf_lpeg=1; hf_list="$hf_list,lpeg" ;;
+            workers) hf_workers=1 ;;
+            *) hf_list="$hf_list,$hf_feature" ;;
+        esac
+    done
+    mkdir -p "$hf_directory"
+    {
+        printf '/* What this host was built with: generated by scripts/toolchain. */\n'
+        printf 'const char *nupp_host_build_features(void) { return "%s"; }\n' "$hf_list"
+        printf 'int nupp_host_build_lpeg(void) { return %s; }\n' "$hf_lpeg"
+        printf 'int nupp_host_build_workers(void) { return %s; }\n' "$hf_workers"
+        if [ "$hf_lpeg" = 1 ]; then
+            printf 'int luaopen_lpeg(void *L);\n'
+            printf 'int nupp_host_build_open_lpeg(void *L) { return luaopen_lpeg(L); }\n'
+        else
+            printf 'int nupp_host_build_open_lpeg(void *L) { (void)L; return 0; }\n'
+        fi
+    } > "$hf_directory/features.c"
+    rm -f "$hf_directory/features.a"
+    "$CC" -c -O2 -o "$hf_directory/features.o" "$hf_directory/features.c" >&2 \
+        || die "cannot compile the host's feature list"
+    "${AR:-ar}" rcs "$hf_directory/features.a" "$hf_directory/features.o" >&2 \
+        || die "cannot archive the host's feature list"
+    rm -f "$hf_directory/features.o"
 }
 
 # Merges static archives into one, members whole, with the platform's own
@@ -1730,26 +1754,24 @@ host_stub_exports() {
     hx_embedding=${3:-}
     hx_include=$(cat "$hx_luajit/.include")
     hx_version=$(sed -n 's/^#define LUAJIT_VERSION_SYM[ 	]*//p' "$hx_include/luajit.h" | tr -d '\r')
-    hx_applies=false
-    while IFS= read -r hx_line; do
-        hx_line=$(printf '%s' "$hx_line" | tr -d '\r' | sed 's/^[ 	]*//; s/[ 	]*$//')
-        case "$hx_line" in
-            ''|'#'*) continue ;;
-            '['*']')
-                hx_applies=false
-                for hx_section in $(printf '%s' "$hx_line" | tr -d '[]'); do
-                    case ",always,$hx_features," in
-                        *,"$hx_section",*) hx_applies=true ;;
-                    esac
-                done
-                continue
-                ;;
-            nupp_*) [ -n "$hx_embedding" ] || continue ;;
-        esac
-        [ "$hx_applies" = true ] || continue
-        [ "$hx_line" = LUAJIT_VERSION_SYM ] && hx_line=$hx_version
-        printf '%s\n' "$hx_line"
-    done < "$ROOT/host/include/nupp.exports"
+    # One pass, not a pipeline per line: a fork costs tens of milliseconds on
+    # Windows, and every host and kit reads the whole list (#361).
+    awk -v features=",always,$hx_features," -v embedding="$hx_embedding" -v version="$hx_version" '
+        { sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+        $0 == "" || /^#/ { next }
+        /^\[.*\]$/ {
+            applies = 0
+            count = split(substr($0, 2, length($0) - 2), sections, /[ \t]+/)
+            for (i = 1; i <= count; i++) {
+                if (sections[i] != "" && index(features, "," sections[i] ",")) applies = 1
+            }
+            next
+        }
+        /^nupp_/ && embedding == "" { next }
+        !applies { next }
+        $0 == "LUAJIT_VERSION_SYM" { $0 = version }
+        { print }
+    ' "$ROOT/host/include/nupp.exports"
 }
 
 # What the stub executable exports, and nothing of LLVM, lld or C++: exported,
@@ -1791,6 +1813,39 @@ host_stub_export_flags() {
     esac
 }
 
+# Compiles the host program, KIND `host` for the stub or `embedding` for the
+# embedding library, into HOST_LIBRARY_OUT: one static archive for every
+# feature list, since `write_host_features` links the list in beside it. It
+# is the expensive part of a host, a whole native Nupp program, and a test run
+# asks for hosts with many feature lists (#361).
+build_host_library() {
+    hl_kind=$1
+    hl_luajit=$2
+    hl_entry=main.nupp
+    [ "$hl_kind" = embedding ] && hl_entry=embed.nupp
+    hl_digest=$(printf '%s|%s|%s|%s' \
+        "nupp-host-library-$hl_kind" "$(host_program_digest)" "$hl_luajit" "$KEY" \
+        | sha256_stdin | cut -c1-16)
+    hl_out="$PREFIX/nupp-host-library/$hl_digest"
+    HOST_LIBRARY_OUT="$hl_out/libnupphost.a"
+    take_lock "nupp-host-library-$hl_digest" "$hl_out/.complete" || return 0
+    [ -f "$hl_out/.complete" ] && [ -f "$HOST_LIBRARY_OUT" ] && { release_lock; return 0; }
+
+    note "compiling the Nupp $hl_kind program"
+    rm -rf "$hl_out"
+    mkdir -p "$hl_out/src"
+    if [ "$hl_kind" = embedding ]; then
+        write_embedding_program "$hl_out/src" "$hl_luajit"
+    else
+        write_host_program "$hl_out/src" "$hl_luajit"
+    fi
+    "$ROOT/bin/nupp" aot --emit static-library --output "$(native_path "$HOST_LIBRARY_OUT")" \
+        "$(native_path "$hl_out/src/$hl_entry")" >&2 \
+        || die "cannot compile the Nupp $hl_kind program"
+    printf 'done\n' > "$hl_out/.complete"
+    release_lock
+}
+
 # Builds the Nupp host for one normalized feature list into NUPP_HOST_OUT: the
 # static archive the kit's runtime is (the host with its C `main`, the native
 # provider, LuaJIT and LPeg) and the stub executable linked from it.
@@ -1808,8 +1863,10 @@ build_nupp_host() {
     esac
     build_native_provider base || die "cannot compile the native provider"
     nh_provider_archive=$NATIVE_PROVIDER_STATIC_OUT
+    build_host_library host "$nh_luajit"
+    nh_library=$HOST_LIBRARY_OUT
     nh_digest=$(printf '%s|%s|%s|%s|%s|%s' \
-        nupp-host "$nh_features" "$(host_program_digest)" "$nh_provider_archive" "$KEY" "$nh_codegen" \
+        nupp-host "$nh_features" "$nh_library" "$nh_provider_archive" "$KEY" "$nh_codegen" \
         | sha256_stdin | cut -c1-16)
     nh_out="$PREFIX/nupp-host/$nh_digest"
     NUPP_HOST_OUT=$nh_out
@@ -1820,17 +1877,13 @@ build_nupp_host() {
 
     note "building the Nupp host"
     rm -rf "$nh_out"
-    mkdir -p "$nh_out/src"
-    write_host_program "$nh_out/src" "$nh_features" "$nh_luajit"
-    "$ROOT/bin/nupp" aot --emit static-library --output "$(native_path "$nh_out/libnupphost.a")" \
-        "$(native_path "$nh_out/src/main.nupp")" >&2 \
-        || die "cannot compile the Nupp host"
-    set -- "$nh_out/libnupphost.a" "$nh_provider_archive" "$nh_luajit/lib/libluajit-5.1.a"
+    write_host_features "$nh_out" "$nh_features"
+    set -- "$nh_library" "$nh_out/features.a" "$nh_provider_archive" "$nh_luajit/lib/libluajit-5.1.a"
     [ -z "$nh_lpeg" ] || set -- "$@" "$nh_lpeg/lib/liblpeg.a"
     merge_static_archives "$nh_out/libnupp-host-merged.a" "$@"
     stage_application_archive "$nh_out/libnupp-host-merged.a" "$nh_out/libnupp-host.a" \
         "$nh_out/libnupp-host-imports.a"
-    rm -f "$nh_out/libnupp-host-merged.a" "$nh_out/libnupphost.a"
+    rm -f "$nh_out/libnupp-host-merged.a" "$nh_out/features.a"
 
     if [ "$PLATFORM" = darwin ]; then
         # ld64 hashes the debug map's object paths, which name this build's
@@ -2670,8 +2723,7 @@ case "$1" in
         native_path "$WGPU_STATIC"
         exit 0
         ;;
-    native-provider|native-rust)
-        # `native-rust` is the name the pinned stage-zero compiler asks by.
+    native-provider)
         if ! prebuilt_provider_wanted; then
             if build_native_provider "${2:-}"; then
                 native_path "$NATIVE_PROVIDER_OUT"

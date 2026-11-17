@@ -13,10 +13,11 @@
 -- packages (`pkgConfig`) this machine's pkg-config cannot resolve: checking it reads
 -- their flags, and CI's runners carry neither simdjson nor a luajit.pc.
 --
--- Each check starts cold in CI and reads the standard library it reaches.
--- Even two checks ran for over thirty minutes together on a three-core macOS
--- runner, so the checks run one at a time, each a plain command the test run's
--- compile service can answer.
+-- Each project is its own case, checking the sources under its own include roots:
+-- `../../src` is the repository's project, which `nupp check` at the root covers, and
+-- naming it here checked the whole compiler again for every benchmark, cold, about a
+-- thousand seconds in all (#360). The tree still reaches each project through its
+-- imports, which is what a library change breaks.
 
 local HERE = require("helpers.paths").absoluteTests
 if HERE:sub(1, 1) ~= "/" and not HERE:match("^%a:[/\\]") then
@@ -24,8 +25,10 @@ if HERE:sub(1, 1) ~= "/" and not HERE:match("^%a:[/\\]") then
     HERE = assert(pipe:read("*l")) .. "/" .. HERE
     pipe:close()
 end
-local ROOT = HERE .. "/.."
+local ROOT = assert(HERE:match("^(.*)/[^/]+$"), "tests directory has no parent")
 local NUPP = ROOT .. "/bin/nupp"
+local envMod = require("nupp.compiler.project.env")
+local manifest = require("nupp.tools.build.manifest")
 
 local M = {}
 
@@ -89,30 +92,57 @@ local function projects()
     return names
 end
 
-function M.everyBenchmarkProjectChecks()
-    local names = projects()
-    assert(#names >= 8, "the benchmark projects were found: " .. #names)
-    local scratch = os.tmpname()
-    os.remove(scratch)
-    assert(os.execute("mkdir -p '" .. scratch .. "'") == 0)
-    for _, name in ipairs(names) do
-        os.execute(
-            (
-                "cd '%s/bench/%s' && NO_COLOR=1 '%s' check >'%s/%s.log' 2>&1; echo $? >'%s/%s.status'"
-            ):format(ROOT, name, NUPP, scratch, name, scratch, name)
-        )
-    end
-    local problems = {}
-    for _, name in ipairs(names) do
-        local status = read(scratch .. "/" .. name .. ".status"):match("%d+")
-        if status ~= "0" then
-            problems[
-                #problems + 1
-            ] = ("bench/%s (status %s):\n%s"):format(name, tostring(status), read(scratch .. "/" .. name .. ".log"))
+--- Whether a manifest include root lies inside its project rather than reaching out.
+local function ownRoot(dir)
+    return dir:sub(1, 1) ~= "/" and not dir:match("^%a:[/\\]") and dir ~= ".." and dir:sub(1, 3) ~= "../"
+end
+
+--- The project's own sources: those under the include roots inside it.
+local function ownSources(dir)
+    local config = assert(manifest.load(dir))
+    local roots = {}
+    for _, include in ipairs(config.include or {}) do
+        if ownRoot(include) then
+            roots[#roots + 1] = include
         end
     end
-    os.execute("rm -rf '" .. scratch .. "'")
-    assert(#problems == 0, #problems .. " benchmark projects do not check:\n" .. table.concat(problems, "\n"))
+    assert(
+        #roots > 0 or #(config.include or {}) == 0,
+        ("bench project %s includes nothing of its own"):format(dir)
+    )
+    local outDir = dir .. "/" .. (config.build and config.build.outDir or "build")
+    local sources = envMod.listSourceFilesFor({}, dir, roots, outDir, true)
+    table.sort(sources)
+
+    return sources
+end
+
+local function checkProject(name)
+    local dir = ROOT .. "/bench/" .. name
+    local sources = ownSources(dir)
+    assert(#sources > 0, ("bench/%s has no sources of its own"):format(name))
+    local quoted = {}
+    for index, path in ipairs(sources) do
+        quoted[index] = "'" .. path .. "'"
+    end
+    local log = os.tmpname()
+    local status = os.execute(
+        ("cd '%s' && NO_COLOR=1 '%s' check %s >'%s' 2>&1"):format(dir, NUPP, table.concat(quoted, " "), log)
+    )
+    local output = read(log)
+    os.remove(log)
+    assert(status == 0 or status == true, ("bench/%s does not check:\n%s"):format(name, output))
+end
+
+function M.theBenchmarkProjectsAreFound()
+    local names = projects()
+    assert(#names >= 8, "the benchmark projects were found: " .. #names)
+end
+
+for _, name in ipairs(projects()) do
+    M["benchmarkProjectChecks_" .. name:gsub("%W", "_")] = function()
+        checkProject(name)
+    end
 end
 
 return M

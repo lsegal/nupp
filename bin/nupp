@@ -470,6 +470,16 @@ take_build_lock() {
             trap 'release_build_lock' EXIT
             trap 'release_build_lock; exit 130' INT
             trap 'release_build_lock; exit 143' TERM
+            # Asked again now the lock is this one's. The tree was found behind
+            # before the lock was free, and a build that held it may have
+            # finished in between: its stamp went back and its lock came off in
+            # the moment between that question and this `mkdir`. Building again
+            # then was a second build of the same sources, announced into
+            # whatever output a test was capturing (#347).
+            if [ "$lock_mode" = share ] && built_is_current; then
+                release_build_lock
+                return 1
+            fi
             return 0
         fi
         if ! lock_holder_alive; then

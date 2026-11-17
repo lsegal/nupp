@@ -64,14 +64,20 @@ function M.capabilityDescriptorsRejectUnknownAndDuplicateEntries()
     remove(dir)
 end
 
-function M.namedManifestTargetsCarryTheSelectedHostAndVm()
-    local source = [[
+local NAMED_TARGETS_SOURCE = [[
 local text = require("bytes")
 local time = require("coroutine")
 local array = table.Array
 return {newBuffer = text.Buffer.create, now = os.monotonic, bytes = array.bytes}
 ]]
-    local dir = tempProject({
+
+--- A project naming a browser and a native target, the browser one its default.
+---
+--- Each case below starts from its own: the editor's check, the project's check
+--- and the two builds share nothing but this fixture, and as one case they were
+--- about three minutes of one worker.
+local function namedTargetsProject()
+    return tempProject({
         [
             "nupp.lua"
         ] = [[return {include = {"src"}, build = {
@@ -81,46 +87,64 @@ return {newBuffer = text.Buffer.create, now = os.monotonic, bytes = array.bytes}
                 native = {host = "native", outDir = "out/native"},
             }
         }}]],
-        ["src/main.nupp"] = source,
+        ["src/main.nupp"] = NAMED_TARGETS_SOURCE,
     })
-    local ok, why = pcall(function()
+end
+
+--- Runs `body` against a fresh named-targets project and removes it either way.
+local function withNamedTargets(body)
+    local dir = namedTargetsProject()
+    local ok, why = pcall(body, dir)
+    remove(dir)
+    assert(ok, why)
+end
+
+local function namedTargetBuilds(name, host)
+    withNamedTargets(function(dir)
+        local options = name == "browser" and {} or {target = name}
+        testAssert.eq(project.build(dir, options), 0, name .. " target builds")
+        local output = dir .. "/out/" .. name
+        local facts = assert(loadfile(output .. "/nupp/runtime/target.lua"))()
+        testAssert.eq(facts.host, host, "generated host")
+        testAssert.eq(facts.dialect, "luajit", "every target runs on LuaJIT")
+        assert(exists(output .. "/nupp/runtime/provider/nativestorage.lua"), name .. " carries storage")
+        assert(not exists(output .. "/nupp/runtime/provider/nativebuffer.lua"), "the retired buffer provider is absent")
+        testAssert.eq(
+            exists(output .. "/nupp/runtime/provider/nativetime.lua"),
+            host == "native",
+            name .. " carries native clocks"
+        )
+        testAssert.eq(exists(output .. "/nupp/runtime/browser/time.lua"), host == "browser", name .. " carries browser clocks")
+    end)
+end
+
+function M.anEditorHonorsTheNamedDefaultTarget()
+    withNamedTargets(function(dir)
         -- An editor opens the manifest directly, without build's private _target.
         local environment = require("nupp.compiler.project.env").new(dir, {cache = false})
         local path = dir .. "/src/main.nupp"
-        local parsed = require("nupp.compiler.syntax.parser").parse(source, path)
+        local parsed = require("nupp.compiler.syntax.parser").parse(NAMED_TARGETS_SOURCE, path)
         assert(#parsed.errors == 0)
         local diagnostics = require("helpers.fragment").check(parsed, path, environment)
         for _, diagnostic in ipairs(diagnostics) do
             assert(diagnostic.severity ~= "error", diagnostic.code .. ": " .. diagnostic.msg)
         end
         testAssert.eq(parsed.host, "browser", "the editor honors the named default target")
-        testAssert.eq(project.check(dir), 0, "the default browser target checks")
-        for _, target in ipairs({{name = "browser", host = "browser"}, {name = "native", host = "native"},}) do
-            local options = target.name == "browser" and {} or {target = target.name}
-            testAssert.eq(project.build(dir, options), 0, target.name .. " target builds")
-            local output = dir .. "/out/" .. target.name
-            local facts = assert(loadfile(output .. "/nupp/runtime/target.lua"))()
-            testAssert.eq(facts.host, target.host, "generated host")
-            testAssert.eq(facts.dialect, "luajit", "every target runs on LuaJIT")
-            assert(exists(output .. "/nupp/runtime/provider/nativestorage.lua"), target.name .. " carries storage")
-            assert(
-                not exists(output .. "/nupp/runtime/provider/nativebuffer.lua"),
-                "the retired buffer provider is absent"
-            )
-            testAssert.eq(
-                exists(output .. "/nupp/runtime/provider/nativetime.lua"),
-                target.host == "native",
-                target.name .. " carries native clocks"
-            )
-            testAssert.eq(
-                exists(output .. "/nupp/runtime/browser/time.lua"),
-                target.host == "browser",
-                target.name .. " carries browser clocks"
-            )
-        end
     end)
-    remove(dir)
-    assert(ok, why)
+end
+
+function M.theNamedDefaultBrowserTargetChecks()
+    withNamedTargets(function(dir)
+        testAssert.eq(project.check(dir), 0, "the default browser target checks")
+    end)
+end
+
+function M.theNamedBrowserTargetCarriesTheBrowserHost()
+    namedTargetBuilds("browser", "browser")
+end
+
+function M.theNamedNativeTargetCarriesTheNativeHostAndVm()
+    namedTargetBuilds("native", "native")
 end
 
 function M.fixedHostLibrariesRemainOrdinaryBundleImports()

@@ -12,10 +12,12 @@
 -- store is content-keyed and never load-bearing, so a stale or missing entry costs one
 -- slow run and changes no answer.
 --
--- In parts, because a cold run is that minute and a half and the runner can only
--- spread a suite across shards case by case. One case asking about the whole tree was
--- the floor of the whole test run whenever the formatter changed; four each ask about
--- their quarter and can run at once. Every file is in exactly one part.
+-- In parts, because the runner can only spread a suite across shards case by case.
+-- One case asking about the whole tree was the floor of the whole test run whenever
+-- the formatter changed; four each ask about their quarter and can run at once. Every
+-- file is in exactly one part. A cold part costs about half a minute now that the
+-- formatter checks only the files whose paths could become imports (#360); before,
+-- checking nearly every file checked most of the compiler in each part.
 local envMod = require("nupp.compiler.project.env")
 
 local HERE = require("helpers.paths").absoluteTests

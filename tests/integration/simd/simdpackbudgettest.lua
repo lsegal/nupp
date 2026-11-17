@@ -81,6 +81,43 @@ function M.compactPackGenerationStaysWithinItsWorkCeilings()
     within("wasm", wasm)
 end
 
+function M.semanticCasesBuildTheWholePackOnce()
+    local whole = packs.semantics()
+    local seen, probes, cases = {}, 0, packs.semanticCases()
+    assert(#cases >= 20, "the semantic pack must run as many cases")
+    local owners = {}
+    for _, case in ipairs(cases) do
+        local part = packs.semantics({segments = {case.segment}, types = case.types})
+        for module, names in pairs(part.probes) do
+            assert(not seen[module], module .. " is built by two semantic cases")
+            seen[module] = true
+            assert(part.files[module .. ".nupp"] == whole.files[module .. ".nupp"], module .. " differs from the pack")
+            assert(table.concat(names, ",") == table.concat(whole.probes[module] or {}, ","), module .. " probes differ")
+            probes = probes + #names
+        end
+        for _, element in ipairs(case.types) do
+            local key = case.segment .. "/" .. element
+            assert(not owners[key], key .. " runs in two semantic cases")
+            owners[key] = case.name
+        end
+    end
+    for module in pairs(whole.probes) do
+        assert(seen[module], module .. " is built by no semantic case")
+    end
+    assert(probes == 1282, "semantic cases cover " .. probes .. " of the pack's 1282 probes")
+    for _, identity in ipairs({
+        {host = "macos-arm64", compiler = "clang", tier = "neon"},
+        {host = "linux-x64", compiler = "llvm", tier = "avx512f"},
+    }) do
+        local witnesses = packs.witnesses("semantics", identity, whole)
+        assert(#witnesses == 179)
+        for _, witness in ipairs(witnesses) do
+            local segment, element = packs.semanticWitnessPart(witness)
+            assert(owners[segment .. "/" .. element], witness.id .. " is proved by no semantic case")
+        end
+    end
+end
+
 function M.semanticWitnessesRejectMissingGeneratedEvidence()
     local generated = packs.semantics()
     refuses(
