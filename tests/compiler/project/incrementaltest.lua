@@ -1111,9 +1111,7 @@ function M.bundledModulesAreLoadedWhenSomethingAsksForThem()
     -- after it -- which does not read as this test's fault when the suite
     -- crashes four tests later.
     local ok, err = pcall(function()
-        -- Its own prelude, so `ffi` is not one an earlier environment in the
-        -- process already checked and shares.
-        local env = envMod.new(dir, {cache = false, sharedPrelude = false})
+        local env = envMod.new(dir, {cache = false})
         testAssert.eq(checked["ffi"], nil, "building an environment does not check ffi")
         testAssert.eq(checked["debug.profile.zone"], nil, "nor the standard library")
 

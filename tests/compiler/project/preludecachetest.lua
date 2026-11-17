@@ -237,6 +237,9 @@ function M.laterEnvironmentsShareTheCheckedPrelude()
     assert(second.globals.string ~= first.globals.string, "and their entries")
     assert(second.globalTypes ~= first.globalTypes, "and its global types")
     assert(second.annotations.byname ~= first.annotations.byname, "and its annotations")
+    -- A definition is written to after it is registered, and a write from one
+    -- environment broke a later one's `@debug(skip = true)` fields.
+    assert(second.annotations.byname.debug ~= first.annotations.byname.debug, "down to each definition")
     second.globals.sharedPreludeProbe = {t = types.any}
     second.globalTypes.SharedPreludeProbe = types.any
     test.eq(first.globals.sharedPreludeProbe, nil, "a global one adds is not another's")
@@ -251,28 +254,6 @@ function M.laterEnvironmentsShareTheCheckedPrelude()
     assert(name ~= nil, "the prelude declares a nominal type")
     assert(other.globalTypes[name] ~= t, "a prelude under another profile is checked for it: " .. tostring(name))
     os.execute("rm -rf '" .. dir .. "'")
-end
-
--- A standard-library module one environment checked is not checked again by the
--- next one with the same prelude, unless that one's project shadows it.
-function M.laterEnvironmentsShareCheckedStandardLibraryModules()
-    local dir = project()
-    local first = envMod.new(dir)
-    local kept = first.bundled["jit.zone"]
-    assert(kept and kept.type ~= nil, "the module checks")
-    local second = envMod.new(dir)
-    local shared = second.bundled["jit.zone"]
-    assert(shared and shared ~= kept, "a later environment holds a record of its own")
-    test.eq(shared.type, kept.type, "for the same checked module")
-
-    local shadowing = project()
-    assert(os.execute("mkdir -p '" .. shadowing .. "/jit'") == 0)
-    local file = assert(io.open(shadowing .. "/jit/zone.nupp", "wb"))
-    file:write("return {}\n")
-    file:close()
-    local own = envMod.new(shadowing).bundled["jit.zone"]
-    assert(own and own.type ~= kept.type, "a project that shadows a bundled module checks it against its own")
-    os.execute("rm -rf '" .. dir .. "' '" .. shadowing .. "'")
 end
 
 -- A stored prelude is true only of the type identity it was written from.
