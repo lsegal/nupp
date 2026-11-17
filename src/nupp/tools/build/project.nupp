@@ -1582,10 +1582,19 @@ function project.test(root: string?, args: {string}?, opts: project.TestOptions?
         return 1, "manifest"
     end
     local test = manifest.testConfig(config)
+    -- A test target may load what it does not carry from another build, as this
+    -- repository's runner loads the compiler from its own tree (#396). Those
+    -- modules are not instrumented, so coverage builds the target's
+    -- `<name>Coverage` sibling when the manifest declares one, built to carry
+    -- every module the suites can load.
+    local testTarget = test.build
+    if asked.coverage and testTarget ~= nil and targetConfig(config, testTarget .. "Coverage") ~= nil then
+        testTarget = testTarget .. "Coverage"
+    end
     local produced: {[string]: any} = {}
     local build = asked.build or project.build
     if build(root, {
-        target = test.build,
+        target = testTarget,
         testBuild = true,
         outDir = asked.outDir,
         coverage = asked.coverage,
@@ -1598,10 +1607,13 @@ function project.test(root: string?, args: {string}?, opts: project.TestOptions?
     for _, item in ipairs(manifest.testArgv(test)) do
         argv[#argv + 1] = item
     end
-    local builtTarget = assert(targetConfig(config, test.build))
+    local builtTarget = assert(targetConfig(config, testTarget))
+    -- The command names the test target's own output, also when coverage built
+    -- its sibling.
+    local namedOutput = assert(targetConfig(config, test.build)).output
     if asked.outDir ~= nil and builtTarget.output ~= nil and produced.artifact then
         for index, item in ipairs(argv) do
-            if item == builtTarget.output then
+            if item == builtTarget.output or item == namedOutput then
                 argv[index] = produced.artifact as string
             end
         end
