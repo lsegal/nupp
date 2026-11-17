@@ -1215,6 +1215,48 @@ return M
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- Half a share is no limit when the share is large: on four CI cores it let
+-- `aotbuildtest` hold one worker for six minutes (#381). Two minutes of cases on
+-- one lane is a share of 120 s, and half of that would make two pieces of a
+-- minute each; the piece ceiling makes three of forty seconds.
+function M.noQueuePieceCarriesMoreThanTheCeiling()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/build")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+
+    write(
+        dir .. "/tests/heavytest.lua",
+        [[
+local M = {}
+function M.alpha() end
+function M.beta() end
+function M.gamma() end
+function M.delta() end
+function M.epsilon() end
+function M.zeta() end
+return M
+]]
+    )
+    write(
+        dir .. "/build/.nupp-test-times.json",
+        [[
+{"suites":{"heavytest":120000},
+ "cases":{"heavytest":{"alpha":20000,"beta":20000,"gamma":20000,
+   "delta":20000,"epsilon":20000,"zeta":20000}}}
+]]
+    )
+    local command = (
+        "cd %q && %sNUPP_TEST_BUILD=%q %q heavytest --jobs=4 --timings=0 --no-color 2>&1"
+    ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+    local output, invocation = capturedRun(command)
+    test.eq(invocation.status, 0, "the sliced suite succeeded" .. evidence(invocation))
+    test.matches(output, "1 suites across 3 Nupp workers")
+    test.matches(output, "6 tests, 6 passed")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 -- A run with no `--jobs` starts one Nupp worker per processor and no more
 -- (#351). The machine here is made to report two, so nine suites share two
 -- workers. Windows asks the processor count of a shell the shim does not reach.

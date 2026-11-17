@@ -2646,6 +2646,14 @@ end
 --- A suite costing more than a fair share is asked to run in slices, because one suite
 --- longer than the share is on its own the floor however many workers there are: with
 --- `selfFormatStable` whole, the best possible run was fifty seconds at any count.
+--- The most measured work one queue piece may carry before its suite is sliced.
+---
+--- A piece is held by one worker from start to finish, so a heavy one decides the
+--- run's floor however the rest is packed. Under the minute a piece is meant to
+--- stay below, because slicing packs measured case times and the next run's cases
+--- are rarely exactly those.
+local PIECE_CEILING_MS = 45 * 1000
+
 local function planWork(list, shards, timings)
     local known, counted = 0, 0
     for _, ms in pairs(timings) do
@@ -2686,7 +2694,12 @@ local function planWork(list, shards, timings)
         -- four more suites. Halving the target gives the packer pieces it can fit
         -- around each other, and a slice costs only loading its suite again, which
         -- is milliseconds for all but a handful.
-        local target = share / 2
+        --
+        -- And never more than `PIECE_CEILING_MS`, whatever the share. The share
+        -- is total work over workers, so on four CI cores half of it came to ten
+        -- minutes: `aotbuildtest`, 696 s of cases a few seconds each, was cut in
+        -- two at most and held a worker for six minutes a piece.
+        local target = math.min(share / 2, PIECE_CEILING_MS)
         local pieces = 1
         if target > 0 and item.cost > target then
             pieces = math.ceil(item.cost / target)
