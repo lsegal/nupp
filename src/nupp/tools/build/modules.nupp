@@ -2456,7 +2456,14 @@ local function buildModules(root: string, outDir: string, config: Config, target
                     -- A worker checked a dependency it was not handed -- a carried
                     -- runtime module, a bundled declaration -- from the same source
                     -- this run reads, so it cannot have moved under the record.
-                    if depPath and not (parallelChecked[name] and not parallelChecked[depName]) then
+                    -- A source staged from the compiler only to be checked against is
+                    -- not built, so neither run has a record of it; it is the
+                    -- compiler's own, which the cache key already covers (#384).
+                    local checkOnlySource = packagedCheckSources[depName] and not packagedRuntimeModules[depName]
+                    if depPath
+                        and not checkOnlySource
+                        and not (parallelChecked[name] and not parallelChecked[depName])
+                    then
                         local current = records[depName]
                         local previous = oldState.modules[depName]
                         if not current or not previous or current.interfaceHash ~= previous.interfaceHash then

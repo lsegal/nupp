@@ -2101,6 +2101,64 @@ io.write(report.total, "\n", report.tests[1].name, "\n")
     os.execute("rm -rf " .. string.format("%q", dir))
 end
 
+-- A Nupp lane keeps a module a piece loaded, so it keeps the global that module
+-- published when it loaded too: the next piece's `require` answers from
+-- `package.loaded` and never runs the module again. Removing the global left
+-- hotreloadtest without `_G.__nuppHotReload` and processnativetest without the
+-- runtime's handle registries (#384). A global the piece overwrote is still put
+-- back.
+function M.embeddedLanesKeepTheGlobalsOfModulesTheyKeep()
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/queue")) == 0)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/nested")) == 0)
+    write(dir .. "/run.lua", read(ROOT .. "/tests/run.lua"))
+
+    write(dir .. "/lanepublisher.lua", 'rawset(_G, "lanePublished", {})\nreturn {published = _G.lanePublished}\n')
+    write(dir .. "/nested/afirsttest.lua", [[
+local M = {}
+function M.loadsThePublisher()
+    assert(require("lanepublisher").published == rawget(_G, "lanePublished"))
+    _G._VERSION = "contaminated"
+end
+return M
+]])
+    write(dir .. "/nested/bsecondtest.lua", [[
+local M = {}
+function M.findsWhatThePublisherPublished()
+    local publisher = require("lanepublisher")
+    assert(rawget(_G, "lanePublished") ~= nil, "the kept module's global was removed")
+    assert(publisher.published == rawget(_G, "lanePublished"), "the global is the kept module's own")
+    assert(_VERSION ~= "contaminated", "a global the previous piece overwrote")
+end
+return M
+]])
+    write(dir .. "/queue/order", "afirsttest\nbsecondtest\n")
+    write(dir .. "/queue/piece-1", "afirsttest\n")
+    write(dir .. "/queue/piece-2", "bsecondtest\n")
+    write(
+        dir .. "/host.lua",
+        (
+            [=[
+rawset(_G, "__NUPP_TEST_EMBEDDED", true)
+rawset(_G, "__NUPP_TEST_SUITE_CATALOG", "nested/afirsttest.lua\nnested/bsecondtest.lua")
+arg = {[0] = %q, "--json", "--queue=" .. %q, "--no-color"}
+local report = dofile(arg[0])
+io.write(report.total, " ", report.passed, "\n")
+for _, case in ipairs(report.tests) do
+    if case.failure then
+        io.write(case.name, ": ", tostring(case.failure.message), "\n")
+    end
+end
+]=]
+        ):format(dir .. "/run.lua", dir .. "/queue")
+    )
+
+    local output = run(dir .. "/host.lua")
+    test.matches(output, "\n2 2\n", output)
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
+
 function M.runsLifecycleHooksInOrder()
     local dir = os.tmpname()
     os.remove(dir)

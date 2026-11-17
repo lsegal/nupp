@@ -40,14 +40,35 @@ local function elfObject()
     return path
 end
 
+-- Whether this case is itself a worker task, as every suite is under the
+-- one-process runner. A task cannot open a scope of its own.
+local function insideWorkerTask()
+    local loaded, native = pcall(require, "nupp.workers.native")
+
+    return loaded and type(native.current) == "function" and native.current() ~= nil
+end
+
 -- Lanes need a worker host, which the runner's Nupp worker states run in. The
 -- scope comes from the provider `nupp.workers` selects, opened directly as
 -- workerstartuptest reaches the host, so the suite stays among those states.
+-- Inside a worker task the case runs in a runner of its own, whose main state
+-- can open the scope (#384).
 function M.lldLinksFromSeveralStatesAtOnce()
     if not codegen.available() then
         return
     end
     if package.preload["nupp.workers.native"] == nil and package.loaded["nupp.workers.native"] == nil then
+        return
+    end
+    if insideWorkerTask() then
+        local command = (
+            "cd '%s' && ./bin/nupp test --shard=llvmconcurrencytest"
+            .. " --case=llvmconcurrencytest/lldLinksFromSeveralStatesAtOnce 2>&1"
+        ):format(require("helpers.paths").root)
+        local pipe = assert(io.popen(command))
+        local output = pipe:read("*a")
+        local ok, _, code = pipe:close()
+        assert(ok == true or code == 0, output)
         return
     end
     local object = elfObject()
