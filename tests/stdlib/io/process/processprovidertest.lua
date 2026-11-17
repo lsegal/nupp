@@ -32,22 +32,40 @@ local function longRunning()
     return {"sleep", "30"}
 end
 
--- Processor seconds this process has used. `os.clock` measures that on POSIX,
--- but the Microsoft C runtime answers wall time since start.
-local processorSeconds = os.clock
-if WINDOWS then
+-- Processor seconds the calling thread has used. In a one-process run other
+-- suites work on other threads of this process, so the process's own total
+-- would charge their work to whatever this suite is measuring.
+local processorSeconds
+do
     local ffi = require("ffi")
-    pcall(
-        ffi.cdef,
-        [[
-    int32_t GetProcessTimes(void *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
-    void *GetCurrentProcess(void);
-    ]]
-    )
-    local times = ffi.new("uint64_t[4]")
-    processorSeconds = function()
-        assert(ffi.C.GetProcessTimes(ffi.C.GetCurrentProcess(), times, times + 1, times + 2, times + 3) ~= 0)
-        return tonumber(times[2] + times[3]) / 1e7
+    if WINDOWS then
+        pcall(
+            ffi.cdef,
+            [[
+        int32_t GetThreadTimes(void *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+        void *GetCurrentThread(void);
+        ]]
+        )
+        local times = ffi.new("uint64_t[4]")
+        processorSeconds = function()
+            assert(ffi.C.GetThreadTimes(ffi.C.GetCurrentThread(), times, times + 1, times + 2, times + 3) ~= 0)
+            return tonumber(times[2] + times[3]) / 1e7
+        end
+    else
+        pcall(ffi.cdef, "typedef struct NuppProviderTestTime { long seconds; long nanoseconds; } NuppProviderTestTime;")
+        pcall(ffi.cdef, "int clock_gettime(int clock, NuppProviderTestTime *time);")
+        -- CLOCK_THREAD_CPUTIME_ID, which macOS and the BSDs number differently
+        -- from Linux.
+        local clock = ffi.os == "OSX" and 16 or (ffi.os == "BSD" and 14 or 3)
+        local time = ffi.new("NuppProviderTestTime")
+        -- Another module may have declared clock_gettime over its own
+        -- timespec first, and the first declaration wins, so pass the same
+        -- layout untyped.
+        local timeArgument = ffi.cast("void *", time)
+        processorSeconds = function()
+            assert(ffi.C.clock_gettime(clock, timeArgument) == 0, "clock_gettime failed")
+            return tonumber(time.seconds) + tonumber(time.nanoseconds) / 1e9
+        end
     end
 end
 
