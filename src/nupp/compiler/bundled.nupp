@@ -29,8 +29,15 @@ local function moduleDir(): string
         return "."
     end
     local source = hostDebug.getinfo(1, "S").source
+    local dir = source:match("^@(.*)[/\\]") or "."
+    -- A stamped payload names every chunk for its executable. One that carries the
+    -- compiler records where its build wrote the modules, seen from there (#389).
+    local payloadRoot = rawget(_G, "__nuppPayloadModuleRoot")
+    if type(payloadRoot) == "string" and source:match("%.lua$") == nil then
+        return dir .. "/" .. payloadRoot .. "/nupp/compiler"
+    end
 
-    return source:match("^@(.*)[/\\]") or "."
+    return dir
 end
 
 -- Guarded like the reads around it. An embedded host may have no `io` or

@@ -1036,6 +1036,20 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
         end
         table.sort(runtimeModules)
         local requiredHostFeatures = nativeFeatures.requiredHostFeatureNames(resolvedEffects)
+        -- Where the modules sit seen from the executable, so a payload carrying the
+        -- compiler can find the build it came from. Only under the executable's own
+        -- directory: anything else would record this machine's layout.
+        local moduleRoot: string? = nil
+        if target.kind == "binary" then
+            local name = target.name or opts.target or (target.platforms and "default") or target.kind
+            local executableDir = normalize(dirname(binaryOutput(root, target, name, outDir, selectedPlatform, opts.outDir ~= nil)))
+            local modulesDir = normalize(join(root, outDir))
+            if modulesDir == executableDir then
+                moduleRoot = "."
+            elseif modulesDir:sub(1, #executableDir + 1) == executableDir .. "/" then
+                moduleRoot = modulesDir:sub(#executableDir + 2)
+            end
+        end
         local text, bundleErr, unreachable = bundleText(
             root,
             config,
@@ -1047,7 +1061,8 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
             ((target.kind == "binary" and target.stub == "nupp") or target.kind == "component") and requiredHostFeatures
             or nil,
             target.kind == "component",
-            outDir
+            outDir,
+            moduleRoot
         )
         if not text then
             say(opts, "NUPP0004", "nupp: " .. tostring(bundleErr) .. "\n")
