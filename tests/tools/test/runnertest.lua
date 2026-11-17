@@ -1313,6 +1313,19 @@ function M.sharesEvidence()
     test.suite.requirecapability("compiler.first", true, evidence)
     test.suite.requirecapability("cpu.second", true, evidence)
 end
+function M.passes() end
+return M
+]]
+    )
+    local command = (
+        "cd %q && %sNUPP_TEST_BUILD=%q %q sharedevidencetest --jobs=2 --timings=0 --no-color 2>&1"
+    ):format(dir, MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+    local output, invocation = capturedRun(command)
+    test.eq(invocation.status, 0, "shared evidence crossed the worker message" .. evidence(invocation))
+    test.matches(output, "Nupp worker")
+    test.matches(output, "2 tests, 2 passed")
+    os.execute("rm -rf " .. string.format("%q", dir))
+end
 
 -- Half a share grows with the run, so a long run used to leave a ten-minute
 -- suite whole (#382). Two suites of two minutes on eight workers make half a
