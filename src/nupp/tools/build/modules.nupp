@@ -1609,6 +1609,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
     -- A carried module takes no part in const specialization: it can serve no body
     -- a new caller asks for, and every body it calls was planned with it.
     local compilerGeneration: any = nil
+
     local function loadedGeneration(): any
         if compilerGeneration == nil then
             local bundled = require("nupp.compiler.bundled")
@@ -1617,8 +1618,10 @@ local function buildModules(root: string, outDir: string, config: Config, target
 
         return compilerGeneration
     end
+
     local carriesOwnSources: boolean? = nil
     local ownSourceText: {[string]: string} = {}
+
     local function carriesOwnSource(name: string, path: string): boolean
         if carriesOwnSources == nil then
             local bundled = require("nupp.compiler.bundled")
@@ -1640,6 +1643,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
 
         return true
     end
+
     -- Carried once the build can carry, ahead of the modules it compiles.
     local carriedSeeds: {[string]: string} = {}
 
@@ -1999,6 +2003,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
     local addingCarriedRuntime: {[string]: boolean} = {}
     local carriedRuntime: {[string]: boolean} = {}
     local runtimeSourceRoot = join(root, join(outDir, "cache/runtime-source"))
+
     local function addCarriedRuntime(name: string): boolean
         if browserTarget then
             return false
@@ -2069,9 +2074,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
         local output = join(root, join(outDir, name:gsub("%.", "/") .. ".lua"))
         local artifactHash = contentDigest(text)
         local ownSource = ownSourceText[name]
-        records[
-            name
-        ] = {
+        records[name] = {
             -- A module carried from its own source keeps that source's hash, so a
             -- build that carries from this one finds it current (#389).
             sourceHash = ownSource ~= nil and contentDigest(ownSource) or artifactHash,
