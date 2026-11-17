@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `nupp fmt` type-checks a file only when one of its paths could become an
+  import. Before, nearly every file was checked, along with every module it
+  reached, so formatting a cold project cost about as much as checking all of
+  it. A cold `nupp fmt --check` over a quarter of this repository went from
+  about 250 seconds to about 30 on Windows, with the same results.
+
 - Two worker lanes of one process that link native code at the same time no
   longer corrupt each other. lld runs in process and keeps its state in
   process globals, so overlapping links freed each other's state, failed with
