@@ -1314,11 +1314,11 @@ do
             -- File descriptors belong to the process, not to a Lua state. Redirecting
             -- them from several worker threads would make one test capture another's
             -- output and occasionally restore the wrong descriptor. Worker jobs keep
-            -- Lua failures associated with their cases; suites that specifically test
-            -- runner capture stay in the process-isolated lane below.
+            -- Lua failures associated with their cases by capturing in the state.
             local active = {stdout = {}, stderr = {}}
             rawset(_G, "__NUPP_TEST_CAPTURE", active)
             local originalPrint, originalWrite = print, io.write
+            local defaultOutput = io.output()
             local originalStdout, originalStderr = io.stdout, io.stderr
             local fileOut, fileErr = assert(io.tmpfile()), assert(io.tmpfile())
             io.stdout, io.stderr = fileOut, fileErr
@@ -1330,6 +1330,11 @@ do
                 active.stdout[#active.stdout + 1] = table.concat(values, "\t") .. "\n"
             end
             io.write = function(...)
+                -- A case that points `io.output` at a file or a process is testing
+                -- where `io.write` goes, so it goes there (#351).
+                if io.output() ~= defaultOutput then
+                    return originalWrite(...)
+                end
                 for index = 1, select("#", ...) do
                     active.stdout[#active.stdout + 1] = tostring(select(index, ...))
                 end
