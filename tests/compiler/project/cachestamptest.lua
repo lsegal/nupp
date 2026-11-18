@@ -544,6 +544,28 @@ function M.theModuleStampMovesWhenACarriedDeclarationChanges()
     )
 end
 
+-- Every build hands the native digest in, and the native digest is byte for byte
+-- the portable one's answer, so either one asking about the compiler's own
+-- declarations is asking the remembered question. A digest of the caller's own is
+-- a different question, and must not be answered from what was remembered (#406).
+function M.theCompilersOwnDeclarationsAreStampedOnceWhicheverDigestAsks()
+    local own = fingerprint.declarationFingerprint()
+    assert(
+        fingerprint.declarationFingerprint(fingerprint.contentDigest()) == own,
+        "the native digest stamped the compiler's declarations differently"
+    )
+    assert(
+        fingerprint.declarationFingerprint(fingerprint.contentDigest(false)) == own,
+        "the portable digest stamped the compiler's declarations differently"
+    )
+    assert(
+        fingerprint.declarationFingerprint(function()
+            return "a digest of the caller's own"
+        end) == "a digest of the caller's own",
+        "a caller's own digest was answered with the remembered stamp"
+    )
+end
+
 -- A carried library module that fails to check is `unknown` to every importer, and
 -- the importers' stored diagnostics said so. Stamped with `decls/` alone, they went
 -- on saying it after the library was fixed: `json.decodevalue` was "no field in
@@ -953,9 +975,11 @@ end
 -- module included, with or without `NUPP_NO_STDLIB_CACHE`.
 function M.aStoredStandardLibraryInterfaceChecksTheSameAsItsSource()
     local dir = tempProject({
-        ["main.nupp"] = 'local json = require("serde.json")\n'
-            .. "local value, reason = json.decodevalue(42)\n"
-            .. "print(value, reason)\n",
+        [
+            "main.nupp"
+        ] = 'local json = require("serde.json")\n'
+        .. "local value, reason = json.decodevalue(42)\n"
+        .. "print(value, reason)\n",
     })
     local shared = dir .. "/cache"
 
@@ -965,6 +989,7 @@ function M.aStoredStandardLibraryInterfaceChecksTheSameAsItsSource()
         )
         local output = pipe:read("*a"):gsub("\r", "")
         pipe:close()
+
         return output
     end
 
@@ -995,10 +1020,14 @@ end
 -- links it without checking it, and builds the same module either way.
 function M.aFreshProjectBuildReusesTheStandardLibraryAnotherOneChecked()
     local files = {
-        ["nupp.lua"] = 'return {include = {"src"}, build = {targets = {lib = {\n'
-            .. '    kind = "modules", entries = {"greet"}, outDir = "build/lib",\n}}}}\n',
-        ["src/greet.nupp"] = 'module greet\n\nconst json = require("serde.json")\n\n'
-            .. "export function parse(text: string): any\n    local value = json.decodevalue(text)\n    return value\nend\n",
+        [
+            "nupp.lua"
+        ] = 'return {include = {"src"}, build = {targets = {lib = {\n'
+        .. '    kind = "modules", entries = {"greet"}, outDir = "build/lib",\n}}}}\n',
+        [
+            "src/greet.nupp"
+        ] = 'module greet\n\nconst json = require("serde.json")\n\n'
+        .. "export function parse(text: string): any\n    local value = json.decodevalue(text)\n    return value\nend\n",
     }
     local shared = tempProject({})
 
@@ -1006,12 +1035,9 @@ function M.aFreshProjectBuildReusesTheStandardLibraryAnotherOneChecked()
         local dir = tempProject(files)
         local pipe = assert(
             io.popen(
-                ("cd '%s' && %sNUPP_CACHE_DIR='%s' '%s' build --target lib 2>&1; echo \"__exit__:$?\""):format(
-                    dir,
-                    prefix,
-                    shared,
-                    NUPP
-                )
+                (
+                    "cd '%s' && %sNUPP_CACHE_DIR='%s' '%s' build --target lib 2>&1; echo \"__exit__:$?\""
+                ):format(dir, prefix, shared, NUPP)
             )
         )
         local output = pipe:read("*a")
@@ -1087,15 +1113,21 @@ end
 function M.storedProjectInterfacesCompileTheSameAsTheirSource()
     local dir = tempProject({
         ["nupp.lua"] = 'return {include = {"src"}}\n',
-        ["src/shapes.nupp"] = "module shapes\n\n"
-            .. "export record Point\n    x: number\n    y: number\nend\n\n"
-            .. "export function length(p: Point): number\n    return math.sqrt(p.x * p.x + p.y * p.y)\nend\n",
-        ["src/geometry.nupp"] = 'module geometry\n\nconst shapes = require("shapes")\n\n'
-            .. "export function distance(a: shapes.Point, b: shapes.Point): number\n"
-            .. "    return shapes.length(shapes.Point(x = a.x - b.x, y = a.y - b.y))\nend\n",
-        ["src/main.nupp"] = 'local geometry = require("geometry")\nlocal shapes = require("shapes")\n\n'
-            .. "local d: number = geometry.distance(shapes.Point(x = 0, y = 0), shapes.Point(x = 3, y = 4))\n"
-            .. "print(d)\n",
+        [
+            "src/shapes.nupp"
+        ] = "module shapes\n\n"
+        .. "export record Point\n    x: number\n    y: number\nend\n\n"
+        .. "export function length(p: Point): number\n    return math.sqrt(p.x * p.x + p.y * p.y)\nend\n",
+        [
+            "src/geometry.nupp"
+        ] = 'module geometry\n\nconst shapes = require("shapes")\n\n'
+        .. "export function distance(a: shapes.Point, b: shapes.Point): number\n"
+        .. "    return shapes.length(shapes.Point(x = a.x - b.x, y = a.y - b.y))\nend\n",
+        [
+            "src/main.nupp"
+        ] = 'local geometry = require("geometry")\nlocal shapes = require("shapes")\n\n'
+        .. "local d: number = geometry.distance(shapes.Point(x = 0, y = 0), shapes.Point(x = 3, y = 4))\n"
+        .. "print(d)\n",
         ["src/bad.nupp"] = 'local geometry = require("geometry")\n\nprint(geometry.distance(1, 2))\n',
     })
     local shared = dir .. "/cache"
@@ -1129,8 +1161,8 @@ function M.storedProjectInterfacesCompileTheSameAsTheirSource()
         dir,
         "src/geometry.nupp",
         'module geometry\n\nconst shapes = require("shapes")\n\n'
-            .. "export function distance(a: shapes.Point, b: shapes.Point): string\n"
-            .. "    return tostring(shapes.length(shapes.Point(x = a.x - b.x, y = a.y - b.y)))\nend\n"
+        .. "export function distance(a: shapes.Point, b: shapes.Point): string\n"
+        .. "    return tostring(shapes.length(shapes.Point(x = a.x - b.x, y = a.y - b.y)))\nend\n"
     )
     local edited = compile("")
     local editedFromSource = compile("NUPP_NO_INTERFACE_CACHE=1 ")
@@ -1145,7 +1177,10 @@ function M.storedProjectInterfacesCompileTheSameAsTheirSource()
     )
     assert(hydrated == fromSource, "the stored interfaces compiled differently:\n" .. hydrated .. "\n" .. fromSource)
     assert(edited ~= fromSource, "the edited dependency was not checked again:\n" .. edited)
-    assert(edited == editedFromSource, "an edited dependency compiled differently:\n" .. edited .. "\n" .. editedFromSource)
+    assert(
+        edited == editedFromSource,
+        "an edited dependency compiled differently:\n" .. edited .. "\n" .. editedFromSource
+    )
 end
 
 --- Another spelling of the existing directory `dir`, or nil where the platform has
@@ -1181,11 +1216,7 @@ function M.storedProjectInterfacesAreSharedByEverySpellingOfTheRoot()
     assert(os.execute("mkdir -p '" .. dir .. "/src'") == 0)
     editFixture(dir, "nupp.lua", 'return {include = {"src"}}\n')
     editFixture(dir, "src/shapes.nupp", "module shapes\n\nexport record Point\n    x: number\n    y: number\nend\n")
-    editFixture(
-        dir,
-        "src/main.nupp",
-        'local shapes = require("shapes")\n\nprint(shapes.Point(x = 3, y = 4).x)\n'
-    )
+    editFixture(dir, "src/main.nupp", 'local shapes = require("shapes")\n\nprint(shapes.Point(x = 3, y = 4).x)\n')
     local other = otherSpelling(dir)
     if other == nil then
         os.execute("rm -rf '" .. parent .. "'")
@@ -1214,7 +1245,8 @@ function M.storedProjectInterfacesAreSharedByEverySpellingOfTheRoot()
         return text
     end
 
-    -- The first command keeps the prelude, the second the interfaces checked against it.
+    -- The first command keeps the prelude, the second the interfaces checked against
+    -- it.
     local first = compile(dir)
     compile(dir)
     local kept = stored()
@@ -1254,7 +1286,9 @@ local function runFixture()
             return {
                 isolated = isolated,
                 tool = isolated.toolFingerprint(),
-                subsystem = isolated.subsystemFingerprint({"nupp.compiler.one"}),
+                subsystem = isolated.subsystemFingerprint({
+                    "nupp.compiler.one"
+                }),
             }
         end)
         os.getenv = getenv
