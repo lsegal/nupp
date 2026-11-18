@@ -19,12 +19,13 @@ local parser = require("nupp.compiler.syntax.parser")
 local gen = require("nupp.compiler.lua.gen")
 local optimize = require("nupp.compiler.lua.optimize")
 local check = require("helpers.fragment")
-local repositoryEnv = require("helpers.repositoryenv")
+local envMod = require("nupp.compiler.project.env")
 local json = require("testjson")
 local files = require("io.internal.files")
 
 local HERE = require("helpers.paths").tests
-local env = repositoryEnv.new()
+-- A plain environment: `debug.bench` lives only in `src`, not the carried library.
+local env = envMod.new(HERE .. "/..")
 local NUPP = HERE .. "/../bin/nupp"
 
 local function read(path)

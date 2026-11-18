@@ -125,10 +125,12 @@ end
 -- An exported integer constant is a `#define`, and one past int32_t is
 -- unsigned in C as it is in the source.
 function M.aConstantIsADefine()
-    local header = assert(cabi.header({}, {}, "abi.h", {
-        {name = "ABI_VERSION", value = 2},
-        {name = "FEATURE_HIGH", value = 4294967296},
-    }))
+    local header = assert(
+        cabi.header({}, {}, "abi.h", {
+            {name = "ABI_VERSION", value = 2},
+            {name = "FEATURE_HIGH", value = 4294967296},
+        })
+    )
     assert(header:find("#define ABI_VERSION 2\n", 1, true), header)
     assert(header:find("#define FEATURE_HIGH 4294967296ULL\n", 1, true), header)
 end
@@ -202,16 +204,7 @@ end
 return game
 ]]
     local parsed = parser.parse(source, "src/game.nupp")
-    local diagnostics = check.check(
-        parsed,
-        "src/game.nupp",
-        repositoryEnv.new({
-            cache = false
-        }),
-        {
-            moduleName = "game"
-        }
-    )
+    local diagnostics = check.check(parsed, "src/game.nupp", repositoryEnv.new({cache = false}), {moduleName = "game"})
     testAssert.eq(diagnostics[1] and diagnostics[1].code, "NUPP2201")
     assert(
         diagnostics[1].msg:find("contain itself", 1, true),

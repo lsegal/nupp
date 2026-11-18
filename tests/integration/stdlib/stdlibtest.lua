@@ -675,18 +675,22 @@ function M.nativeHttpDispatchDrainsAfterAWakerRaises()
             insecureHosts = {},
         })
     )
+
     local function request(timeoutMs)
-        return assert(client:send({
-            uri = assert(require("io.internal.uri").newuri("http://example.test/")),
-            method = "GET",
-            headers = {},
-            bodyKind = 0,
-            timeoutMs = timeoutMs,
-            stallTimeoutMs = 0,
-            maxBytes = 0,
-            insecure = false,
-        }))
+        return assert(
+            client:send({
+                uri = assert(require("io.internal.uri").newuri("http://example.test/")),
+                method = "GET",
+                headers = {},
+                bodyKind = 0,
+                timeoutMs = timeoutMs,
+                stallTimeoutMs = 0,
+                maxBytes = 0,
+                insecure = false,
+            })
+        )
     end
+
     -- A connect that never completes, under a deadline that has passed by the
     -- poll, fails the transfer and wakes every waiter it has. The clock stands
     -- still while it is sent: a millisecond lost between the request's deadline
@@ -943,24 +947,29 @@ end
 
 function M.nativeGpuRejectsFractionalCountsBeforeTheDevice()
     local nextHandle = 0
+
     local function handle()
         nextHandle = nextHandle + 1
         return nextHandle
     end
-    local device = setmetatable({
-        open = function()
-            return {}
-        end,
-        createbuffer = handle,
-        createkernel = handle,
-        createbindings = handle,
-    }, {
-        __index = function()
-            return function()
-                return true
+
+    local device = setmetatable(
+        {
+            open = function()
+                return {}
+            end,
+            createbuffer = handle,
+            createkernel = handle,
+            createbindings = handle,
+        },
+        {
+            __index = function()
+                return function()
+                    return true
+                end
             end
-        end
-    })
+        }
+    )
     local enabled = false
     local costs = {
         enabled = function()
@@ -1901,7 +1910,8 @@ function M.byteIoInstallerDoesNotSelectStructuredProcesses()
     local file = assert(io.open(path, "rb"))
     local source = file:read("*a")
     file:close()
-    local env = repositoryEnv.new({cache = false})
+    -- A plain environment: the case checks a file under `src` itself.
+    local env = envMod.new(HERE .. "/..", {cache = false})
     for _, level in ipairs({0, 1, 2}) do
         local result = parser.parse(source, path)
         testAssert.eq(#result.errors, 0, "the actual byte I/O installer parses")
@@ -2040,7 +2050,8 @@ function M.popenAliasesKeepTheirExplicitProcessFeature()
         "module nupp.fixture\nlocal channel = require('nupp.runtime.standardio')\nlocal open = channel.popen\n"
         .. "do local child = open({'fixture-child'}) end",
     }
-    local env = repositoryEnv.new({cache = false})
+    -- A plain environment: the case checks a file under `src` itself.
+    local env = envMod.new(HERE .. "/..", {cache = false})
     for _, source in ipairs(sources) do
         local path = source:match("^module nupp%.fixture") and HERE .. "/../src/nupp/fixture.nupp"
             or "popen-features.nupp"
