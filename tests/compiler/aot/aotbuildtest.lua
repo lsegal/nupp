@@ -964,18 +964,10 @@ end
 --- code that computed them, so two fixtures can only hit each other's entries
 --- when the answer is the same answer. Every project here is a handful of files
 --- over the same standard library, and each one used to pay to rediscover the
---- whole of it.
-local sharedCacheDir = nil
-
+--- whole of it. The run's store rather than one per suite run: a sliced suite
+--- is several runs, and each slice's first build started cold (#406).
 local function sharedCache()
-    if not sharedCacheDir then
-        local dir = os.tmpname()
-        os.remove(dir)
-        assert(os.execute("mkdir -p '" .. dir .. "'") == 0)
-        sharedCacheDir = dir
-    end
-
-    return sharedCacheDir
+    return require("helpers.commandcache").dir()
 end
 
 --- Fixtures whose case asserts what two builds of *that project* did.
@@ -2852,13 +2844,16 @@ function M.theRuntimeBindsEveryLuaFunction()
     assert(#declared > 0, "the guest's runtime declares the Lua API")
     test.eq(table.concat(looked, " "), table.concat(declared, " "), "the provider binds what the guest declares")
     assert(not bound:find("\ncdef function lua", 1, true), "the provider's runtime imports no Lua API")
+
     local function exports(text)
         local names = {}
         for name in text:gmatch("\nexport function (ks%u[%w]*)%(") do
             names[#names + 1] = name
         end
+
         return table.concat(names, " ")
     end
+
     test.eq(exports(bound), exports(direct), "both runtimes export the same API")
     for _, file in ipairs({"values", "builder", "runtime"}) do
         local source = assert(read(root .. "common/ksrt/" .. file .. ".nupp"))
@@ -4469,7 +4464,10 @@ function M.theAotRuntimeTableMatchesItsLowering()
     local runtime = require("nupp.compiler.aot.llvm.lua.runtime")
     local root = HERE .. "/../native/aotruntime/common/ksrt/"
     local source = assert(read(root .. "runtime.nupp"))
-    local slots = assert(source:match("export const ks_rt_table = ffi%.new<const voidptr%[%d+%]>%({(.-)\n}%)"), "ks_rt_table")
+    local slots = assert(
+        source:match("export const ks_rt_table = ffi%.new<const voidptr%[%d+%]>%({(.-)\n}%)"),
+        "ks_rt_table"
+    )
     local names, header = {}, 0
     for entry in slots:gmatch("[^\n]+") do
         local name = entry:match("^%s*ks_rt_([%w_]+) as voidptr,?$")
@@ -7913,11 +7911,13 @@ local function soaProject(policy)
     local dir = os.tmpname()
     os.remove(dir)
     assert(os.execute(("mkdir -p %q"):format(dir .. "/src")) == 0)
+
     local function write(name, text)
         local handle = assert(io.open(dir .. "/" .. name, "wb"))
         handle:write(text)
         handle:close()
     end
+
     write("src/main.nupp", assert(read(NATIVE_HERE .. "/integration/aot/soa/main.nupp")))
     write(
         "nupp.lua",
