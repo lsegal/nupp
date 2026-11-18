@@ -8,10 +8,10 @@
 -- the standard-library store applies, and every such environment checked the same
 -- forty-odd modules again: 10 to 30 seconds for the first check of each (#410).
 --
--- Those files are the bytes the running compiler was built from, so leaving `src`
--- out changes no answer for a fragment checked inside the repository. A suite about
--- the repository's own sources, rather than a fragment checked beside them, still
--- roots a plain environment.
+-- Without `src` a fragment sees the standard library a project outside this
+-- repository sees, built from the same bytes. What only `src` holds -- modules the
+-- compiler does not carry, such as `debug.bench` -- is not reachable, so a suite
+-- that checks against those keeps a plain environment: the guide examples do.
 local envMod = require("nupp.compiler.project.env")
 
 local ROOT = require("helpers.paths").tests .. "/.."
