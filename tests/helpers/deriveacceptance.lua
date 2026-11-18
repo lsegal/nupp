@@ -8,7 +8,8 @@ local check = require("helpers.fragment")
 local envMod = require("nupp.compiler.project.env")
 
 local HERE = require("helpers.paths").tests
-local env = envMod.new(HERE .. "/..")
+-- Checked against the carried standard library; see `helpers.repositoryenv`.
+local env = require("helpers.repositoryenv").new()
 
 local function run(source)
     source = [[local byteapi = require("bytes")

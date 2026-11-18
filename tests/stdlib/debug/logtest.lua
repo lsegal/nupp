@@ -2,11 +2,11 @@ local testAssert = require("assert")
 local parser = require("nupp.compiler.syntax.parser")
 local gen = require("nupp.compiler.lua.gen")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
 local stdlib = require("nupp.compiler.stdlib")
 
 local HERE = require("helpers.paths").tests
-local env = envMod.new(HERE .. "/..")
+-- Checked against the carried standard library; see `helpers.repositoryenv`.
+local env = require("helpers.repositoryenv").new()
 
 -- Check, then generate under the module name a logged line should carry.
 local function compile(src, moduleName)

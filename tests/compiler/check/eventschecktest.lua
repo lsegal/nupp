@@ -7,12 +7,12 @@ local testAssert = require("assert")
 
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
 local process = require("nupp.compiler.process")
 
 local HERE = require("helpers.paths").tests
 local NUPP = HERE .. "/../bin/nupp"
-local env = envMod.new(HERE .. "/..")
+-- Checked against the carried standard library; see `helpers.repositoryenv`.
+local env = require("helpers.repositoryenv").new()
 
 local run = 0
 

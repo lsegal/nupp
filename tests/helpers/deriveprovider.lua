@@ -11,8 +11,16 @@ local NUPP = require("nupp.compiler.fs").canonical(HERE .. "/../bin/nupp")
 local projects = {}
 
 local function projectAt(root)
-    root = root or HERE .. "/.."
+    if not root then
+        -- The repository checks against the carried standard library; see
+        -- `helpers.repositoryenv`.
+        local repository = require("helpers.repositoryenv")
+        projects[repository.root] = projects[repository.root]
+            or require("helpers.contractproject").open(repository.root, {config = repository.config()})
+        return projects[repository.root]
+    end
     projects[root] = projects[root] or require("helpers.contractproject").open(root)
+
     return projects[root]
 end
 
