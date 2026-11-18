@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- A process that builds several environments, such as a `nupp test` run with
+  its suites in one process, no longer checks the prelude and the standard
+  library again for each of them. Environments that agree on the target,
+  compat and lints share one checked prelude, and the standard-library modules
+  checked against it unless a project shadows one. A later environment now
+  takes about 2 ms instead of 380, and requiring `simd` or `serde.json`
+  again checks in tens of milliseconds instead of 8 to 18 seconds.
+  `NUPP_NO_SHARED_PRELUDE` turns the sharing off.
+
+- A binary built beside the compiler's own build carries every module whose
+  source is the one the compiler was built from, byte-for-byte, instead of
+  compiling it again. The repository's test runner went from 610 compiled
+  modules to 75, and its cold build from about 104 to 63 seconds on Linux.
+  Coverage builds and checks still compile everything.
+
 - Diagnostics reported at the same position now keep the order they were
   reported in. Before, the sort could swap them, so which of two came first
   depended on where it happened to move them.

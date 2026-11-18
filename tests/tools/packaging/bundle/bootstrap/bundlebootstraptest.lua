@@ -21,10 +21,12 @@ function M.aBootstrapCompilerRetainsPublicRuntimeArtifacts()
     local savedMain, savedMainLoaded = package.preload["nupp.tools.main"], package.loaded["nupp.tools.main"]
     local savedLog, savedLogLoaded = package.preload["debug.log"], package.loaded["debug.log"]
     local savedWarn = rawget(_G, "warn")
+    local savedEmbedded = package.preload["nupp.embedded"]
     package.loaded["nupp.tools.main"] = nil
     local ok, result = pcall(assert(loadstring(text)))
     package.preload["nupp.tools.main"], package.loaded["nupp.tools.main"] = savedMain, savedMainLoaded
     package.preload["debug.log"], package.loaded["debug.log"] = savedLog, savedLogLoaded
+    package.preload["nupp.embedded"] = savedEmbedded
     rawset(_G, "warn", savedWarn)
     rawset(_G, "__nuppCompilerModuleArtifacts", savedArtifacts)
     os.execute("rm -rf '" .. dir .. "'")
@@ -53,6 +55,10 @@ function M.aCompilerCarryingPayloadFindsItsModulesFromTheExecutable()
     -- A stamped payload names its chunk for the executable, and a worker state's for
     -- nothing; either way the modules are found from the executable the host names.
     local source = assert(readFile(HERE .. "/../build/nupp/compiler/bundled.lua"))
+    -- Loading the module registers it in package.loaded, and the last one loaded
+    -- here reads a checkout that is not there. Left installed, every later build
+    -- in the process stopped finding the compiler's carried runtime (#403).
+    local savedBundled = package.loaded["nupp.compiler.bundled"]
     local savedRoot, savedExecutable = rawget(_G, "__nuppPayloadModuleRoot"), rawget(_G, "__NUPP_EXECUTABLE")
     rawset(_G, "__nuppPayloadModuleRoot", "test-runner")
     rawset(_G, "__NUPP_EXECUTABLE", "/work/build/nupp-test")
@@ -66,6 +72,7 @@ function M.aCompilerCarryingPayloadFindsItsModulesFromTheExecutable()
     local okLua, fromFile = moduleDirAs("@/work/build/nupp/compiler/bundled.lua")
     rawset(_G, "__nuppPayloadModuleRoot", savedRoot)
     rawset(_G, "__NUPP_EXECUTABLE", savedExecutable)
+    package.loaded["nupp.compiler.bundled"] = savedBundled
     assert(ok, carried)
     assert(okWorker, worker)
     assert(okLua, fromFile)
@@ -97,6 +104,7 @@ return loaded
     -- installed for every later `require` of it.
     local stubbed = {"lpeg", "nupp.workers.native"}
     local savedPreloads, savedLoaded = {}, package.loaded.lpeg
+    local savedEmbedded = package.preload["nupp.embedded"]
     local savedPath, savedCpath = package.path, package.cpath
     for _, name in ipairs(stubbed) do
         savedPreloads[name] = package.preload[name]
@@ -117,7 +125,7 @@ return loaded
     for _, name in ipairs(stubbed) do
         package.preload[name] = savedPreloads[name]
     end
-    package.preload["nupp.embedded"] = nil
+    package.preload["nupp.embedded"] = savedEmbedded
     os.execute("rm -rf '" .. dir .. "'")
 end
 

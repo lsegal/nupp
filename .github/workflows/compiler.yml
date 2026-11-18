@@ -590,7 +590,8 @@ jobs:
       # hostbinarytest stamps this binary once and reuses it while it is newer
       # than its sources. Stamped here, its host build -- a link with LLVM in
       # it -- does not hold the checkout's build lock while every other test's
-      # nupp waits on it.
+      # nupp waits on it. On every platform: on Linux the runner otherwise stamped
+      # it before the first suite started, about 150 s of the suite step (#396).
       - name: Stamp the compiler binary
         shell: bash
         run: ./bin/nupp build --target dist

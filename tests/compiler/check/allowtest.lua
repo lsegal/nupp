@@ -273,7 +273,9 @@ local function environmentWithPreludeDiagnostic(severity)
 
         return diags, moduleType, exports
     end
-    local ok, value = pcall(envMod.new, HERE .. "/..", {config = {}})
+    -- Its own prelude, not one an earlier environment in the process checked:
+    -- the injected diagnostic is only seen by a prelude checked here.
+    local ok, value = pcall(envMod.new, HERE .. "/..", {config = {}, sharedPrelude = false})
     compilerCheck.check = original
 
     return ok, value

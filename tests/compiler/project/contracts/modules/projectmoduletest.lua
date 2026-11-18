@@ -129,13 +129,17 @@ end
 function M.malformedBundledDeclarationsAreRefusedInBothProfiles()
     local parser = require("nupp.compiler.syntax.parser")
     local dir = tempProject({["nupp.lua"] = 'return {include = {"."}}\n'})
+    -- Each with its own prelude, so `bit` is checked here rather than taken from
+    -- an earlier environment in the process that already checked it.
     local environments = {
         compilerEnv.new(dir, {
-            cache = false
+            cache = false,
+            sharedPrelude = false
         }),
         compilerEnv.new(dir, {
             cache = false,
-            compat = "lua51"
+            compat = "lua51",
+            sharedPrelude = false
         }),
     }
     local original = parser.parse
