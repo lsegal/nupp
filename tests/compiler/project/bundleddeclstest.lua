@@ -19,13 +19,31 @@ local ROOT = HERE .. "/.."
 -- An environment the strict checks below run in.
 --
 -- Built once and answered again: every case wants the same one, and building it
--- means checking the prelude from source.
+-- means checking the prelude from source. It is rooted outside the checkout, where
+-- a consumer's project is: inside it the checkout's own sources answer for the
+-- standard library and every environment checks them again, where the carried
+-- modules are checked once and shared by the environments in this process. It
+-- keeps no store, so nothing is written under that root for a later run to read.
 local strict = nil
 
 local function strictEnv()
-    strict = strict or envMod.new(ROOT, {config = {include = {"src"}}})
+    strict = strict or envMod.new("/private/tmp/nupp-strict-consumer", {config = {include = {"src"}}, cache = false})
 
     return strict
+end
+
+-- An environment with no store and no native compiler services, which is what an
+-- embedded compiler checks in. Built once for the same reason.
+local memory = nil
+
+local function memoryEnv()
+    memory = memory or envMod.new("/private/tmp/nupp-memory-consumer", {
+        memoryOnly = true,
+        nativeCompilerServices = false,
+        typeRoots = {},
+    })
+
+    return memory
 end
 
 -- Every module the compiler ships a declaration for.
@@ -212,11 +230,7 @@ function M.retiredNamespacesAreNotBundled()
 end
 
 function M.reIsNotACompilerProvidedModule()
-    local env = envMod.new("/private/tmp/nupp-retired-re-consumer", {
-        memoryOnly = true,
-        nativeCompilerServices = false,
-        typeRoots = {},
-    })
+    local env = memoryEnv()
     testAssert(not env.bundled.re, "re must not have a bundled declaration")
     testAssert.eq(env.bundledImplementation("re"), nil)
     testAssert.eq(env.resolveModuleExports(env, "re"), nil)
@@ -422,7 +436,7 @@ return version, report.aborts
 end
 
 function M.uuidUsesItsContractWithoutNativeCompilerServices()
-    local env = envMod.new(".", {memoryOnly = true, nativeCompilerServices = false, typeRoots = {},})
+    local env = memoryEnv()
     local result = parser.parse(
         "local function make(version: 4 | 7): string return os.uuid(version) end\nreturn make(4), make(7)",
         "uuid-contract.nupp"
@@ -691,9 +705,11 @@ function M.theCompilerKeepsTheEmbeddedTableItLoadedWith()
             return nil
         end
     }
+
     local function stranger()
         return {["/compiler/coroutine.nupp"] = "module stranger"}
     end
+
     local preloads = {
         ["nupp.embedded"] = function()
             return {["/compiler/coroutine.nupp"] = "module coroutine"}
@@ -707,7 +723,11 @@ function M.theCompilerKeepsTheEmbeddedTableItLoadedWith()
     )
     local bundled = load("nupp.compiler.bundled")
     preloads["nupp.embedded"] = stranger
-    testAssert.eq(bundled.source("/coroutine.nupp"), "module coroutine", "a later program's table is not the compiler's")
+    testAssert.eq(
+        bundled.source("/coroutine.nupp"),
+        "module coroutine",
+        "a later program's table is not the compiler's"
+    )
 
     local bare = {}
     local fromDisk = instances.instance(
@@ -1022,11 +1042,7 @@ function M.movedPrivateBundledSourcesKeepFileAndTreePrivacyDistinct()
 end
 
 function M.retiredUtilRootIsNotCarriedButItsPrivateOwnersRemain()
-    local env = envMod.new("/private/tmp/nupp-retired-util-consumer", {
-        memoryOnly = true,
-        nativeCompilerServices = false,
-        typeRoots = {},
-    })
+    local env = envMod.new("/private/tmp/nupp-retired-util-consumer", {cache = false})
     testAssert(not env.bundled["nupp.util"], "retired module is not bundled: nupp.util")
     testAssert(
         not env.bundled["nupp.util.internal.protected"],

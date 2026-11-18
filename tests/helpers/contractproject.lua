@@ -6,11 +6,12 @@ local runtime = require("nupp.compiler.runtime")
 
 local M = {}
 
-function M.open(root)
+--- `opts` is passed to `envmod.new` with `root`.
+function M.open(root, opts)
     local env
 
     local function environment()
-        env = env or envmod.new(root)
+        env = env or envmod.new(root, opts)
         return env
     end
 

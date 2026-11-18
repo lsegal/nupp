@@ -9,7 +9,8 @@ local derive = require("nupp.compiler.check.derive")
 local recipeCodec = require("nupp.compiler.comptime.materialize.codec")
 
 local HERE = require("helpers.paths").tests
-local env = envMod.new(HERE .. "/..")
+-- Checked against the carried standard library; see `helpers.repositoryenv`.
+local env = require("helpers.repositoryenv").new()
 
 local function compileAt(source, filename, opts)
     filename = filename or "derive_test.nupp"

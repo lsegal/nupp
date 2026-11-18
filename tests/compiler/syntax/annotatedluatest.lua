@@ -8,6 +8,23 @@ local envMod = require("nupp.compiler.project.env")
 
 local M = {}
 
+-- The environment the serialization migrations are planned and checked in.
+--
+-- Built once and answered again: a fresh one checks every standard-library module
+-- a case requires all over again. It is rooted outside the checkout, where a
+-- consumer's project is, so those modules are the carried ones rather than the
+-- checkout's own sources, and environments in this process share them.
+local serdeEnv = nil
+
+local function migrationEnv()
+    serdeEnv = serdeEnv or envMod.new("/private/tmp/nupp-serde-migration-consumer", {
+        cache = false,
+        releaseModuleTrees = true
+    })
+
+    return serdeEnv
+end
+
 -- A LuaCATS library is written in stubs: `function love.window.fromPixels(v) end`
 -- beside a `---@return number`. In a declaration tree the empty body is the
 -- declaration, not a function that forgot to return, so it is taken rather than
@@ -452,7 +469,7 @@ writer:close()
 assert(buffer:tostring() == '{"user_name":"Ada"}')
 assert(user:debug():find("Ada", 1, true))
 ]]
-    local plan, problem = migrate.plan(source, "serialization-migration.nupp")
+    local plan, problem = migrate.plan(source, "serialization-migration.nupp", nil, migrationEnv())
     assert(plan, problem)
     assert(plan.destination == plan.source and plan.dialect == "serde")
     assert(not plan.text:find("@json", 1, true), plan.text)
@@ -464,13 +481,12 @@ assert(user:debug():find("Ada", 1, true))
     assert(plan.text:find("omitempty = true", 1, true), plan.text)
     local parsed = parser.parse(plan.text, plan.destination)
     testAssert.eq(#parsed.errors, 0, parsed.errors[1] and parsed.errors[1].msg)
-    local env = envMod.new(".", {cache = false, releaseModuleTrees = true})
-    local diagnostics = check.check(parsed, plan.destination, env)
+    local diagnostics = check.check(parsed, plan.destination, migrationEnv())
     testAssert.eq(#diagnostics, 0, diagnostics[1] and diagnostics[1].msg .. "\n" .. plan.text)
     local code, errors = require("nupp.compiler.lua.gen").generate(parsed, "serialization_migration")
     testAssert.eq(#errors, 0)
     assert(loadstring(code))()
-    local again = assert(migrate.plan(plan.text, plan.destination))
+    local again = assert(migrate.plan(plan.text, plan.destination, nil, migrationEnv()))
     assert(#again.edits == 0 and again.text == plan.text, "migration is not idempotent")
 end
 
@@ -494,7 +510,7 @@ local handwritten = Handwritten()
 assert(handwritten:writeJSON("x") == Handwritten.fromJSON("x"))
 return selected
 ]]
-    local plan, problem = migrate.plan(source, "shadowed-migration.nupp")
+    local plan, problem = migrate.plan(source, "shadowed-migration.nupp", nil, migrationEnv())
     assert(plan, problem)
     assert(plan.text:find(".binding(Value)", 1, true), plan.text)
     assert(plan.text:find("serde.of(2)", 1, true), plan.text)
@@ -513,7 +529,7 @@ end
 local record Parent child: Child end
 return Parent.fromJSON('{"child":{"wire":"value"}}')
 ]]
-    local plan, problem = migrate.plan(source, "nested-policy.nupp")
+    local plan, problem = migrate.plan(source, "nested-policy.nupp", nil, migrationEnv())
     assert(plan == nil and problem:find("nested JSON policies", 1, true), tostring(problem))
     plan, problem = migrate.plan(
         [[
@@ -522,7 +538,9 @@ local record Conflict
     function writeJSON(self): nil end
 end
 ]],
-        "conflicting-migration.nupp"
+        "conflicting-migration.nupp",
+        nil,
+        migrationEnv()
     )
     assert(plan == nil and problem:find("handwritten member", 1, true), tostring(problem))
 end
@@ -537,12 +555,11 @@ local record Child value: string end
 local restored, problem = Parent.fromJSON('{"child":{"value":"forward"}}')
 assert(restored ~= nil and problem == nil and restored.child.value == "forward")
 ]]
-    local plan, problem = migrate.plan(source, "forward-policy.nupp")
+    local plan, problem = migrate.plan(source, "forward-policy.nupp", nil, migrationEnv())
     assert(plan, problem)
     local parsed = parser.parse(plan.text, plan.destination)
     assert(#parsed.errors == 0)
-    local env = envMod.new(".", {cache = false, releaseModuleTrees = true})
-    local diagnostics = check.check(parsed, plan.destination, env)
+    local diagnostics = check.check(parsed, plan.destination, migrationEnv())
     testAssert.eq(#diagnostics, 0, diagnostics[1] and diagnostics[1].msg)
     local code, errors = require("nupp.compiler.lua.gen").generate(parsed, "forward_policy")
     assert(#errors == 0)
@@ -567,7 +584,7 @@ local record Envelope
 end
 local value = Envelope.fromJSON('{}')
 ]]
-    local plan, problem = migrate.plan(source, "record-union.nupp")
+    local plan, problem = migrate.plan(source, "record-union.nupp", nil, migrationEnv())
     assert(plan == nil and tostring(problem):find("explicit union adapter", 1, true), tostring(problem))
 end
 
