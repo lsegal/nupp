@@ -389,11 +389,13 @@ jobs:
 
   integration:
     name: ${{ matrix.name }} / LuaJIT 2.1 rolling
-    needs: [classify, fast-checks, bootstrap]
+    # Not `needs: bootstrap`: that waits for every platform's entry, so a leg
+    # would sit behind another platform's queued runner. Each leg waits for its
+    # own platform's bootstrap below instead.
+    needs: [classify, fast-checks]
     if: >-
       !cancelled() && needs.classify.result == 'success'
       && needs.fast-checks.result == 'success'
-      && needs.bootstrap.result == 'success'
       && needs.classify.outputs.integration-matrix != '[]'
     runs-on: ${{ matrix.os }}
     # A timeout is here to end a hang, so it has to sit above the work rather
@@ -534,7 +536,30 @@ jobs:
           '
           echo "$luajit/bin" >> "$GITHUB_PATH"
 
+      # Waits while this platform's bootstrap job runs. One that has not left
+      # the queue is not waited for: it may be queued behind this very runner,
+      # and the build below then does the work here, as it did before.
+      - name: Wait for this platform's bootstrap
+        id: shared-compiler
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOOTSTRAP_JOB: ${{ matrix.name }} / bootstrap
+        run: |
+          jobs=repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs
+          while :; do
+            state=$(gh api "$jobs" --paginate \
+              --jq ".jobs[] | select(.name == env.BOOTSTRAP_JOB) | \"\\(.status) \\(.conclusion)\"" | head -n 1)
+            echo "$BOOTSTRAP_JOB: ${state:-not found}"
+            case "$state" in
+              "completed success") echo "available=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+              in_progress*) sleep 15 ;;
+              *) echo "building the compiler here instead"; exit 0 ;;
+            esac
+          done
+
       - name: Download the bootstrapped compiler
+        if: steps.shared-compiler.outputs.available == 'true'
         uses: actions/download-artifact@v4
         with:
           name: compiler-${{ matrix.artifact }}
@@ -544,6 +569,7 @@ jobs:
       # what is true: it was built from these sources. The build below still
       # compares content hashes, so a mismatch rebuilds rather than passing.
       - name: Unpack the bootstrapped compiler
+        if: steps.shared-compiler.outputs.available == 'true'
         shell: bash
         run: |
           tar -xf compiler.tar
