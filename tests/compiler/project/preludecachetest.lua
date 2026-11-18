@@ -164,10 +164,11 @@ function M.theNextCommandReadsWhatThisOneWrote()
 
     local json = require("testjson")
     local first = json.decode(run())
-    -- Wherever the stores live. A shard is handed NUPP_CACHE_DIR so every project
-    -- it builds shares one warm store, and the prelude goes in beside the rest of
-    -- them rather than under the project being checked.
-    local storeDir = os.getenv("NUPP_CACHE_DIR") or (dir .. "/build/cache")
+    -- Wherever the stores live. A run hands the commands its cases start one
+    -- NUPP_CACHE_DIR, named here as __NUPP_TEST_COMMAND_CACHE, so every project they
+    -- build shares one warm store, and the prelude goes in beside the rest of them
+    -- rather than under the project being checked.
+    local storeDir = rawget(_G, "__NUPP_TEST_COMMAND_CACHE") or os.getenv("NUPP_CACHE_DIR") or (dir .. "/build/cache")
     local written = io.open(storeDir .. "/prelude.buf", "rb")
     assert(written, "the first command wrote the prelude down, in " .. storeDir)
     written:close()
