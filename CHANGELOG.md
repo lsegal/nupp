@@ -8,7 +8,10 @@
   compat and lints share one checked prelude, and the standard-library modules
   checked against it unless a project shadows one. A later environment now
   takes about 2 ms instead of 380, and requiring `simd` or `serde.json`
-  again checks in tens of milliseconds instead of 8 to 18 seconds.
+  again checks in tens of milliseconds instead of 8 to 18 seconds. A later
+  environment also reads the stored standard-library interfaces beside the
+  stored prelude, so a process whose first environment never needed the
+  standard library no longer checks it from source.
   `NUPP_NO_SHARED_PRELUDE` turns the sharing off.
 
 - A binary built beside the compiler's own build carries every module whose

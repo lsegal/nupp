@@ -231,9 +231,8 @@ function M.laterEnvironmentsShareTheCheckedPrelude()
     table.sort(differing)
     test.eq(table.concat(differing, " "), "", "every global type is the same object")
     test.eq(second.stringLib, first.stringLib, "and so is the string library")
-    -- The interface stores stay with an environment that read the stored
-    -- prelude itself; one that takes a shared prelude checks modules from source.
-    test.eq(second.preludeStamp, nil, "without the stored prelude's stamp")
+    -- And the stored prelude's stamp with it, whichever way the first came by it.
+    test.eq(second.preludeStamp, first.preludeStamp, "with the first one's stamp")
 
     assert(second.globals ~= first.globals, "each environment owns its globals")
     assert(second.globals.string ~= first.globals.string, "and their entries")
@@ -300,6 +299,106 @@ function M.laterEnvironmentsShareCheckedStandardLibraryModules()
     local own = envMod.new(shadowing).bundled["jit.zone"]
     assert(own and own.type ~= kept.type, "a project that shadows a bundled module checks it against its own")
     os.execute("rm -rf '" .. dir .. "' '" .. shadowing .. "'")
+end
+
+-- A later environment holding a stored prelude hydrates the standard library
+-- from the store beside it, rather than checking it from source once per
+-- process (#417). In a process of its own, so the first environment is the one
+-- that reads the stored prelude.
+--
+-- The store is decoded once for every environment sharing the prelude: a decode
+-- declares the nominals its modules declare, so a second one would give a
+-- module another environment already holds a second set.
+function M.laterEnvironmentsHydrateTheStandardLibraryStore()
+    local dir = project()
+    local store = dir .. "/store"
+    local script = dir .. "/hydrate.lua"
+    local file = assert(io.open(script, "wb"))
+    file:write(
+        [[
+local project, store, phase = arg[1], arg[2], arg[3]
+local envMod = require("nupp.compiler.project.env")
+local stdlibimage = require("nupp.compiler.project.stdlibimage")
+local types = require("nupp.compiler.types")
+local hydrations, checked = 0, {}
+local hydrateData = stdlibimage.hydrateData
+stdlibimage.hydrateData = function(...)
+    local hydrated, problem = hydrateData(...)
+    hydrations = hydrations + (hydrated and 1 or 0)
+    return hydrated, problem
+end
+local checkModuleSource = envMod.checkModuleSource
+envMod.checkModuleSource = function(env, name, ...)
+    checked[#checked + 1] = name
+    return checkModuleSource(env, name, ...)
+end
+local function report(label, value)
+    print(label .. ": " .. tostring(value))
+end
+local first = envMod.new(project, {cacheDir = store})
+if phase == "seed" then
+    assert(first.bundled.simd, "simd checks")
+    report("stamped", first.preludeStamp ~= nil)
+    return
+end
+-- The first environment asks for nothing, as a test worker's first usually does.
+local second = envMod.new(project, {cacheDir = store})
+report("stamp", second.preludeStamp ~= nil and second.preludeStamp == first.preludeStamp)
+local simd = second.bundled.simd
+report("simd", simd and simd.type ~= nil)
+report("hydrated", hydrations)
+report("checked", table.concat(checked, " "))
+
+local third = envMod.new(project, {cacheDir = store})
+local before = types.identity().nominal
+report("same simd", third.bundled.simd.type == simd.type)
+report("span", third.bundled["nupp.mem.span"] and third.bundled["nupp.mem.span"].type ~= nil)
+report("declared", types.identity().nominal - before)
+report("hydrated again", hydrations)
+
+-- Not in the store: checked from source once, then shared.
+local zone = third.bundled["jit.zone"]
+local count = #checked
+local fourth = envMod.new(project, {cacheDir = store})
+report("same zone", fourth.bundled["jit.zone"].type == zone.type)
+report("checked again", #checked - count)
+]]
+    )
+    file:close()
+
+    local function run(phase)
+        local pipe = assert(
+            io.popen(
+                (
+                    "NUPP_COMPILER_ROOT='%s' LUA_PATH='%s' luajit '%s' '%s' '%s' %s 2>&1"
+                ):format(ROOT, package.path, script, dir, store, phase)
+            )
+        )
+        local out = pipe:read("*a")
+        pipe:close()
+
+        return out
+    end
+
+    -- The first writes the prelude image, the second the standard library's beside it.
+    run("seed")
+    local seeded = run("seed")
+    local out = run("share")
+    os.execute("rm -rf '" .. dir .. "'")
+    test.eq(seeded:match("stamped: %S+"), "stamped: true", "the seeding environment read the prelude:\n" .. seeded)
+    local function field(label)
+        return ("\n" .. out):match("\n" .. label:gsub("%p", "%%%0") .. ": ([^\n]*)")
+    end
+    test.eq(field("stamp"), "true", "a later environment carries the stored prelude's stamp:\n" .. out)
+    test.eq(field("simd"), "true", "the module loads")
+    test.eq(field("hydrated"), "1", "from the store")
+    test.eq(field("checked"), "", "and nothing is checked from source")
+    test.eq(field("same simd"), "true", "a module one environment hydrated is the next one's")
+    test.eq(field("span"), "true", "and one it did not ask for comes out of the same decode")
+    test.eq(field("declared"), "0", "which declares no nominals again")
+    test.eq(field("hydrated again"), "1", "because the store is decoded once")
+    test.eq(field("same zone"), "true", "a module checked from source is shared too")
+    test.eq(field("checked again"), "0", "and not checked again")
 end
 
 -- A stored prelude is true only of the type identity it was written from.
