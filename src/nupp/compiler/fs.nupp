@@ -207,7 +207,8 @@ export function sizeAndModified(path: string): (integer?, number?)
         return nil, nil
     end
 
-    return size, modified
+    -- `os` answers milliseconds, the clock's unit.
+    return size, (modified as number) / 1000
 end
 
 export function mkdir(path: string): boolean

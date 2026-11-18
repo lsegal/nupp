@@ -57,7 +57,7 @@ end
 
 local function hashFile(path: string, contentDigest: (function(string): string)?): string?
     local text = readFile(path)
-    local digest = contentDigest or hash.digest
+    local digest = contentDigest or fingerprint.contentDigest()
 
     return text and digest(text) or nil
 end
@@ -65,10 +65,10 @@ end
 local function hashFiles(files: {string}): string
     local parts = {}
     for _, path in ipairs(files) do
-        parts[#parts + 1] = path .. "\0" .. (hashFile(path, hash.digest) or "missing")
+        parts[#parts + 1] = path .. "\0" .. (hashFile(path) or "missing")
     end
 
-    return hash.digest(table.concat(parts, "\0"))
+    return fingerprint.contentDigest()(table.concat(parts, "\0"))
 end
 
 --- The compiler's own directory, `<root>/nupp/compiler`: this file sits in `project/`
@@ -973,7 +973,11 @@ function fingerprint.declarationFingerprint(
     listDeclarations: (function(string): {string})?,
     readDeclaration: (function(string): string?)?
 ): string
-    local own = contentDigest == nil and listDeclarations == nil and readDeclaration == nil
+    -- Either digest gives the same answer, so a build passing the native one still
+    -- reads what the run kept rather than digesting every declaration again.
+    local own = (contentDigest == nil or contentDigest == hash.digest or contentDigest == fingerprint.contentDigest())
+        and listDeclarations == nil
+        and readDeclaration == nil
     if own and declarationMemo ~= nil then
         return declarationMemo as string
     end

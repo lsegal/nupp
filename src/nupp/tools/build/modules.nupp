@@ -1619,6 +1619,35 @@ local function buildModules(root: string, outDir: string, config: Config, target
         return compilerGeneration
     end
 
+    -- What the compiler's build recorded of one module: its source and artifact
+    -- hashes, which are all a carried module is compared by. That state is about
+    -- ten megabytes of JSON, and decoding it was most of a no-op build of a small
+    -- project, so a test run keeps each answer for the commands after it. The
+    -- run's compiler is not rebuilt while the run lasts (see
+    -- `fingerprint.runRemembered`).
+    local generationRecords: {[string]: any} = {}
+
+    local function generationRecord(name: string): any
+        if generationRecords[name] == nil then
+            local fingerprint = require("nupp.compiler.project.fingerprint")
+            local kept = fingerprint.runRemembered("compiler record\0" .. name, function(): string
+                local record = loadedGeneration().modules[name]
+                if type(record) ~= "table" or type(record.sourceHash) ~= "string" then
+                    return "none"
+                end
+                local artifactHash = record.artifactHash
+
+                return "record\0" .. record.sourceHash .. "\0" .. (type(artifactHash) == "string" and artifactHash or "")
+            end)
+            local sourceHash, artifactHash = kept:match("^record%z([^%z]*)%z([^%z]*)$")
+            generationRecords[name] = sourceHash
+                and {sourceHash = sourceHash, artifactHash = artifactHash ~= "" and artifactHash or nil}
+                or false
+        end
+
+        return generationRecords[name] or nil
+    end
+
     local carriesOwnSources: boolean? = nil
     local ownSourceText: {[string]: string} = {}
 
@@ -1635,7 +1664,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
             return false
         end
         local text = inc.fileText(path)
-        local record = loadedGeneration().modules[name]
+        local record = generationRecord(name)
         if text == nil or type(record) ~= "table" or record.sourceHash ~= contentDigest(text as string) then
             return false
         end
@@ -2029,7 +2058,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
         local bundled = require("nupp.compiler.bundled")
         local modulePath = name:gsub("%.", "/") .. ".lua"
         local text = modules.currentCarriedArtifact(
-            loadedGeneration().modules[name],
+            generationRecord(name),
             ownSourceText[name] or currentCarriedSource(name),
             readFile(join(bundled.moduleDir(), "../../" .. modulePath)),
             contentDigest
