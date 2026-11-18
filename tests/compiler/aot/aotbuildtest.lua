@@ -964,10 +964,10 @@ end
 --- code that computed them, so two fixtures can only hit each other's entries
 --- when the answer is the same answer. Every project here is a handful of files
 --- over the same standard library, and each one used to pay to rediscover the
---- whole of it. The run's store rather than one per suite run: a sliced suite
---- is several runs, and each slice's first build started cold (#406).
+--- whole of it. A store for the run rather than one per suite run: a sliced
+--- suite is several runs, and each slice's first build started cold (#406).
 local function sharedCache()
-    return require("helpers.commandcache").dir()
+    return require("helpers.commandcache").dir("aotbuildtest")
 end
 
 --- Fixtures whose case asserts what two builds of *that project* did.

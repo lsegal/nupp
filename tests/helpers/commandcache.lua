@@ -13,39 +13,46 @@
 -- own stores sit beside. Writes to a store are atomic, so two lanes writing it
 -- at once can lose an entry, which is a recomputation later, and never a wrong
 -- answer. Outside a runner lane it is a temporary directory of this process.
+--
+-- A suite whose commands want a different prelude than the rest -- native
+-- builds rather than reports, say -- names a store of its own beside that one:
+-- one store file holds the bodies of two preludes, and two suites rewriting it
+-- for each other in turn cost both of them more than either saved.
 local fs = require("nupp.compiler.fs")
 
 local M = {}
 
-local memo = nil
+local memo = {}
 
-local function runStore()
+local function runStore(name)
     local named = rawget(_G, "__NUPP_TEST_COMMAND_CACHE")
     if type(named) == "string" and named ~= "" then
-        return named
+        return name and (named:gsub("[/\\]+$", "") .. "-" .. name) or named
     end
     local lane = rawget(_G, "__NUPP_TEST_LANE_CACHE")
     local root = type(lane) == "string" and lane:match("^(.*)[/\\]shard%-%d+$")
     if root then
-        return root .. "/commands"
+        return root .. "/commands" .. (name and ("-" .. name) or "")
     end
 
     return nil
 end
 
---- The absolute directory, created on first use.
-function M.dir()
-    if memo then
-        return memo
+--- The absolute directory, created on first use: the run's command store, or
+--- the store named `name` beside it.
+function M.dir(name)
+    local key = name or ""
+    if memo[key] then
+        return memo[key]
     end
-    local dir = runStore()
+    local dir = runStore(name)
     if not dir then
         dir = os.tmpname()
         os.remove(dir)
     end
     dir = fs.absolute(dir)
     assert(os.execute(("mkdir -p %q"):format(dir)) == 0, "cannot create the command store " .. dir)
-    memo = dir
+    memo[key] = dir
 
     return dir
 end
