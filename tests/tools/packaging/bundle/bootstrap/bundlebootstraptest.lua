@@ -55,6 +55,10 @@ function M.aCompilerCarryingPayloadFindsItsModulesFromTheExecutable()
     -- A stamped payload names its chunk for the executable, and a worker state's for
     -- nothing; either way the modules are found from the executable the host names.
     local source = assert(readFile(HERE .. "/../build/nupp/compiler/bundled.lua"))
+    -- Loading the module registers it in package.loaded, and the last one loaded
+    -- here reads a checkout that is not there. Left installed, every later build
+    -- in the process stopped finding the compiler's carried runtime (#403).
+    local savedBundled = package.loaded["nupp.compiler.bundled"]
     local savedRoot, savedExecutable = rawget(_G, "__nuppPayloadModuleRoot"), rawget(_G, "__NUPP_EXECUTABLE")
     rawset(_G, "__nuppPayloadModuleRoot", "test-runner")
     rawset(_G, "__NUPP_EXECUTABLE", "/work/build/nupp-test")
@@ -68,6 +72,7 @@ function M.aCompilerCarryingPayloadFindsItsModulesFromTheExecutable()
     local okLua, fromFile = moduleDirAs("@/work/build/nupp/compiler/bundled.lua")
     rawset(_G, "__nuppPayloadModuleRoot", savedRoot)
     rawset(_G, "__NUPP_EXECUTABLE", savedExecutable)
+    package.loaded["nupp.compiler.bundled"] = savedBundled
     assert(ok, carried)
     assert(okWorker, worker)
     assert(okLua, fromFile)
