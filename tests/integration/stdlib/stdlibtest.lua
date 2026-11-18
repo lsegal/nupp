@@ -5,6 +5,7 @@ local assertions = require("helpers.assertions")
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
 local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 local native = require("nupp.compiler.native")
 local buildNative = require("nupp.tools.build.native")
 local stdlib = require("nupp.compiler.stdlib")
@@ -1831,7 +1832,7 @@ function M.fileViewFeaturesDecorateTypeOnlyInterfaceIdentities()
 end
 
 function M.parameterOnlyFileViewsCarryTheirRuntimeFeature()
-    local env = envMod.new(HERE .. "/..", {cache = false})
+    local env = repositoryEnv.new({cache = false})
     for _, method in ipairs({"reader", "writer"}) do
         local source = (
             [=[
@@ -1900,7 +1901,7 @@ function M.byteIoInstallerDoesNotSelectStructuredProcesses()
     local file = assert(io.open(path, "rb"))
     local source = file:read("*a")
     file:close()
-    local env = envMod.new(HERE .. "/..", {cache = false})
+    local env = repositoryEnv.new({cache = false})
     for _, level in ipairs({0, 1, 2}) do
         local result = parser.parse(source, path)
         testAssert.eq(#result.errors, 0, "the actual byte I/O installer parses")
@@ -2023,7 +2024,7 @@ print(path:filename(), io.sep())
         "const {type Path} = require('io')\nconst {Path} = require('io')\nlocal path: Path = Path.of('src')\nprint(path)"
     )
     assert(
-        #check.check(parser.parse("io.open({})", "bad-path.nupp"), "bad-path.nupp", envMod.new(HERE .. "/..")) > 0,
+        #check.check(parser.parse("io.open({})", "bad-path.nupp"), "bad-path.nupp", repositoryEnv.new()) > 0,
         "an unrelated table is not a path"
     )
 end
@@ -2039,7 +2040,7 @@ function M.popenAliasesKeepTheirExplicitProcessFeature()
         "module nupp.fixture\nlocal channel = require('nupp.runtime.standardio')\nlocal open = channel.popen\n"
         .. "do local child = open({'fixture-child'}) end",
     }
-    local env = envMod.new(HERE .. "/..", {cache = false})
+    local env = repositoryEnv.new({cache = false})
     for _, source in ipairs(sources) do
         local path = source:match("^module nupp%.fixture") and HERE .. "/../src/nupp/fixture.nupp"
             or "popen-features.nupp"

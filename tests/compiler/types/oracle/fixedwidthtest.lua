@@ -1,7 +1,7 @@
 local testAssert = require("assert")
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 local stdlib = require("nupp.compiler.stdlib")
 local fixed = require("nupp.compiler.types.fixedwidth")
 local types = require("nupp.compiler.types")
@@ -16,7 +16,7 @@ local HERE = require("helpers.paths").tests
 -- building one means checking the prelude from source. Per case that was
 -- most of what this suite cost; the cases share it the way the other
 -- checker suites do.
-local sharedEnv = envMod.new(HERE .. "/..")
+local sharedEnv = repositoryEnv.new()
 
 local function library()
     local prior = rawget(_G, "nupp")

@@ -1,12 +1,12 @@
 local test = require("assert")
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 local gen = require("nupp.compiler.lua.gen")
 local stdlib = require("nupp.compiler.stdlib")
 
 local HERE = require("helpers.paths").tests
-local env = envMod.new(HERE .. "/..")
+local env = repositoryEnv.new()
 local M = {}
 
 local function compile(source)
