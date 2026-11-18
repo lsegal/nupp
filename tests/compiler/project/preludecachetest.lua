@@ -337,22 +337,23 @@ local function report(label, value)
 end
 local first = envMod.new(project, {cacheDir = store})
 if phase == "seed" then
-    assert(first.bundled.simd, "simd checks")
+    assert(first.bundled["nupp.mem.span"], "the span module checks")
     report("stamped", first.preludeStamp ~= nil)
     return
 end
 -- The first environment asks for nothing, as a test worker's first usually does.
 local second = envMod.new(project, {cacheDir = store})
 report("stamp", second.preludeStamp ~= nil and second.preludeStamp == first.preludeStamp)
-local simd = second.bundled.simd
-report("simd", simd and simd.type ~= nil)
+local span = second.bundled["nupp.mem.span"]
+report("span", span and span.type ~= nil)
 report("hydrated", hydrations)
 report("checked", table.concat(checked, " "))
 
 local third = envMod.new(project, {cacheDir = store})
 local before = types.identity().nominal
-report("same simd", third.bundled.simd.type == simd.type)
-report("span", third.bundled["nupp.mem.span"] and third.bundled["nupp.mem.span"].type ~= nil)
+report("same span", third.bundled["nupp.mem.span"].type == span.type)
+report("layout", third.bundled["nupp.array.internal.layout"]
+    and third.bundled["nupp.array.internal.layout"].type ~= nil)
 report("declared", types.identity().nominal - before)
 report("hydrated again", hydrations)
 
@@ -392,11 +393,11 @@ report("checked again", #checked - count)
     end
 
     test.eq(field("stamp"), "true", "a later environment carries the stored prelude's stamp:\n" .. out)
-    test.eq(field("simd"), "true", "the module loads")
+    test.eq(field("span"), "true", "the module loads")
     test.eq(field("hydrated"), "1", "from the store")
     test.eq(field("checked"), "", "and nothing is checked from source")
-    test.eq(field("same simd"), "true", "a module one environment hydrated is the next one's")
-    test.eq(field("span"), "true", "and one it did not ask for comes out of the same decode")
+    test.eq(field("same span"), "true", "a module one environment hydrated is the next one's")
+    test.eq(field("layout"), "true", "and one it did not ask for comes out of the same decode")
     test.eq(field("declared"), "0", "which declares no nominals again")
     test.eq(field("hydrated again"), "1", "because the store is decoded once")
     test.eq(field("same zone"), "true", "a module checked from source is shared too")
