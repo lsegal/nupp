@@ -63,6 +63,12 @@ local function readFile(path: string): string?
     return content
 end
 
+-- The compiler's own table is installed before any of its modules load, so the one
+-- present now is the one that carries them. Read later, it is whatever the last
+-- program loaded in this process left behind: a test that runs a bundle in-process
+-- replaced it with a table carrying none of the compiler's files, and every later
+-- build stopped carrying the compiler's runtime and checked it from source (#403).
+local embeddedLoader: any = package.preload["nupp.embedded"]
 local embedded: any = nil
 
 --- Where the compiler's carried files sit in a bundle whose entry is elsewhere in
@@ -169,8 +175,7 @@ end
 --- @return the source, or nil when this compiler carries no file by that name
 function bundled.source(relative: string): string?
     if embedded == nil then
-        local preloaded = package.preload["nupp.embedded"]
-        embedded = preloaded and preloaded() or false
+        embedded = embeddedLoader and embeddedLoader() or false
     end
     if embedded then
         return embeddedFile(embedded, relative)
