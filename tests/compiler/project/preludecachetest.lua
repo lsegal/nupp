@@ -386,9 +386,11 @@ report("checked again", #checked - count)
     local out = run("share")
     os.execute("rm -rf '" .. dir .. "'")
     test.eq(seeded:match("stamped: %S+"), "stamped: true", "the seeding environment read the prelude:\n" .. seeded)
+
     local function field(label)
         return ("\n" .. out):match("\n" .. label:gsub("%p", "%%%0") .. ": ([^\n]*)")
     end
+
     test.eq(field("stamp"), "true", "a later environment carries the stored prelude's stamp:\n" .. out)
     test.eq(field("simd"), "true", "the module loads")
     test.eq(field("hydrated"), "1", "from the store")
@@ -403,15 +405,15 @@ end
 
 -- A stored prelude is true only of the type identity it was written from.
 --
--- An arena key spells a type by its parts' ids, and a nominal's id is a number
--- issued per process. So an image restored over an arena that already holds
--- other declarations under those numbers gives two objects one id, and every key built from that id
--- afterwards finds whichever the arena met first. The test runner's process lanes
--- made exactly that arena: after each suite they unload the modules it loaded,
--- which takes `nupp.compiler.project.env` and keeps `nupp.compiler.types`, so the
--- next suite's first environment read the stored prelude over the last suite's
--- checked one. A generic prelude nominal could then differ from the same nominal
--- in its annotation, depending on which suites the runner put in one lane.
+-- An arena key spells a type by its parts' ids, and a nominal's id is a number issued
+-- per process. So an image restored over an arena that already holds other declarations
+-- under those numbers gives two objects one id, and every key built from that id
+-- afterwards finds whichever the arena met first. The test runner's process lanes made
+-- exactly that arena: after each suite they unload the modules it loaded, which takes
+-- `nupp.compiler.project.env` and keeps `nupp.compiler.types`, so the next suite's
+-- first environment read the stored prelude over the last suite's checked one. A
+-- generic prelude nominal could then differ from the same nominal in its annotation,
+-- depending on which suites the runner put in one lane.
 function M.aStoredPreludeIsNotRestoredOverAnotherIdentity()
     local saved = {}
     for name, value in pairs(package.loaded) do
