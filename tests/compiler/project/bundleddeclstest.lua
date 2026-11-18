@@ -680,6 +680,47 @@ function M.anEmbeddedCompilerDoesNotProbeDiskForMissingDeclarations()
     end
 end
 
+-- A test that runs a bundle in-process installs that bundle's table, and a later
+-- build in the same process stopped finding the compiler's own runtime in it (#403).
+function M.theCompilerKeepsTheEmbeddedTableItLoadedWith()
+    local instances = require("helpers.providerstate")
+    local opened = {}
+    local host = {
+        open = function(path)
+            opened[#opened + 1] = path
+            return nil
+        end
+    }
+    local function stranger()
+        return {["/compiler/coroutine.nupp"] = "module stranger"}
+    end
+    local preloads = {
+        ["nupp.embedded"] = function()
+            return {["/compiler/coroutine.nupp"] = "module coroutine"}
+        end,
+    }
+    local load = instances.instance(
+        {["nupp.compiler.bundled"] = true},
+        {["nupp.runtime.standardio"] = {value = host},},
+        preloads,
+        {io = host, __nuppCleanupRegistry = {}}
+    )
+    local bundled = load("nupp.compiler.bundled")
+    preloads["nupp.embedded"] = stranger
+    testAssert.eq(bundled.source("/coroutine.nupp"), "module coroutine", "a later program's table is not the compiler's")
+
+    local bare = {}
+    local fromDisk = instances.instance(
+        {["nupp.compiler.bundled"] = true},
+        {["nupp.runtime.standardio"] = {value = host},},
+        bare,
+        {io = host, __nuppCleanupRegistry = {}}
+    )("nupp.compiler.bundled")
+    bare["nupp.embedded"] = stranger
+    testAssert.eq(fromDisk.source("/coroutine.nupp"), nil, "a compiler loaded from disk keeps reading disk")
+    testAssert.eq(#opened, 1, "the disk was asked")
+end
+
 -- A declaration the build copied beside the compiled modules goes stale the moment
 -- `src` changes it, and the compiler then checks today's source against yesterday's
 -- interface. That surfaces as an ordinary type error about a field that is plainly

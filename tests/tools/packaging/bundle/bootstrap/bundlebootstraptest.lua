@@ -21,10 +21,12 @@ function M.aBootstrapCompilerRetainsPublicRuntimeArtifacts()
     local savedMain, savedMainLoaded = package.preload["nupp.tools.main"], package.loaded["nupp.tools.main"]
     local savedLog, savedLogLoaded = package.preload["debug.log"], package.loaded["debug.log"]
     local savedWarn = rawget(_G, "warn")
+    local savedEmbedded = package.preload["nupp.embedded"]
     package.loaded["nupp.tools.main"] = nil
     local ok, result = pcall(assert(loadstring(text)))
     package.preload["nupp.tools.main"], package.loaded["nupp.tools.main"] = savedMain, savedMainLoaded
     package.preload["debug.log"], package.loaded["debug.log"] = savedLog, savedLogLoaded
+    package.preload["nupp.embedded"] = savedEmbedded
     rawset(_G, "warn", savedWarn)
     rawset(_G, "__nuppCompilerModuleArtifacts", savedArtifacts)
     os.execute("rm -rf '" .. dir .. "'")
@@ -97,6 +99,7 @@ return loaded
     -- installed for every later `require` of it.
     local stubbed = {"lpeg", "nupp.workers.native"}
     local savedPreloads, savedLoaded = {}, package.loaded.lpeg
+    local savedEmbedded = package.preload["nupp.embedded"]
     local savedPath, savedCpath = package.path, package.cpath
     for _, name in ipairs(stubbed) do
         savedPreloads[name] = package.preload[name]
@@ -117,7 +120,7 @@ return loaded
     for _, name in ipairs(stubbed) do
         package.preload[name] = savedPreloads[name]
     end
-    package.preload["nupp.embedded"] = nil
+    package.preload["nupp.embedded"] = savedEmbedded
     os.execute("rm -rf '" .. dir .. "'")
 end
 
