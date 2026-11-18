@@ -890,6 +890,8 @@ jobs:
           name: suite-timings-${{ runner.os }}-${{ runner.arch }}
           path: build/test-runner/.nupp-test-times.json
           if-no-files-found: ignore
+          # The file is a dotfile, which upload-artifact otherwise skips.
+          include-hidden-files: true
 
       # Linux has already saved this key from the fast gate, where the same
       # revision built the same compiler; that save warns and keeps the first
