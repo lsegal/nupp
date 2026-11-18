@@ -499,7 +499,8 @@ jobs:
         with:
           path: build/test-runner/.nupp-test-times.json
           key: >-
-            nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+            nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{
+            github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             nupp-test-times-${{ runner.os }}-${{ runner.arch }}-
 
@@ -870,14 +871,17 @@ jobs:
 
       # Saved whatever the suite concluded. A failing run still measured every
       # suite that ran, and the next run's shard packing is better for having
-      # it than for relearning it from nothing.
+      # it than for relearning it from nothing. Keyed by run, like the results:
+      # keyed by commit, a second run of one commit could not save, and the
+      # next run packed from older timings.
       - name: Save the recorded suite timings
         if: always()
         uses: actions/cache/save@v4
         with:
           path: build/test-runner/.nupp-test-times.json
           key: >-
-            nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+            nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{
+            github.run_id }}-${{ github.run_attempt }}
 
       # The same timings where a reader can download them. The summary prints
       # only the slowest fifteen suites, and a run stopped at its deadline
