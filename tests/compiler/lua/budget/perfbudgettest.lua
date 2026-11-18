@@ -420,8 +420,8 @@ end
 
 -- The same bound for a program that requires a standard-library module (#265).
 -- Checking `serde.json`'s graph from source peaked at 274-320 MB; the checked
--- interfaces are kept beside the prelude and hydrated instead. Two warm-ups: the
--- first command keeps the prelude, the second the interfaces checked against it.
+-- interfaces are kept beside the prelude and hydrated instead. One warm-up: the
+-- first command keeps the prelude and the interfaces checked beside it.
 function M.aCompileThatRequiresTheStandardLibraryStaysUnderItsMemoryBudget()
     local out, peak = measuredRun(
         table.concat({
@@ -434,7 +434,7 @@ function M.aCompileThatRequiresTheStandardLibraryStaysUnderItsMemoryBudget()
             'print(json.encode(users, User(id = 41, name = "Ada")))',
             "",
         }, "\n"),
-        2
+        1
     )
     assert(out:find('{"id":41,"name":"Ada"}', 1, true), "the program did not run: " .. out)
     assert(
@@ -482,13 +482,12 @@ end
 -- rather than checking the whole import graph again (#277). `nupp bc` of one file in
 -- the compiler's own checkout checked a hundred and forty modules from source and
 -- peaked at about 530 MB; with the project's interfaces read back from the build
--- directory, the same graph here costs what the one file does. Two warm-ups: the
--- first command keeps the prelude, the second the interfaces checked against it.
+-- directory, the same graph here costs what the one file does. One warm-up: the
+-- first command keeps the prelude and the interfaces checked beside it.
 function M.aSingleFileCompileInAProjectReadsItsDependenciesBack()
     local dir = temporary()
     moduleGraph(dir, 120)
     writeFile(dir .. "/src/main.nupp", 'local top = require("m119")\nprint(top.make(3).a)\n')
-    run(dir, "bc -O1 src/main.nupp")
     run(dir, "bc -O1 src/main.nupp")
     local warm = bytecodePeak(dir, "src/main.nupp", "")
     local fromSource = bytecodePeak(dir, "src/main.nupp", "NUPP_NO_INTERFACE_CACHE=1 ")

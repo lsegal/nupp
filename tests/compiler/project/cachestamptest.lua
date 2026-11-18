@@ -1223,10 +1223,8 @@ function M.storedProjectInterfacesAreSharedByEverySpellingOfTheRoot()
         return text
     end
 
-    -- The first command keeps the prelude, the second the interfaces checked against
-    -- it.
+    -- The first command keeps the prelude and the interfaces checked beside it.
     local first = compile(dir)
-    compile(dir)
     local kept = stored()
     local again = compile(other)
     local after = stored()
