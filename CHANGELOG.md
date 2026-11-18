@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A build that links `nupp` or `nupp.workers.native` keeps using the stored
+  standard-library interfaces. The project's `nupp.lua` manifest counted as a
+  module shadowing the staged `nupp`, and a staged declaration never counted
+  as the compiler's own copy, so either one turned the store and sharing off
+  and the standard library was checked from source again.
+
 - A process that builds several environments, such as a `nupp test` run with
   its suites in one process, no longer checks the prelude and the standard
   library again for each of them. Environments that agree on the target,
