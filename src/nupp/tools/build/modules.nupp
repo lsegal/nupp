@@ -1581,12 +1581,83 @@ local function buildModules(root: string, outDir: string, config: Config, target
     -- entry. Entries never say what exists.
     local queue, queuedPaths = {}, {}
 
-    local function seed(name, path)
+    local carriedSourceText: {[string]: any} = {}
+
+    local function currentCarriedSource(name: string): string?
+        if carriedSourceText[name] == nil then
+            local bundled = require("nupp.compiler.bundled")
+            local source: string? = nil
+            for _, suffix in ipairs({".nupp", "/init.nupp", ".d.nupp", ".lua"}) do
+                source = bundled.source("/" .. name:gsub("%.", "/") .. suffix)
+                if source ~= nil then
+                    break
+                end
+            end
+            carriedSourceText[name] = source or false
+        end
+
+        return carriedSourceText[name] or nil
+    end
+
+    -- A binary built beside the compiler's own build, like this repository's test
+    -- runner, has the compiler's modules among its own sources. One whose source is
+    -- the very text the compiler was built from is the compiler's module, and is
+    -- carried like one rather than compiled a second time (#396). Not into the
+    -- compiler's own build, whose records are what is carried; not for a check,
+    -- which reports what it checks; and not for coverage, which instruments.
+    --
+    -- A carried module takes no part in const specialization: it can serve no body
+    -- a new caller asks for, and every body it calls was planned with it.
+    local compilerGeneration: any = nil
+
+    local function loadedGeneration(): any
+        if compilerGeneration == nil then
+            local bundled = require("nupp.compiler.bundled")
+            compilerGeneration = cache.loadState(join(bundled.moduleDir(), "../../.nupp-state.json"))
+        end
+
+        return compilerGeneration
+    end
+
+    local carriesOwnSources: boolean? = nil
+    local ownSourceText: {[string]: string} = {}
+
+    local function carriesOwnSource(name: string, path: string): boolean
+        if carriesOwnSources == nil then
+            local bundled = require("nupp.compiler.bundled")
+            carriesOwnSources = target.kind == "binary"
+                and target.host ~= "browser"
+                and not checkOnly
+                and not config._coverage
+                and fs.absolute(join(root, outDir)) ~= fs.absolute(join(bundled.moduleDir(), "../.."))
+        end
+        if not carriesOwnSources then
+            return false
+        end
+        local text = inc.fileText(path)
+        local record = loadedGeneration().modules[name]
+        if text == nil or type(record) ~= "table" or record.sourceHash ~= contentDigest(text as string) then
+            return false
+        end
+        ownSourceText[name] = text as string
+
+        return true
+    end
+
+    -- Carried once the build can carry, ahead of the modules it compiles.
+    local carriedSeeds: {[string]: string} = {}
+
+    local function seed(name, path, entry: boolean?)
         path = normalize(path)
         if queuedPaths[path] then
             return
         end
         queuedPaths[path] = true
+        -- An entry is the chunk a deliverable starts in, so it is always compiled.
+        if not entry and carriesOwnSource(name, path) then
+            carriedSeeds[name] = path
+            return
+        end
         queue[#queue + 1] = {name = name, path = path}
     end
 
@@ -1627,7 +1698,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
             if not name then
                 return nil, "cannot determine module name for " .. path
             end
-            seed(name, path)
+            seed(name, path, true)
         end
         if #queue == 0 and (target.kind or "modules") ~= "modules" then
             return nil, "build.entries must contain at least one entry"
@@ -1719,7 +1790,10 @@ local function buildModules(root: string, outDir: string, config: Config, target
             reaching = reaching + 1
             for _, dependency in ipairs(header and header.dependencies or {}) do
                 local dependencyPath = inc.modulePath(dependency)
-                if dependencyPath ~= nil and not packagedCheckSources[dependency] then
+                if dependencyPath ~= nil
+                    and not packagedCheckSources[dependency]
+                    and not carriesOwnSource(dependency, dependencyPath)
+                then
                     reach(dependency, dependencyPath as string)
                     seed(dependency, dependencyPath)
                 end
@@ -1930,24 +2004,6 @@ local function buildModules(root: string, outDir: string, config: Config, target
     local addingCarriedRuntime: {[string]: boolean} = {}
     local carriedRuntime: {[string]: boolean} = {}
     local runtimeSourceRoot = join(root, join(outDir, "cache/runtime-source"))
-    local compilerGeneration: any = nil
-    local carriedSourceText: {[string]: any} = {}
-
-    local function currentCarriedSource(name: string): string?
-        if carriedSourceText[name] == nil then
-            local bundled = require("nupp.compiler.bundled")
-            local source: string? = nil
-            for _, suffix in ipairs({".nupp", "/init.nupp", ".d.nupp", ".lua"}) do
-                source = bundled.source("/" .. name:gsub("%.", "/") .. suffix)
-                if source ~= nil then
-                    break
-                end
-            end
-            carriedSourceText[name] = source or false
-        end
-
-        return carriedSourceText[name] or nil
-    end
 
     local function addCarriedRuntime(name: string): boolean
         if browserTarget then
@@ -1966,17 +2022,15 @@ local function buildModules(root: string, outDir: string, config: Config, target
         if existing ~= nil
             and not envMod.isDependencyTypePath(inc.env, existing)
             and existing:sub(1, #runtimeSourceRoot + 1) ~= runtimeSourceRoot .. "/"
+            and not carriesOwnSource(name, existing)
         then
             return false
         end
         local bundled = require("nupp.compiler.bundled")
         local modulePath = name:gsub("%.", "/") .. ".lua"
-        if compilerGeneration == nil then
-            compilerGeneration = cache.loadState(join(bundled.moduleDir(), "../../.nupp-state.json"))
-        end
         local text = modules.currentCarriedArtifact(
-            compilerGeneration.modules[name],
-            currentCarriedSource(name),
+            loadedGeneration().modules[name],
+            ownSourceText[name] or currentCarriedSource(name),
             readFile(join(bundled.moduleDir(), "../../" .. modulePath)),
             contentDigest
         )
@@ -2020,10 +2074,11 @@ local function buildModules(root: string, outDir: string, config: Config, target
         end
         local output = join(root, join(outDir, name:gsub("%.", "/") .. ".lua"))
         local artifactHash = contentDigest(text)
-        records[
-            name
-        ] = {
-            sourceHash = artifactHash,
+        local ownSource = ownSourceText[name]
+        records[name] = {
+            -- A module carried from its own source keeps that source's hash, so a
+            -- build that carries from this one finds it current (#389).
+            sourceHash = ownSource ~= nil and contentDigest(ownSource) or artifactHash,
             interfaceHash = contentDigest("compiler-runtime\0" .. text),
             artifactHash = artifactHash,
             dependencies = required,
@@ -2072,6 +2127,9 @@ local function buildModules(root: string, outDir: string, config: Config, target
             return
         end
         path = path or inc.modulePath(name)
+        if path and carriesOwnSource(name, path) and addCarriedRuntime(name) then
+            return
+        end
         if path then
             queued[name] = true
             queue[#queue + 1] = {name = name, path = normalize(path)}
@@ -2081,6 +2139,17 @@ local function buildModules(root: string, outDir: string, config: Config, target
     enqueueLinked = function(name: string): nil
         if not addCarriedRuntime(name) then
             enqueue(name)
+        end
+    end
+
+    local carriedNames: {string} = {}
+    for name in pairs(carriedSeeds) do
+        carriedNames[#carriedNames + 1] = name
+    end
+    table.sort(carriedNames)
+    for _, name in ipairs(carriedNames) do
+        if not addCarriedRuntime(name) then
+            enqueue(name, carriedSeeds[name])
         end
     end
 

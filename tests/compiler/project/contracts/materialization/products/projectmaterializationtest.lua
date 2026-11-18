@@ -151,6 +151,49 @@ return child == getmetatable(value.child) and value.child.value == 7
     remove(dir)
 end
 
+function M.aBinaryBesideTheCompilerCarriesTheCompilersOwnModules()
+    local bundled = require("nupp.compiler.bundled")
+    local checkout = os.getenv("NUPP_COMPILER_ROOT") or (bundled.moduleDir() .. "/../../..")
+    local source = assert(read(checkout .. "/src/nupp/compiler/stable.nupp"), "the compiler's own source")
+    local artifact = read(bundled.moduleDir() .. "/stable.lua")
+    local manifest = [[
+return {include = {"src"}, build = {outDir = "out", default = "app", targets = {
+    app = {kind = "binary", stub = "stub.bin", output = "out/app", entries = {"nupp.probe"}},
+}}}
+]]
+    local dir = tempProject({
+        ["nupp.lua"] = manifest,
+        ["stub.bin"] = "stub",
+        ["src/nupp/probe.nupp"] = 'local stable = require("nupp.compiler.stable") return stable({1})',
+        ["src/nupp/compiler/stable.nupp"] = source,
+    })
+    testAssert.eq(project.build(dir, {}), 0)
+    local state = json.decode(read(dir .. "/out/.nupp-state.json"))
+    testAssert.eq(state.modules["nupp.compiler.stable"].compilerRuntime, true, "the compiler's module is carried")
+    testAssert.eq(read(dir .. "/out/nupp/compiler/stable.lua"), artifact, "byte-for-byte")
+    testAssert.eq(state.modules["nupp.probe"].compilerRuntime, nil, "the project's own module is compiled")
+
+    -- Coverage instruments what it carries, so it compiles the module.
+    testAssert.eq(project.build(dir, {coverage = true, outDir = "cover"}), 0)
+    local covered = json.decode(read(dir .. "/cover/.nupp-state.json"))
+    testAssert.eq(covered.modules["nupp.compiler.stable"].compilerRuntime, nil, "coverage compiles it")
+
+    -- An entry is the chunk the binary starts in, so it is compiled even when it is
+    -- the compiler's module.
+    write(dir .. "/nupp.lua", (manifest:gsub('"nupp%.probe"', '"nupp.compiler.stable"')))
+    testAssert.eq(project.build(dir, {outDir = "entry"}), 0)
+    local entry = json.decode(read(dir .. "/entry/.nupp-state.json"))
+    testAssert.eq(entry.modules["nupp.compiler.stable"].compilerRuntime, nil, "the entry is compiled")
+    write(dir .. "/nupp.lua", manifest)
+
+    -- Edited, it is no longer the compiler's module.
+    write(dir .. "/src/nupp/compiler/stable.nupp", source .. "\n-- edited\n")
+    testAssert.eq(project.build(dir, {}), 0)
+    local edited = json.decode(read(dir .. "/out/.nupp-state.json"))
+    testAssert.eq(edited.modules["nupp.compiler.stable"].compilerRuntime, nil, "an edited copy is compiled")
+    remove(dir)
+end
+
 function M.foreignWitnessesSurviveCollectionBetweenModuleLoads()
     local dir = tempProject({
         ["nupp.lua"] = 'return {include={"src"},build={outDir="out",entries={"main"}}}',

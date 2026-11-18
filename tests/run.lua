@@ -2993,8 +2993,9 @@ end
 -- failure is reported and the run goes on: the suites ask the same helper,
 -- which skips them with the toolchain's output.
 --
--- A `background` build is started here and not waited for (#383). The serde
--- contracts' AOT build is minutes cold, and waiting for it would leave every
+-- A `background` build is started here and not waited for (#383, #399). The
+-- serde contracts' AOT build is minutes cold, and the embedding SDK was most of
+-- the Windows suite step's first minute; waiting for either would leave every
 -- worker idle that long. Its helper's `pending` variable names where the build
 -- writes its output, and a `.status` file beside it once it has finished; the
 -- suites that need it are dealt last, and a case that still gets there first
