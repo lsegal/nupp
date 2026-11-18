@@ -300,12 +300,100 @@ jobs:
             nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-${{
             hashFiles('src/**', 'nupp.lua', 'scripts/toolchain.pins') }}
 
+  # The compiler each rolling leg runs, built once per platform beside the fast
+  # gate rather than inside every leg after it, so a leg starts on its suites
+  # instead of on a five-minute bootstrap. Its setup matches the leg's, LLVM and
+  # all, because the leg's warm `nupp build` must find nothing left to do.
+  bootstrap:
+    name: ${{ matrix.name }} / bootstrap
+    needs: classify
+    if: needs.classify.outputs.integration-matrix != '[]'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.classify.outputs.integration-matrix) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Restore the pinned build tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/nupp-ci-tools
+            .rocks
+          key: >-
+            nupp-tools-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('scripts/toolchain.pins', 'rocks/**') }}
+
+      - name: Restore the provisioned toolchain
+        uses: actions/cache@v4
+        with:
+          path: .nupp-cache/toolchain
+          key: >-
+            nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('scripts/toolchain.pins', 'scripts/toolchain') }}
+          restore-keys: |
+            nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore the content-validated compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/cache
+          key: >-
+            nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('src/**', 'nupp.lua', 'scripts/toolchain.pins') }}
+          restore-keys: |
+            nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Fetch or build the pinned LLVM
+        uses: ./.github/actions/pinned-llvm
+
+      - name: Provision the pinned toolchain
+        shell: bash
+        env:
+          NUPP_REQUIRE_CODEGEN: '1'
+        run: |
+          ./scripts/toolchain --all
+          echo "$(./scripts/toolchain luajit)/bin" >> "$GITHUB_PATH"
+
+      - name: Bootstrap the compiler
+        shell: bash
+        run: ./bin/nupp build
+
+      # A tarball rather than the directory, so the launcher and the staged
+      # libraries keep their modes. The store and the test runner's records are
+      # left out: each leg restores its own.
+      - name: Pack the compiler
+        shell: bash
+        run: tar -cf compiler.tar --exclude=build/cache --exclude=build/test-runner build
+
+      - name: Upload the compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-${{ matrix.artifact }}
+          path: compiler.tar
+          retention-days: 1
+
+      - name: Save the content-validated compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: build/cache
+          key: >-
+            nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('src/**', 'nupp.lua', 'scripts/toolchain.pins') }}
+
   integration:
     name: ${{ matrix.name }} / LuaJIT 2.1 rolling
-    needs: [classify, fast-checks]
+    needs: [classify, fast-checks, bootstrap]
     if: >-
       !cancelled() && needs.classify.result == 'success'
       && needs.fast-checks.result == 'success'
+      && needs.bootstrap.result == 'success'
       && needs.classify.outputs.integration-matrix != '[]'
     runs-on: ${{ matrix.os }}
     # A timeout is here to end a hang, so it has to sit above the work rather
@@ -445,6 +533,22 @@ jobs:
             print(jit.version)
           '
           echo "$luajit/bin" >> "$GITHUB_PATH"
+
+      - name: Download the bootstrapped compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: compiler-${{ matrix.artifact }}
+
+      # The launcher decides freshness by mtime, and the checkout above is newer
+      # than anything the bootstrap job wrote. Touching the unpacked tree says
+      # what is true: it was built from these sources. The build below still
+      # compares content hashes, so a mismatch rebuilds rather than passing.
+      - name: Unpack the bootstrapped compiler
+        shell: bash
+        run: |
+          tar -xf compiler.tar
+          rm compiler.tar
+          find build -path build/cache -prune -o -path build/test-runner -prune -o -exec touch {} +
 
       - name: Bootstrap the compiler
         shell: bash
@@ -1221,6 +1325,7 @@ jobs:
     needs:
       - classify
       - fast-checks
+      - bootstrap
       - integration
       - fixpoint
       - portable-compiler
