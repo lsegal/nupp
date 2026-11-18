@@ -7932,6 +7932,31 @@ return {include={"src"},build={targets={native={kind="bundle",entries={"main"},
     return dir, write
 end
 
+--- The required SoA project as built once for the run, copied into a directory
+--- of the caller's own.
+---
+--- Two cases build that same project: one to run it against the interpreted
+--- answer, the other to ask a second build what it reused. Each paid for a
+--- native compilation in a slice of its own, the most expensive build in the
+--- suite (#406). The copy is the project and its build directory as they were,
+--- so building it again is the warm build either case goes on to make, and a
+--- case is free to run or rebuild in it without touching the shared build.
+local soaRequiredBuild = nil
+
+local function builtSoaCopy()
+    if not soaRequiredBuild then
+        soaRequiredBuild = sharedBuild("soa-require", function()
+            return (soaProject("require"))
+        end)
+    end
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute(("cp -R %q %q"):format(soaRequiredBuild, dir)) == 0)
+    os.remove(dir .. "/.nupp-fixture.json")
+
+    return dir
+end
+
 --- Builds and runs the SoA program, and returns what it printed.
 local function soaAnswer(dir, policy)
     local out, code = build(dir)
@@ -7947,7 +7972,7 @@ end
 function M.directSoaViewsRunAgainstTheSameLuaOracle()
     local dir = soaProject("off")
     local expected = soaAnswer(dir, "off")
-    local required = soaProject("require")
+    local required = builtSoaCopy()
     test.eq(soaAnswer(required, "require"), expected, "identical SoA input and all resulting columns")
     local code = assert(read(required .. "/build/native/main.lua"))
     assert(code:find("__nuppAotCompiled", 1, true), "required AOT installed the native wrappers")
@@ -7955,7 +7980,7 @@ function M.directSoaViewsRunAgainstTheSameLuaOracle()
 end
 
 function M.directSoaViewsReuseNativeObjectsOnAWarmBuild()
-    local dir = soaProject("require")
+    local dir = builtSoaCopy()
     local out, code = build(dir)
     test.eq(code, 0, "require SoA build at " .. dir .. ": " .. out)
     local pipe = assert(
