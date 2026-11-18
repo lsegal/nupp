@@ -46,45 +46,6 @@ end
 
 local M = {}
 
--- A shared cache directory holding a stored prelude and nothing else.
---
--- The first command against an empty store checks the prelude and keeps it; only
--- the next one, reading that prelude back, keeps the standard library checked
--- against it. A case about the standard library's store has nothing to learn from
--- that first command, so the prelude is stored once for the suite and each such
--- case starts from a copy of it: its first command then checks the standard library
--- from source and keeps it, as the second would have.
-local preludeStore = nil
-local preludeProject = nil
-
-local function storedPrelude()
-    if preludeStore == nil then
-        local dir = tempProject({["main.nupp"] = "print(1)\n"})
-        local status = os.execute(
-            ("cd '%s' && NUPP_CACHE_DIR='%s/cache' '%s' check main.nupp > /dev/null 2>&1"):format(dir, dir, NUPP)
-        )
-        assert(status == 0 or status == true, "the prelude could not be stored")
-        assert(exists(dir .. "/cache/prelude.buf"), "a command kept no prelude")
-        preludeProject = dir
-        preludeStore = dir .. "/cache/prelude.buf"
-    end
-
-    return preludeStore
-end
-
-function M.afterAll()
-    if preludeProject ~= nil then
-        os.execute("rm -rf '" .. preludeProject .. "'")
-    end
-end
-
-local function primedCache(dir)
-    assert(os.execute("mkdir -p '" .. dir .. "'") == 0)
-    assert(os.execute(("cp '%s' '%s/prelude.buf'"):format(storedPrelude(), dir)) == 0)
-
-    return dir
-end
-
 local function compiledFingerprintSource()
     local file = assert(io.open(ROOT .. "/build/nupp/compiler/project/fingerprint.lua", "rb"))
     local source = file:read("*a")
@@ -144,11 +105,13 @@ function M.keptGraphsFollowPublicRootDependenciesWithoutReadingOtherOutputs()
     assert(exists(cacheDir .. "/modulegraph.buf"), "the dependency graph was persisted")
     local store = require("nupp.compiler.project.store")
     local originalOpen, saves = store.openValue, 0
-    local lexer = require("nupp.compiler.syntax.lexer")
-    local originalLex, lexes = lexer.lex, 0
-    lexer.lex = function(...)
+    -- Counted where the graph reads a file, ahead of the process's memo of what each
+    -- text requires: a graph computed again would read every file through it.
+    local requires = require("nupp.compiler.project.requires")
+    local originalScan, lexes = requires.scan, 0
+    requires.scan = function(...)
         lexes = lexes + 1
-        return originalLex(...)
+        return originalScan(...)
     end
     store.openValue = function(...)
         local opened = originalOpen(...)
@@ -162,7 +125,7 @@ function M.keptGraphsFollowPublicRootDependenciesWithoutReadingOtherOutputs()
     end
     local ok, warm = pcall(fixtureStamp, dir, cacheDir)
     store.openValue = originalOpen
-    lexer.lex = originalLex
+    requires.scan = originalScan
     assert(ok, warm)
     assert(warm == first and saves == 0 and lexes == 0, "an unchanged graph was not reused without lexing")
 
@@ -998,7 +961,7 @@ function M.aStoredStandardLibraryInterfaceChecksTheSameAsItsSource()
         .. "local value, reason = json.decodevalue(42)\n"
         .. "print(value, reason)\n",
     })
-    local shared = primedCache(dir .. "/cache")
+    local shared = dir .. "/cache"
 
     local function check(prefix)
         local pipe = assert(
@@ -1010,8 +973,8 @@ function M.aStoredStandardLibraryInterfaceChecksTheSameAsItsSource()
         return output
     end
 
-    -- The prelude is already kept, so the first command keeps the interfaces it
-    -- checked against it; the second reads both back.
+    -- The first command keeps the prelude and the interfaces it checked beside it;
+    -- the second reads both back.
     local fromSource = check("")
     local stored = exists(shared .. "/stdlib.buf")
     local hydrated = check("")
@@ -1046,7 +1009,7 @@ function M.aFreshProjectBuildReusesTheStandardLibraryAnotherOneChecked()
         .. "export function parse(text: string): any\n    local value = json.decodevalue(text)\n    return value\nend\n",
     }
     local sharedRoot = tempProject({})
-    local shared = primedCache(sharedRoot .. "/cache")
+    local shared = sharedRoot .. "/cache"
 
     local function build(prefix)
         local dir = tempProject(files)
@@ -1070,8 +1033,8 @@ function M.aFreshProjectBuildReusesTheStandardLibraryAnotherOneChecked()
         return assert(generated, "the build wrote no module:\n" .. output)
     end
 
-    -- The prelude is already kept, so the first build keeps the interfaces checked
-    -- against it, and the second is a fresh project reading both back.
+    -- The first build keeps the prelude and the interfaces checked beside it, and
+    -- the second is a fresh project reading both back.
     local fromSource = build("")
     local stdlibStored = exists(shared .. "/stdlib.buf")
     local runtimeStored = exists(shared .. "/runtime-dependencies.buf")
@@ -1093,7 +1056,7 @@ end
 -- `simd`, and a span it made was not a span to `simd`.
 function M.aStoredImageCarriesTheModulesItsInterfacesNamed()
     local sharedRoot = tempProject({})
-    local shared = primedCache(sharedRoot .. "/cache")
+    local shared = sharedRoot .. "/cache"
 
     local function check(source)
         local dir = tempProject({["nupp.lua"] = 'return {include = {"src"}}\n', ["src/k.nupp"] = source})
@@ -1113,8 +1076,8 @@ function M.aStoredImageCarriesTheModulesItsInterfacesNamed()
         .. "    local source = assert(simd.species(array.int8, 16))\n"
         .. "    local wide = assert(simd.species(array.number, 16))\n"
         .. "    wide:store(out, 1, wide:convert(source:load(input, 1)))\nend\n"
-    -- The prelude is already kept, so the first checks `simd` and stores it; the
-    -- second reads it back beside whatever the first left out.
+    -- The first checks `simd` and stores it beside the prelude; the second reads
+    -- it back beside whatever the first left out.
     check('module k\nlocal simd = require("simd")\nexport const s = simd\n')
     local output = check(widen)
     os.execute("rm -rf '" .. sharedRoot .. "'")
@@ -1166,10 +1129,9 @@ function M.storedProjectInterfacesCompileTheSameAsTheirSource()
         return table.concat(outputs, "\n")
     end
 
-    -- The first round keeps the prelude, the second the interfaces checked against it,
+    -- The first round keeps the prelude, the second the interfaces checked beside it,
     -- and the third reads both back.
     local fromSource = compile("NUPP_NO_INTERFACE_CACHE=1 ")
-    compile("")
     compile("")
     local stored = exists(dir .. "/build/cache/interfaces.buf")
     local hydrated = compile("")
