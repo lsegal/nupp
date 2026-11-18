@@ -139,20 +139,35 @@ end
 --- `compute()`, kept for the rest of the run under `name` when the running
 --- compiler is the run's (see `runDirectory`), and computed every time otherwise.
 function fingerprint.runRemembered(name: string, compute: function(): string): string
-    local directory = runDirectory()
-    if directory == nil then
-        return compute()
-    end
-    local place = join(directory as string, fingerprint.contentDigest()(name))
-    local kept = readFile(place)
-    if kept and kept ~= "" then
+    local kept = fingerprint.runRecalled(name)
+    if kept ~= nil then
         return kept as string
     end
     local answer = compute()
-    -- Best effort: a run that cannot keep one computes it again next time.
-    fs.writeFile(place, answer)
+    fingerprint.runKeep(name, answer)
 
     return answer
+end
+
+--- What the run kept under `name`, or nil when it kept nothing or this is not the
+--- run's compiler (see `runDirectory`).
+function fingerprint.runRecalled(name: string): string?
+    local directory = runDirectory()
+    if directory == nil then
+        return nil
+    end
+    local kept = readFile(join(directory as string, fingerprint.contentDigest()(name)))
+
+    return kept and kept ~= "" and kept or nil
+end
+
+--- Keeps `answer` under `name` for the rest of the run, when there is a run.
+function fingerprint.runKeep(name: string, answer: string): nil
+    local directory = runDirectory()
+    if directory ~= nil then
+        -- Best effort: a run that cannot keep one computes it again next time.
+        fs.writeFile(join(directory as string, fingerprint.contentDigest()(name)), answer)
+    end
 end
 
 --- Drops the run's kept fingerprints when `buildDir` is the run's compiler tree,

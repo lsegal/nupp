@@ -122,6 +122,47 @@ local function writeSealed(path: string, stamp: string, body: any): nil
     end
 end
 
+--- How old a file has to be before a test run believes a seal it checked once.
+---
+--- Git's "racily clean" rule. A file rewritten within the timestamp granularity of
+--- the check before it can keep its size and its modification time, so one that
+--- was modified this recently is digested every time.
+local SETTLED_SECONDS = 2
+
+--- What the run keeps for a body whose seal it checked: the file, as its size and
+--- modification time, the stamp, and the seal. Nil outside a test run, or for a
+--- file that cannot be read or is too new to tell apart from a rewrite of it.
+---
+--- A command that opens the run-wide prelude store digested all of a 4 to 9 MB
+--- body, which was about a fifth of a warm `nupp aot`, to learn what the command
+--- before it had already learned of the same bytes.
+local function settledSeal(path: string, stamp: string, seal: any): string?
+    if type(seal) ~= "string" then
+        return nil
+    end
+    local size, modified = fs.sizeAndModified(path)
+    if size == nil or modified == nil or (modified as number) > os.time() - SETTLED_SECONDS then
+        return nil
+    end
+
+    return table.concat(
+        {"seal", fs.absolute(path), stamp, tostring(size), ("%.9f"):format(modified as number), seal as string},
+        "\0"
+    )
+end
+
+local fingerprintMemo: any = nil
+
+-- Named indirectly: `fingerprint` reads the module graph through this module.
+local function runFingerprints(): any
+    if fingerprintMemo == nil then
+        local ok, loaded = pcall(require, "nupp.compiler.project." .. "fingerprint")
+        fingerprintMemo = ok and loaded or false
+    end
+
+    return fingerprintMemo or nil
+end
+
 --- The body `path` holds under `stamp` when it is intact, else nil.
 ---
 --- The stamp is compared before the body is digested, so a body some other compiler
@@ -130,8 +171,17 @@ local function unseal(path: string, stamp: string): any
     for _, slot in ipairs(slotsIn(path)) do
         if slot.stamp == stamp then
             local digest = sealDigest()
-            if digest and slot.seal ~= digest(slot.body) then
-                return nil
+            if digest then
+                local runs = runFingerprints()
+                local settled = runs and settledSeal(path, stamp, slot.seal) or nil
+                if settled == nil or runs.runRecalled(settled) == nil then
+                    if slot.seal ~= digest(slot.body) then
+                        return nil
+                    end
+                    if settled ~= nil then
+                        runs.runKeep(settled, "intact")
+                    end
+                end
             end
             local decodedOk, body = pcall(buffer.decode, slot.body)
 
