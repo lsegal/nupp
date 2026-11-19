@@ -947,7 +947,11 @@ local declarationMemo: string? = nil
 --- kept saying so after the module was fixed.
 ---
 --- The readers are parameters so a test can hand in declarations of its own; a
---- caller passing none reads what this compiler carries, once per process.
+--- caller passing none reads what this compiler carries, once per process, and
+--- once per test run where the run keeps fingerprints (`runRemembered`). Either
+--- digest counts as passing none: the native one is byte for byte the portable
+--- one's answer, and every build hands in the native one, so a build reading the
+--- compiler's own declarations used to read and hash all of them again (#406).
 ---
 --- @param contentDigest the digest to stamp with, or the build's own
 --- @param listDeclarations lists the carried files under a prefix, or the compiler's
@@ -958,13 +962,15 @@ function fingerprint.declarationFingerprint(
     listDeclarations: (function(string): {string})?,
     readDeclaration: (function(string): string?)?
 ): string
-    local own = contentDigest == nil and listDeclarations == nil and readDeclaration == nil
+    local own = listDeclarations == nil
+        and readDeclaration == nil
+        and (contentDigest == nil or contentDigest == hash.digest or contentDigest == fingerprint.contentDigest())
     if own and declarationMemo ~= nil then
         return declarationMemo as string
     end
 
     local function compute(): string
-        local digest = contentDigest or hash.digest
+        local digest = contentDigest or fingerprint.contentDigest()
         local list = listDeclarations or require("nupp.compiler.bundledlist").list
         local read = readDeclaration or require("nupp.compiler.bundled").source
         local checked: {[string]: boolean} = {}

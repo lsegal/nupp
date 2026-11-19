@@ -583,6 +583,28 @@ function M.theModuleStampMovesWhenACarriedDeclarationChanges()
     )
 end
 
+-- Every build hands the native digest in, and the native digest is byte for byte
+-- the portable one's answer, so either one asking about the compiler's own
+-- declarations is asking the remembered question. A digest of the caller's own is
+-- a different question, and must not be answered from what was remembered (#406).
+function M.theCompilersOwnDeclarationsAreStampedOnceWhicheverDigestAsks()
+    local own = fingerprint.declarationFingerprint()
+    assert(
+        fingerprint.declarationFingerprint(fingerprint.contentDigest()) == own,
+        "the native digest stamped the compiler's declarations differently"
+    )
+    assert(
+        fingerprint.declarationFingerprint(fingerprint.contentDigest(false)) == own,
+        "the portable digest stamped the compiler's declarations differently"
+    )
+    assert(
+        fingerprint.declarationFingerprint(function()
+            return "a digest of the caller's own"
+        end) == "a digest of the caller's own",
+        "a caller's own digest was answered with the remembered stamp"
+    )
+end
+
 -- A carried library module that fails to check is `unknown` to every importer, and
 -- the importers' stored diagnostics said so. Stamped with `decls/` alone, they went
 -- on saying it after the library was fixed: `json.decodevalue` was "no field in
