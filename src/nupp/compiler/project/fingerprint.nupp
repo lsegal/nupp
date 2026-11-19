@@ -176,6 +176,43 @@ function fingerprint.runKeep(name: string, answer: string): nil
     end
 end
 
+--- How old a file has to be before a test run believes a seal it checked once.
+---
+--- Git's "racily clean" rule. A file rewritten within the timestamp granularity of
+--- the check before it can keep its size and its modification time, so one that
+--- was modified this recently is digested every time.
+local SETTLED_SECONDS = 2
+
+--- Whether the store body at `path`, sealed with `seal` under `stamp`, is intact:
+--- `check()`, or what an earlier command of the run found it answered.
+---
+--- A command that opens the run-wide prelude store digested all of a 4 to 9 MB
+--- body, which was about a fifth of a warm `nupp aot`, to learn what the command
+--- before it had already learned of the same bytes. The run keeps the answer for
+--- the file as its size and modification time, so a rewrite is checked again. Kept
+--- here rather than in the store because a compiler without fingerprints, such as
+--- the browser bundle, has no run to keep it in.
+function fingerprint.sealIntact(path: string, stamp: string, seal: any, check: function(): boolean): boolean
+    local kind, size, modified = require("io.internal.files").stat(path)
+    -- `os` answers milliseconds, the clock's unit.
+    if type(seal) ~= "string" or kind ~= "file" or modified == nil or modified / 1000 > os.time() - SETTLED_SECONDS then
+        return check()
+    end
+    local name = table.concat(
+        {"seal", fs.absolute(path), stamp, tostring(size), ("%.3f"):format(modified as number), seal as string},
+        "\0"
+    )
+    if fingerprint.runRecalled(name) ~= nil then
+        return true
+    end
+    if not check() then
+        return false
+    end
+    fingerprint.runKeep(name, "intact")
+
+    return true
+end
+
 --- Drops the run's kept fingerprints when `buildDir` is the run's compiler tree,
 --- because a build of it is about to rewrite what they describe. This process
 --- stops keeping any as well: it may be the build, and its next answers describe

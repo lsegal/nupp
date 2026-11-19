@@ -200,18 +200,6 @@ export function exists(path: string): boolean
     return files2.exists(path) == true
 end
 
---- A file's size and modification time in seconds, or nil when it cannot be read.
-export function sizeAndModified(path: string): (integer?, number?)
-    local kind, size, modified = files2.stat(path)
-    if kind ~= "file" or size == nil or modified == nil then
-        return nil, nil
-    end
-
-    -- `os` answers milliseconds, the clock's unit.
-
-    return size, (modified as number) / 1000
-end
-
 export function mkdir(path: string): boolean
     if path == "" or path == "." then
         return true

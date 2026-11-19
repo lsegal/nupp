@@ -481,17 +481,18 @@ local function countingStore(kept, operation)
             end,
         },
     }
-    package.loaded["nupp.compiler.project.fingerprint"] = {
-        runRecalled = function(name)
+    local ok, why = pcall(function()
+        -- The real `sealIntact`, keeping what it keeps in `kept` instead of a run.
+        local runs = dofile(ROOT .. "/build/nupp/compiler/project/fingerprint.lua")
+        runs.runRecalled = function(name)
             return kept and kept[name] or nil
-        end,
-        runKeep = function(name, answer)
+        end
+        runs.runKeep = function(name, answer)
             if kept then
                 kept[name] = answer
             end
-        end,
-    }
-    local ok, why = pcall(function()
+        end
+        package.loaded["nupp.compiler.project.fingerprint"] = runs
         operation(dofile(ROOT .. "/build/nupp/compiler/project/store.lua"))
     end)
     package.loaded["nupp.compiler.hostservices"] = services
