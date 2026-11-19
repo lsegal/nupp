@@ -665,6 +665,39 @@ function M.twoEnvironmentsAgreeOnAHeaderKeyWhenTheModuleNameAgrees()
     os.execute("rm -rf '" .. dir .. "'")
 end
 
+-- A later environment finds a file's header by its identity -- path, size and
+-- modification time -- without reading it again (#440). An edit moves that identity
+-- whether or not it keeps the size, so the file is read again and its new
+-- declarations answer. The files are dated in the past so the identity is remembered
+-- rather than passed over as too recent to trust.
+function M.aFileEditedUnderTheSamePathIsReadAgainForItsHeader()
+    local dir = tempProject({
+        ["nupp.lua"] = 'return { include = { "src" } }\n',
+        ["src/m.nupp"] = "export type Alpha = integer\n",
+    })
+    local function age(stamp)
+        assert(os.execute("touch -t " .. stamp .. " '" .. dir .. "/src/m.nupp'") == 0)
+    end
+    local function declares(name)
+        return (envMod.ensureProjectIndex(envMod.new(dir)).byName[name] or {})[1] ~= nil
+    end
+    age("202001010000")
+    assert(declares("Alpha"), "the first environment indexes the file")
+    assert(declares("Alpha"), "and a second one finds the same header")
+
+    editFixture(dir, "src/m.nupp", "export type Bravo = integer\n")
+    age("202001010001")
+    assert(declares("Bravo") and not declares("Alpha"), "an edit that keeps the size was not read again")
+
+    editFixture(dir, "src/m.nupp", "export type Charlie = integer\n")
+    age("202001010001")
+    assert(
+        declares("Charlie") and not declares("Bravo"),
+        "an edit that keeps the modification time was not read again"
+    )
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
 -- The prelude is the compiler's own source and is checked before the project has been
 -- looked at. Answering its lookups from the project made every environment -- one per
 -- case in the suites that check fragments -- read and index every file in the project.
