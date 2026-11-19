@@ -52,7 +52,7 @@ end
 
 local function diagnostics(source)
     local parser = require("nupp.compiler.syntax.parser")
-    local environment = require("nupp.compiler.project.env").new(require("helpers.paths").tests .. "/..")
+    local environment = require("helpers.repositoryenv").new()
     local parsed = parser.parse(source, "bytes-api.nupp")
     assert(#parsed.errors == 0, parsed.errors[1] and parsed.errors[1].msg)
 

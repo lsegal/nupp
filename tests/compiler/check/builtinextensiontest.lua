@@ -578,11 +578,15 @@ end
 end
 
 function M.extendedLuaPipeRemainsWritable()
-    compile([[
+    compile(
+        [[
 io.popen = function(...: any): (nil, nil)
     return nil, nil
 end
-]], "replace-popen.nupp", envMod.new("."))
+]],
+        "replace-popen.nupp",
+        require("helpers.repositoryenv").new()
+    )
 end
 
 function M.aPartialIoExtensionPreservesTheLuaPipe()
