@@ -302,6 +302,66 @@ function M.laterEnvironmentsShareCheckedStandardLibraryModules()
     os.execute("rm -rf '" .. dir .. "' '" .. shadowing .. "'")
 end
 
+-- A project that shadows a bundled module changes what reaches that module, and
+-- nothing else. A harness case that shadows `types` or an extension module used
+-- to check every standard-library module it reached again (#439); now it checks
+-- only those that reach what it shadows.
+function M.aShadowingProjectSharesWhatItsShadowsDoNotReach()
+    local dir = project()
+    -- The first environment may be the one that reads the stored prelude, which
+    -- keeps its modules to itself; the second checks them for the process.
+    assert(envMod.new(dir).bundled["bytes._representation"], "the module checks")
+    assert(envMod.new(dir).bundled["bytes._representation"], "and checks for the process")
+
+    local checked = {}
+    local checkModuleSource = envMod.checkModuleSource
+    -- Bundled modules are checked under their names; project files by path.
+    envMod.checkModuleSource = function(env, path, ...)
+        if not path:find("/", 1, true) then
+            checked[#checked + 1] = path
+        end
+        return checkModuleSource(env, path, ...)
+    end
+
+    local function load(shadows)
+        local root = project()
+        for file, source in pairs(shadows) do
+            assert(os.execute("mkdir -p '" .. root .. "/" .. file:match("^(.*)/[^/]+$") .. "'") == 0)
+            local handle = assert(io.open(root .. "/" .. file, "wb"))
+            handle:write(source)
+            handle:close()
+        end
+        checked = {}
+        local ok, record = pcall(function()
+            return envMod.new(root).bundled["bytes._representation"]
+        end)
+        os.execute("rm -rf '" .. root .. "'")
+        assert(ok, record)
+        table.sort(checked)
+
+        return record, table.concat(checked, " ")
+    end
+
+    local ok, failure = pcall(function()
+        local record, unrelated = load({["jit/zone.nupp"] = "return {}\n"})
+        assert(record, "the module checks beside an unrelated shadow")
+        test.eq(unrelated, "", "nothing it reaches is shadowed, so nothing is checked again")
+
+        local tablestruct = assert(require("nupp.compiler.bundled").source("/nupp/runtime/provider/tablestruct.nupp"))
+        local dependent
+        record, dependent = load({["nupp/runtime/provider/tablestruct.nupp"] = tablestruct})
+        assert(record, "the module checks against the project's copy")
+        test.eq(
+            dependent,
+            "bytes._representation",
+            "only the module that reaches the shadow is checked again"
+        )
+    end)
+    envMod.checkModuleSource = checkModuleSource
+    os.execute("rm -rf '" .. dir .. "'")
+    assert(ok, failure)
+end
+
 -- A stored prelude is true only of the type identity it was written from.
 --
 -- An arena key spells a type by its parts' ids, and a nominal's id is a number
