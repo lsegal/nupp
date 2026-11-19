@@ -4,8 +4,10 @@
 
 - A process that builds several environments over one project no longer parses
   every file in it again for each one to build its project index. Headers
-  already worked out in the process are reused, so a later environment rooted
-  at this repository indexes its 1,004 files in about 0.8 seconds instead of 5.
+  already worked out in the process are reused, and found by each file's size
+  and modification time rather than by reading and digesting it again, so a
+  later environment rooted at this repository indexes its 1,004 files in under
+  0.2 seconds instead of 5.
 
 - The first command against an empty cache now keeps the standard-library
   interfaces it checked, and a project's own, as well as the prelude. Before,
