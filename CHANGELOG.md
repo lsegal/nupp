@@ -7,6 +7,12 @@
   loads is about 540 KiB smaller (7.0 to 6.5 MiB). It had grown to within
   about 200 bytes of the guest's 7 MiB startup mailbox.
 
+- A type function applied to two same-named local records, such as
+  `Identity(Item)` with a record `Item` declared in each of two functions, no
+  longer gives the second call the first call's record. The second call
+  reused the first one's cached answer, so its value was reported as
+  `NUPP2001` against a record it was never declared with.
+
 - A process that builds several environments over one project no longer parses
   every file in it again for each one to build its project index. Headers
   already worked out in the process are reused, so a later environment rooted
