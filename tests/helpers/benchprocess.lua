@@ -54,12 +54,34 @@ local function jsonLines(path)
     return values
 end
 
+-- What `debug.bench` reaches that the compiler does not carry. A project that
+-- compiles a benchmark from source includes these copies rather than the whole of
+-- `src`: with `src` included, every standard-library module the program reaches
+-- resolves to a project file there and is checked again in each process instead
+-- of shared from the carried copy (#410). A child listing a fixture that way took
+-- about twenty seconds of CPU; with the copies, whose checks the shard's store
+-- keeps by content, it takes about two (#438).
+local UNCARRIED = {"debug/bench.nupp", "nupp/bench/internal/record.nupp", "nupp/bench/internal/statistics.nupp",}
+
+local function copyUncarried(directory)
+    for _, relative in ipairs(UNCARRIED) do
+        local target = directory .. "/" .. relative
+        assert(os.execute(("mkdir -p %q"):format(assert(target:match("^(.*)/[^/]+$")))) == 0)
+        local file = assert(io.open(target, "wb"))
+        file:write(read(NUPP_SRC .. "/" .. relative))
+        file:close()
+    end
+end
+
 local function workspace(precompiled)
     local directory = os.tmpname()
     os.remove(directory)
     testAssert.eq(os.execute(("mkdir -p %q"):format(directory)), 0, "create isolated benchmark workspace")
+    if not precompiled then
+        copyUncarried(directory .. "/bench")
+    end
     local manifest = assert(io.open(directory .. "/nupp.lua", "wb"))
-    manifest:write(("return {include = {%q}}\n"):format(precompiled and "." or NUPP_SRC))
+    manifest:write(("return {include = {%q}}\n"):format(precompiled and "." or "bench"))
     manifest:close()
 
     return directory
@@ -105,12 +127,6 @@ local programIdentity
 -- Every program the suites run, built together: one build per run rather than one
 -- per program, which is what a cold run spends nearly all of these suites' time on.
 local PROGRAMS = {"bench_fixed_records", "bench_protocol", "bench_suite"}
-
--- What `debug.bench` reaches that the compiler does not carry. The build includes
--- these copies rather than the whole of `src`: with `src` included, every
--- standard-library module the programs reach resolves to a project file there and
--- is checked again in each build instead of shared from the carried copy (#410).
-local UNCARRIED = {"debug/bench.nupp", "nupp/bench/internal/record.nupp", "nupp/bench/internal/statistics.nupp",}
 
 local function benchmarkProgram(name)
     local fingerprint = require("nupp.compiler.project.fingerprint")
@@ -171,13 +187,7 @@ local function benchmarkProgram(name)
             file:close()
             entries[index], files[index] = ("%q"):format(program), ("%q"):format("src/" .. program .. ".nupp")
         end
-        for _, relative in ipairs(UNCARRIED) do
-            local target = directory .. "/bench/" .. relative
-            assert(os.execute(("mkdir -p %q"):format(assert(target:match("^(.*)/[^/]+$")))) == 0)
-            local file = assert(io.open(target, "wb"))
-            file:write(read(NUPP_SRC .. "/" .. relative))
-            file:close()
-        end
+        copyUncarried(directory .. "/bench")
         local file = assert(io.open(directory .. "/nupp.lua", "wb"))
         file:write(
             (
