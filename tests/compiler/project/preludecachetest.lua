@@ -305,7 +305,7 @@ end
 -- A project that shadows a bundled module changes what reaches that module, and
 -- nothing else. A harness case that shadows `types` or an extension module used
 -- to check every standard-library module it reached again (#439); now it checks
--- only those that reach what it shadows.
+-- only those that reach what it shadows, and once per way of shadowing it.
 function M.aShadowingProjectSharesWhatItsShadowsDoNotReach()
     local dir = project()
     -- The first environment may be the one that reads the stored prelude, which
@@ -326,7 +326,10 @@ function M.aShadowingProjectSharesWhatItsShadowsDoNotReach()
     local function load(shadows)
         local root = project()
         for file, source in pairs(shadows) do
-            assert(os.execute("mkdir -p '" .. root .. "/" .. file:match("^(.*)/[^/]+$") .. "'") == 0)
+            local parent = file:match("^(.*)/[^/]+$")
+            if parent then
+                assert(os.execute("mkdir -p '" .. root .. "/" .. parent .. "'") == 0)
+            end
             local handle = assert(io.open(root .. "/" .. file, "wb"))
             handle:write(source)
             handle:close()
@@ -356,6 +359,17 @@ function M.aShadowingProjectSharesWhatItsShadowsDoNotReach()
             "bytes._representation",
             "only the module that reaches the shadow is checked again"
         )
+
+        -- A plain Lua `assert` turns the assertion extension off for everything
+        -- after it. The first project like that checks what reaches it; the next,
+        -- answering alike, takes those checks.
+        local first, again
+        record, first = load({["assert.lua"] = "return _G.assert\n"})
+        assert(record, "the module checks without the assertion extension")
+        assert(first:find("bytes._representation", 1, true), "it reaches the assertion extension: " .. first)
+        record, again = load({["assert.lua"] = "return assert\n"})
+        assert(record, "and checks again")
+        test.eq(again, "", "a project that answers alike checks none of it again")
     end)
     envMod.checkModuleSource = checkModuleSource
     os.execute("rm -rf '" .. dir .. "'")
