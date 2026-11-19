@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A type function applied to two same-named local records, such as
+  `Identity(Item)` with a record `Item` declared in each of two functions, no
+  longer gives the second call the first call's record. The second call
+  reused the first one's cached answer, so its value was reported as
+  `NUPP2001` against a record it was never declared with.
+
 - The first command against an empty cache now keeps the standard-library
   interfaces it checked, and a project's own, as well as the prelude. Before,
   only the next command could keep them, so a fresh cache paid for checking
