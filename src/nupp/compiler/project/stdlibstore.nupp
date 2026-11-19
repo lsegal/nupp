@@ -13,15 +13,12 @@ which carries its image in and has a startup mailbox to fit, does not bundle it.
 ## One decode per shared prelude
 
 An environment that takes a prelude another one read from the stored image holds
-that image's arena, so it can hydrate the store written beside it (#417). It must
-not decode the store again, though: a decode allocates the nominals its modules
-declare, so a second decode beside a module another environment already holds
-would give that module a second set. So the first decode is kept with the shared
-prelude, and every later environment takes the same one.
-
-A module an environment checked from source before any decode has nominals no
-decode knows, so once one is shared the store is left alone and each environment
-checks the rest from source, as before.
+that image's arena, so it can hydrate the store written beside it (#417). It does
+not decode the store again: a decode allocates the nominals its modules declare
+and binds the type variables they share, so every environment holding the prelude
+takes the first decode, and with it one set of nominals. What an environment checks
+from source beside it stays its own, as it does for any environment with an image
+(#412).
 ]]
 module nupp.compiler.project.stdlibstore
 
@@ -66,23 +63,18 @@ export function open(env: any, sources: {string}, storeDir: string): (any, strin
     return store, digest(table.concat(parts, "\0"))
 end
 
---- The decode kept under `key` in `images`, or the first one made, by `decode`, when
---- none of `modules` -- what the sharing environments already hold -- came from
---- source. Each decoded module's binder bounds are kept too, by `boundsOf`, since
---- an environment that checks a prelude of its own in between rebinds them.
+--- The decode kept under `key` in `images`, or the first one, made by `decode`.
+--- Each decoded module's binder bounds are kept with it, by `boundsOf`, since an
+--- environment that checks a prelude of its own in between rebinds them.
 export function hydrate(
     images: {[string]: any},
     key: string,
-    modules: {[string]: any},
     decode: function(): (any?, string?),
     boundsOf: function(any, any, string): any
 ): (any?, string?)
     local kept = images[key]
     if kept ~= nil then
         return kept or nil, nil
-    end
-    if next(modules) ~= nil then
-        return nil, "a shared standard-library module was checked from source"
     end
     local hydrated, problem = decode()
     if hydrated ~= nil then

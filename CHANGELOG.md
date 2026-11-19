@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The first command against an empty cache now keeps the standard-library
+  interfaces it checked, and a project's own, as well as the prelude. Before,
+  only the next command could keep them, so a fresh cache paid for checking
+  the standard library from source twice: requiring `serde.json` cost about
+  five seconds on each of the first two commands, and now costs that once and
+  about one second after.
+
+- Compiler and tool stamps use the native digest whenever the caller names
+  none, instead of the portable one. The answers are the same; the portable
+  digest spent seconds over the whole compiler tree, which an AOT build paid
+  for its tool stamp.
+
 - A process that builds several environments, such as a `nupp test` run with
   its suites in one process, no longer checks the prelude and the standard
   library again for each of them. Environments that agree on the target,

@@ -307,8 +307,8 @@ end
 -- that reads the stored prelude.
 --
 -- The store is decoded once for every environment sharing the prelude: a decode
--- declares the nominals its modules declare, so a second one would give a
--- module another environment already holds a second set.
+-- declares the nominals its modules declare, so the environments holding it agree
+-- on one set, and share what they check from source against it.
 function M.laterEnvironmentsHydrateTheStandardLibraryStore()
     local dir = project()
     local store = dir .. "/store"
