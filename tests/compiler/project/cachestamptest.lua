@@ -510,7 +510,10 @@ local function countingStore(kept, operation)
     package.loaded["nupp.compiler.hostservices"] = {
         hash = {
             digest = function(text)
-                digests = digests + 1
+                -- Not the empty probe that tells the store the digest works.
+                if text ~= "" then
+                    digests = digests + 1
+                end
                 return real(text)
             end,
         },
