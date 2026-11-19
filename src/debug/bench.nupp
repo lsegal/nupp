@@ -27,7 +27,7 @@ merge.
 ]]
 module debug.bench
 
-local json = require("serde.json")
+local json = require("nupp.serde.internal.json.values")
 local profile = require("debug.profile")
 local statistics = require("nupp.bench.internal.statistics")
 local recordio = require("nupp.bench.internal.record")
@@ -508,8 +508,8 @@ end
 --- @return why it was refused, naming its schema and the ones this version reads
 export function decode(text: string, path: string, floor: integer?): (any, string?)
     local low = floor or oldest
-    local decoded, document = pcall(json.decodevalue, text)
-    if not decoded or type(document) ~= "table" or json.isarray(document) then
+    local decoded, document = pcall(json.decode, text)
+    if not decoded or type(document) ~= "table" or json.isArray(document) then
         return nil, ("nupp: baseline %s is not a bench record"):format(path)
     end
     local version = document.schema
@@ -669,7 +669,7 @@ local function announce(listing: any): nil
         if not handle then
             error("nupp: cannot write " .. options.casesout, 0)
         end
-        handle:write(json.encodevalue(recordio.writemeasurement(listing)), "\n")
+        handle:write(json.encode(recordio.writemeasurement(listing)), "\n")
         handle:close()
 
         return
@@ -1364,7 +1364,7 @@ local function readremarks(): any
     if not content then
         return nil
     end
-    local decoded = json.decodevalue(content)
+    local decoded = json.decode(content)
 
     return decoded
 end
@@ -2020,7 +2020,7 @@ export function report(): nil
         job.run()
     end
     local record = buildrecord()
-    local encoded = json.encodevalue(recordio.write(record))
+    local encoded = json.encode(recordio.write(record))
     writefile(options.out, encoded)
     if options.json then
         io.stdout:write(encoded, "\n")
