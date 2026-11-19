@@ -675,12 +675,15 @@ function M.aFileEditedUnderTheSamePathIsReadAgainForItsHeader()
         ["nupp.lua"] = 'return { include = { "src" } }\n',
         ["src/m.nupp"] = "export type Alpha = integer\n",
     })
+
     local function age(stamp)
         assert(os.execute("touch -t " .. stamp .. " '" .. dir .. "/src/m.nupp'") == 0)
     end
+
     local function declares(name)
         return (envMod.ensureProjectIndex(envMod.new(dir)).byName[name] or {})[1] ~= nil
     end
+
     age("202001010000")
     assert(declares("Alpha"), "the first environment indexes the file")
     assert(declares("Alpha"), "and a second one finds the same header")
@@ -691,10 +694,7 @@ function M.aFileEditedUnderTheSamePathIsReadAgainForItsHeader()
 
     editFixture(dir, "src/m.nupp", "export type Charlie = integer\n")
     age("202001010001")
-    assert(
-        declares("Charlie") and not declares("Bravo"),
-        "an edit that keeps the modification time was not read again"
-    )
+    assert(declares("Charlie") and not declares("Bravo"), "an edit that keeps the modification time was not read again")
     os.execute("rm -rf '" .. dir .. "'")
 end
 
