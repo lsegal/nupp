@@ -49,9 +49,13 @@ export function open(env: any, sources: {string}, storeDir: string): (any, strin
     end
     local services = env.compilerServices and env.compilerServices.hash and env.compilerServices.hash.digest or nil
     local digest = services or require("nupp.compiler.hash").digest
-    local store = require("nupp.compiler.project.store").open(
+    local store = require(
+        "nupp.compiler.project.store"
+    ).open(
         storeDir .. "/stdlib.buf",
-        require("nupp.compiler.project.fingerprint").subsystemFingerprint(
+        require(
+            "nupp.compiler.project.fingerprint"
+        ).subsystemFingerprint(
             {"nupp.compiler.project.env", "nupp.compiler.project.stdlibimage", "nupp.compiler.project.stdlibstore"},
             storeDir,
             services,
