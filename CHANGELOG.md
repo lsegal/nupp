@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A process that builds several environments over one project no longer parses
+  every file in it again for each one to build its project index. Headers
+  already worked out in the process are reused, so a later environment rooted
+  at this repository indexes its 1,004 files in about 0.8 seconds instead of 5.
+
 - A process that builds several environments, such as a `nupp test` run with
   its suites in one process, no longer checks the prelude and the standard
   library again for each of them. Environments that agree on the target,
