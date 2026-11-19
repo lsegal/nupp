@@ -643,7 +643,8 @@ function M.browserCompilerOmitsTheCliTestHarness()
 end
 
 -- The guest hands the compiler over through a 7 MiB startup mailbox, and nothing
--- the browser bundle loads reads the AOT link's IR or the documentation theme.
+-- the browser bundle loads reads the AOT link's IR, the documentation theme, or a
+-- provider only native artifacts may reach.
 function M.browserCompilerOmitsCliOnlyResources()
     local targets = assert(loadfile(ROOT .. "/nupp.lua"))().build.targets
     for _, name in ipairs({"browserLuaJITCompiler", "browserLuaJITCompilerWithoutPrelude"}) do
@@ -651,13 +652,21 @@ function M.browserCompilerOmitsCliOnlyResources()
             local path = type(resource) == "table" and resource.source or resource
             assert(not path:match("%.ll$"), name .. " carries AOT link IR: " .. path)
             assert(path ~= "src/nupp/tools/doc/theme.css", name .. " carries the documentation theme")
-            -- The browser binds the GPU to WebGPU, so wgpu-native's provider is dead weight.
-            for _, module in ipairs({"nativegpu", "nativegpurelease", "gpudevice", "gpucosts", "wgpu"}) do
+            -- A browser artifact is refused the native providers and bound to
+            -- `nupp.runtime.browser.*` and WebGPU instead, so their source is dead
+            -- weight. Storage backs `bytes` on every host.
+            for _, module in ipairs({"gpudevice", "gpucosts", "wgpu", "workers", "channels", "suspension"}) do
                 assert(
                     path ~= "src/nupp/runtime/provider/" .. module .. ".nupp",
-                    name .. " carries the native GPU provider: " .. path
+                    name .. " carries a native provider: " .. path
                 )
             end
+            assert(
+                not path:match("^src/nupp/runtime/provider/native")
+                    or path == "src/nupp/runtime/provider/nativestorage.nupp",
+                name .. " carries a native provider: " .. path
+            )
+            assert(path ~= "src/nupp/codec/json/aot.nupp", name .. " carries the AOT JSON codec")
         end
     end
 end
