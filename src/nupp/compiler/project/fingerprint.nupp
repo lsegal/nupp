@@ -34,6 +34,11 @@ local fingerprint = {}
 --- every source, every compiler file and every memoized value through it, so the
 --- difference is seconds a command rather than a micro-optimization.
 ---
+--- It is also what every function here digests with when its caller names no
+--- digest. The answers are the same either way, and a caller that named none --
+--- an AOT build asking for the tool stamp, a test asking for the graph -- paid
+--- seconds of the portable arithmetic over the whole compiler tree for them.
+---
 --- Resolved once. The running compiler cannot grow or lose an FFI while it runs,
 --- and a portable `lua51` session has none to load: `native` false is how a
 --- caller that knows it is building for one says so, and the `pcall` is for a
@@ -57,18 +62,19 @@ end
 
 local function hashFile(path: string, contentDigest: (function(string): string)?): string?
     local text = readFile(path)
-    local digest = contentDigest or hash.digest
+    local digest = contentDigest or fingerprint.contentDigest()
 
     return text and digest(text) or nil
 end
 
 local function hashFiles(files: {string}): string
+    local digest = fingerprint.contentDigest()
     local parts = {}
     for _, path in ipairs(files) do
-        parts[#parts + 1] = path .. "\0" .. (hashFile(path, hash.digest) or "missing")
+        parts[#parts + 1] = path .. "\0" .. (hashFile(path, digest) or "missing")
     end
 
-    return hash.digest(table.concat(parts, "\0"))
+    return digest(table.concat(parts, "\0"))
 end
 
 --- The compiler's own directory, `<root>/nupp/compiler`: this file sits in `project/`
@@ -238,7 +244,7 @@ local function toolFingerprint(contentDigest: (function(string): string)?): stri
 end
 
 computeToolFingerprint = function(contentDigest: (function(string): string)?): string
-    local digest = contentDigest or hash.digest
+    local digest = contentDigest or fingerprint.contentDigest()
     -- The toolchain is two trees, the compiler and the tools built on it, and both
     -- decide what a build writes: `nupp.tools.build` is where an artifact is put
     -- together. Named from the directory holding both.
@@ -307,7 +313,7 @@ end
 --- The compiler, its tools, and their resolved implementation dependencies.
 --- A subsystem whose dependencies cannot be narrowed falls back to this digest.
 local function graphFingerprint(contentDigest: (function(string): string)?): string
-    local digest = contentDigest or hash.digest
+    local digest = contentDigest or fingerprint.contentDigest()
     if bundled() then
         return toolFingerprint(digest)
     end
@@ -457,106 +463,8 @@ local function moduleNameOf(root: string, path: string): string?
     return name ~= "" and name or nil
 end
 
---- The modules `text` requires, what it may require dynamically, and whether it
---- requires something this cannot name at all.
----
---- The shapes are `require "m"`, `require("m")`, and `pcall(require, "m")`, which is
---- how an optional library is reached. `_G.require` names the same global operation.
---- A `require` that is a field of anything else -- the
---- checker looks up `env.globals.require` -- is a different name that happens to be
---- spelled the same, and is not one of these.
----
---- A `require` whose argument is not a literal is one this cannot follow, and a module
---- holding one could depend on anything, so the stamp covering it has to cover the
---- whole compiler. A module that knows better says so:
----
----     --@requires-dynamically nupp.runtime.provider.*
----     --@requires-dynamically nothing
----
---- The first names what it may load -- a trailing `.*` is every module under that
---- prefix -- and the second says the name it resolves is not code it is defined by.
---- Both are claims the module makes and this cannot check, which is why they are
---- written where the `require` is rather than inferred from it. Nupp source carries
---- these markers in a const string so they survive generation; ordinary comments
---- are removed before this graph reads the compiled Lua.
-local function requiredBy(text: string, path: string): {string}, boolean, {string}
-    local lexer = require("nupp.compiler.syntax.lexer")
-    -- This generated startup guard initializes a service; it is not an import
-    -- from the compiler subsystem being fingerprinted. Authored imports remain.
-    local guard = 'if not package.loaded["debug.log"] then require("debug.log") end;'
-    local prelude = text:find("local __nupp=_G.nupp or ", 1, true)
-    if prelude then
-        local start = text:find(guard, prelude, true)
-        local newline = text:find("\n", 1, true)
-        if start and (not newline or start < newline) then
-            text = text:sub(1, start - 1) .. text:sub(start + #guard)
-        end
-    end
-    local tokens = lexer.lex(text, path)
-    local names: {string} = {}
-    local declared: {string} = {}
-    local reflective = false
-    local unknown = false
-    for pattern in text:gmatch("@requires%-dynamically%s+([%w%.%*%-_]+)") do
-        if pattern == "nothing" then
-            reflective = true
-        else
-            declared[#declared + 1] = pattern
-        end
-    end
-    for index = 1, #tokens do
-        local token = tokens[index]
-        local previous = tokens[index - 1]
-        local following = tokens[index + 1]
-        local globalRequire = previous
-            and previous.text == "."
-            and tokens[index - 2]
-            and tokens[index - 2].text == "_G"
-            and not (tokens[index - 3] and (tokens[index - 3].text == "." or tokens[index - 3].text == ":"))
-        local callPrefix = globalRequire and tokens[index - 3] or previous
-        if token.kind == "name"
-            and token.text == "require"
-            and (globalRequire or not (previous and (previous.text == "." or previous.text == ":")))
-            and not (previous and previous.text == "function")
-            and not (following and following.text == "=")
-        then
-            local literal = nil
-            if following and following.kind == "string" then
-                literal = following
-            elseif following and following.text == "(" and tokens[index + 2] and tokens[index + 2].kind == "string" then
-                literal = tokens[index + 2]
-            elseif following
-                and following.text == ","
-                and callPrefix
-                and callPrefix.text == "("
-                and tokens[index + 2]
-                and tokens[index + 2].kind == "string"
-            then
-                literal = tokens[index + 2]
-            end
-            if not literal then
-                unknown = unknown or not (reflective or #declared > 0)
-            else
-                -- On its own line: `chunk and pcall(chunk)` is one value, the way any
-                -- call inside a larger expression is, so the string would arrive as
-                -- nil.
-                local chunk = loadstring("return " .. literal.text)
-                if not chunk then
-                    unknown = unknown or not (reflective or #declared > 0)
-                else
-                    local ok, value = pcall(chunk)
-                    if not ok or type(value) ~= "string" then
-                        unknown = unknown or not (reflective or #declared > 0)
-                    else
-                        names[#names + 1] = value as string
-                    end
-                end
-            end
-        end
-    end
-
-    return names, unknown, declared
-end
+--- The modules a compiled file requires; see `nupp.compiler.project.requires`.
+local requiredBy = require("nupp.compiler.project.requires").scan
 
 local function validName(name: string): boolean
     return name:match("^[%w_%.%-]+$") ~= nil
@@ -859,7 +767,7 @@ function fingerprint.subsystemFingerprint(
     contentDigest: (function(string): string)?,
     readOnly: boolean?
 ): string
-    local digest = contentDigest or hash.digest
+    local digest = contentDigest or fingerprint.contentDigest()
     local ordered: {string} = {}
     for index, name in ipairs(roots) do
         ordered[index] = name
@@ -947,7 +855,11 @@ local declarationMemo: string? = nil
 --- kept saying so after the module was fixed.
 ---
 --- The readers are parameters so a test can hand in declarations of its own; a
---- caller passing none reads what this compiler carries, once per process.
+--- caller passing none reads what this compiler carries, once per process, and
+--- once per test run where the run keeps fingerprints (`runRemembered`). Either
+--- digest counts as passing none: the native one is byte for byte the portable
+--- one's answer, and every build hands in the native one, so a build reading the
+--- compiler's own declarations used to read and hash all of them again (#406).
 ---
 --- @param contentDigest the digest to stamp with, or the build's own
 --- @param listDeclarations lists the carried files under a prefix, or the compiler's
@@ -958,13 +870,15 @@ function fingerprint.declarationFingerprint(
     listDeclarations: (function(string): {string})?,
     readDeclaration: (function(string): string?)?
 ): string
-    local own = contentDigest == nil and listDeclarations == nil and readDeclaration == nil
+    local own = listDeclarations == nil
+        and readDeclaration == nil
+        and (contentDigest == nil or contentDigest == hash.digest or contentDigest == fingerprint.contentDigest())
     if own and declarationMemo ~= nil then
         return declarationMemo as string
     end
 
     local function compute(): string
-        local digest = contentDigest or hash.digest
+        local digest = contentDigest or fingerprint.contentDigest()
         local list = listDeclarations or require("nupp.compiler.bundledlist").list
         local read = readDeclaration or require("nupp.compiler.bundled").source
         local checked: {[string]: boolean} = {}

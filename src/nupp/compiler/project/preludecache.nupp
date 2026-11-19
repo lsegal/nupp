@@ -344,9 +344,15 @@ end
 --- `origin` is where the arena stood before the prelude was checked, sealed while
 --- it still stood there. Without one there is nothing to say which readers the
 --- image is true for, so there is no image.
-function preludecache.encode(roots: any, origin: preludecache.Origin?): any?
+---
+--- The second result is every table the image numbered, by id: the live
+--- counterpart of the `arena` that `decode` returns. An image written against it
+--- names the same tables a reader of this image will build, so the command that
+--- checked the prelude can keep the interfaces it checks against it as well,
+--- rather than leaving them to the next one.
+function preludecache.encode(roots: any, origin: preludecache.Origin?): (any?, {any}?)
     if origin == nil or origin.digest == nil then
-        return nil
+        return nil, nil
     end
     local owned = ownedByModules()
     local identity = types.identity()
@@ -554,7 +560,7 @@ function preludecache.encode(roots: any, origin: preludecache.Origin?): any?
         origin = {capability = origin.capability, nominal = origin.nominal, digest = origin.digest,},
         roots = rootIds,
         runtime = roots.preludeRuntime,
-    }
+    }, tables
 end
 
 --- Builds the roots again from what `encode` wrote, or nil when the image is not
