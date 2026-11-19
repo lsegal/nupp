@@ -8,6 +8,11 @@
   reused the first one's cached answer, so its value was reported as
   `NUPP2001` against a record it was never declared with.
 
+- A process that builds several environments over one project no longer parses
+  every file in it again for each one to build its project index. Headers
+  already worked out in the process are reused, so a later environment rooted
+  at this repository indexes its 1,004 files in about 0.8 seconds instead of 5.
+
 - The first command against an empty cache now keeps the standard-library
   interfaces it checked, and a project's own, as well as the prelude. Before,
   only the next command could keep them, so a fresh cache paid for checking

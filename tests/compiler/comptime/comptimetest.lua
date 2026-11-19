@@ -18,7 +18,7 @@ local hash = require("nupp.compiler.hash")
 local stable = require("nupp.compiler.stable")
 
 local HERE = require("helpers.paths").tests
-local env = envMod.new(HERE .. "/..")
+local env = require("helpers.repositoryenv").new()
 
 -- Checks, then generates. Comptime runs during checking, so a diagnostic it produced is
 -- in the list this returns; nothing here optimizes, because comptime is semantics and
@@ -606,21 +606,26 @@ function M.aCdefStructsFunctionFieldIsLaidOutAsAPointer()
     if host ~= nil then
         local ffi = require("ffi")
         local native = runIn(FUNCTION_FIELDS_SOURCE, layoutEnv(host))
-        local ct = ffi.typeof([[struct {
+        local ct = ffi.typeof(
+            [[struct {
             int8_t tag;
             int32_t (*panic)(void *L);
             int32_t (*fallback)(void *L);
             int8_t after;
-        }]])
+        }]]
+        )
         testAssert.eq(
             table.concat(native, ","),
-            table.concat({
-                ffi.sizeof(ct),
-                ffi.alignof(ct),
-                ffi.offsetof(ct, "panic"),
-                ffi.offsetof(ct, "fallback"),
-                ffi.offsetof(ct, "after"),
-            }, ","),
+            table.concat(
+                {
+                    ffi.sizeof(ct),
+                    ffi.alignof(ct),
+                    ffi.offsetof(ct, "panic"),
+                    ffi.offsetof(ct, "fallback"),
+                    ffi.offsetof(ct, "after"),
+                },
+                ","
+            ),
             "the host layout agrees with LuaJIT's"
         )
     end
@@ -1158,7 +1163,7 @@ end
 ]]
     local checked = parser.parse(source, "phaseexports.nupp")
     testAssert.eq(#checked.errors, 0)
-    local diagnostics = check.check(checked, "phaseexports.nupp", envMod.new(HERE .. "/..", {cache = false}))
+    local diagnostics = check.check(checked, "phaseexports.nupp", require("helpers.repositoryenv").new({cache = false}))
     testAssert.eq(#diagnostics, 0, diagnostics[1] and diagnostics[1].msg)
     testAssert.eq(type(checked.moduleExports.comptimeFunctions.debug), "table")
     local code, generated = gen.generate(checked, "phaseexports.nupp")
