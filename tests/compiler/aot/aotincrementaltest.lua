@@ -322,11 +322,7 @@ function M.anUnchangedBuildSkipsTheCheckingSession()
     local manifest = assert(read(dir .. "/nupp.lua"))
     write(
         dir .. "/nupp.lua",
-        (manifest:gsub(
-            "}}},",
-            '}, other = {kind = "modules", entries = {"k1"}, outDir = "build/other"}}},',
-            1
-        ))
+        (manifest:gsub("}}},", '}, other = {kind = "modules", entries = {"k1"}, outDir = "build/other"}}},', 1))
     )
     assert(phaseNames(build(dir))["aot:lookup"], "a manifest change takes the ordinary path")
     assert(not phaseNames(build(dir))["aot:lookup"], "and settles again")

@@ -66,15 +66,12 @@ function reuse.input(
         tostring(jit and jit.arch)
     }
     if target.aot ~= nil and target.aot ~= "off" then
-        -- What the AOT replay compares beyond source bytes: the code
-        -- generator and its facts, and the carried standard library and LLVM
-        -- IR the compiler-code digest does not cover.
-        parts[#parts + 1] = "<aot>" .. stable(aotPolicy.toolchainPolicy(
-            target.aot as string,
-            target.aotTarget as string?,
-            digest
-        ))
-        parts[#parts + 1] = "<aot-resources>" .. aotPolicy.compilerResourceFingerprint(digest)
+        -- What the AOT replay compares beyond source bytes: the policy, its
+        -- target and the code generator with its facts. The carried standard
+        -- library and LLVM IR are among the carried sources digested below.
+        parts[
+            #parts + 1
+        ] = "<aot>" .. stable(aotPolicy.toolchainPolicy(target.aot as string, target.aotTarget as string?, digest))
     end
     local seen: {[string]: boolean} = {}
     local output = fs.absolute(fs.join(root, outDir))

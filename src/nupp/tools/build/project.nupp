@@ -633,7 +633,11 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
         if aotTarget and testInput ~= nil then
             aotReplayed = aotPolicy.replay(
                 oldState.aotReplay,
-                aotPolicy.toolchainPolicy(target.aot as string, target.aotTarget as string?, contentDigest).desiredCommand
+                aotPolicy.toolchainPolicy(
+                    target.aot as string,
+                    target.aotTarget as string?,
+                    contentDigest
+                ).desiredCommand
             )
             if aotReplayed == nil then
                 previous = nil
@@ -1443,6 +1447,11 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
         opts.produced.accountedModules = result.accountedModules
     end
     if testInput ~= nil then
+        -- The AOT stage hands its selections to the module build on the target,
+        -- which the key reads as part of the config. Both are spent by now, and
+        -- the next lookup sees the target without them.
+        local internalTarget = target as any
+        internalTarget._constSelection, internalTarget._aotGpuSources = nil, nil
         -- Never publish a result for source that changed while the build ran.
         local after = testBuild.input(root, outDir, config, target, newState, contentDigest)
         local outputs = testBuild.outputs(mine, contentDigest)
