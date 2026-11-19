@@ -50,12 +50,12 @@ local magnitude: number = math.quat.len(0, 0, 0, 1)
 local x, y, z, w = math.quat.mul(1, 0, 0, 0, 0, 1, 0, 0)
 return length, distance, magnitude, x, y, z, w
 ]],
-        envMod.new(ROOT)
+        require("helpers.repositoryenv").new()
     )
 end
 
 function M.soaAllocKeepsTheExistingAllocationOperation()
-    local env = envMod.new(ROOT)
+    local env = require("helpers.repositoryenv").new()
     local source = [[
 local soa = table.Array
 local span = require("bytes.span")
@@ -97,7 +97,7 @@ function M.lowercaseBuilderFunctionsAndLenKeepNativeOperations()
             return (source:gsub("export const ([%w_]+)", function(name)
                 return "export const " .. (name == "length" and "len" or name:lower())
             end))
-        end) or envMod.new(ROOT)
+        end) or require("helpers.repositoryenv").new()
         local source = future and BUILDER:gsub("builder%.([%w_]+)", function(name)
             return "builder." .. (name == "length" and "len" or name:lower())
         end) or BUILDER
@@ -121,7 +121,7 @@ local builder = {len = function(): number return 3 end}
 local math = {quat = {mul = function(): number return 5 end}}
 return soa.alloc() + builder.len() + math.quat.mul()
 ]]
-    local parsed = checked(source, envMod.new(ROOT))
+    local parsed = checked(source, require("helpers.repositoryenv").new())
     local code, diagnostics = generator.generate(parsed, "short-names.nupp")
     test.eq(#diagnostics, 0)
     test.eq(assert(loadstring(code, "@short-names.nupp"))(), 10)
