@@ -16,7 +16,7 @@ local function finalEnv(root)
     if root then
         return envMod.new(root, {config = {include = {"src"}}})
     end
-    sharedEnv = sharedEnv or envMod.new(HERE .. "/..", {config = {include = {"src"}}})
+    sharedEnv = sharedEnv or require("helpers.repositoryenv").new()
 
     return sharedEnv
 end

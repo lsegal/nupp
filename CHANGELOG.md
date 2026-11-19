@@ -7,6 +7,11 @@
   loads is about 540 KiB smaller (7.0 to 6.5 MiB). It had grown to within
   about 200 bytes of the guest's 7 MiB startup mailbox.
 
+- A process that builds several environments over one project no longer parses
+  every file in it again for each one to build its project index. Headers
+  already worked out in the process are reused, so a later environment rooted
+  at this repository indexes its 1,004 files in about 0.8 seconds instead of 5.
+
 - The first command against an empty cache now keeps the standard-library
   interfaces it checked, and a project's own, as well as the prelude. Before,
   only the next command could keep them, so a fresh cache paid for checking
@@ -25,7 +30,10 @@
   compat and lints share one checked prelude, and the standard-library modules
   checked against it unless a project shadows one. A later environment now
   takes about 2 ms instead of 380, and requiring `simd` or `serde.json`
-  again checks in tens of milliseconds instead of 8 to 18 seconds.
+  again checks in tens of milliseconds instead of 8 to 18 seconds. A later
+  environment also reads the stored standard-library interfaces beside the
+  stored prelude, so a process whose first environment never needed the
+  standard library no longer checks it from source.
   `NUPP_NO_SHARED_PRELUDE` turns the sharing off.
 
 - A binary built beside the compiler's own build carries every module whose

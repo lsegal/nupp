@@ -612,7 +612,7 @@ function M.mutableArraysPreserveTheirElementType()
     testAssert.eq(diagsOf(decl .. "local nums: {number} = ints\nnums[1] = 1.5"), "NUPP2001:2")
     testAssert.eq(diagsOf(decl .. "local function fill(xs: {number}): nil xs[1] = 1.5 end\nfill(ints)"), "NUPP2006:3")
     local here = require("helpers.paths").tests
-    local env = require("nupp.compiler.project.env").new(here .. "/..")
+    local env = require("helpers.repositoryenv").new()
     testAssert.eq(checkedDiags(decl .. "table.insert(ints, 1.5)", env), "NUPP2125:2")
     testAssert.eq(checkedDiags(decl .. "table.insert(ints, 1, 1.5)", env), "NUPP2125:2")
     testAssert.eq(checkedDiags(decl .. "table.insert(ints, 3)\ntable.insert(ints, 1, 4)", env), "")
@@ -643,7 +643,7 @@ end
 
 function M.tableMovePreservesElementAndDestinationMutabilityContracts()
     local here = require("helpers.paths").tests
-    local env = require("nupp.compiler.project.env").new(here .. "/..")
+    local env = require("helpers.repositoryenv").new()
     local source = [[
 local source: {integer} = {1, 2, 3}
 local destination: {integer} = {}
@@ -875,7 +875,7 @@ function M.assertRemovesFalseFromItsResult()
         table.concat({"local impossible: never = assert(false)", "return impossible",}, "\n"),
         "test.nupp"
     )
-    local diags = check.check(result, "test.nupp", envMod.new(here .. "/.."))
+    local diags = check.check(result, "test.nupp", require("helpers.repositoryenv").new())
     testAssert.eq(#diags, 0, diags[1] and diags[1].msg or "check")
 end
 
@@ -2179,7 +2179,7 @@ end
 -- than reporting NUPP2148 for parameters nothing bound.
 function M.tableArgumentIsGradualEvidence()
     local here = require("helpers.paths").tests
-    local env = require("nupp.compiler.project.env").new(here .. "/..")
+    local env = require("helpers.repositoryenv").new()
 
     local function strictDiags(source)
         local result = parser.parse(source, "walk.nupp")
@@ -2282,7 +2282,7 @@ end
 -- the full spelling has, which is what native lowering admits.
 function M.aNamespaceAliasKeepsTypesAndIntrinsics()
     local here = require("helpers.paths").tests
-    local env = require("nupp.compiler.project.env").new(here .. "/..")
+    local env = require("helpers.repositoryenv").new()
     local spanSource = table.concat(
         {
             "local span = bytes.span",
