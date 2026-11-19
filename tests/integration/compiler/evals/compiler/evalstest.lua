@@ -1,16 +1,13 @@
-local HERE = require("helpers.paths").absoluteTests
-local NUPP = HERE .. "/../bin/nupp"
-
 local M = {}
 
+-- In process against the carried standard library, as evalsemanticstest runs: a
+-- `nupp run` rooted at the repository checked its `src` copy of the standard
+-- library cold, 143 modules, before the self-test started (#419).
 function M.theEvaluationHarnessIsImplementedAndTestedInNupp()
-    local output = os.tmpname()
-    local status = os.execute(("'%s' run tests/fixtures/evals/compiler.nupp > '%s' 2>&1"):format(NUPP, output))
-    local file = assert(io.open(output, "rb"))
-    local text = file:read("*a")
-    file:close()
-    os.remove(output)
-    assert(status == 0, "the Nupp evaluation self-test failed: " .. text)
+    local root = require("helpers.paths").root
+    local config = require("helpers.repositoryenv").config()
+    local project = require("helpers.contractproject").open(root, {config = config})
+    local text = project.run("tests/fixtures/evals/compiler.nupp", true)
     assert(text:find("evaluation harness self-test passed", 1, true), text)
 end
 
