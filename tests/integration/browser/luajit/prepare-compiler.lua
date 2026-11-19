@@ -56,19 +56,21 @@ end
 -- A standard-library image that does not fit the bundle is refused quietly and
 -- the guest checks from source again, which costs minutes rather than failing.
 local hydrated, refused = require("nupp.compiler.project.stdlibimage").hydrate(session:environment(nil))
-assert(hydrated and next(hydrated.semantics), "compiler carries no usable standard-library image: " .. tostring(refused))
+assert(
+    hydrated and next(hydrated.semantics),
+    "compiler carries no usable standard-library image: " .. tostring(refused)
+)
 -- The guest hands the compiler over through its startup mailbox, which holds 7
 -- MiB of application. Said on every run, so a shrinking margin is seen before a
 -- compiler change runs out of it.
 local MAILBOX_BYTES = 7 * 1024 * 1024
 local bytecode = string.dump(assert(loadfile(bundle, "tW")), "sd")
 local margin = MAILBOX_BYTES - #bytecode
-print(("compiler bytecode: %d bytes, %d bytes (%.1f KiB) under the %d-byte startup mailbox"):format(
-    #bytecode,
-    margin,
-    margin / 1024,
-    MAILBOX_BYTES
-))
+print(
+    (
+        "compiler bytecode: %d bytes, %d bytes (%.1f KiB) under the %d-byte startup mailbox"
+    ):format(#bytecode, margin, margin / 1024, MAILBOX_BYTES)
+)
 assert(margin >= 0, ("compiler exceeds startup mailbox by %d bytes"):format(-margin))
 write("compiler.ljbc", bytecode)
 write("compiler-requests.json", fixture)

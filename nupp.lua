@@ -293,10 +293,7 @@ local RESOURCES = {
         source = "src/nupp/runtime/provider/gpudevice.nupp",
         output = "nupp/compiler/nupp/runtime/provider/gpudevice.nupp"
     },
-    {
-        source = "src/nupp/runtime/provider/gpucosts.nupp",
-        output = "nupp/compiler/nupp/runtime/provider/gpucosts.nupp"
-    },
+    {source = "src/nupp/runtime/provider/gpucosts.nupp", output = "nupp/compiler/nupp/runtime/provider/gpucosts.nupp"},
     {source = "src/nupp/runtime/provider/wgpu.nupp", output = "nupp/compiler/nupp/runtime/provider/wgpu.nupp"},
     {source = "src/nupp/runtime/bitops.nupp", output = "nupp/compiler/nupp/runtime/bitops.nupp"},
     {source = "src/nupp/gpu/api.nupp", output = "nupp/compiler/nupp/gpu/api.nupp"},
@@ -627,14 +624,18 @@ local NATIVE_PROVIDER_RESOURCES = {
     ["src/nupp/runtime/provider/suspension.nupp"] = true,
     ["src/nupp/codec/json/aot.nupp"] = true,
 }
+
 local function nativeProviderResource(path)
     -- Storage backs `bytes` on every host, so the browser keeps it.
     return NATIVE_PROVIDER_RESOURCES[path]
         or path:match("^src/nupp/runtime/provider/native") and path ~= "src/nupp/runtime/provider/nativestorage.nupp"
 end
+
 local function cliOnlyResource(resource)
     local path = type(resource) == "table" and resource.source or resource
-    return path:match("^tests/") or path:match("%.ll$") or path == "src/nupp/tools/doc/theme.css"
+    return path:match("^tests/")
+        or path:match("%.ll$")
+        or path == "src/nupp/tools/doc/theme.css"
         or nativeProviderResource(path)
 end
 

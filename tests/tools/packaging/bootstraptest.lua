@@ -100,11 +100,7 @@ function M.launcherFallsBackToTheFetchedStageZero()
     local cache = capture(("'%s/scripts/toolchain' --prefix"):format(ROOT))
     cache = assert(cache:match("^%s*(.-)/[^/]+%s*$"), "the toolchain named no prefix")
 
-    local out = capture(
-        (
-            "NUPP_TOOLCHAIN_DIR='%s' '%s/bin/nupp' --help 2>&1"
-        ):format(cache, dir)
-    )
+    local out = capture(("NUPP_TOOLCHAIN_DIR='%s' '%s/bin/nupp' --help 2>&1"):format(cache, dir))
     assert(out:find("Usage:\n  nupp", 1, true), "launcher did not start the stage-zero compiler: " .. out)
 
     os.execute("rm -rf '" .. dir .. "'")
@@ -445,7 +441,8 @@ end
     assert(find)
     plant(
         "shim/find",
-        ([[
+        (
+            [[
 #!/bin/sh
 out=$('%s' "$@")
 if [ "${1%%/src}" != "$1" ] && [ ! -e '%s/seen' ]; then
@@ -455,7 +452,8 @@ if [ "${1%%/src}" != "$1" ] && [ ! -e '%s/seen' ]; then
 fi
 [ -n "$out" ] && printf '%%s\n' "$out"
 exit 0
-]]):format(find, dir, dir, dir)
+]]
+        ):format(find, dir, dir, dir)
     )
     assert(os.execute("chmod +x '" .. dir .. "/shim/find'") == 0)
 
@@ -663,7 +661,7 @@ function M.browserCompilerOmitsCliOnlyResources()
             end
             assert(
                 not path:match("^src/nupp/runtime/provider/native")
-                    or path == "src/nupp/runtime/provider/nativestorage.nupp",
+                or path == "src/nupp/runtime/provider/nativestorage.nupp",
                 name .. " carries a native provider: " .. path
             )
             assert(path ~= "src/nupp/codec/json/aot.nupp", name .. " carries the AOT JSON codec")

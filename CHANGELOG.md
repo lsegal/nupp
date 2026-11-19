@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The playground's compiler no longer carries the source of the native runtime
+  providers, which a browser program is refused anyway, so the bytecode it
+  loads is about 540 KiB smaller (7.0 to 6.5 MiB). It had grown to within
+  about 200 bytes of the guest's 7 MiB startup mailbox.
+
 - The first command against an empty cache now keeps the standard-library
   interfaces it checked, and a project's own, as well as the prelude. Before,
   only the next command could keep them, so a fresh cache paid for checking
