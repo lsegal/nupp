@@ -527,8 +527,20 @@ return comptime do
 end
 ]]
 
+-- The root the layout environments share: an empty directory, made once per
+-- process. These fragments read nothing of this repository, and an environment
+-- rooted there reads and digests every file under it to index the project, a
+-- second or more for each of the dozen environments below, most of it on Windows.
+local layoutRoot = nil
+
 local function layoutEnv(target)
-    return envMod.new(HERE .. "/..", {cache = false, config = {build = {entries = {"main"}, layoutTarget = target}}})
+    if not layoutRoot then
+        layoutRoot = os.tmpname()
+        os.remove(layoutRoot)
+        testAssert.eq(os.execute(("mkdir -p %q"):format(layoutRoot)), 0)
+    end
+
+    return envMod.new(layoutRoot, {cache = false, config = {build = {entries = {"main"}, layoutTarget = target}}})
 end
 
 function M.computesLayoutForTheDeclaredTargetRatherThanTheHost()

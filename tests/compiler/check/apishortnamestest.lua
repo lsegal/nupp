@@ -11,7 +11,7 @@ local ROOT = HERE .. "/.."
 local M = {}
 
 local function futureModule(name, path, transform)
-    local env = envMod.new(ROOT, {cache = false})
+    local env = require("helpers.repositoryenv").new({cache = false})
     local file = assert(io.open(ROOT .. "/" .. path, "rb"))
     local source = file:read("*a")
     file:close()
