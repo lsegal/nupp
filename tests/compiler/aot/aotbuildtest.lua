@@ -964,18 +964,10 @@ end
 --- code that computed them, so two fixtures can only hit each other's entries
 --- when the answer is the same answer. Every project here is a handful of files
 --- over the same standard library, and each one used to pay to rediscover the
---- whole of it.
-local sharedCacheDir = nil
-
+--- whole of it. A store for the run rather than one per suite run: a sliced
+--- suite is several runs, and each slice's first build started cold (#406).
 local function sharedCache()
-    if not sharedCacheDir then
-        local dir = os.tmpname()
-        os.remove(dir)
-        assert(os.execute("mkdir -p '" .. dir .. "'") == 0)
-        sharedCacheDir = dir
-    end
-
-    return sharedCacheDir
+    return require("helpers.commandcache").dir("aotbuildtest")
 end
 
 --- Fixtures whose case asserts what two builds of *that project* did.
@@ -2852,13 +2844,16 @@ function M.theRuntimeBindsEveryLuaFunction()
     assert(#declared > 0, "the guest's runtime declares the Lua API")
     test.eq(table.concat(looked, " "), table.concat(declared, " "), "the provider binds what the guest declares")
     assert(not bound:find("\ncdef function lua", 1, true), "the provider's runtime imports no Lua API")
+
     local function exports(text)
         local names = {}
         for name in text:gmatch("\nexport function (ks%u[%w]*)%(") do
             names[#names + 1] = name
         end
+
         return table.concat(names, " ")
     end
+
     test.eq(exports(bound), exports(direct), "both runtimes export the same API")
     for _, file in ipairs({"values", "builder", "runtime"}) do
         local source = assert(read(root .. "common/ksrt/" .. file .. ".nupp"))
@@ -4469,7 +4464,10 @@ function M.theAotRuntimeTableMatchesItsLowering()
     local runtime = require("nupp.compiler.aot.llvm.lua.runtime")
     local root = HERE .. "/../native/aotruntime/common/ksrt/"
     local source = assert(read(root .. "runtime.nupp"))
-    local slots = assert(source:match("export const ks_rt_table = ffi%.new<const voidptr%[%d+%]>%({(.-)\n}%)"), "ks_rt_table")
+    local slots = assert(
+        source:match("export const ks_rt_table = ffi%.new<const voidptr%[%d+%]>%({(.-)\n}%)"),
+        "ks_rt_table"
+    )
     local names, header = {}, 0
     for entry in slots:gmatch("[^\n]+") do
         local name = entry:match("^%s*ks_rt_([%w_]+) as voidptr,?$")
@@ -7913,11 +7911,13 @@ local function soaProject(policy)
     local dir = os.tmpname()
     os.remove(dir)
     assert(os.execute(("mkdir -p %q"):format(dir .. "/src")) == 0)
+
     local function write(name, text)
         local handle = assert(io.open(dir .. "/" .. name, "wb"))
         handle:write(text)
         handle:close()
     end
+
     write("src/main.nupp", assert(read(NATIVE_HERE .. "/integration/aot/soa/main.nupp")))
     write(
         "nupp.lua",
@@ -7930,6 +7930,31 @@ return {include={"src"},build={targets={native={kind="bundle",entries={"main"},
     )
 
     return dir, write
+end
+
+--- The required SoA project as built once for the run, copied into a directory
+--- of the caller's own.
+---
+--- Two cases build that same project: one to run it against the interpreted
+--- answer, the other to ask a second build what it reused. Each paid for a
+--- native compilation in a slice of its own, the most expensive build in the
+--- suite (#406). The copy is the project and its build directory as they were,
+--- so building it again is the warm build either case goes on to make, and a
+--- case is free to run or rebuild in it without touching the shared build.
+local soaRequiredBuild = nil
+
+local function builtSoaCopy()
+    if not soaRequiredBuild then
+        soaRequiredBuild = sharedBuild("soa-require", function()
+            return (soaProject("require"))
+        end)
+    end
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute(("cp -R %q %q"):format(soaRequiredBuild, dir)) == 0)
+    os.remove(dir .. "/.nupp-fixture.json")
+
+    return dir
 end
 
 --- Builds and runs the SoA program, and returns what it printed.
@@ -7947,7 +7972,7 @@ end
 function M.directSoaViewsRunAgainstTheSameLuaOracle()
     local dir = soaProject("off")
     local expected = soaAnswer(dir, "off")
-    local required = soaProject("require")
+    local required = builtSoaCopy()
     test.eq(soaAnswer(required, "require"), expected, "identical SoA input and all resulting columns")
     local code = assert(read(required .. "/build/native/main.lua"))
     assert(code:find("__nuppAotCompiled", 1, true), "required AOT installed the native wrappers")
@@ -7955,7 +7980,7 @@ function M.directSoaViewsRunAgainstTheSameLuaOracle()
 end
 
 function M.directSoaViewsReuseNativeObjectsOnAWarmBuild()
-    local dir = soaProject("require")
+    local dir = builtSoaCopy()
     local out, code = build(dir)
     test.eq(code, 0, "require SoA build at " .. dir .. ": " .. out)
     local pipe = assert(

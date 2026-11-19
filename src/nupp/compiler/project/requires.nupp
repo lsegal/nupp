@@ -1,0 +1,139 @@
+--[[
+Which modules a compiled Lua file requires, as the fingerprint's module graph
+reads them.
+
+Finding out lexes the file, and the graph lexes the whole built compiler, which
+is seconds. The answer depends on the text and nothing else, so it is kept for
+the life of the process by the text it was read from: a `fingerprint` loaded
+afresh -- a test reloading it to start from an empty graph, a runner reloading
+the compiler between suites -- then reads only the files that changed since an
+earlier one did, rather than the whole tree again. An edited file is different
+text, so it is read again.
+]]
+module nupp.compiler.project.requires
+
+local requires = {}
+
+--- The modules `text` requires, what it may require dynamically, and whether it
+--- requires something this cannot name at all.
+---
+--- The shapes are `require "m"`, `require("m")`, and `pcall(require, "m")`, which is
+--- how an optional library is reached. `_G.require` names the same global operation.
+--- A `require` that is a field of anything else -- the
+--- checker looks up `env.globals.require` -- is a different name that happens to be
+--- spelled the same, and is not one of these.
+---
+--- A `require` whose argument is not a literal is one this cannot follow, and a module
+--- holding one could depend on anything, so the stamp covering it has to cover the
+--- whole compiler. A module that knows better says so:
+---
+---     --@requires-dynamically nupp.runtime.provider.*
+---     --@requires-dynamically nothing
+---
+--- The first names what it may load -- a trailing `.*` is every module under that
+--- prefix -- and the second says the name it resolves is not code it is defined by.
+--- Both are claims the module makes and this cannot check, which is why they are
+--- written where the `require` is rather than inferred from it. Nupp source carries
+--- these markers in a const string so they survive generation; ordinary comments
+--- are removed before this graph reads the compiled Lua.
+local function scanText(text: string, path: string): ({string}, boolean, {string})
+    local lexer = require("nupp.compiler.syntax.lexer")
+    -- This generated startup guard initializes a service; it is not an import
+    -- from the compiler subsystem being fingerprinted. Authored imports remain.
+    local guard = 'if not package.loaded["debug.log"] then require("debug.log") end;'
+    local prelude = text:find("local __nupp=_G.nupp or ", 1, true)
+    if prelude then
+        local start = text:find(guard, prelude, true)
+        local newline = text:find("\n", 1, true)
+        if start and (not newline or start < newline) then
+            text = text:sub(1, start - 1) .. text:sub(start + #guard)
+        end
+    end
+    local tokens = lexer.lex(text, path)
+    local names: {string} = {}
+    local declared: {string} = {}
+    local reflective = false
+    local unknown = false
+    for pattern in text:gmatch("@requires%-dynamically%s+([%w%.%*%-_]+)") do
+        if pattern == "nothing" then
+            reflective = true
+        else
+            declared[#declared + 1] = pattern
+        end
+    end
+    for index = 1, #tokens do
+        local token = tokens[index]
+        local previous = tokens[index - 1]
+        local following = tokens[index + 1]
+        local globalRequire = previous
+            and previous.text == "."
+            and tokens[index - 2]
+            and tokens[index - 2].text == "_G"
+            and not (tokens[index - 3] and (tokens[index - 3].text == "." or tokens[index - 3].text == ":"))
+        local callPrefix = globalRequire and tokens[index - 3] or previous
+        if token.kind == "name"
+            and token.text == "require"
+            and (globalRequire or not (previous and (previous.text == "." or previous.text == ":")))
+            and not (previous and previous.text == "function")
+            and not (following and following.text == "=")
+        then
+            local literal = nil
+            if following and following.kind == "string" then
+                literal = following
+            elseif following and following.text == "(" and tokens[index + 2] and tokens[index + 2].kind == "string" then
+                literal = tokens[index + 2]
+            elseif following
+                and following.text == ","
+                and callPrefix
+                and callPrefix.text == "("
+                and tokens[index + 2]
+                and tokens[index + 2].kind == "string"
+            then
+                literal = tokens[index + 2]
+            end
+            if not literal then
+                unknown = unknown or not (reflective or #declared > 0)
+            else
+                -- On its own line: `chunk and pcall(chunk)` is one value, the way any
+                -- call inside a larger expression is, so the string would arrive as
+                -- nil.
+                local chunk = loadstring("return " .. literal.text)
+                if not chunk then
+                    unknown = unknown or not (reflective or #declared > 0)
+                else
+                    local ok, value = pcall(chunk)
+                    if not ok or type(value) ~= "string" then
+                        unknown = unknown or not (reflective or #declared > 0)
+                    else
+                        names[#names + 1] = value as string
+                    end
+                end
+            end
+        end
+    end
+
+    return names, unknown, declared
+end
+
+--- What `text` requires, as `scanText` reads it, once per process per text.
+---
+--- The lists are shared by every caller that asks about the same text, so they
+--- are read and never written.
+local scanned: {[string]: {
+    required: {string},
+    unknown: boolean,
+    declared: {string}
+}} = {}
+
+function requires.scan(text: string, path: string): ({string}, boolean, {string})
+    local kept = scanned[text]
+    if kept == nil then
+        local required, unknown, declared = scanText(text, path)
+        kept = {required = required, unknown = unknown, declared = declared}
+        scanned[text] = kept
+    end
+
+    return kept.required, kept.unknown, kept.declared
+end
+
+export = requires

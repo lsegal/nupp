@@ -5,10 +5,21 @@
 - Commands in a test run no longer redo fixed work the run's first command
   already did. The prelude store's seal, the prelude's key, the declaration
   fingerprint and the compiler build's record of each carried runtime module
-  are each worked out once per run rather than once per command, and the
-  file digests a build takes outside a run use the native digest. A warm
-  `nupp aot` and a no-op native build of a small project spend less time
-  before doing any real work.
+  are each worked out once per run rather than once per command. A no-op
+  native build of a small project went from about 690 ms of build work to
+  about 140, and a warm `nupp aot` no longer digests the prelude store.
+
+- The first command against an empty cache now keeps the standard-library
+  interfaces it checked, and a project's own, as well as the prelude. Before,
+  only the next command could keep them, so a fresh cache paid for checking
+  the standard library from source twice: requiring `serde.json` cost about
+  five seconds on each of the first two commands, and now costs that once and
+  about one second after.
+
+- Compiler and tool stamps use the native digest whenever the caller names
+  none, instead of the portable one. The answers are the same; the portable
+  digest spent seconds over the whole compiler tree, which an AOT build paid
+  for its tool stamp.
 
 - A process that builds several environments, such as a `nupp test` run with
   its suites in one process, no longer checks the prelude and the standard

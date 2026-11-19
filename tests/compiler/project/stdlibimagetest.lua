@@ -215,4 +215,44 @@ function M.anEnvironmentTakesImagedModulesInsteadOfCheckingThem()
     testAssert.eq(hydrations, 1, "the image is decoded once")
 end
 
+-- An image decodes a graph of nominals of its own, and other environments in the
+-- process check what it holds from source. The two must not meet: a hydrated
+-- module shared beside one checked from source gave `io.cli` two `Entry`s, and
+-- an environment that took a shared module over its own image had both (#412).
+function M.imagedModulesAreNotSharedWithEnvironmentsThatCheckThem()
+    local name = "nupp.suspension"
+    local moduleType = T.shape({
+        {name = "imaged", read = T.boolean}
+    })
+    local function newEnv(root, image)
+        return envMod.new(root, {
+            cache = false,
+            nativeCompilerServices = false,
+            typeRoots = {},
+            stdlibImage = image,
+        })
+    end
+    local imaged = newEnv("/private/tmp/nupp-412-imaged-consumer", {
+        hydrate = function()
+            return {
+                semantics = {
+                    [name] = {
+                        interface = {type = moduleType},
+                        exports = {types = {}, typeDefs = {}, values = {}, valueDefs = {}, comptimeFunctions = {}},
+                        diags = {},
+                        annotations = {},
+                    },
+                },
+                modules = {[name] = {declarationOnly = false, declared = true}},
+            }
+        end,
+    })
+    local checked = newEnv("/private/tmp/nupp-412-checked-consumer")
+    local fromSource = assert(checked.loadBundledModule(name))
+    assert(fromSource.type ~= moduleType, "the checking environment checks from source")
+    testAssert.eq(assert(imaged.loadBundledModule(name)).type, moduleType, "an image wins over a shared module")
+    local later = assert(newEnv("/private/tmp/nupp-412-later-consumer").loadBundledModule(name))
+    assert(later.type ~= moduleType, "a hydrated module is not handed to an environment that checks")
+end
+
 return M
