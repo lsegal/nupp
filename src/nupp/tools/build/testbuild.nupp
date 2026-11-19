@@ -4,11 +4,15 @@ local fs = require("nupp.compiler.fs")
 local deps = require("nupp.tools.build.deps")
 local stable = require("nupp.compiler.stable")
 local buildLibraries = require("nupp.tools.build.libraries")
+local aotPolicy = require("nupp.tools.build.aot")
 local reuse = {}
 
--- This is a completed test build, above the module cache. Dependency resolution
--- and generators still run before lookup; native providers and the host are
--- refreshed before accepting a hit. Unknown input surfaces use the normal build.
+-- This is a completed build, above the module cache: every test build, and an
+-- ordinary build of a target with an AOT policy, whose no-op otherwise pays for
+-- a whole checking session before its replay can say nothing changed (#427).
+-- Dependency resolution and generators still run before lookup; native
+-- providers and the host are refreshed before accepting a hit. Unknown input
+-- surfaces use the normal build.
 function reuse.input(
     root: string,
     outDir: string,
@@ -21,7 +25,7 @@ function reuse.input(
         or target.reload
         or target.standalone
         or target.host ~= "native"
-        or (target.aot ~= nil and target.aot ~= "off")
+        or (target.aot ~= nil and target.aot ~= "off" and not aotPolicy.POLICIES[target.aot])
         or config._coverage
         or #(config.include or {}) == 0
     then
@@ -61,6 +65,17 @@ function reuse.input(
         tostring(jit and jit.os),
         tostring(jit and jit.arch)
     }
+    if target.aot ~= nil and target.aot ~= "off" then
+        -- What the AOT replay compares beyond source bytes: the code
+        -- generator and its facts, and the carried standard library and LLVM
+        -- IR the compiler-code digest does not cover.
+        parts[#parts + 1] = "<aot>" .. stable(aotPolicy.toolchainPolicy(
+            target.aot as string,
+            target.aotTarget as string?,
+            digest
+        ))
+        parts[#parts + 1] = "<aot-resources>" .. aotPolicy.compilerResourceFingerprint(digest)
+    end
     local seen: {[string]: boolean} = {}
     local output = fs.absolute(fs.join(root, outDir))
     local valid = true

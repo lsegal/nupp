@@ -620,10 +620,24 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
     config._spiEntries = spiEntries
     local testBuild = require("nupp.tools.build.testbuild")
     local testInput: string? = nil
-    if opts.testBuild and not opts.checkOnly and not selectedPlatform and opts.paths == nil then
-        report:at("test-build:lookup")
+    -- An AOT target's no-op build otherwise builds a checking session, reading
+    -- the stored prelude, only for its replay to find nothing changed (#427).
+    local aotTarget = target.aot ~= nil and target.aot ~= "off"
+    if (opts.testBuild or aotTarget) and not opts.checkOnly and not selectedPlatform and opts.paths == nil then
+        report:at(opts.testBuild and "test-build:lookup" or "build:lookup")
         testInput = testBuild.input(root, outDir, config, target, newState, contentDigest)
         local previous = oldState.testBuild
+        -- The completed AOT result has to replay as well: its library, units
+        -- and code generator all still have to be the ones it recorded.
+        if aotTarget
+            and testInput ~= nil
+            and aotPolicy.replay(
+                oldState.aotReplay,
+                aotPolicy.toolchainPolicy(target.aot as string, target.aotTarget as string?, contentDigest).desiredCommand
+            ) == nil
+        then
+            previous = nil
+        end
         if testBuild.intact(previous, testInput, contentDigest) then
             -- Run the existing drivers even on a hit. Their own keys cover native
             -- source, compiler, SDK and environment changes outside the Nupp graph.
@@ -662,7 +676,7 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
                         say(
                             opts,
                             "NUPP0004",
-                            "nupp: cannot make the test artifact executable: " .. tostring(problem) .. "\n"
+                            "nupp: cannot make the reused artifact executable: " .. tostring(problem) .. "\n"
                         )
                         return 1
                     end
