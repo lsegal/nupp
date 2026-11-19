@@ -16,6 +16,14 @@ return {
                     "contract.matrix",
                     "contract.breadth"
                 },
+                sources = {
+                    "../src/contract/compiledfixture.nupp",
+                    "../../../../src/nupp/serde/internal/json/compiled.nupp",
+                    "../../../../src/nupp/codec/json/aot.nupp",
+                    "../src/contract/hotpath.nupp",
+                    "../src/contract/matrix.nupp",
+                    "../src/contract/breadth.nupp",
+                },
                 optimize = 1,
                 aot = "require",
             },

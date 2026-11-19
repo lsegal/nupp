@@ -115,9 +115,25 @@ end
 --- difference is the file kinds they can compile. A glob may select files, while a
 --- directory selected without a glob is walked recursively. Every selection has to
 --- name something so a misspelling cannot quietly produce a smaller artifact.
-local function selectedSourceFiles(root: string, target: Target): ({string}?, string?)
+---
+--- A selection stays inside the project, or inside one of its include roots: a
+--- project whose include reaches above its own directory compiles what is there,
+--- so it may also narrow its source set to part of it.
+local function selectedSourceFiles(root: string, target: Target, includes: {string}?): ({string}?, string?)
     if target.sources == nil then
         return nil
+    end
+
+    local function underInclude(path: string): boolean
+        for _, include in ipairs(includes or {}) do
+            local prefix = normalize(include)
+            local rest = path == prefix and "" or path:sub(1, #prefix + 1) == prefix .. "/" and path:sub(#prefix + 2)
+            if rest and not ("/" .. rest .. "/"):find("/../", 1, true) then
+                return true
+            end
+        end
+
+        return false
     end
 
     local selected, seen = {}, {}
@@ -126,7 +142,7 @@ local function selectedSourceFiles(root: string, target: Target): ({string}?, st
         if normalized == ""
             or normalized:sub(1, 1) == "/"
             or normalized:match("^[A-Za-z]:/")
-            or ("/" .. normalized .. "/"):find("/../", 1, true)
+            or ("/" .. normalized .. "/"):find("/../", 1, true) and not underInclude(normalized)
         then
             return nil, "build.sources must stay inside the project: " .. source
         end
@@ -1613,7 +1629,10 @@ local function buildModules(root: string, outDir: string, config: Config, target
     local function loadedGeneration(): any
         if compilerGeneration == nil then
             local bundled = require("nupp.compiler.bundled")
-            compilerGeneration = cache.loadState(join(bundled.moduleDir(), "../../.nupp-state.json"))
+            -- Only the hashes: the sidecar saves decoding the compiler's whole state.
+            compilerGeneration = {
+                modules = cache.loadModuleHashes(join(bundled.moduleDir(), "../../.nupp-state.json")),
+            }
         end
 
         return compilerGeneration
@@ -1708,7 +1727,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
         -- line does, so it is seeded first and the source set is added around it. A
         -- target that names `sources` owns exactly that selected set plus dependencies
         -- discovered below; an ordinary target retains the whole-project contract.
-        local sourceSet, sourceSetErr = selectedSourceFiles(root, target)
+        local sourceSet, sourceSetErr = selectedSourceFiles(root, target, config.include)
         if sourceSetErr then
             return nil, sourceSetErr
         end
@@ -2464,7 +2483,7 @@ local function buildModules(root: string, outDir: string, config: Config, target
         end
         if target.sources ~= nil then
             seeds = true
-            for _, path in ipairs(selectedSourceFiles(root, target) or {}) do
+            for _, path in ipairs(selectedSourceFiles(root, target, config.include) or {}) do
                 local name = envMod.moduleNameForPath(inc.env, path)
                 if name == nil then
                     return nil
@@ -2989,7 +3008,7 @@ local function targetScope(root: string, target: Target, session: modules.Sessio
         end
         seed(path as string)
     end
-    local selected, selectedErr = selectedSourceFiles(root, target)
+    local selected, selectedErr = selectedSourceFiles(root, target, inc.env.config.include)
     if selectedErr then
         return nil, selectedErr
     end
@@ -3036,11 +3055,36 @@ local function targetScope(root: string, target: Target, session: modules.Sessio
         return inc.moduleDependencies(path)
     end
 
+    -- The scope only ever selects project sources: `aot.emit` reads the files
+    -- under the include roots and keeps the reached ones. A module outside them
+    -- -- the standard library, the runtime, a bundled module -- cannot require
+    -- its way back into the project, so it is reached without being checked
+    -- and generated to find out what it imports. Walking those bodies was most
+    -- of what a small native build cost.
+    local projectRoots: {string} = {}
+    for _, include in ipairs(inc.env.config.include or {}) do
+        projectRoots[#projectRoots + 1] = fs.absolute(join(root, include))
+    end
+    if #projectRoots == 0 then
+        projectRoots[1] = fs.absolute(root)
+    end
+
+    local function inProject(path: string): boolean
+        local absolute = fs.absolute(path)
+        for _, projectRoot in ipairs(projectRoots) do
+            if absolute == projectRoot or absolute:sub(1, #projectRoot + 1) == projectRoot .. "/" then
+                return true
+            end
+        end
+
+        return false
+    end
+
     local cursor: integer = 1
     while cursor <= #queue do
         local path = queue[cursor] as string
         cursor = cursor + 1
-        for _, dependency in ipairs(executableDependencies(path)) do
+        for _, dependency in ipairs(inProject(path) and executableDependencies(path) or {}) do
             local dependencyPath = inc.modulePath(dependency) or session.stageBundled(dependency)
             if dependencyPath ~= nil then
                 seed(dependencyPath as string, dependency)

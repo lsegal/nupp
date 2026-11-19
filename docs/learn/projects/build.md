@@ -62,7 +62,9 @@ module must have been selected independently, or the built program reports an
 ordinary module-not-found error when that call runs. The build does not claim
 that every possible computed name is present.
 
-Every source entry must match at least one compilable file inside the project.
+Every source entry must match at least one compilable file inside the project,
+or inside one of its include roots when an include reaches above the project
+directory.
 The normalized set participates in the target cache key.
 
 ## Targets and outputs

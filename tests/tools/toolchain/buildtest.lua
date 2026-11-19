@@ -899,6 +899,38 @@ function M.targetSourcesRejectEmptyAndEscapingSelections()
     os.execute("rm -rf '" .. escaping .. "'")
 end
 
+-- A project whose include reaches above its directory may narrow its source set
+-- to part of what that include holds, and to nothing beyond it.
+function M.targetSourcesMayNarrowAnIncludeAboveTheProject()
+    local dir = tempProject({
+        ["app/nupp.lua"] = [[return {include = {"src", "../shared"}, build = {
+   kind = "modules", sources = {"src/main.nupp", "../shared/picked.nupp"},
+}}]],
+        ["app/src/main.nupp"] = "return 1\n",
+        ["shared/picked.nupp"] = "return 2\n",
+        ["shared/orphan.nupp"] = "local value: string = 42\nreturn value\n",
+        ["outside/stray.nupp"] = "return 3\n",
+    })
+    local out = capture(("cd '%s/app' && '%s' build"):format(dir, NUPP))
+    testAssert.eq(out, "", "a source under an include above the project builds: " .. out)
+    assert(exists(dir .. "/app/build/picked.lua"), "the selected file under the include is compiled")
+    assert(not exists(dir .. "/app/build/orphan.lua"), "the rest of that include is left out")
+
+    for _, escape in ipairs({"../outside/stray.nupp", "../shared/../outside/stray.nupp"}) do
+        local manifest = assert(io.open(dir .. "/app/nupp.lua", "wb"))
+        manifest:write(
+            ([[return {include = {"src", "../shared"}, build = {kind = "modules", sources = {%q}}}]]):format(escape)
+        )
+        manifest:close()
+        local escapingOut = capture(("cd '%s/app' && '%s' build"):format(dir, NUPP))
+        assert(
+            escapingOut:find("build.sources must stay inside the project", 1, true),
+            escape .. " is outside every include: " .. escapingOut
+        )
+    end
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
 -- An optimized build plans const specialization by checking the modules it emits.
 -- A project with no const-generic function has nothing to plan, so a warm optimized
 -- build of one checks no module at all.

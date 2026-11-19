@@ -1854,7 +1854,7 @@ local function treeDigest(path)
         -- stages that produced identical Lua still disagree there, because they are
         -- two directories.
         local derived = relative:match("^cache/") or relative:match("^%.bytecode/")
-        if relative ~= ".nupp-state.json"
+        if not relative:match("^%.nupp%-state%.json")
             and not relative:match("^%.nupp%-complete")
             and not native
             and not derived
@@ -2049,7 +2049,7 @@ end
 local function copyTree(source, destination)
     for _, path in ipairs(listFiles(source)) do
         local relative = path:sub(#normalize(source) + 2)
-        if relative ~= ".nupp-state.json"
+        if not relative:match("^%.nupp%-state%.json")
             and not relative:match("^%.nupp%-complete")
             and not relative:match("^native/")
         then
