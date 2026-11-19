@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `debug.bench` reads and writes its records through the JSON value codec
+  directly instead of through `serde.json`, so a program that links it no
+  longer has the typed JSON layer checked along with it. Against an empty
+  cache, checking `debug.bench` went from about 21 to 17 seconds of CPU.
+
 - A process that builds several environments over one project no longer parses
   every file in it again for each one to build its project index. Headers
   already worked out in the process are reused, so a later environment rooted
