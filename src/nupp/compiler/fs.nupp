@@ -208,6 +208,7 @@ export function sizeAndModified(path: string): (integer?, number?)
     end
 
     -- `os` answers milliseconds, the clock's unit.
+
     return size, (modified as number) / 1000
 end
 

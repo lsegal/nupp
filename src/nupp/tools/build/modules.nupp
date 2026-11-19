@@ -1637,7 +1637,9 @@ local function buildModules(root: string, outDir: string, config: Config, target
                 end
                 local artifactHash = record.artifactHash
 
-                return "record\0" .. record.sourceHash .. "\0" .. (type(artifactHash) == "string" and artifactHash or "")
+                return "record\0" .. record.sourceHash .. "\0" .. (
+                    type(artifactHash) == "string" and artifactHash or ""
+                )
             end)
             local sourceHash, artifactHash = kept:match("^record%z([^%z]*)%z([^%z]*)$")
             generationRecords[name] = sourceHash
