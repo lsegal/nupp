@@ -300,8 +300,98 @@ jobs:
             nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-${{
             hashFiles('src/**', 'nupp.lua', 'scripts/toolchain.pins') }}
 
+  # The compiler each rolling leg runs, built once per platform beside the fast
+  # gate rather than inside every leg after it, so a leg starts on its suites
+  # instead of on a five-minute bootstrap. Its setup matches the leg's, LLVM and
+  # all, because the leg's warm `nupp build` must find nothing left to do.
+  bootstrap:
+    name: ${{ matrix.name }} / bootstrap
+    needs: classify
+    if: needs.classify.outputs.integration-matrix != '[]'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.classify.outputs.integration-matrix) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Restore the pinned build tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/nupp-ci-tools
+            .rocks
+          key: >-
+            nupp-tools-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('scripts/toolchain.pins', 'rocks/**') }}
+
+      - name: Restore the provisioned toolchain
+        uses: actions/cache@v4
+        with:
+          path: .nupp-cache/toolchain
+          key: >-
+            nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('scripts/toolchain.pins', 'scripts/toolchain') }}
+          restore-keys: |
+            nupp-toolchain-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore the content-validated compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/cache
+          key: >-
+            nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('src/**', 'nupp.lua', 'scripts/toolchain.pins') }}
+          restore-keys: |
+            nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Fetch or build the pinned LLVM
+        uses: ./.github/actions/pinned-llvm
+
+      - name: Provision the pinned toolchain
+        shell: bash
+        env:
+          NUPP_REQUIRE_CODEGEN: '1'
+        run: |
+          ./scripts/toolchain --all
+          echo "$(./scripts/toolchain luajit)/bin" >> "$GITHUB_PATH"
+
+      - name: Bootstrap the compiler
+        shell: bash
+        run: ./bin/nupp build
+
+      # A tarball rather than the directory, so the launcher and the staged
+      # libraries keep their modes. The store and the test runner's records are
+      # left out: each leg restores its own.
+      - name: Pack the compiler
+        shell: bash
+        run: tar -cf compiler.tar --exclude=build/cache --exclude=build/test-runner build
+
+      - name: Upload the compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-${{ matrix.artifact }}
+          path: compiler.tar
+          retention-days: 1
+
+      - name: Save the content-validated compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: build/cache
+          key: >-
+            nupp-buildcache-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('src/**', 'nupp.lua', 'scripts/toolchain.pins') }}
+
   integration:
     name: ${{ matrix.name }} / LuaJIT 2.1 rolling
+    # Not `needs: bootstrap`: that waits for every platform's entry, so a leg
+    # would sit behind another platform's queued runner. Each leg waits for its
+    # own platform's bootstrap below instead.
     needs: [classify, fast-checks]
     if: >-
       !cancelled() && needs.classify.result == 'success'
@@ -409,7 +499,8 @@ jobs:
         with:
           path: build/test-runner/.nupp-test-times.json
           key: >-
-            nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+            nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{
+            github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             nupp-test-times-${{ runner.os }}-${{ runner.arch }}-
 
@@ -445,6 +536,46 @@ jobs:
             print(jit.version)
           '
           echo "$luajit/bin" >> "$GITHUB_PATH"
+
+      # Waits while this platform's bootstrap job runs. One that has not left
+      # the queue is not waited for: it may be queued behind this very runner,
+      # and the build below then does the work here, as it did before.
+      - name: Wait for this platform's bootstrap
+        id: shared-compiler
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOOTSTRAP_JOB: ${{ matrix.name }} / bootstrap
+        run: |
+          jobs=repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs
+          while :; do
+            state=$(gh api "$jobs" --paginate \
+              --jq ".jobs[] | select(.name == env.BOOTSTRAP_JOB) | \"\\(.status) \\(.conclusion)\"" | head -n 1)
+            echo "$BOOTSTRAP_JOB: ${state:-not found}"
+            case "$state" in
+              "completed success") echo "available=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+              in_progress*) sleep 15 ;;
+              *) echo "building the compiler here instead"; exit 0 ;;
+            esac
+          done
+
+      - name: Download the bootstrapped compiler
+        if: steps.shared-compiler.outputs.available == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: compiler-${{ matrix.artifact }}
+
+      # The launcher decides freshness by mtime, and the checkout above is newer
+      # than anything the bootstrap job wrote. Touching the unpacked tree says
+      # what is true: it was built from these sources. The build below still
+      # compares content hashes, so a mismatch rebuilds rather than passing.
+      - name: Unpack the bootstrapped compiler
+        if: steps.shared-compiler.outputs.available == 'true'
+        shell: bash
+        run: |
+          tar -xf compiler.tar
+          rm compiler.tar
+          find build -path build/cache -prune -o -path build/test-runner -prune -o -exec touch {} +
 
       - name: Bootstrap the compiler
         shell: bash
@@ -612,6 +743,11 @@ jobs:
           set -euo pipefail
           ulimit -c unlimited || true
           deadline=$(($(date +%s) + NUPP_SUITE_SECONDS))
+          # The runner stops itself 30 seconds before the halt, says which
+          # suites finished, how long each took and which were still running,
+          # and records their timings (#351).
+          NUPP_TEST_DEADLINE=$((deadline - 30))
+          export NUPP_TEST_DEADLINE
           .github/scripts/suite-deadline.sh "$deadline" -- \
             ./bin/nupp test --scope=all \
             --exclude-group=external-corpus,measurement,wasm-conformance
@@ -687,6 +823,11 @@ jobs:
           NUPP_TEST_SH=$(cygpath -w "$sh_path")
           export NUPP_TEST_BASH NUPP_TEST_SH
           deadline=$(($(date +%s) + NUPP_SUITE_SECONDS))
+          # The runner stops itself 30 seconds before the halt, says which
+          # suites finished, how long each took and which were still running,
+          # and records their timings (#351).
+          NUPP_TEST_DEADLINE=$((deadline - 30))
+          export NUPP_TEST_DEADLINE
           .github/scripts/suite-deadline.sh "$deadline" -- \
             ./bin/nupp test --scope=all \
             --exclude-group=external-corpus,windows-preflight,measurement,wasm-conformance
@@ -730,14 +871,31 @@ jobs:
 
       # Saved whatever the suite concluded. A failing run still measured every
       # suite that ran, and the next run's shard packing is better for having
-      # it than for relearning it from nothing.
+      # it than for relearning it from nothing. Keyed by run, like the results:
+      # keyed by commit, a second run of one commit could not save, and the
+      # next run packed from older timings.
       - name: Save the recorded suite timings
         if: always()
         uses: actions/cache/save@v4
         with:
           path: build/test-runner/.nupp-test-times.json
           key: >-
-            nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+            nupp-test-times-${{ runner.os }}-${{ runner.arch }}-${{
+            github.run_id }}-${{ github.run_attempt }}
+
+      # The same timings where a reader can download them. The summary prints
+      # only the slowest fifteen suites, and a run stopped at its deadline
+      # prints none, so this is what says where the rest of the time went.
+      - name: Upload the recorded suite timings
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-timings-${{ runner.os }}-${{ runner.arch }}
+          path: build/test-runner/.nupp-test-times.json
+          if-no-files-found: ignore
+          # The file is a dotfile, which upload-artifact otherwise skips.
+          include-hidden-files: true
 
       # Linux has already saved this key from the fast gate, where the same
       # revision built the same compiler; that save warns and keeps the first
@@ -953,6 +1111,13 @@ jobs:
           NUPP_REQUIRE_CODEGEN: '1'
         run: ./scripts/toolchain --all
 
+      # Built here rather than by the script, so the conformance step times
+      # dispatch and readback rather than a compiler build (#351).
+      - name: Bootstrap the compiler
+        env:
+          NUPP_REQUIRE_CODEGEN: '1'
+        run: ./bin/nupp build
+
       - name: Run exact GPU dispatch and readback
         id: gpu_conformance
         run: .github/scripts/test-gpu-conformance.sh
@@ -987,6 +1152,14 @@ jobs:
         env:
           NUPP_REQUIRE_CODEGEN: '1'
         run: ./scripts/toolchain --all
+
+      # Built here rather than by the script, so the conformance step times
+      # dispatch and readback rather than a compiler build (#351).
+      - name: Bootstrap the compiler
+        shell: bash
+        env:
+          NUPP_REQUIRE_CODEGEN: '1'
+        run: ./bin/nupp build
 
       # Adapter absence is a failure: Vulkan cannot silently substitute for
       # the retained Windows DX12 contract.
@@ -1184,6 +1357,7 @@ jobs:
     needs:
       - classify
       - fast-checks
+      - bootstrap
       - integration
       - fixpoint
       - portable-compiler

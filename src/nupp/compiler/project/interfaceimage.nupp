@@ -136,6 +136,11 @@ local function copyDefinition(definition: any): any?
         -- An `@aot` function's identity for a native call from another module,
         -- and whether its signature keeps it out of Lua's reach.
         aotNativeOnly = definition.aotNativeOnly,
+        -- The module a namespace value stands for (`const heap = table.Array`). A
+        -- terminal named through it, `table.Array.destroy`, is found by following
+        -- this into that module's exports; without it a hydrated namespace named
+        -- no declared function at all (#351).
+        requiredModule = type(definition.requiredModule) == "string" and definition.requiredModule or nil,
     }
     local origin = definition.aotOrigin
     if type(origin) == "table" then

@@ -47,6 +47,16 @@
         }
       ]
     },
+    "bootstrap": {
+      "platforms": ["linux", "macos", "windows"],
+      "selectedBy": "linux-integration, macos-integration, windows-integration",
+      "steps": [
+        {
+          "name": "Bootstrap the compiler",
+          "guarantees": ["each rolling leg runs a compiler built once for its platform"]
+        }
+      ]
+    },
     "integration": {
       "platforms": ["linux", "macos", "windows"],
       "selectedBy": "linux-integration, macos-integration, windows-integration",

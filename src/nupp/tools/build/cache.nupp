@@ -391,9 +391,66 @@ export function loadState(path: string): State
     return adoptState(state)
 end
 
+--- Beside a state, what each of its modules was generated from and generated to.
+---
+--- A build carrying the compiler's own runtime modules asks the compiler's state only
+--- that, for a handful of modules, and the compiler's state is ten megabytes of JSON:
+--- decoding it was a quarter of what a small native build cost. The sidecar names the
+--- state it was written beside, so one left from an earlier state is never read in
+--- place of the current one.
+local function moduleHashesPath(path: string): string
+    return path .. ".hashes"
+end
+
+-- Which state a sidecar belongs to, without hashing ten megabytes: its length, and
+-- the digest of its two ends. The head names the compiler that wrote the state, and
+-- every writer that leaves a sidecar rewrites it with the state, so one left behind
+-- by an earlier state is one a different writer has since replaced.
+local function stateStamp(text: string): string
+    return tostring(#text) .. ":" .. fingerprint.contentDigest(true)(text:sub(1, 4096) .. text:sub(-4096))
+end
+
+local function writeModuleHashes(path: string, text: string, state: State): nil
+    local hashes: {[string]: any} = {}
+    for name, record in pairs(state.modules) do
+        local entry = record as any
+        hashes[name] = {sourceHash = entry.sourceHash, artifactHash = entry.artifactHash}
+    end
+    writeFile(moduleHashesPath(path), sortedJson({state = stateStamp(text), modules = hashes}) .. "\n")
+end
+
+--- The `sourceHash` and `artifactHash` of every module the state at `path` records,
+--- read from its sidecar when that was written beside this very state, and from the
+--- state itself otherwise.
+export function loadModuleHashes(path: string): {[string]: any}
+    local text = readFile(path)
+    if not text then
+        return {}
+    end
+    local sidecar = readFile(moduleHashesPath(path))
+    if sidecar then
+        local hashes, invalid = json.decodevalue(sidecar, json.NULL)
+        if invalid == nil
+            and type(hashes) == "table"
+            and type(hashes.modules) == "table"
+            and hashes.state == stateStamp(text)
+        then
+            return hashes.modules as {[string]: any}
+        end
+    end
+
+    return loadState(path).modules as {[string]: any}
+end
+
 --- Writes object keys sorted: a table iterates in an order that depends on its
 --- history, so two builds recording the same state would otherwise write
 --- different bytes.
 export function saveState(path: string, state: State): boolean?, string?
-    return writeFile(path, sortedJson(state) .. "\n")
+    local text = sortedJson(state) .. "\n"
+    local written, problem = writeFile(path, text)
+    if written then
+        writeModuleHashes(path, text, state)
+    end
+
+    return written, problem
 end

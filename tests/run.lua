@@ -257,6 +257,7 @@ end
 -- takes the whole process down is still reported against that suite.
 local runningDir = rawget(_G, "__NUPP_TEST_RUNNING") or os.getenv("NUPP_TEST_RUNNING")
 local runningFile = runningDir and runningDir ~= "" and (runningDir .. "/" .. processSalt) or nil
+
 local function markRunning(name)
     if not runningFile then
         return
@@ -271,6 +272,26 @@ local function markRunning(name)
         file:close()
     end
 end
+
+-- Beside the running files, each state also logs every suite it starts and
+-- finishes as it goes. A worker's report only crosses over when the worker is
+-- done, so this log is what a run stopped at its deadline (`NUPP_TEST_DEADLINE`)
+-- can still say about the suites that finished, the ones still running and how
+-- long each took. Kept out of the running directory, whose every file the
+-- launching command reads as a suite that never finished.
+local finishedDir = runningDir and runningDir ~= "" and (runningDir .. "-log") or nil
+
+local function logSuite(...)
+    if not finishedDir then
+        return
+    end
+    local file = io.open(finishedDir .. "/" .. processSalt, "ab")
+    if file then
+        file:write(table.concat({...}, "\t"), "\n")
+        file:close()
+    end
+end
+
 local shardSalt = ((os.getenv("NUPP_CACHE_DIR") or ""):match("shard%-(%d+)") or "0") .. "-" .. processSalt
 local handedOut = 0
 local reservedTempNames = {}
@@ -318,6 +339,7 @@ os.exit = function(code, close)
     pcall(function()
         require("nupp.tools.peakmemory").report({"test", unpack(arg or {})})
     end)
+
     return rawExit(code, close)
 end
 
@@ -388,6 +410,7 @@ end
 -- interpreter was built for it, otherwise the C library's `system` status,
 -- which on POSIX is a wait status.
 local executeStyle = nil
+
 local function executeResult(status)
     if executeStyle == nil then
         executeStyle = type(rawOsExecute()) == "boolean" and "lua52" or (windowsHost and "code" or "wait")
@@ -406,6 +429,7 @@ end
 -- of the run's cold compiler processes, and the place to look for the next one
 -- worth taking.
 local declinedLog = os.getenv("NUPP_TEST_COMPILE_SERVICE_LOG")
+
 local function declined(command)
     if declinedLog and declinedLog ~= "" and command:find("bin/nupp", 1, true) then
         -- A command that only names the compiler -- copies it, marks it
@@ -544,7 +568,10 @@ do
     local isProcessRoute = setmetatable({}, {__mode = "k"})
     routeProcessCommands = function()
         local process = package.loaded["nupp.compiler.process"]
-        if type(process) ~= "table" or rawget(_G, "__NUPP_TEST_EMBEDDED") or os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil then
+        if type(process) ~= "table"
+            or rawget(_G, "__NUPP_TEST_EMBEDDED")
+            or os.getenv("NUPP_LAUNCHER_RUN_ROOT") == nil
+        then
             return
         end
         local modes = {capture = "pipe", captureIsolated = "pipe", run = "out"}
@@ -579,7 +606,8 @@ end
 -- runtime's I/O module replaces the first time anything loads it. So the route is
 -- put back in front before every case rather than once, and only over the
 -- runtime's `popen`, whose processes close with the status `routedPopen` gives.
-local routeCompileCommands = function() end
+local routeCompileCommands = function()
+end
 if not windowsHost then
     local popenRoute, executeRoute
     routeCompileCommands = function()
@@ -1374,6 +1402,7 @@ do
                 for index = 1, select("#", ...) do
                     active.stdout[#active.stdout + 1] = tostring(select(index, ...))
                 end
+
                 return true
             end
             local ok, problem = pcall(run)
@@ -2140,7 +2169,11 @@ do
                     if not encoded then
                         ok, value = false, "fixture value is not JSON-compatible: " .. tostring(document)
                     else
-                        local wrote, writeProblem = pcall(writeText, temporary .. "/.nupp-fixture.json", document .. "\n")
+                        local wrote, writeProblem = pcall(
+                            writeText,
+                            temporary .. "/.nupp-fixture.json",
+                            document .. "\n"
+                        )
                         if not wrote then
                             ok, value = false, writeProblem
                         end
@@ -2168,7 +2201,10 @@ do
             )
             os.remove(lock)
             if not failureWritten then
-                error("fixture " .. key .. " failed and its result could not be published: " .. tostring(failureProblem), 2)
+                error(
+                    "fixture " .. key .. " failed and its result could not be published: " .. tostring(failureProblem),
+                    2
+                )
             end
             error("fixture " .. key .. " failed: " .. tostring(value), 2)
         end
@@ -2278,6 +2314,7 @@ end
 --- How far this state's heap may grow past where the last release left it before
 --- the next case pays for another, in kilobytes.
 local RELEASE_GROWTH_KB = 64 * 1024
+
 local releasedAtKb = nil
 
 --- Lets go of the types the compiles in finished cases interned.
@@ -2356,6 +2393,7 @@ local function recordResult(suite, name, defined, ok, err, stdout, stderr, elaps
 
             return copied
         end
+
         local metrics = {}
         for _, metric in pairs(context.metrics or {}) do
             metrics[#metrics + 1] = metric
@@ -2455,7 +2493,9 @@ end
 
 --- The machine's physical memory in bytes, or nil when it cannot be read.
 local function physicalMemory()
-    local handle = io.popen("sysctl -n hw.memsize 2>/dev/null || echo $(( $(getconf _PHYS_PAGES) * $(getconf PAGESIZE) ))")
+    local handle = io.popen(
+        "sysctl -n hw.memsize 2>/dev/null || echo $(( $(getconf _PHYS_PAGES) * $(getconf PAGESIZE) ))"
+    )
     local text = handle and handle:read("*l") or nil
     if handle then
         handle:close()
@@ -2498,6 +2538,45 @@ local timingsPath = buildRoot .. "/.nupp-test-times.json"
 --- keyed by nothing: the stores inside stamp and key their own entries, so a stale one
 --- is a miss rather than a wrong answer.
 local shardCacheRoot = buildRoot .. "/.nupp-test-cache"
+
+-- One store for every compiler command a run starts. The compiler-wide stores --
+-- the prelude, the standard-library interfaces, headers -- are keyed by what
+-- they were computed from, so they are the same answer for every temporary
+-- project a case builds; each project's own results stay in its build
+-- directory. When each lane was a process, the lane's store was in its
+-- environment and every command a case started inherited it. The lanes are
+-- threads of this process now, and a command started from one had no store but
+-- its project's, so each temporary project checked `simd` and the rest of the
+-- standard library from source again: five seconds a command (#351).
+--
+-- Named in the process environment, which is what those commands inherit, and
+-- nowhere else: the compilers running inside this process -- this state's and
+-- each lane's -- keep the stores they had, because this process builds many
+-- environments and only its first may read a stored prelude. A suite that has
+-- to find where its commands stored something reads
+-- `__NUPP_TEST_COMMAND_CACHE`.
+if not embedded and (os.getenv("NUPP_CACHE_DIR") or "") == "" then
+    -- Absolute, because every command a case starts runs in a directory of its own.
+    local shared = require("nupp.compiler.fs").absolute(shardCacheRoot .. "/commands")
+    os.execute("mkdir -p '" .. shared .. "'")
+    local ffi = require("ffi")
+    if ffi.os == "Windows" then
+        pcall(ffi.cdef, "int _putenv_s(const char *, const char *);")
+        ffi.C._putenv_s("NUPP_CACHE_DIR", shared)
+    else
+        pcall(ffi.cdef, "int setenv(const char *, const char *, int);")
+        ffi.C.setenv("NUPP_CACHE_DIR", shared, 1)
+    end
+    rawset(_G, "__NUPP_TEST_COMMAND_CACHE", shared)
+    local getenv = os.getenv
+    os.getenv = function(name)
+        if name == "NUPP_CACHE_DIR" then
+            return nil
+        end
+
+        return getenv(name)
+    end
+end
 
 local recordedOnce = nil
 
@@ -2706,21 +2785,23 @@ end
 --- slice costs its suite's load again and nothing else (#382).
 local function planWork(list, shards, timings)
     local ceiling = 30000
-    local known, counted = 0, 0
+    local largest = 0
     for _, ms in pairs(timings) do
-        known = known + ms
-        counted = counted + 1
+        largest = math.max(largest, ms)
     end
-    -- An unmeasured suite is guessed at the average rather than zero, so a new one is
-    -- not packed last behind everything. A repository estimate comes first, because
-    -- on a runner that has measured nothing the average is nothing too.
-    local average = counted > 0 and known / counted or 1
+    -- An unmeasured suite is guessed at the costliest measured one, so it starts
+    -- early. Guessed at the average, every unmeasured suite tied and went in name
+    -- order behind the measured heavy ones, so a run stopped at its deadline
+    -- measured the same suites each time and never the rest (#351). A repository
+    -- estimate comes first, because on a runner that has measured nothing there
+    -- is nothing to compare with.
+    local unmeasured = largest > 0 and largest or 1
     local estimates = repositoryPolicy and repositoryPolicy.estimates or {}
 
     local planned = 0
     local costs = {}
     for _, suite in ipairs(list) do
-        local cost = tonumber(timings[suite.name]) or tonumber(estimates[suite.name]) or average
+        local cost = tonumber(timings[suite.name]) or tonumber(estimates[suite.name]) or unmeasured
         costs[#costs + 1] = {name = suite.name, cost = cost}
         planned = planned + cost
     end
@@ -3000,11 +3081,18 @@ end
 -- writes its output, and a `.status` file beside it once it has finished; the
 -- suites that need it are dealt last, and a case that still gets there first
 -- waits on that file. The runner waits for it before the summary.
-if not listing and #shard == 0 and not queueDir and not embedded and repositoryPolicy and repositoryPolicy.prerequisites then
+if not listing
+    and #shard == 0
+    and not queueDir
+    and not embedded
+    and repositoryPolicy
+    and repositoryPolicy.prerequisites
+then
     local selected = {}
     for _, info in ipairs(suites) do
         selected[info.name] = true
     end
+
     local function export(name, value)
         local ffi = require("ffi")
         if ffi.os == "Windows" then
@@ -3015,6 +3103,7 @@ if not listing and #shard == 0 and not queueDir and not embedded and repositoryP
             ffi.C.setenv(name, value, 1)
         end
     end
+
     local started = {}
     for _, prerequisite in ipairs(repositoryPolicy.prerequisites) do
         for _, name in ipairs(prerequisite.suites) do
@@ -3028,22 +3117,22 @@ if not listing and #shard == 0 and not queueDir and not embedded and repositoryP
                     for _, deferred in ipairs(prerequisite.suites) do
                         repositoryPolicy.deferredSuites[deferred] = true
                     end
-                    repositoryPolicy.background[#repositoryPolicy.background + 1] = {
+                    repositoryPolicy.background[
+                        #repositoryPolicy.background + 1
+                    ] = {
                         prerequisite = prerequisite,
                         result = result,
                         before = now(),
                         pipe = io.popen(
-                            ("(%s) > '%s.out' 2>&1; printf %%s $? > '%s.part'; mv '%s.part' '%s.status'"):format(
-                                helper.command(dir .. "/.."),
-                                result,
-                                result,
-                                result,
-                                result
-                            )
+                            (
+                                "(%s) > '%s.out' 2>&1; printf %%s $? > '%s.part'; mv '%s.part' '%s.status'"
+                            ):format(helper.command(dir .. "/.."), result, result, result, result)
                         ),
                     }
                 else
-                    started[#started + 1] = {
+                    started[
+                        #started + 1
+                    ] = {
                         prerequisite = prerequisite,
                         helper = helper,
                         before = now(),
@@ -3063,7 +3152,9 @@ if not listing and #shard == 0 and not queueDir and not embedded and repositoryP
         local seconds = (now() - build.before) / 1000
         if status ~= 0 then
             io.stderr:write(
-                ("nupp: cannot prepare %s for %s (%.1fs); its suites will report why:\n%s\n"):format(
+                (
+                    "nupp: cannot prepare %s for %s (%.1fs); its suites will report why:\n%s\n"
+                ):format(
                     build.prerequisite.name,
                     table.concat(build.prerequisite.suites, ", "),
                     seconds,
@@ -3081,13 +3172,7 @@ if not listing and #shard == 0 and not queueDir and not embedded and repositoryP
         end
     end
 end
-if #shard == 0
-    and #suites > 0
-    and chosenCaseCount == 0
-    and workerHost
-    and not coverage
-    and not audit
-then
+if #shard == 0 and #suites > 0 and chosenCaseCount == 0 and workerHost and not coverage and not audit then
     do
         local json = testJson
         local children = 0
@@ -3095,6 +3180,99 @@ then
         -- Whether any worker wrote a mark, so this end knows whether there is a line
         -- to close. Out here rather than in `fanOut` because it is read after it.
         local marked = false
+
+        -- A run asked to stop by a time (`NUPP_TEST_DEADLINE`, a Unix time) ends
+        -- itself there and says what it got through: the suites that finished and
+        -- what each took, the ones still running, and how many never started. The
+        -- finished suites' times are recorded like a complete run's, so the next
+        -- run packs from them. The workers are threads of this process, so
+        -- nothing outside it can end them one by one and leave it to report.
+        local deadline = tonumber(os.getenv("NUPP_TEST_DEADLINE") or "")
+        if finishedDir then
+            os.execute("rm -rf '" .. finishedDir .. "' && mkdir -p '" .. finishedDir .. "'")
+        end
+
+        local function stopAtDeadline(restoreOutput)
+            local finished, running, failed = {}, {}, 0
+            local listing = finishedDir and io.popen("ls '" .. finishedDir .. "' 2>/dev/null")
+            local names = listing and listing:read("*a") or ""
+            if listing then
+                listing:close()
+            end
+            for name in names:gmatch("[^\r\n]+") do
+                local file = io.open(finishedDir .. "/" .. name, "rb")
+                for line in (file and file:read("*a") or ""):gmatch("[^\r\n]+") do
+                    local fields = {}
+                    for field in (line .. "\t"):gmatch("([^\t]*)\t") do
+                        fields[#fields + 1] = field
+                    end
+                    if fields[1] == "start" then
+                        running[fields[2]] = tonumber(fields[3]) or os.time()
+                    elseif fields[1] == "done" then
+                        running[fields[2]] = nil
+                        finished[
+                            #finished + 1
+                        ] = {
+                            suite = fields[2],
+                            casesMs = tonumber(fields[3]) or 0,
+                            hooksMs = tonumber(fields[4]) or 0,
+                            loadMs = tonumber(fields[5]) or 0,
+                        }
+                        failed = failed + (tonumber(fields[6]) or 0)
+                    end
+                end
+                if file then
+                    file:close()
+                end
+            end
+            local seen = {}
+            for _, record in ipairs(finished) do
+                seen[record.suite] = true
+            end
+            for name in pairs(running) do
+                seen[name] = true
+            end
+            local unstarted = 0
+            for _, info in ipairs(suites) do
+                unstarted = unstarted + (seen[info.name] and 0 or 1)
+            end
+
+            local function cost(record)
+                return record.casesMs + record.hooksMs + record.loadMs
+            end
+
+            table.sort(finished, function(a, b)
+                return cost(a) > cost(b)
+            end)
+            local work = 0
+            for _, record in ipairs(finished) do
+                work = work + cost(record)
+            end
+            local still = {}
+            for name, since in pairs(running) do
+                still[#still + 1] = {name = name, seconds = os.time() - since}
+            end
+            table.sort(still, function(a, b)
+                return a.seconds > b.seconds
+            end)
+            local out = {
+                (
+                    "\nDeadline: stopped after %.1fs; %d suites finished (%.1fs of suite work, %d failed tests), %d running, %d never started\n"
+                ):format((now() - started) / 1000, #finished, work / 1000, failed, #still, unstarted),
+            }
+            for _, entry in ipairs(still) do
+                out[#out + 1] = ("  running  %-40s %6ds\n"):format(entry.name, entry.seconds)
+            end
+            for _, record in ipairs(finished) do
+                out[#out + 1] = ("  finished %-40s %7.1fs\n"):format(record.suite, cost(record) / 1000)
+            end
+            restoreOutput()
+            progressWrite("\n")
+            io.stdout:write(table.concat(out))
+            io.stdout:flush()
+            rememberTimings(finished, {})
+            os.exit(1)
+        end
 
         local function beginPhase(text)
             if marked then
@@ -3135,6 +3313,7 @@ then
                 -- descriptor.
                 local pause = workerPause(#lanes)
                 local restoreOutput = silenceProcessOutput()
+
                 -- Each lane gets a worker of its own rather than a share of the
                 -- pool. The pool is as wide as the machine has cores, so on a
                 -- 3-core runner five of eight lanes queued behind the first three
@@ -3155,6 +3334,7 @@ then
                         rawget(_G, "__NUPP_EXECUTABLE")
                     )
                 end
+
                 local launched, problem = pcall(function()
                     for _, lane in ipairs(lanes) do
                         local index = children + 1
@@ -3226,6 +3406,9 @@ then
                 local function collect()
                     local completed, reports = pcall(function()
                         while not tend() do
+                            if deadline and os.time() >= deadline then
+                                stopAtDeadline(restoreOutput)
+                            end
                             pauseBriefly()
                         end
                         local reports = {}
@@ -3434,15 +3617,7 @@ then
         -- compiler. A heavy suite the plan split into slices is several entries
         -- on the same queue, so its cases spread over the workers too.
         local workerCount = jobs or defaultJobs()
-        local queue = prepareQueue(
-            suites,
-            false,
-            math.min(workerCount, #suites),
-            "shared",
-            nil,
-            nil,
-            workerCount
-        )
+        local queue = prepareQueue(suites, false, math.min(workerCount, #suites), "shared", nil, nil, workerCount)
         if queue then
             beginPhase(("%d suites across %d Nupp workers"):format(#suites, #queue.lanes))
             marked = true
@@ -3642,7 +3817,24 @@ end
 
 local function runSuite(suiteInfo, slices)
     markRunning(suiteInfo.name)
+    logSuite("start", suiteInfo.name, os.time())
+    local before, firstResult = #suiteRecords, #results + 1
     local ok, problem = pcall(executeSuite, suiteInfo, slices)
+    local record = suiteRecords[#suiteRecords]
+    if #suiteRecords > before and record then
+        local failed = 0
+        for index = firstResult, #results do
+            failed = failed + (results[index].status == "failed" and 1 or 0)
+        end
+        logSuite(
+            "done",
+            suiteInfo.name,
+            tonumber(record.casesMs) or 0,
+            tonumber(record.hooksMs) or 0,
+            tonumber(record.loadMs) or 0,
+            failed
+        )
+    end
     markRunning(nil)
     if not ok then
         error(problem, 0)
@@ -3916,11 +4108,9 @@ for _, build in ipairs(repositoryPolicy and repositoryPolicy.background or {}) d
             file:close()
         end
         io.stderr:write(
-            ("nupp: cannot prepare %s for %s:\n%s\n"):format(
-                build.prerequisite.name,
-                table.concat(build.prerequisite.suites, ", "),
-                output:sub(-2000)
-            )
+            (
+                "nupp: cannot prepare %s for %s:\n%s\n"
+            ):format(build.prerequisite.name, table.concat(build.prerequisite.suites, ", "), output:sub(-2000))
         )
     elseif verbose then
         io.stderr:write(("prepared %s in the background\n"):format(build.prerequisite.name))
