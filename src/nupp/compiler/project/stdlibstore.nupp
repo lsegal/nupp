@@ -1,0 +1,94 @@
+@!internal
+
+--[[
+The native standard-library store, `stdlib.buf`.
+
+A native command has no standard-library image carried in, so it keeps one in its
+own store: the first command to check these modules from source writes what it
+checked, and the next one hydrates it instead. `nupp.compiler.project.env` decides
+when; this opens the store and shares what is decoded from it. Only the native
+store reaches it, so it is required where it is used, and the browser compiler,
+which carries its image in and has a startup mailbox to fit, does not bundle it.
+
+## One decode per shared prelude
+
+An environment that takes a prelude another one read from the stored image holds
+that image's arena, so it can hydrate the store written beside it (#417). It must
+not decode the store again, though: a decode allocates the nominals its modules
+declare, so a second decode beside a module another environment already holds
+would give that module a second set. So the first decode is kept with the shared
+prelude, and every later environment takes the same one.
+
+A module an environment checked from source before any decode has nominals no
+decode knows, so once one is shared the store is left alone and each environment
+checks the rest from source, as before.
+]]
+module nupp.compiler.project.stdlibstore
+
+--- The store under `storeDir`, and the key `env`'s image is kept under: the stored
+--- prelude it was written against, the settings its modules were checked under,
+--- and `sources`, each bundled module's name, kind and text.
+export function open(env: any, sources: {string}, storeDir: string): (any, string)
+    local parts = {
+        tostring(env.preludeStamp),
+        tostring(env.layoutTarget or ""),
+        tostring(env.compat or ""),
+        require("nupp.compiler.compat").VERSION
+    }
+    local lints = (env.config or {}).lints
+    if type(lints) == "table" then
+        local named = {}
+        for name, level in pairs(lints as {[string]: any}) do
+            named[#named + 1] = tostring(name) .. "=" .. tostring(level)
+        end
+        table.sort(named)
+        parts[#parts + 1] = table.concat(named, ",")
+    end
+    for _, source in ipairs(sources) do
+        parts[#parts + 1] = source
+    end
+    local services = env.compilerServices and env.compilerServices.hash and env.compilerServices.hash.digest or nil
+    local digest = services or require("nupp.compiler.hash").digest
+    local store = require("nupp.compiler.project.store").open(
+        storeDir .. "/stdlib.buf",
+        require("nupp.compiler.project.fingerprint").subsystemFingerprint(
+            {"nupp.compiler.project.env", "nupp.compiler.project.stdlibimage", "nupp.compiler.project.stdlibstore"},
+            storeDir,
+            services,
+            env.cacheReadOnly
+        )
+    )
+
+    return store, digest(table.concat(parts, "\0"))
+end
+
+--- The decode kept under `key` in `images`, or the first one made, by `decode`, when
+--- none of `modules` -- what the sharing environments already hold -- came from
+--- source. Each decoded module's binder bounds are kept too, by `boundsOf`, since
+--- an environment that checks a prelude of its own in between rebinds them.
+export function hydrate(
+    images: {[string]: any},
+    key: string,
+    modules: {[string]: any},
+    decode: function(): (any?, string?),
+    boundsOf: function(any, any, string): any
+): (any?, string?)
+    local kept = images[key]
+    if kept ~= nil then
+        return kept or nil, nil
+    end
+    if next(modules) ~= nil then
+        return nil, "a shared standard-library module was checked from source"
+    end
+    local hydrated, problem = decode()
+    if hydrated ~= nil then
+        local bounds = {}
+        for name, semantic in pairs(hydrated.semantics) do
+            bounds[name] = boundsOf(semantic.exports and semantic.exports.types, nil, name)
+        end
+        hydrated.bounds = bounds
+    end
+    images[key] = hydrated or false
+
+    return hydrated, problem
+end
