@@ -460,6 +460,36 @@ function M.rejectsTamperedTypeBlueprints()
     testAssert.eq(invalid.code, "NUPP2415", "the parent rejects a forged graph edge")
 end
 
+function M.reusedTypeBlueprintsNameThisCallsInputs()
+    -- The type-function store keys an envelope by the shape of its inputs, so an
+    -- envelope evaluated for one local record is reused for another of the same name.
+    -- Its reference has to resolve to the input of the call reusing it.
+    local reflection = require("nupp.compiler.reflection")
+    local first = T.nominal("Item", "record")
+    local second = T.nominal("Item", "record")
+    local fingerprint = reflection.describe(second).fingerprint
+    testAssert.eq(reflection.describe(first).fingerprint, fingerprint, "the two records have one shape")
+    local payload = {
+        root = 1,
+        nodes = {{kind = "reference", reference = 1, referenceId = "argument1:1", fingerprint = fingerprint}},
+    }
+    local envelope = {
+        kind = "type-blueprint",
+        provider = "types",
+        schema = typeblueprint.SCHEMA,
+        family = "Type",
+        payload = payload,
+        fingerprint = hash.sha256("nupp.types\0v1\0" .. stable(payload)),
+        references = {{source = first, referenceId = "argument1:1", fingerprint = fingerprint}},
+    }
+    local value, invalid = typeblueprint.validate(
+        envelope,
+        {["argument1:1"] = {source = second, fingerprint = fingerprint}}
+    )
+    testAssert.eq(invalid, nil, "the reused envelope validates")
+    assert(value == second, "the reference names this call's record, not the one it was evaluated for")
+end
+
 function M.rejectsMalformedTypeBlueprintPayloads()
     local function rejected(envelope, label)
         envelope.fingerprint = hash.sha256("nupp.types\0v1\0" .. stable(envelope.payload))
