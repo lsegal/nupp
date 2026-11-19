@@ -58,9 +58,7 @@ end
 -- compiles a benchmark from source includes these copies rather than the whole of
 -- `src`: with `src` included, every standard-library module the program reaches
 -- resolves to a project file there and is checked again in each process instead
--- of shared from the carried copy (#410). A child listing a fixture that way took
--- about twenty seconds of CPU; with the copies, whose checks the shard's store
--- keeps by content, it takes about two (#438).
+-- of shared from the carried copy (#410).
 local UNCARRIED = {"debug/bench.nupp", "nupp/bench/internal/record.nupp", "nupp/bench/internal/statistics.nupp",}
 
 local function copyUncarried(directory)
@@ -87,8 +85,18 @@ local function workspace(precompiled)
     return directory
 end
 
+-- The store every command these suites start shares. `debug.bench` itself checks
+-- in about a second; what a cold command spends its twenty seconds on is the
+-- standard library it reaches, which an empty store checks from source again in
+-- every child. One store for the run pays that once: the shared build fills it,
+-- and each child that compiles a fixture from source finds `debug.bench` and
+-- everything beneath it there (#438).
+local function store()
+    return require("helpers.commandcache").dir("bench")
+end
+
 local function inWorkspace(directory, command)
-    return ("cd %q && %s"):format(directory, command)
+    return ("cd %q && NUPP_CACHE_DIR=%q %s"):format(directory, store(), command)
 end
 
 -- The evidence a `--json` run printed, as the record it saved would hold it: the
@@ -197,7 +205,13 @@ app = {kind = "modules", entries = {%s}, sources = {%s}, outDir = "out", optimiz
             ):format(table.concat(entries, ", "), table.concat(files, ", "))
         )
         file:close()
-        testAssert.eq(require("nupp.tools.build.project").build(directory), 0, "build the shared benchmark programs")
+        -- Built by a command rather than in this process, so the check lands in the
+        -- store the children read. An environment in this process checks the
+        -- standard library again whatever the store holds.
+        local pipe = assert(io.popen(inWorkspace(directory, ("%q build 2>&1; echo \"__exit__:$?\""):format(NUPP))))
+        local output = pipe:read("*a")
+        pipe:close()
+        testAssert.eq(output:match("__exit__:(%d+)%s*$"), "0", "build the shared benchmark programs:\n" .. output)
         -- Register the built modules before `nupp run`'s source loader. Native
         -- libraries remain beside them in the ordinary module output tree.
         local preload = {
