@@ -188,6 +188,17 @@ export function readFile(path: string): string?, string?
     return text
 end
 
+--- A file's size in bytes and its modification time in milliseconds since the Unix
+--- epoch, or nothing when `path` is not a readable regular file.
+export function stamp(path: string): (integer?, number?)
+    local kind, size, modified = files2.stat(path)
+    if kind ~= "file" then
+        return nil, nil
+    end
+
+    return size, modified
+end
+
 --- Whether anything is at `path`, directory included.
 ---
 --- Asked of the filesystem rather than by opening the path. Opening returns the
