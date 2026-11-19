@@ -629,14 +629,15 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
         local previous = oldState.testBuild
         -- The completed AOT result has to replay as well: its library, units
         -- and code generator all still have to be the ones it recorded.
-        if aotTarget
-            and testInput ~= nil
-            and aotPolicy.replay(
+        local aotReplayed: aotPolicy.Result? = nil
+        if aotTarget and testInput ~= nil then
+            aotReplayed = aotPolicy.replay(
                 oldState.aotReplay,
                 aotPolicy.toolchainPolicy(target.aot as string, target.aotTarget as string?, contentDigest).desiredCommand
-            ) == nil
-        then
-            previous = nil
+            )
+            if aotReplayed == nil then
+                previous = nil
+            end
         end
         if testBuild.intact(previous, testInput, contentDigest) then
             -- Run the existing drivers even on a hit. Their own keys cover native
@@ -682,6 +683,9 @@ local function buildOne(root: string?, opts: project.BuildOptions?): integer
                     end
                 end
                 report:counted(0, previous.modules)
+                if aotReplayed ~= nil then
+                    report:aotCounted((aotReplayed as any).facts)
+                end
                 if opts.stats then
                     opts.stats.checkedModules, opts.stats.generatedModules = 0, 0
                     opts.stats.reusedModules = previous.modules

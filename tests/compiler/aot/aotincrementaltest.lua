@@ -293,6 +293,85 @@ function M.rebuildsOnlyWhatChanged()
     test.eq(settled.timing.aot.externalCommands, 0, "the repaired project settles again")
 end
 
+local function phaseNames(report)
+    local names = {}
+    for _, span in ipairs(report.timing.phases) do
+        names[span.name] = true
+    end
+
+    return names
+end
+
+--- A no-op build answers from the completed build above the AOT replay, before
+--- a checking session reads the stored prelude (#427); any input change still
+--- takes the ordinary path.
+function M.anUnchangedBuildSkipsTheCheckingSession()
+    local dir = project()
+    local cold = build(dir)
+    assert(phaseNames(cold)["aot:lookup"], "a cold build looks its AOT result up")
+
+    local unchanged = build(dir)
+    local phases = phaseNames(unchanged)
+    assert(not phases["aot:lookup"], "an unchanged build never reaches the AOT lookup")
+    assert(not phases["aot:reuse"], "nor the replay behind the session")
+    test.eq(unchanged.timing.aot.compiledObjects, 0, "an unchanged build compiles nothing")
+    test.eq(unchanged.timing.aot.reusedObjects, unchanged.timing.aot.units, "and reports every object reused")
+    test.eq(unchanged.timing.aot.linked, false, "and links nothing")
+
+    -- A manifest change is a different build.
+    local manifest = assert(read(dir .. "/nupp.lua"))
+    write(
+        dir .. "/nupp.lua",
+        (manifest:gsub(
+            "}}},",
+            '}, other = {kind = "modules", entries = {"k1"}, outDir = "build/other"}}},',
+            1
+        ))
+    )
+    assert(phaseNames(build(dir))["aot:lookup"], "a manifest change takes the ordinary path")
+    assert(not phaseNames(build(dir))["aot:lookup"], "and settles again")
+
+    -- So is a source change.
+    write(dir .. "/src/k3.nupp", (read(dir .. "/src/k3.nupp"):gsub("factor %+ 3%.0", "factor + 7.0")))
+    assert(phaseNames(build(dir))["aot:lookup"], "a source change takes the ordinary path")
+
+    -- And a damaged library, however well the key matches.
+    local libraries = {
+        dir .. "/build/native/lib/libnative_aot.dylib",
+        dir .. "/build/native/lib/libnative_aot.so",
+        dir .. "/build/native/lib/native_aot.dll",
+    }
+    assert(not phaseNames(build(dir))["aot:lookup"], "the edited project settles")
+    for _, library in ipairs(libraries) do
+        local bytes = read(library)
+        if bytes then
+            write(library, bytes .. "\0")
+        end
+    end
+    assert(phaseNames(build(dir))["aot:lookup"], "a damaged library takes the ordinary path")
+end
+
+--- The completed-build key covers the AOT policy, its target and the compiler
+--- beside the source bytes, so a toolchain or compiler change rebuilds.
+function M.theCompletedBuildKeyCoversTheAheadOfTimeInputs()
+    local testBuild = require("nupp.tools.build.testbuild")
+    local hash = require("nupp.compiler.hash")
+    local dir = project()
+    local config = {include = {"src"}}
+
+    local function key(target, state)
+        target.kind, target.host, target.entries = "modules", "native", {"k1"}
+        return testBuild.input(dir, "build/native", config, target, state or {}, hash.digest)
+    end
+
+    local base = assert(key({aot = "require"}), "an AOT target has a completed-build key")
+    test.eq(key({aot = "require"}), base, "identical inputs keep one key")
+    assert(key({aot = "off"}) ~= base, "the policy is in the key")
+    assert(key({aot = "require", aotTarget = "x86_64-unknown-linux-gnu"}) ~= base, "the AOT target is in the key")
+    assert(key({aot = "require"}, {compilerHash = "other"}) ~= base, "the compiler is in the key")
+    test.eq(key({aot = "unknown"}), nil, "an unknown policy uses the ordinary build")
+end
+
 --- The policy accounts for its own time under names a reader can act on.
 ---
 --- The timeline is one activity at a time, so these are parts of the whole

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- An unchanged build of a target with an `aot` policy answers before building
+  a checking session, which used to read and decode the stored prelude image
+  only for the AOT replay to find nothing changed. A no-op native build of a
+  small `aot = "require"` project no longer spends about 80 ms there. Any
+  change to a source, the manifest, a dependency, the compiler or the code
+  generator, or a damaged artifact, still builds as before.
+
 - A process that builds several environments, such as a `nupp test` run with
   its suites in one process, no longer checks the prelude and the standard
   library again for each of them. Environments that agree on the target,
