@@ -8,6 +8,7 @@ local targetLayout = require("nupp.compiler.targetlayout")
 local parser = require("nupp.compiler.syntax.parser")
 local checker = require("helpers.fragment")
 local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 local HERE = require("helpers.paths").tests
 
 local M = {}
@@ -82,7 +83,7 @@ end
 ]]
 
 function M.finalAndLegacyImportsProduceTheSameVerifiedIR()
-    local env = envMod.new(HERE .. "/..")
+    local env = repositoryEnv.new()
     local resolveModule, resolveExports = env.resolveModule, env.resolveModuleExports
     function env:resolveModule(name, ...)
         return resolveModule(self, name == "nupp.simd" and "simd" or name, ...)
@@ -135,7 +136,7 @@ end
 ]]
 
 function M.directNestedReducerNamespacesKeepCheckedIdentity()
-    local env = envMod.new(HERE .. "/..")
+    local env = repositoryEnv.new()
     for _, source in ipairs({
         DIRECT_REDUCERS,
         "local reducers = simd.reducer\n" .. DIRECT_REDUCERS:gsub("simd%.reducer%.", "reducers.")
@@ -160,7 +161,7 @@ local function total(): number
     return simd.reducer.algebraicsum(1.0)
 end
 ]]
-    local env = envMod.new(HERE .. "/..")
+    local env = repositoryEnv.new()
     local parsed = parser.parse(source, "shadow-reducers.nupp")
     test.eq(#parsed.errors, 0)
     local diagnostics = checker.check(parsed, "shadow-reducers.nupp", env)
@@ -191,7 +192,7 @@ function M.gpuImportAndDirectNamespaceProduceTheSameVerifiedWorkgroupIR()
     local before
     local direct = WORKGROUP:format("io.gpu"):gsub('local gpu = require%("io%.gpu"%)', "", 1)
     direct = direct:gsub("%f[%w_]gpu%.", "io.gpu.")
-    local env = envMod.new(HERE .. "/..")
+    local env = repositoryEnv.new()
     for _, source in ipairs({WORKGROUP:format("io.gpu"), direct}) do
         local parsed = parser.parse(source, "gpu-identity.nupp")
         test.eq(#parsed.errors, 0)
@@ -228,7 +229,7 @@ return simd.species == imported.species
 ]]
     local parsed = parser.parse(source, "simd-root.nupp")
     test.eq(#parsed.errors, 0)
-    local env = envMod.new(HERE .. "/..")
+    local env = repositoryEnv.new()
     local diagnostics = checker.check(parsed, "simd-root.nupp", env)
     test.eq(#diagnostics, 0, diagnostics[1] and diagnostics[1].msg)
     local code, problems = generator.generate(parsed, "simd-root.nupp")
@@ -245,7 +246,7 @@ return simd.species(1) + events.id(2), gpu.available()
 ]]
     local parsed = parser.parse(source, "compute-shadow.nupp")
     test.eq(#parsed.errors, 0)
-    local diagnostics = checker.check(parsed, "compute-shadow.nupp", envMod.new(HERE .. "/.."))
+    local diagnostics = checker.check(parsed, "compute-shadow.nupp", repositoryEnv.new())
     test.eq(#diagnostics, 0, diagnostics[1] and diagnostics[1].msg)
     local code, problems = generator.generate(parsed, "compute-shadow.nupp")
     test.eq(#problems, 0, problems[1] and problems[1].msg)
@@ -255,7 +256,7 @@ return simd.species(1) + events.id(2), gpu.available()
 end
 
 function M.formerPublicModulesAreAbsentAndGpuImplementationStaysPrivate()
-    local env = envMod.new(HERE .. "/..")
+    local env = repositoryEnv.new()
     for _, name in ipairs({"gpu", "gpu.layout", "gpu.spi", "nupp.gpu", "nupp.gpu.spi", "nupp.simd", "nupp.events"}) do
         test.eq(env.resolveModule(env, name), nil, name)
     end

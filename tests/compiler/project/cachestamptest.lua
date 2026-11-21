@@ -665,6 +665,23 @@ function M.twoEnvironmentsAgreeOnAHeaderKeyWhenTheModuleNameAgrees()
     os.execute("rm -rf '" .. dir .. "'")
 end
 
+-- An environment that never persists -- every one a test or a test worker makes --
+-- still parsed the whole project for its index. Kept only until `persist`, those
+-- headers were lost, and the next process parsed the repository again (#441).
+function M.aProjectIndexSavesTheHeadersItParsedWithoutPersisting()
+    local dir = tempProject({
+        ["nupp.lua"] = 'return { include = { "src" } }\n',
+        ["src/m.nupp"] = "local m = {}\nreturn m\n",
+    })
+    local cacheDir = dir .. "/shared-cache"
+    envMod.ensureProjectIndex(envMod.new(dir, {cacheDir = cacheDir}))
+    local reader = envMod.new(dir, {cacheDir = cacheDir})
+    local path = dir .. "/src/m.nupp"
+    local key = envMod.headerKey(reader, path, "local m = {}\nreturn m\n")
+    assert(envMod.headerStore(reader).get(key) ~= nil, "the parsed header was not saved for the next environment")
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
 -- The prelude is the compiler's own source and is checked before the project has been
 -- looked at. Answering its lookups from the project made every environment -- one per
 -- case in the suites that check fragments -- read and index every file in the project.
