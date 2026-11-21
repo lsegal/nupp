@@ -676,7 +676,7 @@ export function new(rootDir: string, opts: table?): Inc
         if text == nil or not envMod.isStagedBundledSource(env, name, path) then
             return false
         end
-        local file = env.bundledImplementation and env.bundledImplementation(name) or nil
+        local file = env.bundledImplementation and env.bundledImplementation(name, true) or nil
 
         return file ~= nil and require("nupp.compiler.bundled").source(file) == text
     end

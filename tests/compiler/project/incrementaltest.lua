@@ -1511,6 +1511,56 @@ function M.stagingACarriedModuleChecksNothingAgain()
     os.execute("rm -rf '" .. dir .. "'")
 end
 
+-- A staged carried module counts as the carried copy only when nothing else
+-- answers for its name. The project's `nupp.lua` is its manifest, not a module
+-- named `nupp`, so it does not shadow a staged `nupp` -- every project has one,
+-- and counting it turned the standard-library store off for all of them. A name
+-- that carries only a declaration is the same answer staged unchanged (#418).
+function M.stagedCarriedCopiesIgnoreTheManifestAndCoverDeclarations()
+    local envMod = require("nupp.compiler.project.env")
+    local carried = require("nupp.compiler.bundled")
+    local dir = os.tmpname()
+    os.remove(dir)
+    local staged = dir .. "/build/cache/runtime-source"
+    os.execute("mkdir -p '" .. staged .. "/nupp/workers'")
+
+    local function write(path, text)
+        local out = assert(io.open(path, "wb"))
+        out:write(text)
+        out:close()
+    end
+
+    write(dir .. "/nupp.lua", "return {}\n")
+    local inc = incremental.new(dir, {cache = false, runtimeSourceRoots = {staged}})
+    inc.env.roots[#inc.env.roots + 1] = staged
+
+    local nuppPath = staged .. "/nupp/init.nupp"
+    write(nuppPath, assert(carried.source("/nupp/init.nupp")))
+    assert(envMod.isStagedBundledSource(inc.env, "nupp", nuppPath), "the manifest does not shadow a staged nupp")
+    assert(envMod.isStagedCarriedCopy(inc.env, "nupp", nuppPath), "the staged nupp is the carried copy")
+
+    local nativePath = staged .. "/nupp/workers/native.d.nupp"
+    local declaration = assert(carried.source("/nupp/workers/native.d.nupp"))
+    write(nativePath, declaration)
+    assert(envMod.isStagedBundledSource(inc.env, "nupp.workers.native", nativePath), "a staged declaration is staged")
+    assert(
+        envMod.isStagedCarriedCopy(inc.env, "nupp.workers.native", nativePath),
+        "an unchanged staged declaration is the carried copy"
+    )
+
+    -- A module beside the manifest still shadows, and a declaration that drifted
+    -- from the carried text answers for itself.
+    local edited = staged .. "/nupp/workers/native.d.nupp"
+    write(edited, declaration .. "\n-- edited\n")
+    local fresh = incremental.new(dir, {cache = false, runtimeSourceRoots = {staged}})
+    fresh.env.roots[#fresh.env.roots + 1] = staged
+    assert(not envMod.isStagedCarriedCopy(fresh.env, "nupp.workers.native", edited), "a drifted copy is not carried")
+    write(dir .. "/nupp.nupp", "return {}\n")
+    assert(not envMod.isStagedBundledSource(fresh.env, "nupp", nuppPath), "a real nupp module still shadows")
+
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
 function M.importedInliningObservesBodiesOnlyDuringOptimization()
     local dir = os.tmpname()
     os.remove(dir)

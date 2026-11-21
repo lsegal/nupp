@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A build that links the worker or channel runtime keeps using the stored and
+  shared standard-library interfaces. The declaration it stages for
+  `nupp.workers.native` never counted as the compiler's own copy, so it turned
+  the store and sharing off and the standard library was checked from source
+  again. A project's `nupp.lua` manifest no longer counts as shadowing a
+  staged `nupp` either.
+
 - The playground's compiler no longer carries the source of the native runtime
   providers, which a browser program is refused anyway, so the bytecode it
   loads is about 540 KiB smaller (7.0 to 6.5 MiB). It had grown to within
