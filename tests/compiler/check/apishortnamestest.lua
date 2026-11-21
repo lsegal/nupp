@@ -10,8 +10,11 @@ local HERE = require("helpers.paths").tests
 local ROOT = HERE .. "/.."
 local M = {}
 
+-- Checks an edited copy of one standard-library module under its own name. The
+-- rest of the standard library is the carried copy: rooted with `src`, every module
+-- the edited one requires was checked again from source, most of this suite's time.
 local function futureModule(name, path, transform)
-    local env = envMod.new(ROOT, {cache = false})
+    local env = require("helpers.repositoryenv").new({cache = false})
     local file = assert(io.open(ROOT .. "/" .. path, "rb"))
     local source = file:read("*a")
     file:close()
