@@ -11,10 +11,10 @@ local check = require("assert")
 local data = require("types")
 local parser = require("nupp.compiler.syntax.parser")
 local fragment = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 
 local HERE = require("helpers.paths").tests
-local env = envMod.new(HERE .. "/..")
+local env = repositoryEnv.new()
 
 local M = {}
 

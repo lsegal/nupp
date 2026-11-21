@@ -4,12 +4,12 @@ local cst = require("nupp.compiler.syntax.cst")
 local gen = require("nupp.compiler.lua.gen")
 local fmt = require("nupp.tools.fmt")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 local types = require("nupp.compiler.types")
 local generics = require("nupp.compiler.types.generics")
 
 local HERE = require("helpers.paths").tests
-local env = envMod.new(HERE .. "/..")
+local env = repositoryEnv.new()
 
 local diagnosticRun = 0
 
