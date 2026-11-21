@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The playground's compiler no longer carries the source of the native runtime
+  providers, which a browser program is refused anyway, so the bytecode it
+  loads is about 540 KiB smaller (7.0 to 6.5 MiB). It had grown to within
+  about 200 bytes of the guest's 7 MiB startup mailbox.
+
 - A command run from inside a project that includes `.` now reuses the
   stored standard-library interfaces. The project's own manifest was taken
   for the standard library's `nupp` module there, which turned the store off,

@@ -293,10 +293,7 @@ local RESOURCES = {
         source = "src/nupp/runtime/provider/gpudevice.nupp",
         output = "nupp/compiler/nupp/runtime/provider/gpudevice.nupp"
     },
-    {
-        source = "src/nupp/runtime/provider/gpucosts.nupp",
-        output = "nupp/compiler/nupp/runtime/provider/gpucosts.nupp"
-    },
+    {source = "src/nupp/runtime/provider/gpucosts.nupp", output = "nupp/compiler/nupp/runtime/provider/gpucosts.nupp"},
     {source = "src/nupp/runtime/provider/wgpu.nupp", output = "nupp/compiler/nupp/runtime/provider/wgpu.nupp"},
     {source = "src/nupp/runtime/bitops.nupp", output = "nupp/compiler/nupp/runtime/bitops.nupp"},
     {source = "src/nupp/gpu/api.nupp", output = "nupp/compiler/nupp/gpu/api.nupp"},
@@ -613,21 +610,33 @@ for _, resource in ipairs({
 end
 
 -- What only the CLI reads: its test harness, the LLVM IR an AOT link pulls in,
--- the documentation theme, and the native GPU provider over wgpu-native. The
--- browser bundles carry neither the linker nor `nupp doc`, and bind the GPU to
--- WebGPU instead (targetbindings), and the compiler has to fit the guest's 7 MiB
--- startup mailbox.
-local NATIVE_GPU_RESOURCES = {
-    ["src/nupp/runtime/provider/nativegpu.nupp"] = true,
-    ["src/nupp/runtime/provider/nativegpurelease.nupp"] = true,
+-- the documentation theme, and the native runtime providers. The browser bundles
+-- carry neither the linker nor `nupp doc`, and a browser artifact is refused the
+-- native providers (`standardsurface.supports`): targetbindings binds it to
+-- `nupp.runtime.browser.*` instead, and the GPU to WebGPU. The compiler has to
+-- fit the guest's 7 MiB startup mailbox.
+local NATIVE_PROVIDER_RESOURCES = {
     ["src/nupp/runtime/provider/gpudevice.nupp"] = true,
     ["src/nupp/runtime/provider/gpucosts.nupp"] = true,
     ["src/nupp/runtime/provider/wgpu.nupp"] = true,
+    ["src/nupp/runtime/provider/workers.nupp"] = true,
+    ["src/nupp/runtime/provider/channels.nupp"] = true,
+    ["src/nupp/runtime/provider/suspension.nupp"] = true,
+    ["src/nupp/codec/json/aot.nupp"] = true,
 }
+
+local function nativeProviderResource(path)
+    -- Storage backs `bytes` on every host, so the browser keeps it.
+    return NATIVE_PROVIDER_RESOURCES[path]
+        or path:match("^src/nupp/runtime/provider/native") and path ~= "src/nupp/runtime/provider/nativestorage.nupp"
+end
+
 local function cliOnlyResource(resource)
     local path = type(resource) == "table" and resource.source or resource
-    return path:match("^tests/") or path:match("%.ll$") or path == "src/nupp/tools/doc/theme.css"
-        or NATIVE_GPU_RESOURCES[path]
+    return path:match("^tests/")
+        or path:match("%.ll$")
+        or path == "src/nupp/tools/doc/theme.css"
+        or nativeProviderResource(path)
 end
 
 local BROWSER_RESOURCES = {}
