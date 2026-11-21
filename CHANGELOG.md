@@ -9,6 +9,25 @@
   again. A project's `nupp.lua` manifest no longer counts as shadowing a
   staged `nupp` either.
 
+- A command run from inside a project that includes `.` now reuses the
+  stored standard-library interfaces. The project's own manifest was taken
+  for the standard library's `nupp` module there, which turned the store off,
+  so every such command checked the standard library from source again:
+  requiring `serde.json` cost about 12 seconds of CPU on every run, and now
+  costs about one second after the first.
+
+- An environment that builds a project index now saves the headers it parsed
+  straight away instead of only when it persists. An environment that never
+  persists, such as one a test makes, parsed this repository's 1,006 files in
+  about 8 seconds every time; the next process now reads them back in about
+  0.4 seconds.
+
+- A type function applied to two same-named local records, such as
+  `Identity(Item)` with a record `Item` declared in each of two functions, no
+  longer gives the second call the first call's record. The second call
+  reused the first one's cached answer, so its value was reported as
+  `NUPP2001` against a record it was never declared with.
+
 - A process that builds several environments over one project no longer parses
   every file in it again for each one to build its project index. Headers
   already worked out in the process are reused, so a later environment rooted
@@ -32,7 +51,10 @@
   compat and lints share one checked prelude, and the standard-library modules
   checked against it unless a project shadows one. A later environment now
   takes about 2 ms instead of 380, and requiring `simd` or `serde.json`
-  again checks in tens of milliseconds instead of 8 to 18 seconds.
+  again checks in tens of milliseconds instead of 8 to 18 seconds. A later
+  environment also reads the stored standard-library interfaces beside the
+  stored prelude, so a process whose first environment never needed the
+  standard library no longer checks it from source.
   `NUPP_NO_SHARED_PRELUDE` turns the sharing off.
 
 - A binary built beside the compiler's own build carries every module whose

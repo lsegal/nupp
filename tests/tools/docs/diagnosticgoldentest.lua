@@ -2,12 +2,12 @@
 -- behavior; this corpus catches wording, spans, help, and fix titles.
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 
 local HERE = require("helpers.paths").tests
 local ROOT = HERE .. "/.."
 local FIXTURES = HERE .. "/fixtures/diagnostics"
-local env = envMod.new(ROOT)
+local env = repositoryEnv.new()
 
 local function readFile(path)
     local file = assert(io.open(path, "rb"))

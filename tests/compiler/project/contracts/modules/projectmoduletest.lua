@@ -92,10 +92,20 @@ function M.aProjectManifestIsNotTheModuleNamedNupp()
     testAssert.eq(compilerEnv.findModulePath(env, "nupp"), nil, "the manifest answered for the module `nupp`")
     os.execute("rm -rf " .. string.format("%q", dir))
 
-    local nested = tempProject({
-        ["nupp.lua"] = 'return {include = {"src"}}\n',
-        ["src/nupp.lua"] = "return {}\n",
-    })
+    -- Two `.` segments together, as a command run inside a project that
+    -- includes `.` has (root `./.`, manifest `././nupp.lua`). Folded once, the
+    -- manifest still answered for `nupp`, and every such command checked the
+    -- standard library from source (#441).
+    local dotted = tempProject({["nupp.lua"] = 'return {include = {"./."}}\n'})
+    local dottedEnv = compilerEnv.new(dotted, {cache = false})
+    testAssert.eq(
+        compilerEnv.findModulePath(dottedEnv, "nupp"),
+        nil,
+        "the manifest answered for `nupp` through a `./.` root"
+    )
+    os.execute("rm -rf " .. string.format("%q", dotted))
+
+    local nested = tempProject({["nupp.lua"] = 'return {include = {"src"}}\n', ["src/nupp.lua"] = "return {}\n",})
     local nestedEnv = compilerEnv.new(nested, {cache = false})
     local found = compilerEnv.findModulePath(nestedEnv, "nupp")
     assert(found and found:match("src/nupp%.lua$"), "an include root's nupp.lua is a module: " .. tostring(found))

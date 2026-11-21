@@ -1,7 +1,7 @@
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
 local gen = require("nupp.compiler.lua.gen")
-local env = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 local HERE = require("helpers.paths").tests
 local M = {}
 
@@ -12,7 +12,7 @@ local function verify(contract, provider)
     file:close()
     local tree = parser.parse(source, path)
     assert(#tree.errors == 0, tree.errors[1] and tree.errors[1].msg)
-    local diagnostics = check.check(tree, path, env.new(HERE .. "/.."))
+    local diagnostics = check.check(tree, path, repositoryEnv.new())
     assert(#diagnostics == 0, diagnostics[1] and diagnostics[1].msg)
     local code, errors = gen.generate(tree, path)
     assert(#errors == 0, errors[1] and errors[1].msg)

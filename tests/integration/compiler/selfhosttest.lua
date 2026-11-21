@@ -8,6 +8,7 @@ local gen = require("nupp.compiler.lua.gen")
 local envMod = require("nupp.compiler.project.env")
 
 local HERE = require("helpers.paths").tests
+-- A plain environment: this suite checks `src` itself, the compiler's own sources.
 local env = envMod.new(HERE .. "/..")
 
 local function parse(src)
