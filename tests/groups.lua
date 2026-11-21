@@ -908,6 +908,21 @@ local prerequisites = {
         background = true,
     },
     {name = "the stamped compiler binary", module = "helpers.stampedbinary", suites = {"hostbinarytest"}},
+    -- Made before the first suite although it holds no lock: its suites are most
+    -- of the `measurement` group, which CI runs as a step of its own, so in the
+    -- background there is nothing to overlap it with and they would wait for it
+    -- anyway, each charged for the wait (#438).
+    {
+        name = "the benchmark programs",
+        module = "helpers.benchprograms",
+        suites = {
+            "benchgpuprocesstest",
+            "benchhistoryprocesstest",
+            "benchpilotprocesstest",
+            "benchprotocolprocesstest",
+            "benchrunnertest",
+        },
+    },
     {
         name = "the compiled serde contracts",
         module = "helpers.serdecontracts",

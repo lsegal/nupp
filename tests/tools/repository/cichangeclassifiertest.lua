@@ -400,6 +400,7 @@ function M.everyBenchmarkRunnerInputReachesTheMeasurementSurface()
         "tests/tools/bench/benchrunnertest.lua",
         "tests/tools/bench/process/replication/benchrunnertest.lua",
         "tests/helpers/benchprocess.lua",
+        "tests/helpers/benchprograms.lua",
         "tests/fixtures/bench_fixed_records.nupp",
     }) do
         test(

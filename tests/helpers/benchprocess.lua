@@ -54,15 +54,10 @@ local function jsonLines(path)
     return values
 end
 
--- What `debug.bench` reaches that the compiler does not carry. A project that
--- compiles a benchmark from source includes these copies rather than the whole of
--- `src`: with `src` included, every standard-library module the program reaches
--- resolves to a project file there and is checked again in each process instead
--- of shared from the carried copy (#410).
-local UNCARRIED = {"debug/bench.nupp", "nupp/bench/internal/record.nupp", "nupp/bench/internal/statistics.nupp",}
+local programs = require("helpers.benchprograms")
 
 local function copyUncarried(directory)
-    for _, relative in ipairs(UNCARRIED) do
+    for _, relative in ipairs(programs.UNCARRIED) do
         local target = directory .. "/" .. relative
         assert(os.execute(("mkdir -p %q"):format(assert(target:match("^(.*)/[^/]+$")))) == 0)
         local file = assert(io.open(target, "wb"))
@@ -88,11 +83,11 @@ end
 -- The store every command these suites start shares. `debug.bench` itself checks
 -- in about a second; what a cold command spends its twenty seconds on is the
 -- standard library it reaches, which an empty store checks from source again in
--- every child. One store for the run pays that once: the shared build fills it,
--- and each child that compiles a fixture from source finds `debug.bench` and
--- everything beneath it there (#438).
+-- every child. The build of the benchmark programs fills one store, and each
+-- child that compiles a fixture from source finds `debug.bench` and everything
+-- beneath it there (#438). Before that build, the run's own `bench` store.
 local function store()
-    return require("helpers.commandcache").dir("bench")
+    return programs.preparedStore() or require("helpers.commandcache").dir("bench")
 end
 
 local function inWorkspace(directory, command)
@@ -130,122 +125,17 @@ end
 
 -- Process orchestration reuses a compiled program. Source compilation remains
 -- covered by the standalone protocol tests; every fork still executes its work.
-local programIdentity
-
--- Every program the suites run, built together: one build per run rather than one
--- per program, which is what a cold run spends nearly all of these suites' time on.
-local PROGRAMS = {"bench_fixed_records", "bench_protocol", "bench_suite"}
-
+-- The runner builds every program once before any case starts
+-- (tests/helpers/benchprograms.lua), so no case waits on that build (#438).
 local function benchmarkProgram(name)
-    local fingerprint = require("nupp.compiler.project.fingerprint")
-    local digest = require("nupp.compiler.hostservices").hash.digest
-    if not programIdentity then
-        local root = assert(HERE:match("^(.*)/[^/]+$"))
-        local env = require("nupp.compiler.project.env")
-        local sources = env.listSourceFiles(env.new(root))
-        assert(#sources > 100, "benchmark fixture key must cover the real project sources")
-        table.sort(sources)
-        local parts = {
-            "benchmark-program-v2",
-            fingerprint.graphFingerprint(digest),
-            digest(read(root .. "/scripts/toolchain.pins")),
-            digest(read(HERE .. "/helpers/benchprocess.lua")),
-            digest(read(NUPP)),
-            _VERSION,
-            jit and (jit.version .. jit.os .. jit.arch) or "native",
-        }
-        for _, path in ipairs(sources) do
-            parts[#parts + 1] = path .. "\0" .. digest(read(path))
-        end
-        for _, variable in ipairs({"NUPP_VM_BINARY", "NUPP_VM_CLI_IMAGE", "NUPP_NATIVE_LIBRARY"}) do
-            local path = os.getenv(variable)
-            if path and path ~= "" then
-                parts[#parts + 1] = digest(read(path))
-            end
-        end
-        local host = rawget(_G, "__NUPP_EXECUTABLE")
-        if host then
-            parts[#parts + 1] = digest(read(host))
-        end
-        local pipe = assert(io.popen("env -0"))
-        local environment = pipe:read("*a")
-        pipe:close()
-        local values = {}
-        for value in environment:gmatch("[^%z]+") do
-            -- Content-validated compiler stores do not change the artifact.
-            if not value:match("^NUPP_CACHE_DIR=") then
-                values[#values + 1] = value
-            end
-        end
-        table.sort(values)
-        parts[#parts + 1] = table.concat(values, "\0")
-        programIdentity = digest(table.concat(parts, "\0"))
+    local known = false
+    for _, program in ipairs(programs.PROGRAMS) do
+        known = known or program == name
     end
-    local sources = {}
-    for index, program in ipairs(PROGRAMS) do
-        sources[index] = program .. "\0" .. read(HERE .. "/fixtures/" .. program .. ".nupp")
-    end
-    local key = "benchmark-programs-" .. digest(programIdentity .. "\0" .. table.concat(sources, "\0"))
-    local directory, artifacts, reused = testAssert.suite.fixture(key, function(directory)
-        assert(os.execute(("mkdir -p %q %q"):format(directory .. "/src", directory .. "/bench")) == 0)
-        local entries, files = {}, {}
-        for index, program in ipairs(PROGRAMS) do
-            local file = assert(io.open(directory .. "/src/" .. program .. ".nupp", "wb"))
-            file:write(read(HERE .. "/fixtures/" .. program .. ".nupp"))
-            file:close()
-            entries[index], files[index] = ("%q"):format(program), ("%q"):format("src/" .. program .. ".nupp")
-        end
-        copyUncarried(directory .. "/bench")
-        local file = assert(io.open(directory .. "/nupp.lua", "wb"))
-        file:write(
-            (
-                [[return {include = {"src", "bench"}, build = {default = "app", targets = {
-app = {kind = "modules", entries = {%s}, sources = {%s}, outDir = "out", optimize = 1}
-}}}]]
-            ):format(table.concat(entries, ", "), table.concat(files, ", "))
-        )
-        file:close()
-        -- Built by a command rather than in this process, so the check lands in the
-        -- store the children read. An environment in this process checks the
-        -- standard library again whatever the store holds.
-        local pipe = assert(io.popen(inWorkspace(directory, ("%q build 2>&1; echo \"__exit__:$?\""):format(NUPP))))
-        local output = pipe:read("*a")
-        pipe:close()
-        testAssert.eq(output:match("__exit__:(%d+)%s*$"), "0", "build the shared benchmark programs:\n" .. output)
-        -- Register the built modules before `nupp run`'s source loader. Native
-        -- libraries remain beside them in the ordinary module output tree.
-        local preload = {
-            [[local source = debug.getinfo(1, "S").source:gsub("\\", "/")
-local root = assert(source:match("^@(.*)/[^/]+$"))
-package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path
-]]
-        }
-        for _, path in ipairs(require("nupp.compiler.fs").listFiles(directory .. "/out")) do
-            local relative = path:sub(#directory + #"/out/" + 1)
-            if relative:match("%.lua$") then
-                local module = relative:gsub("%.lua$", ""):gsub("/init$", ""):gsub("/", ".")
-                preload[
-                    #preload + 1
-                ] = (
-                    "if package.loaded[%q] == nil then package.preload[%q] = assert(loadfile(root .. %q)) end\n"
-                ):format(module, module, "/" .. relative)
-            end
-        end
-        local published = {}
-        for _, program in ipairs(PROGRAMS) do
-            local artifact = "out/" .. program .. ".benchmark.lua"
-            file = assert(io.open(directory .. "/" .. artifact, "wb"))
-            file:write(table.concat(preload), ("assert(loadfile(root .. %q))()\n"):format("/" .. program .. ".lua"))
-            file:close()
-            published[program] = artifact
-        end
+    assert(known, "no shared benchmark program is named " .. name)
+    local directory = assert(programs.path(assert(HERE:match("^(.*)/[^/]+$"))))
 
-        return published
-    end)
-    testAssert.suite.work("benchmark.program.builds", reused and 0 or 1)
-    local artifact = assert(artifacts[name], "no shared benchmark program is named " .. name)
-
-    return require("nupp.compiler.fs").absolute(directory .. "/" .. artifact)
+    return directory .. "/project/out/" .. name .. ".benchmark.lua"
 end
 
 return {
