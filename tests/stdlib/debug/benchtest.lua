@@ -24,6 +24,7 @@ local json = require("testjson")
 local files = require("io.internal.files")
 
 local HERE = require("helpers.paths").tests
+-- A plain environment: `debug.bench` lives only in `src`, not the carried library.
 local env = envMod.new(HERE .. "/..")
 local NUPP = HERE .. "/../bin/nupp"
 

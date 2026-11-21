@@ -9,10 +9,10 @@
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
 local gen = require("nupp.compiler.lua.gen")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 
 local HERE = require("helpers.paths").absoluteTests
-local env = envMod.new(HERE .. "/..")
+local env = repositoryEnv.new()
 
 local M = {}
 
