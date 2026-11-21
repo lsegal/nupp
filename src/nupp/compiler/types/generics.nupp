@@ -1865,8 +1865,7 @@ local function keyCount(values: {[string]: any}?): integer
     return count
 end
 
---- What `fillInstantiationSurface` read from a declaration, compared slot by slot.
-local SURFACE_SLOTS: integer = 22
+--- What `fillInstantiationSurface` read from a declaration; see `sameSurface`.
 
 local function surfaceStamp(n: T.Nominal): {any}
     return {
@@ -1895,14 +1894,36 @@ local function surfaceStamp(n: T.Nominal): {any}
     }
 end
 
-local function sameSurface(left: {any}, right: {any}): boolean
-    for slot = 1, SURFACE_SLOTS do
-        if left[slot] ~= right[slot] then
-            return false
-        end
+--- Whether `n` still has the surface `stamp` recorded, without building a stamp
+--- to compare against. Every fill validation asks this of each declaration it
+--- reaches, so the table identities are compared before any entry is counted.
+local function sameSurface(stamp: {any}, n: T.Nominal): boolean
+    if stamp[1] ~= n.constructors
+        or stamp[3] ~= n.constructorEntries
+        or stamp[5] ~= n.methodEntries
+        or stamp[7] ~= n.methodDispatchEntries
+        or stamp[9] ~= n.staticEntries
+        or stamp[11] ~= n.overloadedMethods
+        or stamp[13] ~= n.overloadedStatics
+        or stamp[15] ~= n.associatedRequirements
+        or stamp[17] ~= n.associatedAnswers
+        or stamp[19] ~= n.indexReadKey
+        or stamp[20] ~= n.indexReadValue
+        or stamp[21] ~= n.indexWriteKey
+        or stamp[22] ~= n.indexWriteValue
+    then
+        return false
     end
 
-    return true
+    return stamp[2] == #(n.constructors or {})
+        and stamp[4] == #(n.constructorEntries or {})
+        and stamp[6] == entryCount(n.methodEntries)
+        and stamp[8] == entryCount(n.methodDispatchEntries)
+        and stamp[10] == entryCount(n.staticEntries)
+        and stamp[12] == keyCount(n.overloadedMethods)
+        and stamp[14] == keyCount(n.overloadedStatics)
+        and stamp[16] == #(n.associatedRequirements or {})
+        and stamp[18] == keyCount(n.associatedAnswers)
 end
 
 local function copyBindings(map: Bindings): (Bindings, integer)
@@ -2084,7 +2105,7 @@ local function fillCurrent(
     then
         return false
     end
-    if fill.surface == nil or not sameSurface(fill.surface as {any}, surfaceStamp(declaration)) then
+    if fill.surface == nil or not sameSurface(fill.surface as {any}, declaration) then
         return false
     end
     local supertypeSource = declaration.supertypes
