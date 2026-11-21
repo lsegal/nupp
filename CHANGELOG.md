@@ -42,7 +42,8 @@
   its suites in one process, no longer checks the prelude and the standard
   library again for each of them. Environments that agree on the target,
   compat and lints share one checked prelude, and the standard-library modules
-  checked against it unless a project shadows one. A later environment now
+  checked against it. A project that shadows a standard-library module still
+  shares every module that does not reach the shadow. A later environment now
   takes about 2 ms instead of 380, and requiring `simd` or `serde.json`
   again checks in tens of milliseconds instead of 8 to 18 seconds. A later
   environment also reads the stored standard-library interfaces beside the

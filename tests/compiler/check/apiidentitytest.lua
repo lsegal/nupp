@@ -651,7 +651,12 @@ function M.formattedLuaDeclarationHelpersCloseImportedNamespaces()
 local function accepts(...: unpackof __NuppFindResults("(%a+)", false)): nil end
 accepts(1, 3, "one")
 ]]
-    local formatted = require("nupp.tools.fmt").new():format(table.concat(pieces, "\n"))
+    -- The suite's repository environment, not the formatter's default one: that is
+    -- rooted at the working directory, which is the repository, whose `src` makes
+    -- every standard-library module a project module checked again (#439). Both
+    -- format these pieces to the same text.
+    local formatter = require("nupp.tools.fmt").new({environment = finalEnv()})
+    local formatted = formatter:format(table.concat(pieces, "\n"))
     withProject("module types\nexport const answer: integer = 17", function(env)
         local _, errors = compile(formatted, env)
         test.eq(errors, "", errors)

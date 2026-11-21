@@ -1655,6 +1655,11 @@ function checkMod.check(
             end
             s = s.parent
         end
+        -- An extension's types sit in the global tables once it has loaded, so
+        -- reading one is a dependency on its module that nothing resolves.
+        if extensionRoot and not shadowed and env and env.moduleAsked then
+            env.moduleAsked(builtinExtensions.module(root) or root, true, name)
+        end
         -- Prelude-owned types are complete before builtin implementations load.
         -- Reading a file handle type must not initialize the I/O extension and
         -- recursively load the provider that is currently being checked.
