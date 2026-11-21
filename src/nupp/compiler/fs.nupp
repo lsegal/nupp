@@ -266,11 +266,38 @@ export function stagingSuffix(): string
     return stagingToken .. "-" .. tostring(staged)
 end
 
+--- Renames `from` to `to`, which must not exist, retrying a refusal for a few
+--- seconds. Windows lets a scanner or indexer open a file the moment its writer
+--- closes it, and renaming a file somebody else holds open is a sharing
+--- violation the C runtime reports as `Permission denied` -- the same answer a
+--- rename onto an existing file gets, which is why the destination has to be
+--- free first. The holder lets go on its own, so the refusal is retried rather
+--- than reported as a failed build (#452).
+local function renameFree(from: string, to: string): boolean?, string?
+    local ok, err = os.rename(from, to)
+    local delay = 0.01
+    for _ = 1, 20 do
+        if ok or not tostring(err):find("Permission denied", 1, true) or exists(to) or not exists(from) then
+            break
+        end
+        local deadline = os.clock() + delay
+        while os.clock() < deadline do
+        end
+        delay = math.min(delay * 2, 0.2)
+        ok, err = os.rename(from, to)
+    end
+
+    return ok, err
+end
+
 --- Moves the finished staging file `tmp` onto `path`, replacing whatever is
 --- there, and removes `tmp` when that fails. For a writer that stages a file
 --- itself rather than handing `writeFile` the whole text.
 export function commitStaged(tmp: string, path: string): boolean?, string?
     local ok, renameErr = os.rename(tmp, path)
+    if not ok and not exists(path) then
+        ok, renameErr = renameFree(tmp, path)
+    end
     -- The Windows fallback, where a rename cannot replace an existing file. The
     -- backup is named for this writer for the same reason the staging file is:
     -- two of them moving the destination aside under one name would have the
@@ -279,12 +306,12 @@ export function commitStaged(tmp: string, path: string): boolean?, string?
     if not ok and exists(path) then
         local backup = ("%s.%s-%d.old"):format(path, stagingToken, staged)
         os.remove(backup)
-        local moved, moveErr = os.rename(path, backup)
+        local moved, moveErr = renameFree(path, backup)
         if not moved then
             os.remove(tmp);
             return nil, moveErr
         end
-        ok, renameErr = os.rename(tmp, path)
+        ok, renameErr = renameFree(tmp, path)
         if ok then
             os.remove(backup)
         else
