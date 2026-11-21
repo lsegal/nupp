@@ -106,4 +106,36 @@ function M.stagedWritesKeepTheDestinationAfterStreamFailures()
     end
 end
 
+-- Windows refuses to rename a file a scanner opened the moment its writer closed
+-- it, and says so as `Permission denied`. That passes, so a staged write that
+-- meets it waits rather than failing the build that asked for it (#452).
+function M.stagedWritesOutwaitABrieflyHeldStagingFile()
+    local rename = os.rename
+    local dir = tempProject({})
+    local refusals = 0
+    local ok, failure = pcall(function()
+        os.rename = function(from, to)
+            if from:find("%.tmp$") and refusals < 3 then
+                refusals = refusals + 1
+                return nil, from .. ": Permission denied", 13
+            end
+
+            return rename(from, to)
+        end
+        local wrote, reason = fs.writeFile(dir .. "/site/llms.txt", "page\n")
+        testAssert.eq(reason, nil, "a briefly held staging file is waited out")
+        testAssert.eq(wrote, true, "the write lands")
+        testAssert.eq(refusals, 3, "every refusal was retried")
+        testAssert.eq(read(dir .. "/site/llms.txt"), "page\n", "the staged text is published")
+        for name in fs.children(dir .. "/site") do
+            testAssert.eq(name, "llms.txt", "no staging file is left behind")
+        end
+    end)
+    os.rename = rename
+    remove(dir)
+    if not ok then
+        error(failure, 0)
+    end
+end
+
 return M
