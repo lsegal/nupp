@@ -8,10 +8,10 @@ local testAssert = require("assert")
 -- These characterize both directions at every path that substitutes a partial map.
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 
 local HERE = require("helpers.paths").tests
-local env = envMod.new(HERE .. "/..")
+local env = repositoryEnv.new()
 
 local function diagnostics(source)
     env.loaded = {}
@@ -713,7 +713,7 @@ end
         prefix:gsub("T is 0", "T") .. "local c = cell(0)\nc.value = 5\nlocal d: Cell<integer> = c\nreturn d\n",
     }
     local retained = {}
-    local revisionEnv = envMod.new(HERE .. "/..")
+    local revisionEnv = repositoryEnv.new()
     for index, source in ipairs(revisions) do
         local parsed = parser.parse(source, "generic-bound-edit.nupp")
         retained[index] = parsed

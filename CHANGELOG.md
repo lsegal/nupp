@@ -7,6 +7,19 @@
   loads is about 540 KiB smaller (7.0 to 6.5 MiB). It had grown to within
   about 200 bytes of the guest's 7 MiB startup mailbox.
 
+- A command run from inside a project that includes `.` now reuses the
+  stored standard-library interfaces. The project's own manifest was taken
+  for the standard library's `nupp` module there, which turned the store off,
+  so every such command checked the standard library from source again:
+  requiring `serde.json` cost about 12 seconds of CPU on every run, and now
+  costs about one second after the first.
+
+- An environment that builds a project index now saves the headers it parsed
+  straight away instead of only when it persists. An environment that never
+  persists, such as one a test makes, parsed this repository's 1,006 files in
+  about 8 seconds every time; the next process now reads them back in about
+  0.4 seconds.
+
 - A type function applied to two same-named local records, such as
   `Identity(Item)` with a record `Item` declared in each of two functions, no
   longer gives the second call the first call's record. The second call

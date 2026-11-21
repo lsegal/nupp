@@ -1,8 +1,8 @@
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 local HERE = require("helpers.paths").tests
-local environment = envMod.new(HERE .. "/..")
+local environment = repositoryEnv.new()
 local M = {}
 
 local function errors(source, selectedEnvironment, moduleName)

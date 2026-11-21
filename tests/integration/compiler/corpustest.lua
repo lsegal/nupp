@@ -7,6 +7,7 @@ local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
 local cst = require("nupp.compiler.syntax.cst")
 local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 
 local HERE = require("helpers.paths").tests
 
@@ -74,7 +75,7 @@ end
 -- an ordinary variable name, with the next statement starting on its own
 -- line. Kept as fast, self-contained regression cases.
 function M.declarationKeywordsRemainOrdinaryNames()
-    local env = envMod.new(HERE .. "/..")
+    local env = repositoryEnv.new()
     for _, kw in ipairs({"def", "record", "interface", "struct", "type"}) do
         for _, follow in ipairs({
             "i, j = 1, 2", -- assignment target list
