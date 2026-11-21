@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- On Windows, a build that writes a new file no longer fails with
+  `Permission denied` when a virus scanner or indexer opens the file the
+  moment it is written. `nupp doc` publishing a site was where this showed
+  up. The write now waits a few seconds for the scanner to let go.
+
 - A command run from inside a project that includes `.` now reuses the
   stored standard-library interfaces. The project's own manifest was taken
   for the standard library's `nupp` module there, which turned the store off,
