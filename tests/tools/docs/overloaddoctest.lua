@@ -3,11 +3,11 @@ local testAssert = require("assert")
 -- examples name their intended diagnostic in a leading `-- reports:` comment.
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 
 local HERE = require("helpers.paths").tests
 local ROOT = HERE .. "/.."
-local env = envMod.new(ROOT)
+local env = repositoryEnv.new()
 
 local M = {}
 

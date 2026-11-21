@@ -1,7 +1,7 @@
 local testAssert = require("assert")
 local parser = require("nupp.compiler.syntax.parser")
 local check = require("helpers.fragment")
-local envMod = require("nupp.compiler.project.env")
+local repositoryEnv = require("helpers.repositoryenv")
 local cabi = require("nupp.compiler.cinterop.cabi")
 
 local HERE = require("helpers.paths").tests
@@ -9,7 +9,7 @@ local HERE = require("helpers.paths").tests
 local function checked(source)
     local result = parser.parse(source, "src/game.nupp")
     testAssert.eq(#result.errors, 0, "parse errors")
-    local env = envMod.new(HERE .. "/..", {cache = false})
+    local env = repositoryEnv.new({cache = false})
     local diagnostics, _, exports = check.check(result, "src/game.nupp", env, {moduleName = "game"})
     for _, diagnostic in ipairs(diagnostics) do
         if diagnostic.severity == "error" then
@@ -205,7 +205,7 @@ return game
     local diagnostics = check.check(
         parsed,
         "src/game.nupp",
-        envMod.new(HERE .. "/..", {
+        repositoryEnv.new({
             cache = false
         }),
         {
