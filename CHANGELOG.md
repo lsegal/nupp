@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- An unchanged build of a target with an `aot` policy answers before building
+  a checking session, which used to read and decode the stored prelude image
+  only for the AOT replay to find nothing changed. A no-op native build of a
+  small `aot = "require"` project no longer spends about 80 ms there. Any
+  change to a source, the manifest, a dependency, the compiler or the code
+  generator, or a damaged artifact, still builds as before.
+
 - The playground's compiler no longer carries the source of the native runtime
   providers, which a browser program is refused anyway, so the bytecode it
   loads is about 540 KiB smaller (7.0 to 6.5 MiB). It had grown to within
