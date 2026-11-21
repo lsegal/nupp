@@ -1,0 +1,114 @@
+--[[
+Environments rooted at a project that check against the standard library the
+compiler carries.
+
+A project whose manifest includes the standard library's own source -- this
+compiler's repository includes `src` -- resolves every standard-library module a
+fragment reaches to a file under that include, a project module, instead of the
+carried copy. Neither the process-wide sharing of checked standard-library modules
+(#395) nor the standard-library store applies, so every such environment checks the
+same forty-odd modules again (#410).
+
+Leaving that include out gives a fragment the standard library a project outside the
+repository sees, built from the same bytes. What only the include holds -- modules
+the compiler does not carry, such as `debug.bench` -- is not reachable, so a caller
+that checks against those keeps a plain environment.
+
+This lives in the compiler rather than beside the tests because the Nupp-suite
+loader in `tests/run.lua` runs in every project, where this repository's test
+helpers are not on the path (#451).
+]]
+module nupp.compiler.project.repositoryenv
+
+local carried = require("nupp.compiler.project.carried")
+local envMod = require("nupp.compiler.project.env")
+
+local function exists(path: string): boolean
+    local f = io.open(path, "rb")
+    if not f then
+        return false
+    end
+    f:close()
+
+    return true
+end
+
+-- A source tree may spell a carried module differently from the carried file:
+-- `nupp.time` is carried as `/nupp/time/init.nupp` and written as `nupp/time.nupp`.
+-- Any spelling a `require` would find counts.
+local function holdsModule(dir: string, file: string): boolean
+    local base = file:gsub("/init%.nupp$", ""):gsub("%.nupp$", ""):gsub("%.lua$", "")
+
+    return exists(dir .. base .. ".nupp") or exists(dir .. base .. "/init.nupp") or exists(dir .. base .. ".lua")
+end
+
+--- Whether `dir` holds the source of every module the compiler carries, which is
+--- what an include that duplicates the carried standard library looks like. Any one
+--- missing module means the include is the project's own, and it stays.
+---
+--- @param dir the include directory, as the manifest's root joins it
+--- @return true when every carried implementation has its source under `dir`
+export function holdsCarriedLibrary(dir: string): boolean
+    for _, file in pairs(carried.implementations) do
+        if not holdsModule(dir, file) then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function configAt(rootDir: string): {[string]: any}
+    local loader: any = rawget(_G, "loadfile")
+    local chunk = loader and loader(rootDir .. "/nupp.lua") or nil
+    if not chunk then
+        return {}
+    end
+    local ok, loaded = pcall(chunk)
+
+    return ok and type(loaded) == "table" and loaded as {[string]: any} or {}
+end
+
+--- The manifest at `rootDir` without the includes the carried standard library
+--- already provides. A fresh table each time, as an environment reading the
+--- manifest itself would get; a project with no such include gets its manifest's
+--- entries unchanged.
+---
+--- @param rootDir the project root holding `nupp.lua`
+--- @return the manifest's entries with those includes left out
+export function config(rootDir: string): {[string]: any}
+    local manifest: {[string]: any} = {}
+    for key, value in pairs(configAt(rootDir)) do
+        manifest[key] = value
+    end
+    local includes: any = manifest.include
+    if type(includes) ~= "table" then
+        return manifest
+    end
+    local kept: {string} = {}
+    for _, dir in ipairs(includes as {string}) do
+        if not holdsCarriedLibrary(rootDir .. "/" .. dir) then
+            kept[#kept + 1] = dir
+        end
+    end
+    manifest.include = kept
+
+    return manifest
+end
+
+--- An environment rooted at `rootDir` that checks against the carried standard
+--- library; `opts` as `nupp.compiler.project.env.new` takes them, with `config`
+--- replaced by `config(rootDir)`.
+---
+--- @param rootDir the project root
+--- @param opts the environment options
+--- @return the environment
+export function new(rootDir: string, opts: any?): any
+    local merged: any = {}
+    for key, value in pairs((opts or {}) as {[string]: any}) do
+        merged[key] = value
+    end
+    merged.config = config(rootDir)
+
+    return envMod.new(rootDir, merged)
+end

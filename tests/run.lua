@@ -1735,8 +1735,10 @@ local function loadSuite(suite)
     -- loader installed while its cases run so it may require project modules.
     local compile = require("nupp.tools.cli.compile")
     -- The runner is invoked from the project root, just as `nupp test` runs
-    -- its configured command. Keep this root normalized for module lookup.
-    local env = require("nupp.compiler.project.env").new(".")
+    -- its configured command. Keep this root normalized for module lookup. A
+    -- manifest that includes the standard library's own source checks against
+    -- the carried copy instead, so suites share its checked modules (#451).
+    local env = require("nupp.compiler.project.repositoryenv").new(".")
     local settings = compile.settings({})
     local code, compileErr = compile.module(path, env, settings)
     if not code then
