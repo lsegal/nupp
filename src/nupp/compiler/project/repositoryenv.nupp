@@ -104,7 +104,7 @@ end
 --- @param opts the environment options
 --- @return the environment
 export function new(rootDir: string, opts: any?): any
-    local merged: {[string]: any} = {}
+    local merged: any = {}
     for key, value in pairs((opts or {}) as {[string]: any}) do
         merged[key] = value
     end
