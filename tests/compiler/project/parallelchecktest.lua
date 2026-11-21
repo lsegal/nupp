@@ -238,9 +238,27 @@ local function countKeys(values)
     return count
 end
 
+-- The environment a command against one of these temporary projects runs in.
+--
+-- Every project here is a handful of modules over the same standard library, and
+-- what the cases compare is the project: its records, its diagnostics, what its
+-- build wrote. The standard library they all share is what each command used to
+-- check from nothing, twice a case, for most of the suite's time (#449). The run's
+-- command store keeps it once; its entries are keyed by what they were computed
+-- from, and the project's own check records stay in its build directory, where
+-- `checkState` reads them.
+local function commandEnv(environment)
+    local env = {NUPP_CACHE_DIR = require("helpers.commandcache").dir()}
+    for name, value in pairs(environment or {}) do
+        env[name] = value
+    end
+
+    return env
+end
+
 local function coldCheck(directory, environment)
     os.remove(directory .. "/build/cache/checks.buf")
-    local code, output = process.capture({NUPP, "check", "--json"}, {cwd = directory, env = environment,})
+    local code, output = process.capture({NUPP, "check", "--json"}, {cwd = directory, env = commandEnv(environment),})
     local decoded, report = pcall(json.decode, output)
     assert(decoded, tostring(report) .. "\n" .. output)
 
@@ -278,7 +296,7 @@ local function coldBuild(directory, environment, extra)
     for _, argument in ipairs(extra or {}) do
         argv[#argv + 1] = argument
     end
-    local code, output = process.capture(argv, {cwd = directory, env = environment})
+    local code, output = process.capture(argv, {cwd = directory, env = commandEnv(environment)})
     local decoded, report = pcall(json.decode, output)
     assert(decoded, tostring(report) .. "\n" .. output)
     local outputs = buildOutputs(directory)
@@ -464,6 +482,7 @@ end
         write(directory .. "/src/sample.nupp", "@!internal\n\nmodule sample\n\n" .. first .. "\n" .. second)
         local code, output = process.capture({NUPP, "lsp", "artifact", "--kind", "lua", "src/sample.nupp"}, {
             cwd = directory,
+            env = commandEnv(),
         })
         testAssert.eq(code, 0, output)
         assert(os.remove(directory, true))
@@ -602,7 +621,7 @@ return {make = make}
     testAssert.eq(#report.diagnostics, 0, "parallel diagnostics: " .. json.encode(report.diagnostics))
     testAssert.eq(code, 0, "parallel exit status")
     testAssert.eq(state, serialState, "parallel check records")
-    local warmCode, warmOutput = process.capture({NUPP, "check", "--json"}, {cwd = directory})
+    local warmCode, warmOutput = process.capture({NUPP, "check", "--json"}, {cwd = directory, env = commandEnv()})
     testAssert.eq(warmCode, 0, "the warm check reuses clean records: " .. warmOutput)
 
     assert(os.remove(directory, true))

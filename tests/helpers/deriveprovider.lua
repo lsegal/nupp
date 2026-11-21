@@ -149,7 +149,12 @@ local function ran(path, label)
     if path ~= STRICT.ecs then
         return projectAt().run(path, true)
     end
-    local status, output = process.capture({NUPP, "run", path}, {cwd = INTERNAL_ROOT})
+    -- A project of its own, checked from nothing on a fresh checkout. The run's
+    -- command store keeps the standard library another command already checked.
+    local status, output = process.capture(
+        {NUPP, "run", path},
+        {cwd = INTERNAL_ROOT, env = {NUPP_CACHE_DIR = require("helpers.commandcache").dir()}}
+    )
     assert(status == 0, ("%s: %s did not run:\n%s"):format(label, path, output))
 
     return output

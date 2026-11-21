@@ -5,6 +5,13 @@ local readFile = fixture.readFile
 local run = fixture.run
 local MANIFEST = fixture.MANIFEST
 
+-- Each project here is one module over the standard library, built from nothing. The
+-- run's command store keeps what one build checked of the library for the next,
+-- rather than each build checking it again (#449).
+local function build()
+    return ("NUPP_CACHE_DIR=%q '%s' build"):format(require("helpers.commandcache").dir(), NUPP)
+end
+
 local M = {}
 
 function M.algorithmFactoryReferencesCarryTheirSelectedProviders()
@@ -25,7 +32,7 @@ assert(table.concat(formats("compression"), ",") == "deflate-raw,gzip,zlib")
 print("factories carried")
 ]],
     })
-    local output, built = run(dir, "'" .. NUPP .. "' build")
+    local output, built = run(dir, build())
     assert(built, output)
     for _, family in ipairs({"checksum", "digest", "mac", "nativecompression"}) do
         assert(readFile(dir .. "/build/nupp/runtime/provider/" .. family .. ".lua"), family .. " provider is staged")
@@ -57,7 +64,7 @@ assert(table.concat(formats("mac"), ",") == "hmac-sha256")
             .. compression
             .. '\nprint("catalogs carried")\n',
         })
-        local output, built = run(dir, "'" .. NUPP .. "' build")
+        local output, built = run(dir, build())
         assert(built, output)
         for _, family in ipairs({"checksum", "digest", "mac"}) do
             assert(readFile(dir .. "/build/nupp/runtime/provider/" .. family .. ".lua"), family .. " catalog is staged")

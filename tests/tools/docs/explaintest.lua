@@ -35,6 +35,14 @@ local M = {}
 -- one, among the heaviest in the run, needs to be.
 local reported = {}
 
+-- Both projects are a few hundred small modules over the standard library, built
+-- from nothing. The run's command store keeps what the first command checked of
+-- the library for the second, and for whichever other suite's project comes next
+-- (#449).
+local function commandStore()
+    return require("helpers.commandcache").dir()
+end
+
 local function fileFor(index, which)
     return ("%s_%03d.nupp"):format(which, index)
 end
@@ -96,8 +104,8 @@ local function reportedFor(aot)
     local pipe = assert(
         io.popen(
             (
-                "cd '%s' && '%s' %s --json %s 2>/dev/null"
-            ):format(dir, NUPP, aot and "check" or "build", table.concat(names, " "))
+                "cd '%s' && NUPP_CACHE_DIR=%q '%s' %s --json %s 2>/dev/null"
+            ):format(dir, commandStore(), NUPP, aot and "check" or "build", table.concat(names, " "))
         )
     )
     local out = pipe:read("*a")
