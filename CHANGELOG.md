@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Commands in a test run no longer redo fixed work the run's first command
+  already did. The prelude store's seal, the prelude's key, the declaration
+  fingerprint and the compiler build's record of each carried runtime module
+  are each worked out once per run rather than once per command. A no-op
+  native build of a small project went from about 690 ms of build work to
+  about 140, and a warm `nupp aot` no longer digests the prelude store.
+
 - A command run from inside a project that includes `.` now reuses the
   stored standard-library interfaces. The project's own manifest was taken
   for the standard library's `nupp` module there, which turned the store off,

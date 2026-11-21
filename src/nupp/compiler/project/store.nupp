@@ -122,6 +122,18 @@ local function writeSealed(path: string, stamp: string, body: any): nil
     end
 end
 
+local fingerprintMemo: any = nil
+
+-- Named indirectly: `fingerprint` reads the module graph through this module.
+local function runFingerprints(): any
+    if fingerprintMemo == nil then
+        local ok, loaded = pcall(require, "nupp.compiler.project." .. "fingerprint")
+        fingerprintMemo = ok and loaded or false
+    end
+
+    return fingerprintMemo or nil
+end
+
 --- The body `path` holds under `stamp` when it is intact, else nil.
 ---
 --- The stamp is compared before the body is digested, so a body some other compiler
@@ -130,8 +142,17 @@ local function unseal(path: string, stamp: string): any
     for _, slot in ipairs(slotsIn(path)) do
         if slot.stamp == stamp then
             local digest = sealDigest()
-            if digest and slot.seal ~= digest(slot.body) then
-                return nil
+            if digest then
+                local function intact(): boolean
+                    return slot.seal == digest(slot.body)
+                end
+
+                -- A test run checks a settled file's seal once; see
+                -- `fingerprint.sealIntact`.
+                local runs = runFingerprints()
+                if not (runs and runs.sealIntact(path, stamp, slot.seal, intact) or not runs and intact()) then
+                    return nil
+                end
             end
             local decodedOk, body = pcall(buffer.decode, slot.body)
 

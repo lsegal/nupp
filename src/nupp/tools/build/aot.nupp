@@ -1368,7 +1368,7 @@ function aot.captureReplay(policy: string, result: aot.Result): any
         remembered = result.remembered,
     }
 
-    return {payload = payload, digest = hash.digest(stable(payload)),}
+    return {payload = payload, digest = compilerFingerprint.contentDigest()(stable(payload)),}
 end
 
 local function countMap(values: {[string]: any}?): integer
@@ -1400,7 +1400,7 @@ function aot.replay(snapshot: any?, desiredCommand: string?): aot.Result?
     if payload.version ~= 1
         or type(payload.emitted) ~= "table"
         or payload.hasConstSelection == true
-        or hash.digest(stable(payload)) ~= snapshot.digest
+        or compilerFingerprint.contentDigest()(stable(payload)) ~= snapshot.digest
     then
         return nil
     end

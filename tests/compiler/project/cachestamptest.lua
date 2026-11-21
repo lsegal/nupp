@@ -8,6 +8,7 @@
 local cache = require("nupp.tools.build.cache")
 local envMod = require("nupp.compiler.project.env")
 local stable = require("nupp.compiler.stable")
+local test = require("assert")
 
 local HERE = require("helpers.paths").absoluteTests
 local ROOT = assert(HERE:match("^(.*)/[^/]+$"), "tests directory has no parent")
@@ -457,6 +458,98 @@ function M.aStoreWhoseBodyWasDamagedAnswersNothing()
     assert(store.open(keyedPath, "stamp").get("key").msg == message, "an intact entry is read back")
     damage(keyedPath)
     assert(store.open(keyedPath, "stamp").get("key") == nil, "a damaged entry was believed")
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
+-- Runs `operation` with a store module loaded afresh, whose seal digests are counted
+-- and whose run keeps its answers in `kept`, or keeps none when `kept` is nil.
+-- Answers how many digests it took. Both are looked up when first used, so they
+-- stay in place until the operation is done.
+local function countingStore(kept, operation)
+    local services = package.loaded["nupp.compiler.hostservices"]
+    local runs = package.loaded["nupp.compiler.project.fingerprint"]
+    local real = require("nupp.compiler.hostservices").hash.digest
+    local digests = 0
+    package.loaded["nupp.compiler.hostservices"] = {
+        hash = {
+            digest = function(text)
+                -- Not the empty probe that tells the store the digest works.
+                if text ~= "" then
+                    digests = digests + 1
+                end
+                return real(text)
+            end,
+        },
+    }
+    local ok, why = pcall(function()
+        -- The real `sealIntact`, keeping what it keeps in `kept` instead of a run.
+        local runs = dofile(ROOT .. "/build/nupp/compiler/project/fingerprint.lua")
+        runs.runRecalled = function(name)
+            return kept and kept[name] or nil
+        end
+        runs.runKeep = function(name, answer)
+            if kept then
+                kept[name] = answer
+            end
+        end
+        package.loaded["nupp.compiler.project.fingerprint"] = runs
+        operation(dofile(ROOT .. "/build/nupp/compiler/project/store.lua"))
+    end)
+    package.loaded["nupp.compiler.hostservices"] = services
+    package.loaded["nupp.compiler.project.fingerprint"] = runs
+    assert(ok, why)
+
+    return digests
+end
+
+-- Sets a file's modification time `seconds` ago.
+local function backdate(path, seconds)
+    local stamp = os.date("%Y%m%d%H%M.%S", os.time() - seconds)
+    assert(os.execute(("touch -t %s '%s'"):format(stamp, path)) == 0, "touch failed")
+end
+
+-- Every command of a test run opened the run-wide prelude store and digested all of
+-- its 4 to 9 MB body to check the seal, which the command before it had already
+-- checked. A run now keeps that a file, as its size and modification time, was
+-- intact; a file rewritten since, or too new to tell apart from a rewrite, is
+-- digested again.
+function M.aTestRunChecksASettledStoresSealOnce()
+    local dir = tempProject({})
+    local path = dir .. "/value.buf"
+    local kept = {}
+
+    local function readsIntact(store)
+        local value = store.openValue(path, "stamp").value
+        assert(value and value.msg == "intact", "an intact value was not read back")
+    end
+
+    countingStore(kept, function(store)
+        local writer = store.openValue(path, "stamp")
+        writer.set({msg = "intact"})
+        writer.save()
+    end)
+    test.eq(countingStore(kept, function(store)
+        readsIntact(store)
+        readsIntact(store)
+    end), 2, "a file written just now was not digested every time")
+
+    backdate(path, 60)
+    test.eq(countingStore(kept, readsIntact), 1, "the first command of the run did not check the seal")
+    test.eq(countingStore(kept, readsIntact), 0, "a later command of the run checked the same seal again")
+    test.eq(countingStore(nil, readsIntact), 1, "outside a run the seal was not checked")
+
+    -- Damaged in place, at the same size, and dated to another settled time.
+    local file = assert(io.open(path, "rb"))
+    local text = file:read("*a")
+    file:close()
+    local at = assert(text:find("intact", 1, true), "the value is stored as written")
+    file = assert(io.open(path, "wb"))
+    file:write(text:sub(1, at - 1) .. "Intact" .. text:sub(at + 6))
+    file:close()
+    backdate(path, 120)
+    test.eq(countingStore(kept, function(store)
+        assert(store.openValue(path, "stamp").value == nil, "a rewritten file was believed by its old seal")
+    end), 1, "a rewritten file was not digested")
     os.execute("rm -rf '" .. dir .. "'")
 end
 
@@ -1304,6 +1397,9 @@ local function runFixture()
                 subsystem = isolated.subsystemFingerprint({
                     "nupp.compiler.one"
                 }),
+                -- What a build asks, passing the native digest.
+                declarations = isolated.declarationFingerprint(isolated.contentDigest()),
+                keptDeclarations = isolated.runRecalled("declarations"),
             }
         end)
         os.getenv = getenv
@@ -1346,6 +1442,8 @@ function M.aTestRunKeepsItsCompilersFingerprintsForTheCommandsAfterTheFirst()
     assert(outside.subsystem ~= first.subsystem, "outside a run a subsystem's fingerprint was not computed")
     assert(rebuilt.tool == outside.tool, "a rebuilt compiler was answered from the one before it")
     assert(rebuilt.subsystem == outside.subsystem, "a rebuilt compiler's subsystem came from the one before")
+    assert(first.keptDeclarations == first.declarations, "a build's declaration fingerprint was not kept")
+    assert(outside.keptDeclarations == nil, "outside a run a declaration fingerprint was kept")
 end
 
 -- A build of the run's own tree is about to replace what the kept answers
