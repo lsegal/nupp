@@ -91,6 +91,50 @@ local function runWorkerHost(args)
     return capturedRun(("cd %q && %q %s 2>&1"):format(ROOT, ROOT .. "/build/nupp-test", args))
 end
 
+-- The same worker host over a directory of its own, holding a copy of the runner
+-- and whichever suites a case writes there.
+--
+-- What several cases below assert is about the runner -- how it reads the names
+-- it is given, how it paints its output -- and not about the suites it runs.
+-- Naming this repository's suites made every one of those cases pay to discover
+-- the whole catalogue and then run real suites, seconds of work apiece, to learn
+-- what a suite of one empty case says just as well (#449).
+local function hostProject(suites)
+    local dir = os.tmpname()
+    os.remove(dir)
+    assert(os.execute("mkdir -p " .. string.format("%q", dir .. "/tests")) == 0)
+    write(dir .. "/tests/run.lua", read(ROOT .. "/tests/run.lua"))
+    for name, cases in pairs(suites) do
+        local source = {"local M = {}"}
+        for index = 1, cases do
+            source[#source + 1] = ("function M.case%d() end"):format(index)
+        end
+        source[#source + 1] = "return M\n"
+        write(dir .. "/tests/" .. name .. ".lua", table.concat(source, "\n"))
+    end
+
+    return dir
+end
+
+local function runHostIn(dir, args)
+    return capturedRun(
+        ("cd %q && %sNUPP_TEST_BUILD=%q %q %s 2>&1"):format(
+            dir,
+            MODULES,
+            dir .. "/build",
+            ROOT .. "/build/nupp-test",
+            args
+        )
+    )
+end
+
+-- What a `nupp test` of a temporary project keeps between commands: the run's
+-- store, so the standard library one such project checked is not checked again by
+-- the next (see `helpers.commandcache`).
+local function commandStore()
+    return ("NUPP_CACHE_DIR=%q "):format(require("helpers.commandcache").dir())
+end
+
 -- What the named invocations did, whole. Summarising here would drop exactly the
 -- part a report that went missing is hiding in, and a byte count separates output
 -- that was never written from output that was written and lost in capture.
@@ -149,7 +193,7 @@ return M
     for _, jobs in ipairs({1, 2}) do
         local errors = os.tmpname()
         local output, invocation = capturedRun(
-            ("cd %q && %q test --jobs=%d --json 2>%q"):format(dir, NUPP, jobs, errors)
+            ("cd %q && %s%q test --jobs=%d --json 2>%q"):format(dir, commandStore(), NUPP, jobs, errors)
         )
         local diagnostics = read(errors)
         os.remove(errors)
@@ -199,7 +243,7 @@ end
 return M
 ]]
     )
-    local output, invocation = capturedRun(("cd %q && %q test --json 2>/dev/null"):format(dir, NUPP))
+    local output, invocation = capturedRun(("cd %q && %s%q test --json 2>/dev/null"):format(dir, commandStore(), NUPP))
     test.eq(invocation.status, 0, "the carried library did not load" .. evidence(invocation))
     local report = require("testjson").decode(output)
     test.eq(report.passed, 1, output)
@@ -237,7 +281,7 @@ end
 return M
 ]]
     )
-    local output, invocation = capturedRun(("cd %q && %q test --json 2>/dev/null"):format(dir, NUPP))
+    local output, invocation = capturedRun(("cd %q && %s%q test --json 2>/dev/null"):format(dir, commandStore(), NUPP))
     os.execute("rm -rf " .. string.format("%q", dir))
     test.eq(invocation.status, 1, "the project library was not checked strictly" .. evidence(invocation))
     local report = require("testjson").decode(output)
@@ -348,7 +392,7 @@ return M
     -- Keep the copied runner in one process. External discovery, persistence,
     -- and the public test command are what this case exercises; worker shape is
     -- covered independently below.
-    local command = ("cd %q && %q test --jobs=1 --json 2>/dev/null"):format(dir, NUPP)
+    local command = ("cd %q && %s%q test --jobs=1 --json 2>/dev/null"):format(dir, commandStore(), NUPP)
     local output, bundled = capturedRun(command)
     test.eq(bundled.status, 0, "the bundled runner failed outside its checkout" .. evidence(bundled))
     local report = require("testjson").decode(output)
@@ -449,7 +493,9 @@ return {first = consume, second = consume}
         ):format(fixtureKey .. "-failure")
     )
 
-    local command = ("cd %q && %q test featuretest fixturepeertest --jobs=2 --json 2>/dev/null"):format(dir, NUPP)
+    local command = (
+        "cd %q && %s%q test featuretest fixturepeertest --jobs=2 --json 2>/dev/null"
+    ):format(dir, commandStore(), NUPP)
     local output, invocation = capturedRun(command)
     test.eq(invocation.status, 0, "structured runner case failed" .. evidence(invocation))
     local report = require("testjson").decode(output)
@@ -485,19 +531,19 @@ return {first = consume, second = consume}
     end
     local timingsBefore = require("testjson").decode(read(dir .. "/build/.nupp-test-times.json"))
 
-    local listing, listed = capturedRun(("cd %q && %q test --list-cases 2>&1"):format(dir, NUPP))
+    local listing, listed = capturedRun(("cd %q && %s%q test --list-cases 2>&1"):format(dir, commandStore(), NUPP))
     test.eq(listed.status, 0, "case listing failed" .. evidence(listed))
     test.matches(listing, "featuretest/alpha")
     test.matches(listing, "featuretest/unavailable")
 
     local filteredListing, filtered = capturedRun(
-        ("cd %q && %q test --case=featuretest/beta --list-cases 2>&1"):format(dir, NUPP)
+        ("cd %q && %s%q test --case=featuretest/beta --list-cases 2>&1"):format(dir, commandStore(), NUPP)
     )
     test.eq(filtered.status, 0, "filtered case listing failed" .. evidence(filtered))
     test.eq(filteredListing, "featuretest/beta\n")
 
     local exactOutput, exact = capturedRun(
-        ("cd %q && %q test --case=featuretest/beta --jobs=1 --json 2>/dev/null"):format(dir, NUPP)
+        ("cd %q && %s%q test --case=featuretest/beta --jobs=1 --json 2>/dev/null"):format(dir, commandStore(), NUPP)
     )
     test.eq(exact.status, 0, "exact case selection failed" .. evidence(exact))
     local exactReport = require("testjson").decode(exactOutput)
@@ -513,7 +559,7 @@ return {first = consume, second = consume}
 
     test(os.remove(fixturePath .. "/answer.txt"))
     local rebuiltOutput, rebuilt = capturedRun(
-        ("cd %q && %q test --case=featuretest/alpha --jobs=1 --json 2>/dev/null"):format(dir, NUPP)
+        ("cd %q && %s%q test --case=featuretest/alpha --jobs=1 --json 2>/dev/null"):format(dir, commandStore(), NUPP)
     )
     test.eq(rebuilt.status, 0, "corrupt fixture recovery failed" .. evidence(rebuilt))
     local rebuiltReport = require("testjson").decode(rebuiltOutput)
@@ -544,7 +590,7 @@ end}
 ]]
     )
     local aliasOutput, aliasRun = capturedRun(
-        ("cd %q && %q test fixturealiastest --jobs=1 --json 2>/dev/null"):format(dir, NUPP)
+        ("cd %q && %s%q test fixturealiastest --jobs=1 --json 2>/dev/null"):format(dir, commandStore(), NUPP)
     )
     test.eq(aliasRun.status, 0, "fixture key aliases collided" .. evidence(aliasRun))
     local aliasReport = require("testjson").decode(aliasOutput)
@@ -560,7 +606,9 @@ end}
 ]]
     )
     local infrastructureOutput, infrastructure = capturedRun(
-        ("cd %q && %q test --rerun=infrastructure-failures.json --jobs=1 --json 2>/dev/null"):format(dir, NUPP)
+        (
+            "cd %q && %s%q test --rerun=infrastructure-failures.json --jobs=1 --json 2>/dev/null"
+        ):format(dir, commandStore(), NUPP)
     )
     test.eq(infrastructure.status, 0, "infrastructure-report rerun failed" .. evidence(infrastructure))
     local infrastructureReport = require("testjson").decode(infrastructureOutput)
@@ -576,18 +624,18 @@ end}
 ]]
     )
     local workerOnlyOutput, workerOnly = capturedRun(
-        ("cd %q && %q test --rerun=worker-only-failure.json --jobs=1 2>&1"):format(dir, NUPP)
+        ("cd %q && %s%q test --rerun=worker-only-failure.json --jobs=1 2>&1"):format(dir, commandStore(), NUPP)
     )
     test.eq(workerOnly.status, 2, "a worker-only failure cannot select every suite" .. evidence(workerOnly))
     test.matches(workerOnlyOutput, "contains no rerunnable failed tests")
 
     local failedOutput, failed = capturedRun(
-        ("cd %q && %q test reruntest --jobs=1 --json 2>/dev/null"):format(dir, NUPP)
+        ("cd %q && %s%q test reruntest --jobs=1 --json 2>/dev/null"):format(dir, commandStore(), NUPP)
     )
     test.eq(failed.status, 1, "the seed failure had the wrong status" .. evidence(failed))
     write(dir .. "/failures.json", failedOutput)
     local rerunOutput, rerun = capturedRun(
-        ("cd %q && %q test --rerun=failures.json --jobs=1 --json 2>/dev/null"):format(dir, NUPP)
+        ("cd %q && %s%q test --rerun=failures.json --jobs=1 --json 2>/dev/null"):format(dir, commandStore(), NUPP)
     )
     test.eq(rerun.status, 1, "failure-report rerun had the wrong status" .. evidence(rerun))
     local rerunReport = require("testjson").decode(rerunOutput)
@@ -595,7 +643,7 @@ end}
     test.eq(rerunReport.tests[1].id, "reruntest/fails")
 
     local fixtureFailureOutput, fixtureFailure = capturedRun(
-        ("cd %q && %q test fixturefailuretest --jobs=1 --json 2>/dev/null"):format(dir, NUPP)
+        ("cd %q && %s%q test fixturefailuretest --jobs=1 --json 2>/dev/null"):format(dir, commandStore(), NUPP)
     )
     test.eq(fixtureFailure.status, 1, "fixture failure fan-out had the wrong status" .. evidence(fixtureFailure))
     local fixtureFailureReport = require("testjson").decode(fixtureFailureOutput)
@@ -609,7 +657,7 @@ end}
     )
 
     local retriedOutput, retried = capturedRun(
-        ("cd %q && %q test fixturefailuretest --jobs=1 --json 2>/dev/null"):format(dir, NUPP)
+        ("cd %q && %s%q test fixturefailuretest --jobs=1 --json 2>/dev/null"):format(dir, commandStore(), NUPP)
     )
     test.eq(retried.status, 1, "fixture retry had the wrong status" .. evidence(retried))
     require("testjson").decode(retriedOutput)
@@ -1207,21 +1255,27 @@ function M.namingSeveralSuitesRunsEveryOneOfThem()
     -- Each name used to overwrite the one before it, so `nupp test a b` ran only `b`
     -- and reported a count that looked like an answer. Summed from the single runs
     -- rather than written down, so this keeps meaning what it says as suites grow.
-    local first, firstRun = runWorkerHost("lexertest --timings=0")
-    local second, secondRun = runWorkerHost("uritest --timings=0")
-    local both, bothRun = runWorkerHost("lexertest uritest --timings=0")
+    local dir = hostProject({alphatest = 2, betatest = 3, gammatest = 5})
+    local first, firstRun = runHostIn(dir, "alphatest --timings=0")
+    local second, secondRun = runHostIn(dir, "betatest --timings=0")
+    local both, bothRun = runHostIn(dir, "alphatest betatest --timings=0")
+    os.execute("rm -rf " .. string.format("%q", dir))
     local a = tonumber(first:match("(%d+) tests,"))
     local b = tonumber(second:match("(%d+) tests,"))
     local together = tonumber(both:match("(%d+) tests,"))
     local runs = evidence(firstRun, secondRun, bothRun)
     test(a and b and together, "each run reports a count" .. runs)
+    test.eq(a, 2, "the first suite ran alone" .. runs)
+    test.eq(b, 3, "the second suite ran alone" .. runs)
     test.eq(together, a + b, "naming two suites runs both of them" .. runs)
 end
 
 function M.aNameMatchingNoSuiteIsAFailure()
     -- Discovering nothing and reporting it green is the shape of this that hurts:
     -- a typo in a suite name reads exactly like a suite that passed.
-    local out, missing = runWorkerHost("nosuchsuitetest --timings=0")
+    local dir = hostProject({alphatest = 1})
+    local out, missing = runHostIn(dir, "nosuchsuitetest --timings=0")
+    os.execute("rm -rf " .. string.format("%q", dir))
     test.matches(out, "no tests were discovered")
     test.eq(missing.status, 1, "discovering nothing exits unsuccessfully" .. evidence(missing))
 end
@@ -1506,10 +1560,12 @@ function M.defaultWorkerCountIsOnePerProcessor()
 end
 
 function M.workerHostColorsOnlyWhenAskedDownAPipe()
-    local colored, coloredRun = runWorkerHost("lexertest --timings=0 --color=always")
+    local dir = hostProject({alphatest = 2})
+    local colored, coloredRun = runHostIn(dir, "alphatest --timings=0 --color=always")
+    local plain, plainRun = runHostIn(dir, "alphatest --timings=0 --no-color")
+    os.execute("rm -rf " .. string.format("%q", dir))
     test(colored:find("\27[", 1, true), "--color=always paints runner output" .. evidence(coloredRun))
 
-    local plain, plainRun = runWorkerHost("lexertest --timings=0 --no-color")
     test.eq(plain:find("\27[", 1, true), nil, "--no-color keeps redirected runner output plain" .. evidence(plainRun))
 end
 
@@ -2041,6 +2097,14 @@ local function linger()
 end
 ]]
 
+-- That process ignores being asked to stop, so what ends it is the kill a group's
+-- watcher sends once its grace runs out, and the grace is most of what these
+-- cases wait for. A runner's grace shrinks with how deeply it is nested, so that
+-- inner groups are ended before outer ones; these runners are started as though
+-- nested, which shortens the wait without changing what ends the process or in
+-- which order (#449).
+local QUICK_GRACE = "NUPP_TEST_GROUP_DEPTH=4 "
+
 local function lingeringPid(dir)
     local file = io.open(dir .. "/lingering.pid", "rb")
     if not file then
@@ -2083,7 +2147,13 @@ return {leavesAProcessRunning = linger}
     local output, invocation = capturedRun(
         (
             "cd %q && %sNUPP_COVERAGE_FILE=%q NUPP_TEST_BUILD=%q %q lingertest quiettest --jobs=1 --json 2>/dev/null"
-        ):format(dir, MODULES, dir .. "/inherited-coverage.json", dir .. "/build", ROOT .. "/build/nupp-test")
+        ):format(
+            dir,
+            QUICK_GRACE .. MODULES,
+            dir .. "/inherited-coverage.json",
+            dir .. "/build",
+            ROOT .. "/build/nupp-test"
+        )
     )
     local pid = lingeringPid(dir)
     local ended = pid ~= nil and awaitExit(pid, 3)
@@ -2124,7 +2194,7 @@ end}
                 shellWord(
                     (
                         "%sNUPP_TEST_BUILD=%q %q stucktest quiettest --jobs=1 --json & echo $! > runner.pid; wait"
-                    ):format(MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+                    ):format(QUICK_GRACE .. MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
                 )
             )
         ) == 0
@@ -2179,7 +2249,7 @@ end}
         )
         local runner = (
             "%sNUPP_TEST_BUILD=%q %q lonetest --jobs=1 --json; :"
-        ):format(MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
+        ):format(QUICK_GRACE .. MODULES, dir .. "/build", ROOT .. "/build/nupp-test")
         -- The command: a shell that waits on the runner, or one that names itself
         -- and waits on another shell that waits on the runner.
         local command = shape == "parent" and runner or ("NUPP_TEST_WATCH_PID=$$ sh -c %s; :"):format(shellWord(runner))
